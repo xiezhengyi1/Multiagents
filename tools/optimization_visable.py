@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import main as opt_engine
+import optimization as opt_engine
 from typing import List
 
 # 设置页面配置

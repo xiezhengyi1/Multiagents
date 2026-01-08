@@ -33,6 +33,7 @@ def run_optimization_solver(w1: float, w2: float, w3: float, app_details: str) -
             app_data = app_details
             
         result = optimize_network_slices(app_data, w1, w2, w3)
+        logger.info(f"Optimization Solver Result:\n{result}")
         return result
     except Exception as e:
         return f"工具执行错误: {str(e)}"

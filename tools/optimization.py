@@ -23,14 +23,13 @@ class Flow:
     name: str
     bw: float       # 带宽 (Mbps)
     lat: float      # 时延 (ms)
-    priority: int   # 优先级 (数值越大越高)
+    priority: int   # 优先级 (数值越小越高)
     old_slice: Optional[str] = None # 流的原切片名称
 
 @dataclass
 class App:
     """定义应用及其聚合需求"""
     name: str
-    type: str       # 应用类型 (URLLC, eMBB, mMTC)
     flows: List[Flow]
     weight: float   # 业务权重 (Vi)
     old_slice: Optional[str] = None # App 维度的原切片（主要用于兼容，新的逻辑主要看 Flow）
@@ -54,7 +53,8 @@ class App:
 class Slice:
     """定义网络切片资源与状态"""
     name: str
-    sst: str        # 切片服务类型
+    sst: int        # 切片服务类型 (改为 int 类型, 8bit)
+    sd: str         # 切片微分器 (6位 hex 字符串)
     total_bw: float # 总带宽容量
     current_load_bw: float # 当前基础负载 (不含可被抢占的)
     latency: float  # 链路传输时延 D_link
@@ -224,11 +224,10 @@ class SliceOptimizationEngine:
         )
         
         # 体验损失: Sum Weighted * ( (Req - Act) / Req )
-        # 将 App 的权重分摊到 Flow 上? 或者直接用 Flow priority * App Weight?
-        # 这里使用 App.weight * (Flow缺口 / Flow总需) 的思路，
-        # 并乘上 f.priority/10 做流的微调 (假设priority ~10左右)
+        # 根据用户要求，Weighted 使用每条流的优先级的倒数。
+        # 这里假设 priority 数值越小优先级越高。
         term_exp = pulp.lpSum(
-            (app.weight * (f.priority / 10.0)) * (f.bw - pulp.lpSum(B_act[app.name, f.name, s.name] for s in slices)) / f.bw
+            (1.0 / f.priority if f.priority > 0 else 1.0) * (f.bw - pulp.lpSum(B_act[app.name, f.name, s.name] for s in slices)) / f.bw
             for app in apps for f in app.flows if f.bw > 0
         )
 
@@ -252,7 +251,6 @@ class SliceOptimizationEngine:
                 results.append({
                     "App": app.name,
                     "Flow": f.name,
-                    "Type": app.type,
                     "Old Slice": f.old_slice,
                     "New Slice": mapped_slice,
                     "Req BW": f.bw,
@@ -312,51 +310,52 @@ def get_initial_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     """初始化模拟场景数据"""
     
     # 辅助函数：快速构造 App 并将 old_slice 传递给 flows (简单初始化逻辑)
-    def create_app(name, atype, flows, weight, old_slice_name):
+    def create_app(name, flows, weight, old_slice_name):
         # 将 App 级别的 old_slice 赋给所有 flow 作为初始状态
         for f in flows:
             f.old_slice = old_slice_name
-        return App(name, atype, flows, weight, old_slice=old_slice_name)
+        return App(name, flows, weight, old_slice=old_slice_name)
 
     apps_data = [
-        create_app("Remote_Drive", "URLLC", [
+        create_app("Remote_Drive", [
             Flow("Control", 2, 5, 20),
             Flow("Video_Feed", 8, 20, 15)
         ], weight=1000, old_slice_name="S1_Gold"),
         
-        create_app("4K_Video", "eMBB", [
+        create_app("4K_Video", [
             Flow("Main_Stream", 35, 50, 10),
             Flow("Audio", 5, 100, 5)
         ], weight=50, old_slice_name="S2_Silver"),
         
-        create_app("IoT_Sensor", "URLLC", [
+        create_app("IoT_Sensor", [
             Flow("Telemetry", 2, 20, 10)
         ], weight=100, old_slice_name="S1_Gold"),
         
-        create_app("Web_Browse", "eMBB", [
+        create_app("Web_Browse", [
             Flow("HTTP", 15, 100, 1)
         ], weight=10, old_slice_name="S3_Public"),
         
-        create_app("AR_Gaming", "eMBB", [
+        create_app("AR_Gaming", [
             Flow("Render", 20, 20, 15),
             Flow("Sync", 5, 15, 15)
         ], weight=200, old_slice_name="S2_Silver"),
         
-        create_app("Factory_Robot", "URLLC", [
+        create_app("Factory_Robot", [
             Flow("Motion_Cmd", 5, 5, 100)
         ], weight=2000, old_slice_name="S1_Gold"),
         
-        create_app("Smart_Meter", "mMTC", [
+        create_app("Smart_Meter", [
             Flow("Data_Report", 0.5, 200, 1)
         ], weight=20, old_slice_name="S3_Public")
     ]
 
     slices_data = [
-        Slice("S1_Gold", "URLLC", total_bw=100, current_load_bw=0, latency=3, proc_delay=1, reserved_bw=20),
-        Slice("S2_Silver", "eMBB", total_bw=200, current_load_bw=0, latency=10, proc_delay=2, reserved_bw=50),
-        Slice("S3_Public", "eMBB", total_bw=150, current_load_bw=0, latency=40, proc_delay=5, reserved_bw=10),
-        Slice("S4_Platinum", "URLLC", total_bw=50, current_load_bw=0, latency=1, proc_delay=0.5, reserved_bw=5),
-        Slice("S5_Massive", "mMTC", total_bw=30, current_load_bw=0, latency=100, proc_delay=10, reserved_bw=2)
+        # SST: 1=eMBB, 2=URLLC, 3=MIoT
+        Slice("S1_Gold", sst=2, sd="000001", total_bw=100, current_load_bw=0, latency=3, proc_delay=1, reserved_bw=20),
+        Slice("S2_Silver", sst=1, sd="000001", total_bw=200, current_load_bw=0, latency=10, proc_delay=2, reserved_bw=50),
+        Slice("S3_Public", sst=1, sd="000002", total_bw=150, current_load_bw=0, latency=40, proc_delay=5, reserved_bw=10),
+        Slice("S4_Platinum", sst=2, sd="000002", total_bw=50, current_load_bw=0, latency=1, proc_delay=0.5, reserved_bw=5),
+        Slice("S5_Massive", sst=3, sd="000001", total_bw=30, current_load_bw=0, latency=100, proc_delay=10, reserved_bw=2)
     ]
     
     nodes_data = [
@@ -401,7 +400,6 @@ def main():
     # 3. 模拟新业务接入
     new_flow_app = App(
         name="Emergency_Call", 
-        type="URLLC", 
         flows=[Flow("Voice", 100, 5, 20), Flow("Video", 50, 20, 10)], 
         weight=5000, 
         old_slice=None
@@ -448,7 +446,6 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
             
         new_app = App(
             name=new_app_data.get('app_name', 'NewApp'),
-            type="URLLC" if "URLLC" in new_app_data.get('type', '') else ("mMTC" if "mMTC" in new_app_data.get('type', '') else "eMBB"),
             flows=flows,
             weight=1000, 
             old_slice=None

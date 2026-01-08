@@ -51,6 +51,17 @@ if 'initialized' not in st.session_state:
     st.session_state['nodes'] = nodes
     st.session_state['logs'] = []
     st.session_state['initialized'] = True
+else:
+    # 热修复：检查 Slice 是否包含新加的 'sd' 属性，如果没有则重置
+    if st.session_state.get('slices') and not hasattr(st.session_state['slices'][0], 'sd'):
+        opt_engine = sys.modules.get('tools.optimization', opt_engine) # 尝试获取最新模块
+        # 注意：这里可能需要重新 reload 模块，但在 Streamlit 中通常由 watcher 处理。
+        # 简单起见，直接调用当前的 opt_engine.get_initial_scenario
+        apps, slices, nodes = opt_engine.get_initial_scenario()
+        st.session_state['apps'] = apps
+        st.session_state['slices'] = slices
+        st.session_state['nodes'] = nodes
+        st.toast("系统已自动更新内部数据结构以匹配新代码。", icon="🔄")
 
 if 'agent_results' not in st.session_state:
     st.session_state['agent_results'] = None
@@ -80,6 +91,7 @@ with st.sidebar:
         slice_data.append({
             "name": s.name,
             "sst": s.sst,
+            "sd": s.sd,
             "total_bw": s.total_bw,
             "reserved_bw": s.reserved_bw,
             "latency": s.latency
@@ -92,7 +104,8 @@ with st.sidebar:
         key="slice_editor",
         column_config={
             "name": "切片名称",
-            "sst": st.column_config.SelectboxColumn("切片类型", options=["URLLC", "eMBB", "mMTC"]),
+            "sst": st.column_config.NumberColumn("SST (1:eMBB,2:URLLC,3:MIoT)", min_value=0, max_value=255, step=1),
+            "sd": st.column_config.TextColumn("SD (Hex)", max_chars=6, validate="^[0-9A-Fa-f]{6}$"),
             "total_bw": st.column_config.NumberColumn("总带宽(Mbps)", min_value=0),
             "reserved_bw": st.column_config.NumberColumn("保留带宽(Mbps)", min_value=0),
             "latency": st.column_config.NumberColumn("基础时延(ms)", min_value=0)
@@ -105,7 +118,6 @@ with st.sidebar:
     for app in st.session_state['apps']:
          app_display_data.append({
              "name": app.name,
-             "type": app.type,
              "total_bw": app.total_bw,
              "priority": app.max_prio,
              "slice": app.old_slice
@@ -118,7 +130,6 @@ with st.sidebar:
         key="app_editor",
          column_config={
             "name": "应用名称",
-            "type": st.column_config.SelectboxColumn("业务类型", options=["URLLC", "eMBB", "mMTC"]),
             "total_bw": st.column_config.NumberColumn("总带宽", disabled=True, help="由流汇总计算"),
          }
     )
@@ -137,7 +148,8 @@ with st.sidebar:
             
             s = Slice(
                 name=row['name'],
-                sst=row['sst'],
+                sst=int(row['sst']),
+                sd=str(row['sd']),
                 total_bw=float(row['total_bw']),
                 current_load_bw=0.0, # 重新计算
                 latency=float(row['latency']),
@@ -185,7 +197,7 @@ with col1:
             "剩余": max(0, s.total_bw - used_bw)
         })
     df_status = pd.DataFrame(slice_status)
-    st.dataframe(df_status, use_container_width=True)
+    st.dataframe(df_status)
 
 with col2:
     st.info("💡 说明：\n- 左侧边栏可以自由增删切片和业务。\n- 下方输入意图，智能体将自动分析并调用求解器。")
@@ -220,7 +232,7 @@ with st.expander("展开查看每个业务流的带宽与切片分配详情", ex
                 })
 
         if all_flows_data:
-            st.dataframe(pd.DataFrame(all_flows_data), use_container_width=True)
+            st.dataframe(pd.DataFrame(all_flows_data))
         else:
             st.info("暂无业务流数据")
 
@@ -228,11 +240,65 @@ with st.expander("展开查看每个业务流的带宽与切片分配详情", ex
 st.markdown("---")
 st.subheader("🗣️ 用户意图输入")
 
-user_input = st.text_area(
-    "请输入您的接入需求 (支持自然语言):", 
-    value="我是应急抢险指挥车(App_4)，需要接入网络。\n业务流1：远程机械臂控制，带宽20Mbps，不仅要大带宽而且时延不能超过10ms，这是关键控制流！\n业务流2：现场多路4K高清直播，带宽50Mbps，时延60ms左右。",
-    height=150
-)
+col_intent, col_context = st.columns([1, 1])
+
+with col_intent:
+    st.markdown("##### 1. UserIntent (自然语言)")
+    user_input = st.text_area(
+        "请输入您的接入需求:", 
+        value="我是应急抢险指挥车(App_4)，需要接入网络。\n业务流1：远程机械臂控制，带宽20Mbps，不仅要大带宽而且时延不能超过10ms，这是关键控制流！\n业务流2：现场多路4K高清直播，带宽50Mbps，时延60ms左右。",
+        height=300
+    )
+
+with col_context:
+    st.markdown("##### 2. UeSmDecisionContext (结构化上下文)")
+    with st.container(border=True):
+        st.caption("UE & Session Context")
+        c1, c2 = st.columns(2)
+        with c1:
+            supi = st.text_input("SUPI", value="imsi-46000000001")
+            pdu_id = st.number_input("PDU Session ID", min_value=1, value=1)
+            dnn = st.text_input("DNN", value="default")
+        with c2:
+            rat_type = st.selectbox("RAT Type", ["NR", "EUTRA"], index=0)
+            access_type = st.selectbox("Access Type", ["3GPP_ACCESS", "NON_3GPP_ACCESS"], index=0)
+            pdu_type = st.selectbox("PDU Type", ["IPV4", "IPV6", "ETHERNET"], index=0)
+        
+        st.caption("Slice Info (S-NSSAI)")
+        c3, c4 = st.columns(2)
+        with c3:
+            sst = st.number_input("SST", min_value=0, max_value=255, value=1)
+        with c4:
+            sd = st.text_input("SD (Hex)", value="000000")
+
+        # 构建结构化上下文对象
+        ue_context_data = {
+            "supi": supi,
+            "am_info": {
+                "user_location": None,
+                "serving_plmn": None,
+                "access_type": access_type,
+                "rat_type": rat_type
+            },
+            "target_session": {
+                "policy_context": {
+                    "supi": supi,
+                    "pduSessionId": pdu_id,
+                    "sliceInfo": {"sst": sst, "sd": sd},
+                    "dnn": dnn,
+                    "pduSessionType": pdu_type,
+                    "accessType": access_type,
+                    "ratType": rat_type
+                },
+                "subscription_data": {
+                    "content": {}
+                },
+                "remain_gbr_ul": None,
+                "remain_gbr_dl": None,
+                "active_app_session_ids": [],
+                "traffic_influence_data": {}
+            }
+        }
 
 col_run, col_reset = st.columns([1, 6])
 run_btn = col_run.button("🚀 开始编排", type="primary")
@@ -255,7 +321,10 @@ if run_btn:
             # Step 1: 意图分析
             status_text.markdown("#### 🔄 Step 1: Intent Encoding Agent 正在分析意图...")
             intent_agent = IntentEncodingAgent(model_name="qwen-plus") # 使用更强的模型
-            user_intent = intent_agent.analyze_intent(user_input)
+            
+            # 将结构化上下文转为 JSON 字符串传递给 Agent
+            context_str = json.dumps(ue_context_data, indent=2, ensure_ascii=False)
+            user_intent = intent_agent.analyze_intent(user_input, context=context_str)
             
             if user_intent:
                 with result_container:
