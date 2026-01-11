@@ -338,12 +338,12 @@ if run_btn:
             status_text.markdown("#### 🔄 Step 2: Optimization Strategy Agent 正在制定策略并调用求解器...")
             
             # 构造网络状态描述供 LLM 参考
-            network_desc = "当前切片资源状态:\n"
-            for _, row in df_status.iterrows():
-                network_desc += f"- {row['切片名称']}: 总容量 {row['总容量']}M, 剩余可用 {row['剩余']}M.\n"
+            # network_desc = "当前切片资源状态:\n"
+            # for _, row in df_status.iterrows():
+            #    network_desc += f"- {row['切片名称']}: 总容量 {row['总容量']}M, 剩余可用 {row['剩余']}M.\n"
             
             strategy_agent = OptimizationStrategyAgent(model_name="qwen-plus")
-            final_report = strategy_agent.generate_strategy(user_intent.dict(), network_desc)
+            final_report = strategy_agent.generate_strategy(user_intent.dict())
             
             # 保存结果到 Session State
             st.session_state['final_report'] = final_report
@@ -364,11 +364,30 @@ if run_btn:
 if st.session_state['final_report']:
     st.markdown("---")
     st.markdown("### 📝 最终执行报告")
-    st.markdown(f"""
-    <div class="card">
-        {st.session_state['final_report'].replace(chr(10), '<br>')}
-    </div>
-    """, unsafe_allow_html=True)
+    
+    report_data = st.session_state['final_report']
+    
+    # 检查是否为结构化对象 (OutputStrategy)
+    if hasattr(report_data, 'policy_type'):
+        with st.container(border=True):
+            st.markdown(f"**策略类型:** `{report_data.policy_type}`")
+            st.markdown("**推荐动作:**")
+            for action in report_data.recommended_actions:
+                st.markdown(f"- {action}")
+            
+            st.markdown("---")
+            st.markdown("**策略详细内容 (Policy Details):**")
+            # 兼容 Pydantic v1 vs v2
+            details_dict = report_data.policy_details.dict() if hasattr(report_data.policy_details, 'dict') else report_data.policy_details
+            st.json(details_dict)
+            
+    else:
+        # 兼容旧版本字符串
+        st.markdown(f"""
+        <div class="card">
+            {str(report_data).replace(chr(10), '<br>')}
+        </div>
+        """, unsafe_allow_html=True)
     
     if st.button("🗑️ 清除报告并重置视图"):
         st.session_state['final_report'] = None

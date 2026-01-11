@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import sys
 import os
+import uuid
 try:
     from utils.logger import setup_logger
 except ImportError:
@@ -20,19 +21,21 @@ logger = setup_logger(__name__)
 @dataclass
 class Flow:
     """定义应用内的单个数据流需求"""
-    name: str
+    name: str # 保留作为描述性名称
     bw: float       # 带宽 (Mbps)
     lat: float      # 时延 (ms)
     priority: int   # 优先级 (数值越小越高)
-    old_slice: Optional[str] = None # 流的原切片名称
+    flow_id: str = "f_default" # 流唯一标识 (主要Key)
+    old_slice: Optional[str] = None # 流的原切片名称 (实为 S-NSSAI)
 
 @dataclass
 class App:
     """定义应用及其聚合需求"""
-    name: str
+    name: str # 保留作为描述性名称
     flows: List[Flow]
     weight: float   # 业务权重 (Vi)
-    old_slice: Optional[str] = None # App 维度的原切片（主要用于兼容，新的逻辑主要看 Flow）
+    app_id: str = "app_default" # 应用唯一标识 (主要Key)
+    old_slice: Optional[str] = None # App 维度的原切片
     
     # 聚合属性 (自动计算)
     total_bw: float = field(init=False)
@@ -52,14 +55,19 @@ class App:
 @dataclass
 class Slice:
     """定义网络切片资源与状态"""
-    name: str
-    sst: int        # 切片服务类型 (改为 int 类型, 8bit)
-    sd: str         # 切片微分器 (6位 hex 字符串)
+    name: str # 描述性名称
+    sst: int        # 切片服务类型
+    sd: str         # 切片微分器
+    snssai: str = field(init=False) # 唯一标识 (SST-SD), 自动生成
     total_bw: float # 总带宽容量
-    current_load_bw: float # 当前基础负载 (不含可被抢占的)
-    latency: float  # 链路传输时延 D_link
-    proc_delay: float # 处理时延 D_proc
+    current_load_bw: float # 当前基础负载
+    latency: float  # 链路传输时延
+    proc_delay: float # 处理时延
     reserved_bw: float # 不可抢占的保留带宽
+
+    def __post_init__(self):
+        # 自动生成 snssai 标识
+        self.snssai = f"{self.sst:02X}{self.sd}"
 
 @dataclass
 class Node:
@@ -97,25 +105,25 @@ class SliceOptimizationEngine:
         prob = pulp.LpProblem("5G_Slice_Resource_Allocation_FlowLevel", pulp.LpMinimize)
 
         # 1. 变量定义
-        # x_af_s[app, flow, slice]: App的Flow是否映射到Slice
+        # x_af_s[app_id, flow_id, snssai]: App的Flow是否映射到Slice
         x = pulp.LpVariable.dicts(
             "x", 
-            ((a.name, f.name, s.name) for a in apps for f in a.flows for s in slices), 
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
             cat='Binary'
         )
         
-        # B_act[app, flow, slice]: 实际分配的带宽
+        # B_act[app_id, flow_id, snssai]: 实际分配的带宽
         B_act = pulp.LpVariable.dicts(
             "B_act", 
-            ((a.name, f.name, s.name) for a in apps for f in a.flows for s in slices), 
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
             lowBound=0
         )
 
         # 辅助变量
-        dev = pulp.LpVariable.dicts("dev", (s.name for s in slices), lowBound=0)
+        dev = pulp.LpVariable.dicts("dev", (s.snssai for s in slices), lowBound=0)
         change = pulp.LpVariable.dicts(
             "change", 
-            ((a.name, f.name, s.name) for a in apps for f in a.flows for s in slices), 
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
             lowBound=0
         )
 
@@ -147,64 +155,62 @@ class SliceOptimizationEngine:
         for app in apps:
             for f in app.flows:
                 # C1: 每个 Flow 必须选择且仅选择一个切片
-                prob += pulp.lpSum(x[app.name, f.name, s.name] for s in slices) == 1
+                prob += pulp.lpSum(x[app.app_id, f.flow_id, s.snssai] for s in slices) == 1
                 
                 for s in slices:
-                    # C2: [已放宽] URSP 类型强制匹配 -> 现在只通过 QoS Constraint 隐式控制
-                    # 之前是 if app.type != s.sst: x=0. 
-                    # 现在我们允许流根据性能可以去不同SST，只要物理上可达。
-                    # 如果需要严格限制，可以在这里加回。
-                    # 考虑到用户需求“每个流独立分配”，我们假设SST是兼容的或者用户只看重KPI。
-                    # 但为了不违反基本物理常识（URLLC流不能去完全不支持低延迟的切片），保留时延约束足矣。
+                    # C2: [已放宽] URSP 类型兼容 -> 隐式控制
 
-                    # C3: 时延约束 (针对 Flow 的 lat)
+                    # C3: 时延约束
                     total_latency = s.latency + s.proc_delay
                     if total_latency > f.lat:
-                        prob += x[app.name, f.name, s.name] == 0
+                        prob += x[app.app_id, f.flow_id, s.snssai] == 0
                     
                     # C4: 带宽分配上限
-                    prob += B_act[app.name, f.name, s.name] <= x[app.name, f.name, s.name] * f.bw
+                    prob += B_act[app.app_id, f.flow_id, s.snssai] <= x[app.app_id, f.flow_id, s.snssai] * f.bw
                     
                     # C5: 线性化信令开销 |x - x_old|
-                    is_old = 1 if f.old_slice == s.name else 0 
-                    prob += change[app.name, f.name, s.name] >= x[app.name, f.name, s.name] - is_old
-                    prob += change[app.name, f.name, s.name] >= is_old - x[app.name, f.name, s.name]
+                    is_old = 1 if f.old_slice == s.snssai else 0 
+                    prob += change[app.app_id, f.flow_id, s.snssai] >= x[app.app_id, f.flow_id, s.snssai] - is_old
+                    prob += change[app.app_id, f.flow_id, s.snssai] >= is_old - x[app.app_id, f.flow_id, s.snssai]
 
     def _add_slice_constraints(self, prob, apps, slices, B_act, dev):
         for s in slices:
-            # C6: 切片容量约束 (考虑保留带宽 和 基础静态负载)
-            # 真实可用容量 = 总容量 - 保留带宽 - 静态负载
+            # C6: 切片容量约束
             real_available_bw = s.total_bw - s.reserved_bw - s.current_load_bw
             if real_available_bw < 0:
-                real_available_bw = 0 # 避免负容量导致不可行
+                real_available_bw = 0 
             
             # 统计所有已调度流的带宽之和
             total_allocated_in_slice = pulp.lpSum(
-                B_act[app.name, f.name, s.name] 
+                B_act[app.app_id, f.flow_id, s.snssai] 
                 for app in apps for f in app.flows
             )
             prob += total_allocated_in_slice <= real_available_bw
 
             # C7: 负载均衡辅助约束
-            # 用于均衡计算的负载应当包含所有成分
             final_load = total_allocated_in_slice + s.reserved_bw + s.current_load_bw
             load_ratio = final_load / s.total_bw if s.total_bw > 0 else 0
             
-            prob += dev[s.name] >= load_ratio - self.config.rho
-            prob += dev[s.name] >= self.config.rho - load_ratio
+            prob += dev[s.snssai] >= load_ratio - self.config.rho
+            prob += dev[s.snssai] >= self.config.rho - load_ratio
 
     def _add_node_constraints(self, prob, apps, slices, nodes, B_act):
         for node in nodes:
             # 计算托管切片上的流量总和
+            # 注意: node.slices_hosted 中存储的可能是 slice.name，这里假设已统一为 SNSSAI 
+            # 或者我们需要一个映射。为了简化，假设 User 知道 slices_hosted 里填的是 snssai。
+            # 但实际上初始化数据填的是 name。这里做一个简单的 name->snssai 查找比较好，
+            # 或者直接修改 nodes_data 的 slices_hosted 为 snssai。
+            # 鉴于目前架构，通过 name 查找 snssai 最稳妥。
             
-            # 现有静态负载影响 (current_load_bw 可能是为了模拟背景流量，这里如果全量优化，current_load_bw应为0或外部流量)
-            # 我们假设 current_load_bw 是"除了这些App之外"的负载.
-            current_node_cpu = sum(s.current_load_bw * self.config.alpha for s in slices if s.name in node.slices_hosted)
-            current_node_mem = sum(s.current_load_bw * self.config.beta for s in slices if s.name in node.slices_hosted)
+            hosted_snssais = [s.snssai for s in slices if s.name in node.slices_hosted]
+
+            current_node_cpu = sum(s.current_load_bw * self.config.alpha for s in slices if s.snssai in hosted_snssais)
+            current_node_mem = sum(s.current_load_bw * self.config.beta for s in slices if s.snssai in hosted_snssais)
 
             new_traffic_sum = pulp.lpSum(
-                B_act[app.name, f.name, s.name]
-                for s in slices if s.name in node.slices_hosted
+                B_act[app.app_id, f.flow_id, s.snssai]
+                for s in slices if s.snssai in hosted_snssais
                 for app in apps for f in app.flows
             )
             
@@ -215,19 +221,17 @@ class SliceOptimizationEngine:
             prob += current_node_mem + new_traffic_sum * self.config.beta <= node.memory_capacity
 
     def _set_objective(self, prob, apps, slices, B_act, dev, change):
-        term_load = pulp.lpSum(dev[s.name] for s in slices)
+        term_load = pulp.lpSum(dev[s.snssai] for s in slices)
         
         # 信令开销 (Flow 级别的迁移动作)
         term_sig = pulp.lpSum(
-            change[app.name, f.name, s.name] 
+            change[app.app_id, f.flow_id, s.snssai] 
             for app in apps for f in app.flows for s in slices
         )
         
         # 体验损失: Sum Weighted * ( (Req - Act) / Req )
-        # 根据用户要求，Weighted 使用每条流的优先级的倒数。
-        # 这里假设 priority 数值越小优先级越高。
         term_exp = pulp.lpSum(
-            (1.0 / f.priority if f.priority > 0 else 1.0) * (f.bw - pulp.lpSum(B_act[app.name, f.name, s.name] for s in slices)) / f.bw
+            (1.0 / f.priority if f.priority > 0 else 1.0) * (f.bw - pulp.lpSum(B_act[app.app_id, f.flow_id, s.snssai] for s in slices)) / f.bw
             for app in apps for f in app.flows if f.bw > 0
         )
 
@@ -241,16 +245,18 @@ class SliceOptimizationEngine:
                 allocated_bw = 0.0
                 
                 for s in slices:
-                    if pulp.value(x[app.name, f.name, s.name]) == 1:
-                        mapped_slice = s.name
-                        allocated_bw = float(pulp.value(B_act[app.name, f.name, s.name]))
+                    if pulp.value(x[app.app_id, f.flow_id, s.snssai]) == 1:
+                        mapped_slice = s.snssai # 记录 SNSSAI
+                        allocated_bw = float(pulp.value(B_act[app.app_id, f.flow_id, s.snssai]))
                         break
                 
                 strategies = self._determine_strategy(f, mapped_slice, allocated_bw)
 
                 results.append({
                     "App": app.name,
-                    "Flow": f.name,
+                    "App ID": app.app_id,
+                    "Flow ID": f.flow_id,
+                    "Flow Name": f.name,
                     "Old Slice": f.old_slice,
                     "New Slice": mapped_slice,
                     "Req BW": f.bw,
@@ -264,7 +270,7 @@ class SliceOptimizationEngine:
         slice_stats = []
         for s in slices:
             allocated_to_flows = sum(
-                pulp.value(B_act[app.name, f.name, s.name]) 
+                pulp.value(B_act[app.app_id, f.flow_id, s.snssai]) 
                 for app in apps for f in app.flows
             )
             
@@ -278,6 +284,7 @@ class SliceOptimizationEngine:
 
             slice_stats.append({
                 "Slice": s.name,
+                "SNSSAI": s.snssai,
                 "Total Cap (M)": s.total_bw,
                 "Reserved (M)": s.reserved_bw, # 仅展示
                 "Static Load (M)": s.current_load_bw, # 新增展示
@@ -310,43 +317,53 @@ def get_initial_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     """初始化模拟场景数据"""
     
     # 辅助函数：快速构造 App 并将 old_slice 传递给 flows (简单初始化逻辑)
-    def create_app(name, flows, weight, old_slice_name):
-        # 将 App 级别的 old_slice 赋给所有 flow 作为初始状态
-        for f in flows:
-            f.old_slice = old_slice_name
-        return App(name, flows, weight, old_slice=old_slice_name)
+    def create_app(name, app_id, flows, weight, old_slice_snssai):
+        # 确保每个 Flow 都有 ID (如果未指定)
+        for i, f in enumerate(flows):
+            if f.flow_id == "f_default":
+                 f.flow_id = f"{app_id}_f{i+1}_{f.name}"
+            f.old_slice = old_slice_snssai # 初始状态假定都在旧切片 (使用 SNSSAI)
+            
+        return App(name=name, app_id=app_id, flows=flows, weight=weight, old_slice=old_slice_snssai)
 
     apps_data = [
-        create_app("Remote_Drive", [
+        # S1_Gold (SST=2, SD=000001) -> SNSSAI="02000001"
+        create_app("Remote_Drive", "app_remote_drive", [
             Flow("Control", 2, 5, 20),
             Flow("Video_Feed", 8, 20, 15)
-        ], weight=1000, old_slice_name="S1_Gold"),
+        ], weight=1000, old_slice_snssai="02000001"),
         
-        create_app("4K_Video", [
+        # S2_Silver (SST=1, SD=000001) -> SNSSAI="01000001"
+        create_app("4K_Video", "app_4k_video", [
             Flow("Main_Stream", 35, 50, 10),
             Flow("Audio", 5, 100, 5)
-        ], weight=50, old_slice_name="S2_Silver"),
+        ], weight=50, old_slice_snssai="01000001"),
         
-        create_app("IoT_Sensor", [
+        # S1_Gold -> "02000001"
+        create_app("IoT_Sensor", "app_iot_sensor", [
             Flow("Telemetry", 2, 20, 10)
-        ], weight=100, old_slice_name="S1_Gold"),
+        ], weight=100, old_slice_snssai="02000001"),
         
-        create_app("Web_Browse", [
-            Flow("HTTP", 15, 100, 1)
-        ], weight=10, old_slice_name="S3_Public"),
+        # S3_Public (SST=1, SD=000002) -> SNSSAI="01000002"
+        create_app("Web_Browse", "app_web_browse", [
+            Flow("HTTP", 15, 100, 1, 'f_http')
+        ], weight=10, old_slice_snssai="01000002"),
         
-        create_app("AR_Gaming", [
+        # S2_Silver -> "01000001"
+        create_app("AR_Gaming", "app_ar_gaming", [
             Flow("Render", 20, 20, 15),
             Flow("Sync", 5, 15, 15)
-        ], weight=200, old_slice_name="S2_Silver"),
+        ], weight=200, old_slice_snssai="01000001"),
         
-        create_app("Factory_Robot", [
+        # S1_Gold -> "02000001"
+        create_app("Factory_Robot", "app_factory_robot", [
             Flow("Motion_Cmd", 5, 5, 100)
-        ], weight=2000, old_slice_name="S1_Gold"),
+        ], weight=2000, old_slice_snssai="02000001"),
         
-        create_app("Smart_Meter", [
+        # S3_Public -> "01000002"
+        create_app("Smart_Meter", "app_smart_meter", [
             Flow("Data_Report", 0.5, 200, 1)
-        ], weight=20, old_slice_name="S3_Public")
+        ], weight=20, old_slice_snssai="01000002")
     ]
 
     slices_data = [
@@ -434,18 +451,38 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
              apps, slices, nodes = get_initial_scenario()
         
         # B. 构造新应用对象
+        app_name = new_app_data.get('app_name', 'NewApp')
+        # 生成唯一 ID 防止冲突
+        app_uuid = str(uuid.uuid4())[:6]
+        new_app_id = f"app_{app_name}_{app_uuid}"
+
         flows = []
-        for f in new_app_data.get('flows', []):
+        for i, f in enumerate(new_app_data.get('flows', [])):
+            # 兼容处理带宽字段 (IntentAgent V1 输出 bandwidth_demand, V2 输出 bandwidth_demand_dl/ul)
+            bw_val = f.get('bandwidth_demand', 0)
+            if bw_val == 0:
+                bw_val = f.get('bandwidth_demand_dl', 0) + f.get('bandwidth_demand_ul', 0)
+
+            # 构造唯一 Flow ID
+            original_fid = f.get('flow_id', '')
+            if original_fid:
+                f_id = f"{new_app_id}_{original_fid}"
+            else:
+                f_name = f.get('description', 'flow').replace(" ", "_")
+                f_id = f"{new_app_id}_f{i}_{f_name}"
+
             flows.append(Flow(
-                name=f.get('name', 'DefaultFlow'),
-                bw=f.get('bandwidth_demand', 0), 
+                name=f.get('description', f.get('flow_id', 'DefaultFlow')), # 使用描述或ID作为内部名称
+                bw=bw_val, 
                 lat=f.get('latency_requirement', 100),
                 priority=f.get('priority_level', 10),
+                flow_id=f_id,
                 old_slice=None
             ))
             
         new_app = App(
-            name=new_app_data.get('app_name', 'NewApp'),
+            name=app_name,
+            app_id=new_app_id,
             flows=flows,
             weight=1000, 
             old_slice=None
@@ -465,7 +502,7 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
 
         # --- Side Effect: 更新全局状态 ---
         if _GLOBAL_SCENARIO_CONTEXT["apps"] is not None:
-            # 1. 移除旧的同名应用
+            # 1. 移除旧的同名应用 (注意: 这里依然按Name移除旧的, 这是一个业务逻辑选择, 覆盖同名App)
             _GLOBAL_SCENARIO_CONTEXT["apps"][:] = [a for a in _GLOBAL_SCENARIO_CONTEXT["apps"] if a.name != new_app.name]
             # 2. 加入新应用
             _GLOBAL_SCENARIO_CONTEXT["apps"].append(new_app)
@@ -473,43 +510,59 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
             # 3. 结果写回对象 (Flow级更新)
             # 遍历结果DF，找到对应App和Flow，更新其 old_slice
             for index, res_row in results_df.iterrows():
-                r_app_name = res_row['App']
-                r_flow_name = res_row['Flow']
+                r_app_id = res_row['App ID']
+                r_flow_id = res_row['Flow ID']
                 r_new_slice = res_row['New Slice']
                 
-                # 在全局 App 列表中找到该 App
-                target_app = next((a for a in _GLOBAL_SCENARIO_CONTEXT["apps"] if a.name == r_app_name), None)
+                # 在全局 App 列表中找到该 App (使用ID匹配更准确)
+                target_app = next((a for a in _GLOBAL_SCENARIO_CONTEXT["apps"] if a.app_id == r_app_id), None)
                 if target_app:
-                    # 更新 App 的 old_slice 为主 Slice (仅做展示用，选第一个或者出现最多的)
+                    # 更新 App 的 old_slice 为主 Slice (仅做展示用)
                     target_app.old_slice = r_new_slice 
                     
                     # 关键: 更新 Flow 对象的 old_slice
-                    target_flow = next((f for f in target_app.flows if f.name == r_flow_name), None)
+                    target_flow = next((f for f in target_app.flows if f.flow_id == r_flow_id), None)
                     if target_flow:
                         target_flow.old_slice = r_new_slice
 
         # E. 格式化输出
-        # 我们只关心新应用的分配情况
-        my_result = results_df[results_df['App'] == new_app.name]
-        
         output = []
         output.append(f"--- 优化求解报告 (Flow Level) ---")
         output.append(f"使用的权重: w1={w1}, w2={w2}, w3={w3}")
         
+        # 1. 新业务结果 (用ID匹配)
+        my_result = results_df[results_df['App ID'] == new_app.app_id]
         if not my_result.empty:
             output.append(f"新业务 '{new_app.name}' 分配结果:")
             for idx, row in my_result.iterrows():
                 output.append(
-                    f"  - 流 [{row['Flow']}] -> 切片: {row['New Slice'] if row['New Slice'] else '无'} "
+                    f"  - 流 [{row['Flow Name']}] (ID:{row['Flow ID']}) -> 切片: {row['New Slice'] if row['New Slice'] else '无'} "
                     f"(BW: {row['Act BW']}/{row['Req BW']}M, {row['Strategies']})"
                 )
         else:
             output.append("错误: 结果中未找到新业务。")
 
+        # 2. 受影响的旧业务
+        other_results = results_df[results_df['App ID'] != new_app.app_id]
+        # 筛选出策略不是 "保持" 的流 (即发生了重路由、降级或抢占)
+        impacted_results = other_results[other_results['Strategies'].str.contains("策略", na=False)] 
+        # 注意: 之前的 Strategies 格式是 "保持", "策略B(重路由)", "策略B(重路由), 策略C(降级)"
+        # 只要不全是 "保持" 就算受影响。
+        # 简单的判断方法: Strategies != "保持"
+
+        if not impacted_results.empty:
+            output.append("\n受影响的现有业务流:")
+            for idx, row in impacted_results.iterrows():
+                if row['Strategies'] == "保持": continue
+                output.append(
+                    f"  - {row['App']} / [{row['Flow Name']}] (ID:{row['Flow ID']}) -> {row['New Slice'] if row['New Slice'] else '无'} "
+                    f"(BW: {row['Act BW']}/{row['Req BW']}M, {row['Strategies']})"
+                )
+
         output.append("\n切片负载摘要:")
         # 简化输出
         for _, row in slice_stats_df.iterrows():
-            output.append(f"  - {row['Slice']}: Load {row['Load Ratio (%)']}% (Rem: {row['Remaining (M)']}M)")
+            output.append(f"  - {row['Slice']} ({row['SNSSAI']}): Load {row['Load Ratio (%)']}% (Rem: {row['Remaining (M)']}M)")
             
         return "\n".join(output)
         

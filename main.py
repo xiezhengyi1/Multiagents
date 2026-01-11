@@ -58,10 +58,13 @@ def main():
     logger.info("\n[Step 4] Optimization Strategy Agent 正在制定策略并调用求解器...")
     # 将Pydantic对象转为dict传给下一个Agent
     intent_dict = user_intent.dict()
-    final_report = strategy_agent.generate_strategy(intent_dict, network_status)
+    strategy_output = strategy_agent.generate_strategy(intent_dict)
     
     logger.info("\n>>> 最终执行报告:")
-    logger.info(final_report)
+    if hasattr(strategy_output, "model_dump_json"):
+        logger.info(strategy_output.model_dump_json(indent=2, ensure_ascii=False))
+    else:
+        logger.info(strategy_output)
 
 if __name__ == "__main__":
     main()
