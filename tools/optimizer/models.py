@@ -19,7 +19,11 @@ class Flow:
     flow_id: str # 流唯一标识
     bw_ul: float       # 上行带宽 (Mbps)
     bw_dl: float       # 下行带宽 (Mbps)
+    gbr_ul: float      # 上行保证比特率 (Mbps)
+    gbr_dl: float      # 下行保证比特率 (Mbps)
     lat: float      # 时延 (ms)
+    loss_req: float # 丢包率上限 (0~1)
+    jitter_req: float # 抖动上限 (ms)
     priority: int   # 优先级 (数值越小越高)
     old_slice: Optional[str] = None # 流的原切片名称 (实为 S-NSSAI)
     old_allocated_bw_ul: Optional[float] = None # 上一次分配的实际上行带宽
@@ -55,10 +59,14 @@ class Slice:
     sst: int        # 切片服务类型
     sd: str         # 切片微分器
     snssai: str = field(init=False) # 唯一标识 (SST-SD), 自动生成
-    total_bw: float # 总带宽容量
-    current_load_bw: float # 当前基础负载
+    total_bw_ul: float # 总带宽容量
+    total_bw_dl: float # 总带宽容量
+    current_load_bw_ul: float # 当前基础负载
+    current_load_bw_dl: float # 当前基础负载
     latency: float  # 链路传输时延
     proc_delay: float # 处理时延
+    loss: float # 切片丢包率 (0~1)
+    jitter: float # 切片抖动 (ms)
     reserved_bw: float # 不可抢占的保留带宽
 
     def __post_init__(self):
@@ -80,5 +88,6 @@ class OptimizationConfig:
     w1: float = 100.0  # 负载均衡权重
     w2: float = 50.0   # 信令开销权重
     w3: float = 1000.0 # 体验损失权重
+    w4: float = 0.0    # 丢包/抖动软约束权重
     alpha: float = 0.1 # 带宽转CPU消耗系数
     beta: float = 0.05 # 带宽转内存消耗系数

@@ -1,5 +1,5 @@
 import pandas as pd
-from tools.optimization import _GLOBAL_SCENARIO_CONTEXT, get_initial_scenario, set_global_scenario
+from tools.optimizer import _GLOBAL_SCENARIO_CONTEXT, get_initial_scenario, set_global_scenario
 
 def get_network_status():
     """
@@ -22,32 +22,41 @@ def get_network_status():
     slice_status_list = []
     
     for s in slices:
-        # 基础占用
-        base_used = s.current_load_bw + s.reserved_bw
+        # 基础占用 (上下行)
+        base_used_ul = s.current_load_bw_ul + s.reserved_bw
+        base_used_dl = s.current_load_bw_dl + s.reserved_bw
         
         # 动态业务占用
         # 遍历所有 App 的所有 Flow，检查其 old_slice 是否指向当前切片 s.snssai
-        # 注意: 在 optimization.py 中，flow.old_slice 被用来存储当前实际所在的切片
-        dynamic_used = 0.0
+        dynamic_used_ul = 0.0
+        dynamic_used_dl = 0.0
         active_flows_count = 0
         
         for app in apps:
             for flow in app.flows:
                 if flow.old_slice == s.snssai:
-                    dynamic_used += flow.bw
+                    dynamic_used_ul += flow.bw_ul
+                    dynamic_used_dl += flow.bw_dl
                     active_flows_count += 1
         
-        total_used = base_used + dynamic_used
-        utilization = (total_used / s.total_bw * 100) if s.total_bw > 0 else 0.0
-        remaining = s.total_bw - total_used
+        total_used_ul = base_used_ul + dynamic_used_ul
+        total_used_dl = base_used_dl + dynamic_used_dl
+        
+        utilization_ul = (total_used_ul / s.total_bw_ul * 100) if s.total_bw_ul > 0 else 0.0
+        utilization_dl = (total_used_dl / s.total_bw_dl * 100) if s.total_bw_dl > 0 else 0.0
+        
+        remaining_ul = s.total_bw_ul - total_used_ul
+        remaining_dl = s.total_bw_dl - total_used_dl
         
         slice_status_list.append({
             "Slice Name": s.name,
             "S-NSSAI": s.snssai,
-            "Total BW (Mbps)": s.total_bw,
-            "Used BW (Mbps)": round(total_used, 2),
-            "Usage (%)": round(utilization, 1),
-            "Remaining (Mbps)": round(remaining, 2),
+            "UL Total (Mbps)": s.total_bw_ul,
+            "UL Used (Mbps)": round(total_used_ul, 2),
+            "UL Usage (%)": round(utilization_ul, 1),
+            "DL Total (Mbps)": s.total_bw_dl,
+            "DL Used (Mbps)": round(total_used_dl, 2),
+            "DL Usage (%)": round(utilization_dl, 1),
             "Latency (ms)": s.latency,
             "Active Flows": active_flows_count
         })

@@ -7,7 +7,7 @@ from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float) -> str:
+def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float, w4: float = 0.0, incremental: bool = False) -> str:
     """
     执行网络切片资源优化求解 (粒度: Flow)
     优化逻辑：
@@ -45,6 +45,10 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
             f_desc = f_data.get('name', f'flow_{i}')
             f_prio = f_data.get('priority', 10)
             f_lat = f_data.get('lat', 100)
+            f_loss = f_data.get('loss_req', 0.05)
+            f_jitter = f_data.get('jitter_req', 50)
+            f_gbr_ul = f_data.get('gbr_ul', bw_ul_val)
+            f_gbr_dl = f_data.get('gbr_dl', bw_dl_val)
             
             # 2. 确定 Flow ID (标准化格式: {AppID}_{Suffix})
             raw_fid = f_data.get('flow_id')
@@ -56,13 +60,16 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
             
             # 3. 继承旧状态
             matched_old_flow = existing_flow_map.get(current_f_id)
-            print(matched_old_flow)
  
             new_flows_obj.append(Flow(
                 name=f_desc,
                 bw_ul=bw_ul_val,
                 bw_dl=bw_dl_val,
+                gbr_ul=f_gbr_ul,
+                gbr_dl=f_gbr_dl,
                 lat=f_lat,
+                loss_req=f_loss,
+                jitter_req=f_jitter,
                 priority=f_prio,
                 flow_id=current_f_id,
                 old_slice=matched_old_flow.old_slice if matched_old_flow else None,
@@ -78,13 +85,16 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
         )
         
         # E. 调用求解引擎
-        config = OptimizationConfig(w1=w1, w2=w2, w3=w3)
+        config = OptimizationConfig(w1=w1, w2=w2, w3=w3, w4=w4)
         engine = SliceOptimizationEngine(config)
         
         active_apps = [a for a in apps if a.app_id != final_app_id and a.name != target_app_name]
         updated_apps_list = active_apps + [new_app]
         
-        results_df, slice_stats_df = engine.solve(updated_apps_list, slices, nodes)
+        if incremental:
+            results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve_incremental(updated_apps_list, slices, nodes)
+        else:
+            results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve(updated_apps_list, slices, nodes)
         
         if results_df.empty:
             return "求解器未返回结果 (Empty Result)。"
@@ -113,6 +123,19 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
         output = []
         output.append(f"--- 优化求解报告 (Flow Level) ---")
         output.append(f"参数: w1={w1}, w2={w2}, w3={w3}")
+        output.append(f"模式: {'增量优化' if incremental else '全量优化'}")
+        if w4 not in (0, 0.0):
+            output.append(f"提示: w4 已忽略 (当前为三权重目标). w4={w4}")
+        output.append(f"求解状态: {status_str}")
+        output.append(f"目标函数值: {objective_val if objective_val is not None else 'N/A'}")
+        if breakdown:
+            output.append(
+                "目标项分解: "
+                f"load={breakdown.get('load_norm', 0):.6f}, "
+                f"signal={breakdown.get('signal_norm', 0):.6f}, "
+                f"exp={breakdown.get('exp', 0):.6f}, "
+                f"qos={breakdown.get('qos_norm', 0):.6f}"
+            )
         
         # 1. 本次业务结果
         my_results = results_df[results_df['App ID'] == final_app_id]
@@ -121,7 +144,7 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
             for _, row in my_results.iterrows():
                 strategy_note = f", 策略: {row['Strategies']}" if row['Strategies'] != "保持" else ""
                 output.append(
-                    f"  - 流 [{row['Flow Name']}] -> 切片: {row['New Slice'] or '未分配'} "
+                    f"  - 流 [{row['Flow Name']}]（ID：{row['Flow ID']}） -> 切片: {row['New Slice'] or '未分配'} "
                     f"(分配带宽 UL: {row['Act BW UL']}/{row['Req BW UL']}M, DL: {row['Act BW DL']}/{row['Req BW DL']}M{strategy_note})"
                 )
         else:
@@ -142,7 +165,7 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float)
 
         output.append("\n各切片资源状态:")
         for _, row in slice_stats_df.iterrows():
-            output.append(f"  - {row['Slice']} ({row['SNSSAI']}): 负载 {row['Load Ratio (%)']}% (剩余 {row['Remaining (M)']}M)")
+            output.append(f"  - {row['Slice']} ({row['SNSSAI']}): 上行负载 {row['Load UL (%)']}% (剩余 {row['Rem UL (M)']}M) / 下行负载 {row['Load DL (%)']}% (剩余 {row['Rem DL (M)']}M)")
 
         return "\n".join(output)
         

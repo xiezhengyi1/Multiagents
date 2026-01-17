@@ -121,6 +121,7 @@ class OptimizationStrategyAgent(BaseAgent):
            - policy_details: 必须包含 `routeSelParamSets`。
              * 从优化结果中提取新切片的 S-NSSAI (例如 "01000001" -> sst=1, sd="000001")。
              * 构造结构: {{ "routeSelParamSets": [ {{ "dnn": "default", "snssai": {{ "sst": 1, "sd": "000001" }}, "precedence": 1 }} ], "relatPrecedence": 1 }}
+           - 再生成一项发起新连接请求后，应该发出的 "SmPolicyDecision"
         
         B. 如果结果是 "策略A", "策略C", "策略D" 或 "保持" -> 意味着网络侧控制资源
            - policy_type: "SmPolicyDecision"
