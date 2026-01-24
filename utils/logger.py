@@ -14,28 +14,36 @@ class ColoredFormatter(logging.Formatter):
     """
     自定义日志格式化器，为不同级别的日志添加颜色
     """
-    
-    # 定义每种日志级别的格式
-    # fmt 可以根据需要调整，例如："[%(asctime)s] [%(name)s] [%(levelname)s]: %(message)s"
-    FORMATS = {
-        logging.DEBUG:    LogColors.DEBUG + "[%(asctime)s] [DEBUG]: %(message)s" + LogColors.RESET,
-        logging.INFO:     LogColors.INFO + "[%(asctime)s] [INFO]: %(message)s" + LogColors.RESET,
-        logging.WARNING:  LogColors.WARNING + "[%(asctime)s] [WARNING]: %(message)s" + LogColors.RESET,
-        logging.ERROR:    LogColors.ERROR + "[%(asctime)s] [ERROR]: %(message)s" + LogColors.RESET,
-        logging.CRITICAL: LogColors.CRITICAL + "[%(asctime)s] [CRITICAL]: %(message)s" + LogColors.RESET,
+
+    LEVEL_COLORS = {
+        logging.DEBUG: LogColors.DEBUG,
+        logging.INFO: LogColors.INFO,
+        logging.WARNING: LogColors.WARNING,
+        logging.ERROR: LogColors.ERROR,
+        logging.CRITICAL: LogColors.CRITICAL,
     }
 
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
-        return formatter.format(record)
+        level_color = self.LEVEL_COLORS.get(record.levelno, LogColors.RESET)
+        msg_color = getattr(record, "msg_color", LogColors.RESET)
 
-def setup_logger(name="MultiAgents", level=logging.INFO):
+        prefix = f"{level_color}[%(asctime)s] [{record.levelname}]: {LogColors.RESET}"
+        formatter = logging.Formatter(prefix + "%(message)s" + LogColors.RESET, datefmt="%Y-%m-%d %H:%M:%S")
+
+        original_msg = record.msg
+        try:
+            record.msg = f"{msg_color}{record.getMessage()}{LogColors.RESET}"
+            return formatter.format(record)
+        finally:
+            record.msg = original_msg
+
+def setup_logger(name="MultiAgents", level=logging.INFO, default_msg_color: str = None):
     """
     初始化并返回一个带有颜色输出的 Logger
     
     :param name: Logger 名称
     :param level: 日志级别 (默认 logging.INFO)
+    :param default_msg_color: 日志内容默认颜色 (可选)
     :return: 配置好的 logger 对象
     """
     # 获取 logger
@@ -52,6 +60,16 @@ def setup_logger(name="MultiAgents", level=logging.INFO):
 
     # 设置自定义的颜色 Formatter
     console_handler.setFormatter(ColoredFormatter())
+
+    # 设置内容默认颜色 (仅在未显式传入 msg_color 时生效)
+    if default_msg_color:
+        class _DefaultMsgColorFilter(logging.Filter):
+            def filter(self, record):
+                if not hasattr(record, "msg_color"):
+                    record.msg_color = default_msg_color
+                return True
+
+        logger.addFilter(_DefaultMsgColorFilter())
 
     # 添加 Handler 到 Logger
     logger.addHandler(console_handler)

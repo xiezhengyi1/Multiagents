@@ -1,5 +1,6 @@
 import uuid
-from typing import List
+import json
+from typing import List, Union, Dict, Any
 from .models import App, Flow, OptimizationConfig
 from .engine import SliceOptimizationEngine
 from .data import get_initial_scenario, _GLOBAL_SCENARIO_CONTEXT
@@ -7,13 +8,11 @@ from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float, w4: float = 0.0, incremental: bool = False) -> str:
+def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float, w4: float = 0.0, mode: str = 'full', return_json: bool = True) -> Union[str, Dict[str, Any]]:
     """
-    执行网络切片资源优化求解 (粒度: Flow)
-    优化逻辑：
-    1. 识别应用：基于 app_id 或 app_name 查找是否为已有应用
-    2. 识别/构建流：尝试将新请求的流与已有流进行匹配（基于ID或特征），以为了继承 old_slice 状态
-    3. 全局更新：求解后，用新的应用状态覆盖旧状态
+    执行网络切片资源优化求解
+    :param mode: 'full' (全量), 'incremental' (严格增量), 'hybrid' (增量+挤占)
+    :param return_json: 是否返回结构化字典数据而不是字符串报告
     """
     try:
         if _GLOBAL_SCENARIO_CONTEXT["apps"] is not None:
@@ -91,13 +90,15 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
         active_apps = [a for a in apps if a.app_id != final_app_id and a.name != target_app_name]
         updated_apps_list = active_apps + [new_app]
         
-        if incremental:
+        if mode == 'incremental':
             results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve_incremental(updated_apps_list, slices, nodes)
-        else:
+        elif mode == 'hybrid':
+            results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve_hybrid(updated_apps_list, slices, nodes)
+        else: # full
             results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve(updated_apps_list, slices, nodes)
         
         if results_df.empty:
-            return "求解器未返回结果 (Empty Result)。"
+            return "求解器未返回结果 (Empty Result)。" if not return_json else {"error": "Empty Result"}
 
         # F. 更新全局状态 (Side Effect)
         if _GLOBAL_SCENARIO_CONTEXT["apps"] is not None:
@@ -120,12 +121,30 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
                          target_flow_obj.old_allocated_bw_dl = r_act_bw_dl
 
         # G. 生成报告
+        if return_json:
+            return {
+                "meta": {
+                    "status": status_str,
+                    "objective_value": float(objective_val) if objective_val is not None else None,
+                    "mode": mode,
+                    "params": {"w1": w1, "w2": w2, "w3": w3, "w4": w4},
+                    "breakdown": breakdown
+                },
+                "target_app": {
+                    "app_id": final_app_id,
+                    "name": target_app_name,
+                    "flows": results_df[results_df['App ID'] == final_app_id].to_dict(orient='records')
+                },
+                "impacted_flows": results_df[(results_df['App ID'] != final_app_id) & (results_df['Strategies'] != "保持")].to_dict(orient='records'),
+                "slice_stats": slice_stats_df.to_dict(orient='records'),
+            }
+
         output = []
         output.append(f"--- 优化求解报告 (Flow Level) ---")
-        output.append(f"参数: w1={w1}, w2={w2}, w3={w3}")
-        output.append(f"模式: {'增量优化' if incremental else '全量优化'}")
-        if w4 not in (0, 0.0):
-            output.append(f"提示: w4 已忽略 (当前为三权重目标). w4={w4}")
+        output.append(f"参数: w1={w1}, w2={w2}, w3={w3}, w4={w4}")
+        mode_map = {'full': '全量优化', 'incremental': '严格增量', 'hybrid': '混合/挤占模式'}
+        output.append(f"模式: {mode_map.get(mode, mode)}")
+
         output.append(f"求解状态: {status_str}")
         output.append(f"目标函数值: {objective_val if objective_val is not None else 'N/A'}")
         if breakdown:
@@ -171,4 +190,4 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
         
     except Exception as e:
         logger.error(f"优化过程发生异常: {e}", exc_info=True)
-        return f"系统错误: 优化求解失败 - {str(e)}"
+        return {"error": str(e)} if return_json else f"系统错误: 优化求解失败 - {str(e)}"

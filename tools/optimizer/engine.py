@@ -128,6 +128,63 @@ class SliceOptimizationEngine:
         )
         return flow_results, slice_results, status_str, objective_val, breakdown
 
+    def solve_hybrid(self, apps: List[App], slices: List[Slice], nodes: List[Node]) -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float], Dict[str, float]]:
+        """
+        混合优化：基于挤占的策略。
+        1. 固定已有流的切片映射 (保持稳定性，避免大规模重路由)。
+        2. 允许调整已有流的带宽 (Squeezing/Downgrading)，以便为高优先级新业务腾出空间。
+        3. 优化目标依然包含体验(Priority weighted)，因此低优先级业务会被优先挤占。
+        """
+        logger.info(f"开始混合/挤占优化: Apps={len(apps)}, Slices={len(slices)}, Nodes={len(nodes)}")
+
+        prob = pulp.LpProblem("5G_Slice_R_A_Hybrid", pulp.LpMinimize)
+
+        x = pulp.LpVariable.dicts(
+            "x", 
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
+            cat='Binary'
+        )
+        B_act_ul = pulp.LpVariable.dicts(
+            "B_act_ul", 
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
+            lowBound=0
+        )
+        B_act_dl = pulp.LpVariable.dicts(
+            "B_act_dl", 
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
+            lowBound=0
+        )
+        dev = pulp.LpVariable.dicts("dev", (s.snssai for s in slices), lowBound=0)
+        change = pulp.LpVariable.dicts(
+            "change", 
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
+            lowBound=0
+        )
+
+        # 核心差异：使用 Hybrid 约束（只固定 x，不固定 B_act）
+        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change)
+        self._add_hybrid_constraints(prob, apps, slices, x)
+        self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
+        self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
+
+        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak = self._build_objectives(
+            apps, slices, x, B_act_ul, B_act_dl, dev, change
+        )
+
+        objective = (self.config.w1 * term_load) + (self.config.w2 * term_sig) + (self.config.w3 * (term_exp + term_qos)) + term_tiebreak
+        prob.setObjective(objective)
+        solver = pulp.PULP_CBC_CMD(msg=0)
+        prob.solve(solver)
+
+        status_str = pulp.LpStatus[prob.status]
+        logger.info(f"混合求解完成. 状态: {status_str}")
+
+        flow_results, slice_results, _, objective_val = self._finalize_results(prob, apps, slices, x, B_act_ul, B_act_dl)
+        breakdown = self._build_objective_breakdown(
+            term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak, objective_val
+        )
+        return flow_results, slice_results, status_str, objective_val, breakdown
+
     def _finalize_results(self, prob, apps, slices, x, B_act_ul, B_act_dl):
         status_str = pulp.LpStatus[prob.status]
         flow_results = self._format_results(apps, slices, x, B_act_ul, B_act_dl)
@@ -139,7 +196,6 @@ class SliceOptimizationEngine:
         num_slices = max(1, len(slices))
         num_flows = max(1, sum(len(a.flows) for a in apps))
 
-        # Term QoS: SLA Violation Count (Priority 1)
         # 用软约束替换硬约束，计算违约数量
         term_qos = pulp.lpSum(
             (
@@ -150,8 +206,6 @@ class SliceOptimizationEngine:
             for app in apps for f in app.flows for s in slices
         )
 
-        # Term Experience: Bandwidth Deficit (Priority 2)
-        # (Req - Act) / Req. Minimizing this maximizes Act.
         term_exp = pulp.lpSum(
             (1.0 / f.priority if f.priority > 0 else 1.0) * (
                 (f.bw_ul - pulp.lpSum(B_act_ul[app.app_id, f.flow_id, s.snssai] for s in slices)) / f.bw_ul if f.bw_ul > 0 else 0 +
@@ -160,7 +214,6 @@ class SliceOptimizationEngine:
             for app in apps for f in app.flows
         )
 
-        # Term Ops: Load Balancing + Signaling (Priority 3)
         term_load_raw = pulp.lpSum(dev[s.snssai] for s in slices)
         term_sig_raw = pulp.lpSum(
             change[app.app_id, f.flow_id, s.snssai] 
@@ -203,6 +256,22 @@ class SliceOptimizationEngine:
             "tiebreak": float(pulp.value(term_tiebreak) or 0.0),
             "objective_total": float(objective_val or 0.0),
         }
+
+    def _add_hybrid_constraints(self, prob, apps, slices, x):
+        """混合模式约束：仅固定已有流的切片映射，允许调整带宽。"""
+        for app in apps:
+            for f in app.flows:
+                if not f.old_slice:
+                    continue
+                # 容错：如果原切片已不在切片列表中，则当作新流处理（允许迁移）
+                if f.old_slice not in {s.snssai for s in slices}:
+                    continue
+
+                for s in slices:
+                    if s.snssai == f.old_slice:
+                        prob += x[app.app_id, f.flow_id, s.snssai] == 1
+                    else:
+                        prob += x[app.app_id, f.flow_id, s.snssai] == 0
 
     def _add_incremental_constraints(self, prob, apps, slices, x, B_act_ul, B_act_dl):
         """增量优化约束：固定已有流的切片映射，并在可行范围内保持历史带宽。"""
