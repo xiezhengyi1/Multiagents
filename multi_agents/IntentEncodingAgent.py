@@ -1,8 +1,12 @@
 from typing import List, Optional, Dict, Any
+import re
 from pydantic import BaseModel, Field
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from .basemodel import BaseAgent
+from utils.logger import setup_logger
+from .Prompt import IEA_SYSTEM_PROMPT
+from tools.pcf_tools import get_ue_context
 
 
 # 定义输出结构
@@ -21,6 +25,7 @@ class FlowIntent(BaseModel):
     description: str = Field(description="业务流的简要描述")
 
 class UserIntent(BaseModel):
+    supi: Optional[str] = Field(description="用户唯一标识 SUPI，如 imsi-...")
     app_name: str = Field(description="应用名称")
     app_id: str = Field(description="应用ID")
     operation_type: str = Field(description="操作类型，可选值: add, modify, delete")
@@ -28,61 +33,55 @@ class UserIntent(BaseModel):
     urgency: str = Field(description="整体紧急程度，如：Normal, High, Critical")
     raw_intent_summary: str = Field(description="对用户原始意图的总结")
 
-# 定义输入结构
-from model.UeContext import UeSmPolicyData
-
 class IntentEncodingAgent(BaseAgent):
-    def __init__(self, model_name="qwen-plus"):
+    def __init__(self, model_name="qwen3-30b-a3b-instruct-2507"):
         super().__init__(model_name=model_name)
         self.parser = PydanticOutputParser(pydantic_object=UserIntent)
+        self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[95m")  # 黄色日志
+        self.tools = [get_ue_context]
 
     def analyze_intent(self, user_input: str, context: str = "") -> UserIntent:
         """
         分析用户输入并转化为结构化意图
         """
         
-        prompt_template = """
-        你是一个5G网络切片系统的意图识别Agent (Intent Encoding Agent)。
-        你的任务是根据用户的自然语言描述，分析出具体的网络切片需求。
+        prompt_template = IEA_SYSTEM_PROMPT
 
-        请仔细分析用户的输入和上下文，提取出应用名称、操作类型（新增/更改/删除）、包含的业务流及其具体的QoS需求（带宽、时延、业务类型、优先级）。
+        supi = self._extract_supi(user_input)
+        ue_context = ""
+        if supi:
+            try:
+                ue_context = get_ue_context(supi)
+            except Exception as e:
+                self.logger.warning(f"UE Context 查询失败: {e}")
 
-        参考背景信息：
-        - URLLC: 超高可靠低时延通信，适用于远程控制、自动驾驶等。
-        - eMBB: 增强型移动宽带，适用于高清视频、大数据传输等。
-        - mMTC: 海量机器类通信，适用于传感器网络等。
-        - 优先级：通常1-5为高优先级（关键业务），6-10为中等，11+为低优先级。
-
-        上下文字段含义：
-        subsDefQos (基准权益)：用户归属地的默认 QoS 配置（优先级 arp、类别 5qi），意图未指定时继承此值。
-        vplmnQos (漫游上限)：用户漫游时的 QoS 硬性限制（带宽 maxFbr、总量 sessionAmbr），决策时不可突破此上限。
-        5qi：5G QoS 指标，数值越低优先级越高，常见映射如下：
-            - 1-4: 语音、视频通话等实时业务
-            - 5-9: 视频流、在线游戏等高带宽业务
-            - 10-15: 普通数据业务、背景下载等低优先级业务
-        请根据以上信息，生成符合 UserIntent 结构的输出。
-
-        用户输入:
-        {user_input}
-        
-        用户实际需求和订阅数据:
-        {context}
-        
-        {format_instructions}
-        """
-
+        merged_context = context
         prompt = PromptTemplate(
             template=prompt_template,
-            input_variables=["user_input", "context"],
+            input_variables=["user_input", "context", "ue_context"],
             partial_variables={"format_instructions": self.parser.get_format_instructions()}
         )
 
         chain = prompt | self.llm | self.parser
         
         try:
-            result = chain.invoke({"user_input": user_input, "context": context})
+            result = chain.invoke({"user_input": user_input, "context": merged_context, "ue_context": ue_context})
             self.logger.info(f"LLM 意图分析结果: {result}")
             return result
         except Exception as e:
             self.logger.error(f"意图解析出错: {e}")
             return None
+
+    @staticmethod
+    def _extract_supi(text: str) -> Optional[str]:
+        if not text:
+            return None
+        match = re.search(r"(?i)\bimsi-\d{5,}\b", text)
+        if match:
+            return match.group(0)
+
+        match = re.search(r"(?i)\bsupi\s*[:=]?\s*([\w-]+)", text)
+        if match:
+            return match.group(1)
+
+        return None

@@ -2,6 +2,7 @@ import os
 import sys
 from multi_agents.IntentEncodingAgent import IntentEncodingAgent
 from multi_agents.OptimizationStrategyAgent import OptimizationStrategyAgent
+from multi_agents.PolicyDispatchAgent import PolicyDispatchAgent
 from utils.logger import setup_logger
 
 logger = setup_logger(name="MainSystem")
@@ -17,6 +18,7 @@ def main():
     # 1. 实例化智能体
     intent_agent = IntentEncodingAgent()
     strategy_agent = OptimizationStrategyAgent()
+    dispatch_agent = PolicyDispatchAgent()
 
     # 2. 模拟用户输入 (模拟App_4接入场景)
     user_input = """
@@ -38,7 +40,8 @@ def main():
         logger.info(f"整体紧急度: {user_intent.urgency}")
         logger.info("业务流详情:")
         for flow in user_intent.flows:
-            logger.info(f"  - ID: {flow.flow_id} | Type: {flow.business_type} | BW: {flow.bandwidth_demand}Mbps | Delay: {flow.latency_requirement}ms | Priority: {flow.priority_level}")
+            # 注意：字段名需与 IntentEncodingAgent 定义一致
+            logger.info(f"  - ID: {flow.flow_id} | Type: {flow.business_type} | BW(DL): {flow.bw_dl}Mbps | Delay: {flow.lat}ms | Priority: {flow.priority}")
     else:
         logger.error("意图分析失败，终止流程。")
         return
@@ -62,9 +65,27 @@ def main():
     
     logger.info("\n>>> 最终执行报告:")
     if hasattr(strategy_output, "model_dump_json"):
-        logger.info(strategy_output.model_dump_json(indent=2, ensure_ascii=False))
+        strategy_json = strategy_output.model_dump_json(indent=2, ensure_ascii=False)
+        logger.info(strategy_json)
     else:
+        strategy_json = str(strategy_output)
         logger.info(strategy_output)
+
+    # 6. Policy Dispatch Agent 工作 (闭环反馈)
+    logger.info("\n[Step 5] Policy Dispatch Agent 正在下发策略并验证反馈...")
+    feedback_report = dispatch_agent.execute_and_evaluate(strategy_output)
+
+    logger.info("\n>>> 策略执行反馈报告:")
+    logger.info(f"执行状态: {feedback_report.execution_status}")
+    logger.info(f"网元性能指标: {feedback_report.performance_metrics}")
+    logger.info(f"违规详情: {feedback_report.violation_details}")
+    logger.info(f"修正建议: {feedback_report.correction_suggestion}")
+
+    # 简单展示闭环逻辑
+    if feedback_report.correction_suggestion and feedback_report.correction_suggestion != "None":
+        logger.warning(f"检测到策略执行问题，建议触发【意图修正】或【策略重算】流程。建议内容: {feedback_report.correction_suggestion}")
+    else:
+        logger.success("策略执行成功，闭环结束。") if hasattr(logger, 'success') else logger.info("策略执行成功，闭环结束。")
 
 if __name__ == "__main__":
     main()

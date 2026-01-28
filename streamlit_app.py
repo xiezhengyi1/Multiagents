@@ -4,392 +4,329 @@ import json
 import os
 import sys
 
-# 添加项目根目录到 sys.path，确保能够导入模块
+# 添加项目根目录到 sys.path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from tools import optimization as opt_engine
-from tools.optimization import App, Slice, Node, Flow, set_global_scenario
-from multi_agents import IntentEncodingAgent, OptimizationStrategyAgent
-from utils.logger import setup_logger # 虽然前端不一定看控制台，但保持一致性
+from tools.optimizer import optimize_network_slices, App, Slice, Node, Flow
+from tools.db_tool import get_initial_scenario, cache_scenario, get_cached_scenario, deserialize_scenario_payload
 
 # --- 页面配置 ---
 st.set_page_config(
-    page_title="6G网络体验保障多智能体编排系统",
-    page_icon="🤖",
+    page_title="6G切片优化器测试台",
+    page_icon="🧪",
     layout="wide"
 )
 
-# --- 样式优化 ---
 st.markdown("""
 <style>
-    .reportview-container {
-        background: #f0f2f6
-    }
-    .main-header {
-        font-size: 2.5rem;
-        color: #1E88E5;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        color: #424242;
-    }
-    .card {
-        background-color: white;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        margin-bottom: 20px;
-    }
+    .main-header { font-size: 2rem; color: #1E88E5; margin-bottom: 20px; }
+    .section-header { font-size: 1.2rem; font-weight: bold; margin-top: 15px; margin-bottom: 10px; }
+    .stButton>button { width: 100%; border-radius: 5px; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- Session State 初始化 ---
 if 'initialized' not in st.session_state:
-    apps, slices, nodes = opt_engine.get_initial_scenario()
+    apps, slices, nodes = get_initial_scenario()
     st.session_state['apps'] = apps
     st.session_state['slices'] = slices
     st.session_state['nodes'] = nodes
-    st.session_state['logs'] = []
-    st.session_state['initialized'] = True
-else:
-    # 热修复：检查 Slice 是否包含新加的 'sd' 属性，如果没有则重置
-    if st.session_state.get('slices') and not hasattr(st.session_state['slices'][0], 'sd'):
-        opt_engine = sys.modules.get('tools.optimization', opt_engine) # 尝试获取最新模块
-        # 注意：这里可能需要重新 reload 模块，但在 Streamlit 中通常由 watcher 处理。
-        # 简单起见，直接调用当前的 opt_engine.get_initial_scenario
-        apps, slices, nodes = opt_engine.get_initial_scenario()
+    st.session_state['init_done'] = True
+    st.session_state['last_result'] = None
+
+# --- 侧边栏：配置 ---
+with st.sidebar:
+    st.title("⚙️ 求解器配置")
+    
+    st.markdown("### 1. 优化目标权重")
+    w1 = st.slider("W1: 负载均衡 (Load)", 0.0, 500.0, 100.0)
+    w2 = st.slider("W2: 迁移/信令 (Signal)", 0.0, 500.0, 50.0)
+    w3 = st.slider("W3: 体验/带宽 (Exp)", 0.0, 2000.0, 1000.0)
+    w4 = st.slider("W4: QoS (Loss/Jitter)", 0.0, 500.0, 100.0)
+    
+    st.markdown("### 2. 运行模式")
+    opt_mode = st.radio(
+        "选择优化模式:",
+        ('full', 'incremental', 'hybrid'),
+        format_func=lambda x: {
+            'full': '全量优化 (Global)',
+            'incremental': '严格增量 (Strict)',
+            'hybrid': '混合/挤占 (Hybrid)'
+        }[x],
+        index=2
+    )
+    st.info({
+        'full': "推倒重来：允许任意重路由，追求全局最优。",
+        'incremental': "保守策略：固定旧流切片和带宽，仅优化新流。",
+        'hybrid': "激进策略：固定旧流切片，但允许压缩旧流带宽以接纳高优先级新流。"
+    }[opt_mode])
+
+    if st.button("🔄 重置所有数据"):
+        apps, slices, nodes = get_initial_scenario()
         st.session_state['apps'] = apps
         st.session_state['slices'] = slices
         st.session_state['nodes'] = nodes
-        st.toast("系统已自动更新内部数据结构以匹配新代码。", icon="🔄")
-
-if 'agent_results' not in st.session_state:
-    st.session_state['agent_results'] = None
-
-if 'final_report' not in st.session_state:
-    st.session_state['final_report'] = None
-
-# --- 侧边栏：环境配置 ---
-with st.sidebar:
-    st.title("🛠️ 环境配置")
-    
-    # API 配置
-    with st.expander("🔑 API Key 设置", expanded=False):
-        api_key = st.text_input("OpenAI/DashScope API Key", value=os.getenv("OPENAI_API_KEY", ""), type="password")
-        base_url = st.text_input("Base URL", value=os.getenv("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"))
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
-        if base_url:
-            os.environ["OPENAI_BASE_URL"] = base_url
-    
-    # 功能区：管理切片
-    st.subheader("1. 切片资源池管理")
-    
-    # 将切片对象转换为 DataFrame 供 data_editor 使用
-    slice_data = []
-    for s in st.session_state['slices']:
-        slice_data.append({
-            "name": s.name,
-            "sst": s.sst,
-            "sd": s.sd,
-            "total_bw": s.total_bw,
-            "reserved_bw": s.reserved_bw,
-            "latency": s.latency
-        })
-    df_slices = pd.DataFrame(slice_data)
-    
-    edited_slices_df = st.data_editor(
-        df_slices, 
-        num_rows="dynamic", 
-        key="slice_editor",
-        column_config={
-            "name": "切片名称",
-            "sst": st.column_config.NumberColumn("SST (1:eMBB,2:URLLC,3:MIoT)", min_value=0, max_value=255, step=1),
-            "sd": st.column_config.TextColumn("SD (Hex)", max_chars=6, validate="^[0-9A-Fa-f]{6}$"),
-            "total_bw": st.column_config.NumberColumn("总带宽(Mbps)", min_value=0),
-            "reserved_bw": st.column_config.NumberColumn("保留带宽(Mbps)", min_value=0),
-            "latency": st.column_config.NumberColumn("基础时延(ms)", min_value=0)
-        }
-    )
-    
-    # 功能区：管理现有业务
-    st.subheader("2. 现有背景业务管理")
-    app_display_data = []
-    for app in st.session_state['apps']:
-         app_display_data.append({
-             "name": app.name,
-             "total_bw": app.total_bw,
-             "priority": app.max_prio,
-             "slice": app.old_slice
-         })
-    df_apps = pd.DataFrame(app_display_data)
-    
-    edited_apps_df = st.data_editor(
-        df_apps,
-        num_rows="dynamic",
-        key="app_editor",
-         column_config={
-            "name": "应用名称",
-            "total_bw": st.column_config.NumberColumn("总带宽", disabled=True, help="由流汇总计算"),
-         }
-    )
-
-    if st.button("🔄 重置/应用配置更改"):
-        # 1. 更新切片对象
-        new_slices = []
-        for index, row in edited_slices_df.iterrows():
-            # 尝试查找现有对象以保留不需要更改的属性(如 current_load)，或者直接新建
-            # 这里简化处理：直接新建，这会重置 current_load，但在下一次 solve 时 current_load 是根据 app 分配计算的
-            # 不过 wait, tools.optimization.Slice 中 current_load_bw 是其中一个字段。
-            # 如果我们新建 Slice，current_load_bw 初始设为多少？
-            # 原始代码中 get_initial_scenario 给定了一些初始值。
-            # 既然是"自由配置"，我们假设现有背景业务的分配会决定 load。
-            # 因此这里 current_load_bw 初始设为 0，依靠优化引擎重新计算背景业务的负载。
-            
-            s = Slice(
-                name=row['name'],
-                sst=int(row['sst']),
-                sd=str(row['sd']),
-                total_bw=float(row['total_bw']),
-                current_load_bw=0.0, # 重新计算
-                latency=float(row['latency']),
-                proc_delay=1.0, # 默认值
-                reserved_bw=float(row['reserved_bw'])
-            )
-            new_slices.append(s)
-        st.session_state['slices'] = new_slices
-        
-        # 2. 更新应用对象 (较复杂，因为 App 包含 Flow)
-        # 简易版：只允许删除或修改顶层属性。如果要修改流，这在 data_editor 里不好展示嵌套结构。
-        # 我们保留原始 session_state['apps'] 中未被删除的项。
-        current_app_names = edited_apps_df['name'].tolist()
-        new_apps_list = []
-        for app in st.session_state['apps']:
-            if app.name in current_app_names:
-                new_apps_list.append(app)
-        st.session_state['apps'] = new_apps_list
-        
-        st.success("配置已更新！背景业务负载将在下次优化时重新计算。")
-
-# --- 主界面 ---
-st.markdown('<div class="main-header">🤖 6G网络切片多智能体编排系统</div>', unsafe_allow_html=True)
-st.markdown("---")
-
-# 1. 网络状态看板
-st.subheader("📊 当前网络状态视图")
-
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    # 计算当前负载（简单模拟，基于现有 App 的 old_slice）
-    slice_status = []
-    for s in st.session_state['slices']:
-        used_bw = s.reserved_bw
-        for a in st.session_state['apps']:
-            if a.old_slice == s.name:
-                used_bw += a.total_bw
-        
-        slice_status.append({
-            "切片名称": s.name,
-            "总容量": s.total_bw,
-            "已用(含保留)": used_bw,
-            "使用率": min(100, (used_bw / s.total_bw) * 100) if s.total_bw > 0 else 0,
-            "剩余": max(0, s.total_bw - used_bw)
-        })
-    df_status = pd.DataFrame(slice_status)
-    st.dataframe(df_status)
-
-with col2:
-    st.info("💡 说明：\n- 左侧边栏可以自由增删切片和业务。\n- 下方输入意图，智能体将自动分析并调用求解器。")
-
-# --- 业务流详细展示 ---
-st.subheader("📋 业务流详细资源分布")
-with st.expander("展开查看每个业务流的带宽与切片分配详情", expanded=True):
-    all_flows_data = []
-    if 'apps' in st.session_state and st.session_state['apps']:
-        for app in st.session_state['apps']:
-            assigned_slice = app.old_slice if app.old_slice else "未分配"
-            # 兼容 app.flows 可能为空的情况
-            if hasattr(app, 'flows') and app.flows:
-                for f in app.flows:
-                    all_flows_data.append({
-                        "所属业务": app.name,
-                        "流名称": f.name,
-                        "占用带宽 (Mbps)": f.bw,
-                        "时延要求 (ms)": f.lat,
-                        "优先级": f.priority,
-                        "分配切片": assigned_slice
-                    })
-            else:
-                 # 如果没有流详情，仅显示业务本体
-                 all_flows_data.append({
-                    "所属业务": app.name,
-                    "流名称": "Total (No sub-flows)",
-                    "占用带宽 (Mbps)": app.total_bw,
-                    "时延要求 (ms)": app.min_lat,
-                    "优先级": app.max_prio,
-                    "分配切片": assigned_slice
-                })
-
-        if all_flows_data:
-            st.dataframe(pd.DataFrame(all_flows_data))
-        else:
-            st.info("暂无业务流数据")
-
-# 2. 智能体交互区
-st.markdown("---")
-st.subheader("🗣️ 用户意图输入")
-
-col_intent, col_context = st.columns([1, 1])
-
-with col_intent:
-    st.markdown("##### 1. UserIntent (自然语言)")
-    user_input = st.text_area(
-        "请输入您的接入需求:", 
-        value="我是应急抢险指挥车(App_4)，需要接入网络。\n业务流1：远程机械臂控制，带宽20Mbps，不仅要大带宽而且时延不能超过10ms，这是关键控制流！\n业务流2：现场多路4K高清直播，带宽50Mbps，时延60ms左右。",
-        height=300
-    )
-
-with col_context:
-    st.markdown("##### 2. UeSmDecisionContext (结构化上下文)")
-    with st.container(border=True):
-        st.caption("UE & Session Context")
-        c1, c2 = st.columns(2)
-        with c1:
-            supi = st.text_input("SUPI", value="imsi-46000000001")
-            pdu_id = st.number_input("PDU Session ID", min_value=1, value=1)
-            dnn = st.text_input("DNN", value="default")
-        with c2:
-            rat_type = st.selectbox("RAT Type", ["NR", "EUTRA"], index=0)
-            access_type = st.selectbox("Access Type", ["3GPP_ACCESS", "NON_3GPP_ACCESS"], index=0)
-            pdu_type = st.selectbox("PDU Type", ["IPV4", "IPV6", "ETHERNET"], index=0)
-        
-        st.caption("Slice Info (S-NSSAI)")
-        c3, c4 = st.columns(2)
-        with c3:
-            sst = st.number_input("SST", min_value=0, max_value=255, value=1)
-        with c4:
-            sd = st.text_input("SD (Hex)", value="000000")
-
-        # 构建结构化上下文对象
-        ue_context_data = {
-            "supi": supi,
-            "am_info": {
-                "user_location": None,
-                "serving_plmn": None,
-                "access_type": access_type,
-                "rat_type": rat_type
-            },
-            "target_session": {
-                "policy_context": {
-                    "supi": supi,
-                    "pduSessionId": pdu_id,
-                    "sliceInfo": {"sst": sst, "sd": sd},
-                    "dnn": dnn,
-                    "pduSessionType": pdu_type,
-                    "accessType": access_type,
-                    "ratType": rat_type
-                },
-                "subscription_data": {
-                    "content": {}
-                },
-                "remain_gbr_ul": None,
-                "remain_gbr_dl": None,
-                "active_app_session_ids": [],
-                "traffic_influence_data": {}
-            }
-        }
-
-col_run, col_reset = st.columns([1, 6])
-run_btn = col_run.button("🚀 开始编排", type="primary")
-
-if run_btn:
-    if not os.environ.get("OPENAI_API_KEY"):
-        st.error("请先在左侧边栏配置 API Key！")
-    else:
-        # !!! 关键步骤：将当前的前端配置注入到后端工具的上下文中 !!!
-        set_global_scenario(
-            st.session_state['apps'],
-            st.session_state['slices'],
-            st.session_state['nodes']
-        )
-        
-        status_text = st.empty()
-        result_container = st.container()
-
-        try:
-            # Step 1: 意图分析
-            status_text.markdown("#### 🔄 Step 1: Intent Encoding Agent 正在分析意图...")
-            intent_agent = IntentEncodingAgent(model_name="qwen-plus") # 使用更强的模型
-            
-            # 将结构化上下文转为 JSON 字符串传递给 Agent
-            context_str = json.dumps(ue_context_data, indent=2, ensure_ascii=False)
-            user_intent = intent_agent.analyze_intent(user_input, context=context_str)
-            
-            if user_intent:
-                with result_container:
-                    with st.expander("🧠 意图识别结果", expanded=False):
-                        st.json(user_intent.dict())
-            else:
-                st.error("意图识别失败。")
-                st.stop()
-            
-            # Step 2: 策略制定与执行
-            status_text.markdown("#### 🔄 Step 2: Optimization Strategy Agent 正在制定策略并调用求解器...")
-            
-            # 构造网络状态描述供 LLM 参考
-            # network_desc = "当前切片资源状态:\n"
-            # for _, row in df_status.iterrows():
-            #    network_desc += f"- {row['切片名称']}: 总容量 {row['总容量']}M, 剩余可用 {row['剩余']}M.\n"
-            
-            strategy_agent = OptimizationStrategyAgent(model_name="qwen-plus")
-            final_report = strategy_agent.generate_strategy(user_intent.dict())
-            
-            # 保存结果到 Session State
-            st.session_state['final_report'] = final_report
-            
-            status_text.success("✅ 编排完成！正在刷新全网状态视图...")
-            
-            # 强制刷新页面以更新顶部的表格
-            import time
-            time.sleep(1.5) # 给用户一点时间看到成功提示
-            st.rerun()
-            
-        except Exception as e:
-            st.error(f"运行过程中发生错误: {str(e)}")
-            import traceback
-            st.text(traceback.format_exc())
-
-# 3. 结果展示区 (如果有历史结果)
-if st.session_state['final_report']:
-    st.markdown("---")
-    st.markdown("### 📝 最终执行报告")
-    
-    report_data = st.session_state['final_report']
-    
-    # 检查是否为结构化对象 (OutputStrategy)
-    if hasattr(report_data, 'policy_type'):
-        with st.container(border=True):
-            st.markdown(f"**策略类型:** `{report_data.policy_type}`")
-            st.markdown("**推荐动作:**")
-            for action in report_data.recommended_actions:
-                st.markdown(f"- {action}")
-            
-            st.markdown("---")
-            st.markdown("**策略详细内容 (Policy Details):**")
-            # 兼容 Pydantic v1 vs v2
-            details_dict = report_data.policy_details.dict() if hasattr(report_data.policy_details, 'dict') else report_data.policy_details
-            st.json(details_dict)
-            
-    else:
-        # 兼容旧版本字符串
-        st.markdown(f"""
-        <div class="card">
-            {str(report_data).replace(chr(10), '<br>')}
-        </div>
-        """, unsafe_allow_html=True)
-    
-    if st.button("🗑️ 清除报告并重置视图"):
-        st.session_state['final_report'] = None
+        st.session_state['last_result'] = None
         st.rerun()
+
+st.markdown('<div class="main-header">🧪 6G网络切片优化器 - 可视化测试台</div>', unsafe_allow_html=True)
+
+# --- 第一部分：环境数据编辑 ---
+col_slice, col_flow = st.columns([1, 1.2])
+
+# 1. 切片列表编辑
+with col_slice:
+    st.markdown('<div class="section-header">1. 切片资源池 (Slice Resources)</div>', unsafe_allow_html=True)
+    
+    current_slices = st.session_state['slices']
+    slice_dicts = []
+    for s in current_slices:
+        slice_dicts.append({
+            "SNSSAI": s.snssai,
+            "Name": s.name,
+            "Cap_UL": s.total_bw_ul,
+            "Cap_DL": s.total_bw_dl,
+            "Reserved": s.reserved_bw,
+            "Lat (ms)": s.latency,
+            "Loss": s.loss,
+            "Jitter": s.jitter
+        })
+    
+    edited_slices = st.data_editor(
+        pd.DataFrame(slice_dicts),
+        key="editor_slices",
+        num_rows="dynamic",
+        column_config={
+            "Lat (ms)": st.column_config.NumberColumn(min_value=0.0, format="%.1f"),
+            "Loss": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, format="%.4f"),
+            "Jitter": st.column_config.NumberColumn(min_value=0.0, format="%.1f"),
+        },
+        use_container_width=True
+    )
+    
+    # 实时转换回对象
+    new_slices_obj = []
+    for _, row in edited_slices.iterrows():
+        # 查找旧对象以保留某些状态 (current_load)，或者新建
+        old_obj = next((s for s in current_slices if s.snssai == row['SNSSAI']), None)
+        
+        # 简单起见，从 SNSSAI 反推 SST/SD (如果未修改 SNSSAI)
+        # 如果是新行，给个默认 SST/SD
+        if old_obj:
+            sst, sd = old_obj.sst, old_obj.sd
+            cur_ul, cur_dl = old_obj.current_load_bw_ul, old_obj.current_load_bw_dl
+        else:
+            sst, sd = 1, "FFFFFF"
+            cur_ul, cur_dl = 0.0, 0.0
+            
+        s_new = Slice(
+            name=row['Name'],
+            sst=sst, sd=sd, # 注意：data_editor没有暴露 SST/SD 编辑，简化展示
+            total_bw_ul=row['Cap_UL'],
+            total_bw_dl=row['Cap_DL'],
+            current_load_bw_ul=cur_ul,
+            current_load_bw_dl=cur_dl,
+            latency=row['Lat (ms)'],
+            proc_delay=1.0, 
+            reserved_bw=row['Reserved'],
+            loss=row['Loss'],
+            jitter=row['Jitter']
+        )
+        new_slices_obj.append(s_new)
+    st.session_state['slices'] = new_slices_obj
+
+# 2. 现有业务流编辑 (Flattened View)
+with col_flow:
+    st.markdown('<div class="section-header">2. 现有业务流 (Active Flows)</div>', unsafe_allow_html=True)
+    
+    current_apps = st.session_state['apps']
+    flow_flat_list = []
+    for app in current_apps:
+        for f in app.flows:
+            flow_flat_list.append({
+                "App_ID": app.app_id,
+                "App_Name": app.name,
+                "Flow_ID": f.flow_id,
+                "Name": f.name,
+                "BW_UL": f.bw_ul,
+                "BW_DL": f.bw_dl,
+                "GBR_UL": f.gbr_ul,
+                "GBR_DL": f.gbr_dl,
+                "Prio": f.priority,
+                "Lat_Req": f.lat,
+                "Loss_Req": f.loss_req,
+                "Jitter_Req": f.jitter_req,
+                "Slice": f.old_slice,
+                "Act_UL": f.old_allocated_bw_ul,
+                "Act_DL": f.old_allocated_bw_dl
+            })
+            
+    edited_flows = st.data_editor(
+        pd.DataFrame(flow_flat_list),
+        key="editor_flows",
+        num_rows="dynamic",
+        column_config={
+            "App_ID": st.column_config.TextColumn(disabled=False), # 允许修改归属App
+            "Slice": st.column_config.TextColumn(disabled=True, help="由优化器分配"),
+            "Act_UL": st.column_config.NumberColumn(disabled=True, format="%.2f"),
+            "Act_DL": st.column_config.NumberColumn(disabled=True, format="%.2f"),
+            "Loss_Req": st.column_config.NumberColumn(format="%.4f"),
+        },
+        use_container_width=True
+    )
+    
+    # 重建 App 结构
+    # Group by App_ID
+    new_apps_dict = {}
+
+    def params_check(val):
+        return val is not None
+    
+    # 遍历编辑后的 DataFrame
+    for _, row in edited_flows.iterrows():
+        # 处理可能被用户删除行的情况
+        # ...
+        a_id = row['App_ID']
+        a_name = row['App_Name']
+        
+        if params_check(a_id): # Simple validation
+             if a_id not in new_apps_dict:
+                new_apps_dict[a_id] = {
+                    "name": a_name,
+                    "flows": []
+                }
+            
+             # 构造流
+             f_obj = Flow(
+                name=row['Name'],
+                flow_id=row['Flow_ID'],
+                bw_ul=row['BW_UL'],
+                bw_dl=row['BW_DL'],
+                gbr_ul=row['GBR_UL'],
+                gbr_dl=row['GBR_DL'],
+                lat=row['Lat_Req'],
+                loss_req=row['Loss_Req'],
+                jitter_req=row['Jitter_Req'],
+                priority=int(row['Prio']),
+                old_slice=row['Slice'] if pd.notna(row['Slice']) and row['Slice'] != "" else None,
+                old_allocated_bw_ul=row['Act_UL'] if pd.notna(row['Act_UL']) else None,
+                old_allocated_bw_dl=row['Act_DL'] if pd.notna(row['Act_DL']) else None
+             )
+             new_apps_dict[a_id]["flows"].append(f_obj)
+        
+    # Convert back to List[App]
+    reconstructed_apps = []
+    for a_id, data in new_apps_dict.items():
+        reconstructed_apps.append(App(
+            app_id=a_id,
+            name=data['name'],
+            flows=data['flows']
+        ))
+    st.session_state['apps'] = reconstructed_apps
+
+# --- 第三部分：新业务请求 ---
+st.markdown("---")
+st.markdown('<div class="section-header">3. 发起新业务请求 (Request New Service)</div>', unsafe_allow_html=True)
+
+with st.form("new_app_form"):
+    c1, c2, c3 = st.columns(3)
+    new_app_name = c1.text_input("App Name", "Emergency_Video")
+    new_app_id = c2.text_input("App ID", "app_emerg_01")
+    
+    st.markdown("**Flow Parameters:**")
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    f_ul = fc1.number_input("UL BW (M)", 10.0)
+    f_dl = fc2.number_input("DL BW (M)", 50.0)
+    f_lat = fc3.number_input("Lat Req (ms)", 20.0)
+    f_loss = fc4.number_input("Loss Req", 0.01, format="%.4f")
+    f_jitter = fc5.number_input("Jitter Req (ms)", 10.0)
+    
+    fc6, fc7, fc8 = st.columns(3)
+    f_prio = fc6.number_input("Priority (1=High)", 1, 100, 1)
+    f_gbr_ul = fc7.number_input("GBR UL (M)", 2.0)
+    f_gbr_dl = fc8.number_input("GBR DL (M)", 10.0)
+    
+    submitted = st.form_submit_button("🚀 提交并在当前上下文中优化 (Run Optimizer)")
+
+if submitted:
+    # 构造请求字典
+    req_data = {
+        "name": new_app_name,
+        "app_id": new_app_id,
+        "flows": [{
+            "name": "Default_Stream",
+            "flow_id": "f_main",
+            "bw_ul": f_ul,
+            "bw_dl": f_dl,
+            "gbr_ul": f_gbr_ul,
+            "gbr_dl": f_gbr_dl,
+            "lat": f_lat,
+            "loss_req": f_loss,
+            "jitter_req": f_jitter,
+            "priority": int(f_prio)
+        }]
+    }
+
+    # 同步环境数据到缓存（供优化器读取）
+    cache_scenario(
+        st.session_state['apps'],
+        st.session_state['slices'],
+        st.session_state['nodes']
+    )
+    
+    with st.spinner(f"Running Optimization (Mode={opt_mode})..."):
+        report = optimize_network_slices(
+            req_data,
+            w1=w1, w2=w2, w3=w3, w4=w4,
+            mode=opt_mode
+        )
+        st.session_state['last_result'] = report
+
+        if isinstance(report, dict) and report.get("scenario"):
+            parsed = deserialize_scenario_payload(report)
+            if parsed:
+                apps, slices, nodes = parsed
+                st.session_state['apps'] = apps
+                st.session_state['slices'] = slices
+                st.session_state['nodes'] = nodes
+
+# --- 结果展示 ---
+if st.session_state['last_result']:
+    st.markdown("---")
+    st.markdown('<div class="section-header">4. 优化结果报告</div>', unsafe_allow_html=True)
+    st.text_area("Result Log", st.session_state['last_result'], height=400)
+    
+    # 简单的可视化：切片负载对比
+    st.markdown("##### 切片负载概览 (Slice Load)")
+    
+    # 从缓存取最新切片状态
+    cached_apps, cached_slices, _ = get_cached_scenario()
+    latest_slices = cached_slices if cached_slices else st.session_state['slices']
+    
+    load_data = []
+    # 重新计算负载用于展示 (简单累加)
+    latest_apps = cached_apps if cached_apps else st.session_state['apps']
+    
+    for s in latest_slices:
+        used_ul = s.reserved_bw + s.current_load_bw_ul
+        used_dl = s.reserved_bw + s.current_load_bw_dl
+        
+        # 加上 Apps 的负载
+        for app in latest_apps:
+            for f in app.flows:
+                if f.old_slice == s.snssai: # 此时 old_slice 已经被更新为最新分配结果
+                    used_ul += (f.old_allocated_bw_ul or 0)
+                    used_dl += (f.old_allocated_bw_dl or 0)
+
+        load_data.append({
+            "Slice": s.name,
+            "Used UL": used_ul,
+            "Total UL": s.total_bw_ul,
+            "Used DL": used_dl,
+            "Total DL": s.total_bw_dl,
+        })
+    
+    df_load = pd.DataFrame(load_data)
+    if not df_load.empty:
+        st.bar_chart(df_load.set_index("Slice")[["Used UL", "Used DL"]])
 

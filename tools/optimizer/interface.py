@@ -1,9 +1,9 @@
 import uuid
 import json
 from typing import List, Union, Dict, Any
-from .models import App, Flow, OptimizationConfig
+from ..models import App, Flow, OptimizationConfig
 from .engine import SliceOptimizationEngine
-from .data import get_initial_scenario, _GLOBAL_SCENARIO_CONTEXT
+from tools.db_tool import get_current_scenario, cache_scenario, serialize_scenario_for_api
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -15,12 +15,7 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
     :param return_json: 是否返回结构化字典数据而不是字符串报告
     """
     try:
-        if _GLOBAL_SCENARIO_CONTEXT["apps"] is not None:
-             apps = _GLOBAL_SCENARIO_CONTEXT["apps"]
-             slices = _GLOBAL_SCENARIO_CONTEXT["slices"]
-             nodes = _GLOBAL_SCENARIO_CONTEXT["nodes"]
-        else:
-             apps, slices, nodes = get_initial_scenario()
+        apps, slices, nodes = get_current_scenario()
         
         # B. 应用身份识别
         target_app_id = new_app_data.get('app_id')
@@ -100,25 +95,24 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
         if results_df.empty:
             return "求解器未返回结果 (Empty Result)。" if not return_json else {"error": "Empty Result"}
 
-        # F. 更新全局状态 (Side Effect)
-        if _GLOBAL_SCENARIO_CONTEXT["apps"] is not None:
-             _GLOBAL_SCENARIO_CONTEXT["apps"][:] = updated_apps_list
-             
-             # 回写状态
-             for _, row in results_df.iterrows():
-                 r_app_id = row['App ID']
-                 r_flow_id = row['Flow ID']
-                 r_new_slice = row['New Slice']
-                 r_act_bw_ul = row['Act BW UL']
-                 r_act_bw_dl = row['Act BW DL']
-                 
-                 target_app_obj = next((a for a in _GLOBAL_SCENARIO_CONTEXT["apps"] if a.app_id == r_app_id), None)
-                 if target_app_obj:
-                     target_flow_obj = next((f for f in target_app_obj.flows if f.flow_id == r_flow_id), None)
-                     if target_flow_obj:
-                         target_flow_obj.old_slice = r_new_slice
-                         target_flow_obj.old_allocated_bw_ul = r_act_bw_ul
-                         target_flow_obj.old_allocated_bw_dl = r_act_bw_dl
+        # F. 更新内存快照 (不在优化器内维护全局变量)
+        for _, row in results_df.iterrows():
+            r_app_id = row['App ID']
+            r_flow_id = row['Flow ID']
+            r_new_slice = row['New Slice']
+            r_act_bw_ul = row['Act BW UL']
+            r_act_bw_dl = row['Act BW DL']
+
+            target_app_obj = next((a for a in updated_apps_list if a.app_id == r_app_id), None)
+            if target_app_obj:
+                target_flow_obj = next((f for f in target_app_obj.flows if f.flow_id == r_flow_id), None)
+                if target_flow_obj:
+                    target_flow_obj.old_slice = r_new_slice
+                    target_flow_obj.old_allocated_bw_ul = r_act_bw_ul
+                    target_flow_obj.old_allocated_bw_dl = r_act_bw_dl
+
+        # 缓存最新场景（供后续下发成功后的提交工具使用）
+        cache_scenario(updated_apps_list, slices, nodes)
 
         # G. 生成报告
         if return_json:
@@ -137,6 +131,7 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
                 },
                 "impacted_flows": results_df[(results_df['App ID'] != final_app_id) & (results_df['Strategies'] != "保持")].to_dict(orient='records'),
                 "slice_stats": slice_stats_df.to_dict(orient='records'),
+                "scenario": serialize_scenario_for_api(updated_apps_list, slices, nodes)
             }
 
         output = []
@@ -187,7 +182,6 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
             output.append(f"  - {row['Slice']} ({row['SNSSAI']}): 上行负载 {row['Load UL (%)']}% (剩余 {row['Rem UL (M)']}M) / 下行负载 {row['Load DL (%)']}% (剩余 {row['Rem DL (M)']}M)")
 
         return "\n".join(output)
-        
     except Exception as e:
         logger.error(f"优化过程发生异常: {e}", exc_info=True)
         return {"error": str(e)} if return_json else f"系统错误: 优化求解失败 - {str(e)}"

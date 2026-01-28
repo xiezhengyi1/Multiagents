@@ -2,7 +2,7 @@ import pulp
 import pandas as pd
 from typing import List, Tuple, Optional, Dict
 
-from .models import App, Slice, Node, Flow, OptimizationConfig
+from ..models import App, Slice, Node, Flow, OptimizationConfig
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)

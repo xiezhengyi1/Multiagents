@@ -1,7 +1,6 @@
 import os
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
-from utils.logger import setup_logger
 
 # 加载环境变量
 load_dotenv()
@@ -13,9 +12,6 @@ class BaseAgent:
         :param model_name: 模型名称，默认 qwen-plus (阿里云百炼)
         :param temperature: 温度系数，0表示最确定的输出
         """
-        # 初始化日志
-        self.logger = setup_logger(self.__class__.__name__)
-
         # 优先使用 OPENAI_API_KEY，如果没有则尝试 DASHSCOPE_API_KEY
         api_key = os.getenv("OPENAI_API_KEY")
         

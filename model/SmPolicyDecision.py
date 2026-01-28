@@ -152,7 +152,7 @@ class TscaiInputContainer(BaseModel):
     surTimeInTime: Optional[int] = None
 
 class QosData(BaseModel):
-    qosId: str
+    qosId: Optional[str] = None
     var5qi: Optional[int] = Field(None, alias="5qi")
     maxbrUl: Optional[str] = None
     maxbrDl: Optional[str] = None

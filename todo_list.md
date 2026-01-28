@@ -8,8 +8,8 @@
 1. Itent 的输入应该是编码后的 UeContext 和 UeIntent ，而其输出字段是否是这样还需要考虑
 2. Itent 的输入UeContext的具体字段和结构需要明确 UeSmPolicyContext，UeAmPolicyContext
 3. Itent 的输出的具体字段和结构需要确认是否符合最终要求
-4. Optimization 的输出字段定义
-5. Optimization 使用工具获取网络状态
+4. Optimization 的输出字段定义  --完成
+5. Optimization 使用工具获取网络状态  --完成
 
 ### 三、优化求解器
 
@@ -18,16 +18,18 @@
 
 ### 三、结构化输出
 
-### 四、完善 tools agent 的逻辑
+### 四、完善 Policy Dispatch agent 的逻辑
 
-- 如何给 pcf 发送policy
+- 如何给 pcf 发送policy --需要模拟
 - 如何从 pcf 获取UeContext
 - 如何从 MANO 获取节点状态
+- ** 如何获取 切片/流 状态 **
 
 ### 五、添加 RAG 库
 
 1. 添加额外专业知识
 2. 存储过往成功策略（需要考虑如何构建这个数据结构）
+3. 考虑成功策略的有效时间
 
 ### 六、确认模型训练所需数据
 
@@ -35,7 +37,6 @@
 ### 七、一些问题
 
 1. 如何确保LLM的及时反馈和输出
-2. Intent的输入是用户意图以及UeContext，在实际应用场景中，如何得到用户意图？
+2. Intent的输入是用户意图以及UeContext，在实际应用场景中，如何得到用户意图？？
 3. Intent的输入用户意图与UeContext如何对应起来？
-4. 如何查找现有流的状态？
-5. 切片资源是否有其他指标？除了上下行带宽和延迟，
+4. 切片资源是否有其他指标？除了上下行带宽和延迟，还有丢包率、抖动，也就是 SLA（服务等级协议） --完成

@@ -1,19 +1,14 @@
 import pandas as pd
-from tools.optimizer import _GLOBAL_SCENARIO_CONTEXT, get_initial_scenario, set_global_scenario
+import json
+from tools.db_tool import get_current_scenario
 
 def get_network_status():
     """
     获取当前网络切片和节点的状态摘要。
     返回包含切片资源使用情况、节点状态的文本报告。
     """
-    # 1. 获取全局上下文
-    if _GLOBAL_SCENARIO_CONTEXT["apps"] is None:
-        apps, slices, nodes = get_initial_scenario()
-        set_global_scenario(apps, slices, nodes)
-    else:
-        apps = _GLOBAL_SCENARIO_CONTEXT["apps"]
-        slices = _GLOBAL_SCENARIO_CONTEXT["slices"]
-        nodes = _GLOBAL_SCENARIO_CONTEXT["nodes"]
+    # 1. 获取场景数据 (优先缓存，否则DB/默认)
+    apps, slices, nodes = get_current_scenario()
 
     # 2. 统计切片负载
     # 切片本身可能有 base load (current_load_bw) 和 reserved_bw
@@ -71,26 +66,12 @@ def get_network_status():
             "Mem Cap": n.memory_capacity
         })
         
-    # 4. 格式化输出
-    df_slice = pd.DataFrame(slice_status_list)
-    df_node = pd.DataFrame(node_status_list)
-    
-    report = []
-    report.append("### 当前网络切片状态")
-    try:
-        report.append(df_slice.to_markdown(index=False, numalign="left", stralign="left"))
-    except ImportError:
-         report.append(df_slice.to_string(index=False))
-    
-    report.append("\n### 物理基础设施状态")
-    try:
-        report.append(df_node.to_markdown(index=False, numalign="left", stralign="left"))
-    except ImportError:
-        report.append(df_node.to_string(index=False))
-    
-    report.append(f"\n当前接入应用总数: {len(apps)}")
-    
-    return "\n".join(report)
+    # 4. 返回JSON格式
+    return json.dumps({
+        "slice_status": slice_status_list,
+        "node_status": node_status_list,
+        "total_apps": len(apps)
+    }, ensure_ascii=False, indent=4)
 
 if __name__ == "__main__":
     print(get_network_status())

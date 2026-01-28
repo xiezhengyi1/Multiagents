@@ -28,6 +28,7 @@ class Flow:
     old_slice: Optional[str] = None # 流的原切片名称 (实为 S-NSSAI)
     old_allocated_bw_ul: Optional[float] = None # 上一次分配的实际上行带宽
     old_allocated_bw_dl: Optional[float] = None # 上一次分配的实际下行带宽
+    supi: Optional[str] = None # 用户标识 (如 imsi-...)
 
 @dataclass
 class App:
