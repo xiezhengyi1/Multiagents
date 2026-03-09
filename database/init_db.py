@@ -10,7 +10,7 @@ sys.path.insert(0, parent_dir)
 from sqlalchemy import text
 from database.connection import engine, Base
 # Import models so Base metadata is populated
-from database.models import SessionContext, EpisodicExperience, SemanticKnowledge
+from database.models import SessionContext, EpisodicExperience, SemanticKnowledge, NetworkStatusSnapshot
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +27,15 @@ def init_db():
             connection.commit()
             
         logger.info("Creating tables...")
+        
+        # Development helper: Explicitly drop semantic_knowledge to apply schema changes (e.g. adding embedding column)
+        # In production, use Alembic for migrations.
+        try:
+            SemanticKnowledge.__table__.drop(bind=engine, checkfirst=True)
+            logger.info("Dropped existing semantic_knowledge table to apply schema updates.")
+        except Exception as e:
+            logger.warning(f"Could not drop semantic_knowledge table: {e}")
+
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created successfully.")
         

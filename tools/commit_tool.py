@@ -40,9 +40,10 @@ def commit_optimization_result_to_db(optimization_result: Union[Dict, str]) -> s
         return "Error: 未找到可提交的场景数据。请先执行优化求解并确保结果被缓存或传入。"
 
     # 4. 执行 DB 更新
-    success = update_scenario_in_db(apps, slices, nodes)
+    # 将最新状态保存到 NetworkStatusSnapshot 表
+    success = update_scenario_in_db(apps, slices, nodes, trigger="Agent-Optimization-Result")
     
     if success:
-        return "Success: 网络切片状态已成功同步到数据库。"
+        return "Success: 优化后的网络切片状态已成功保存为新的快照 (NetworkStatusSnapshot)。"
     else:
-        return "Failed: 数据库更新过程发生错误，请查看日志。"
+        return "Failed: 数据库快照保存发生错误，请查看日志。"

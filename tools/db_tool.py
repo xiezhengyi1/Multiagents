@@ -1,14 +1,93 @@
 from typing import List, Tuple, Dict, Any, Optional, Union
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from contextlib import contextmanager
 import logging
 import json
 
 from database.connection import SessionLocal
-from database.models import SemanticKnowledge
-from .models import App, Flow, Slice, Node
+from database.models import SemanticKnowledge, NetworkStatusSnapshot
+import sys
+import os
 
-logger = logging.getLogger(__name__)
+try:
+    from utils.logger import setup_logger
+except ImportError:
+    # Fallback if running relative
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+@dataclass
+class Flow:
+    """定义应用内的单个数据流需求"""
+    name: str # 保留作为描述性名称
+    flow_id: str # 流唯一标识
+    bw_ul: float       # 上行带宽 (Mbps)
+    bw_dl: float       # 下行带宽 (Mbps)
+    gbr_ul: float      # 上行保证比特率 (Mbps)
+    gbr_dl: float      # 下行保证比特率 (Mbps)
+    lat: float      # 时延 (ms)
+    loss_req: float # 丢包率上限 (0~1)
+    jitter_req: float # 抖动上限 (ms)
+    priority: int   # 优先级 (数值越小越高)
+    old_slice: Optional[str] = None # 流的原切片名称 (实为 S-NSSAI)
+    old_allocated_bw_ul: Optional[float] = None # 上一次分配的实际上行带宽
+    old_allocated_bw_dl: Optional[float] = None # 上一次分配的实际下行带宽
+    supi: Optional[str] = None # 用户标识 (如 imsi-...)
+
+@dataclass
+class App:
+    """定义应用及其聚合需求"""
+    name: str # 保留作为描述性名称
+    app_id: str # 应用唯一标识
+    flows: List[Flow]
+    total_bw_ul: float = field(init=False)
+    total_bw_dl: float = field(init=False)
+    min_lat: float = field(init=False)
+    max_prio: int = field(init=False)
+
+    def __post_init__(self):
+        if not self.flows:
+            self.total_bw_ul = 0.0
+            self.total_bw_dl = 0.0
+            self.min_lat = float('inf')
+            self.max_prio = 0
+        else:
+            self.total_bw_ul = sum(f.bw_ul for f in self.flows)
+            self.total_bw_dl = sum(f.bw_dl for f in self.flows)
+            self.min_lat = min(f.lat for f in self.flows)
+            self.max_prio = max(f.priority for f in self.flows)
+
+@dataclass
+class Slice:
+    """定义网络切片资源与状态"""
+    name: str # 描述性名称
+    sst: int        # 切片服务类型
+    sd: str         # 切片微分器
+    snssai: str = field(init=False) # 唯一标识 (SST-SD), 自动生成
+    total_bw_ul: float # 总带宽容量
+    total_bw_dl: float # 总带宽容量
+    current_load_bw_ul: float # 当前基础负载
+    current_load_bw_dl: float # 当前基础负载
+    latency: float  # 链路传输时延
+    proc_delay: float # 处理时延
+    loss: float # 切片丢包率 (0~1)
+    jitter: float # 切片抖动 (ms)
+    reserved_bw: float # 不可抢占的保留带宽
+
+    def __post_init__(self):
+        # 自动生成 snssai 标识
+        self.snssai = f"{self.sst:02X}{self.sd}"
+
+@dataclass
+class Node:
+    """定义物理节点资源"""
+    name: str
+    cpu_capacity: float
+    memory_capacity: float # 内存容量
+    slices_hosted: List[str] # 节点托管的切片列表
+
 
 # 简单缓存：仅作为优化-下发-提交之间的短期桥接
 _SCENARIO_CACHE: Dict[str, Optional[List[Any]]] = {
@@ -198,44 +277,39 @@ def _create_default_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
 
 
 def get_initial_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
-    """Get scenario data. Priority: DB -> Default (and save to DB)."""
-    db_data: Dict[str, Any] = {}
-    keys = ["config:apps", "config:slices", "config:nodes"]
-
+    """Get scenario data. Priority: DB (NetworkStatusSnapshot) -> Default (and save to DB)."""
+    
+    # 1. Try to load latest snapshot from NetworkStatusSnapshot
     try:
         with session_scope() as session:
-            for k in keys:
-                rec = session.query(SemanticKnowledge).filter_by(key=k).first()
-                if rec and rec.value:
-                    db_data[k.replace("config:", "")] = rec.value
+            # Get the latest snapshot by timestamp
+            latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
+            
+            if latest_snapshot and latest_snapshot.snapshot_data:
+                logger.info(f"Loaded scenario from NetworkStatusSnapshot (Timestamp: {latest_snapshot.timestamp}).")
+                snapshot_data = latest_snapshot.snapshot_data
+                apps, slices, nodes = _deserialize_scenario(snapshot_data)
+                cache_scenario(apps, slices, nodes)
+                return apps, slices, nodes
+                
     except Exception as e:
-        logger.warning(f"DB access failed, using defaults. Error: {e}")
-        apps, slices, nodes = _create_default_scenario()
-        cache_scenario(apps, slices, nodes)
-        return apps, slices, nodes
+        logger.warning(f"Failed to load form NetworkStatusSnapshot: {e}")
 
-    if all(k in db_data for k in ["apps", "slices", "nodes"]):
-        logger.info("Loaded scenario from SemanticKnowledge.")
-        apps, slices, nodes = _deserialize_scenario(db_data)
-        cache_scenario(apps, slices, nodes)
-        return apps, slices, nodes
-
-    logger.info("Initializing SemanticKnowledge with default scenario...")
+    # 2. Fallback to initialize defaults and save them
+    logger.info("Initializing NetworkStatusSnapshot with default scenario...")
     apps, slices, nodes = _create_default_scenario()
     serialized = _serialize_scenario_for_db(apps, slices, nodes)
 
     try:
         with session_scope() as session:
-            if not session.query(SemanticKnowledge).filter_by(key="config:apps").first():
-                session.add(SemanticKnowledge(key="config:apps", category="optimizer_config", value=serialized["apps"], description="Initial Apps Def"))
-
-            if not session.query(SemanticKnowledge).filter_by(key="config:slices").first():
-                session.add(SemanticKnowledge(key="config:slices", category="optimizer_config", value=serialized["slices"], description="Initial Slices Def"))
-
-            if not session.query(SemanticKnowledge).filter_by(key="config:nodes").first():
-                session.add(SemanticKnowledge(key="config:nodes", category="optimizer_config", value=serialized["nodes"], description="Initial Nodes Def"))
+            # Save the initial state as a snapshot
+            snapshot = NetworkStatusSnapshot(
+                snapshot_data=serialized,
+                trigger_event="System-Init"
+            )
+            session.add(snapshot)
     except Exception as e:
-        logger.error(f"Failed to save defaults: {e}")
+        logger.error(f"Failed to save default snapshot: {e}")
 
     cache_scenario(apps, slices, nodes)
     return apps, slices, nodes
@@ -249,24 +323,23 @@ def get_current_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     return get_initial_scenario()
 
 
-def update_scenario_in_db(apps: List[App], slices: List[Slice], nodes: List[Node]) -> bool:
-    """Persist scenario to DB (SemanticKnowledge)."""
+def update_scenario_in_db(apps: List[App], slices: List[Slice], nodes: List[Node], trigger: str = "Optimization-Result") -> bool:
+    """
+    Persist scenario state as a new NetworkStatusSnapshot.
+    Now we treat network state as time-series snapshots instead of just updating a single config row.
+    """
     serialized = _serialize_scenario_for_db(apps, slices, nodes)
 
     try:
         with session_scope() as session:
-            for key, value in [
-                ("config:apps", serialized["apps"]),
-                ("config:slices", serialized["slices"]),
-                ("config:nodes", serialized["nodes"])
-            ]:
-                rec = session.query(SemanticKnowledge).filter_by(key=key).first()
-                if rec:
-                    rec.value = value
-                    rec.category = rec.category or "optimizer_config"
-                else:
-                    session.add(SemanticKnowledge(key=key, category="optimizer_config", value=value, description="Updated by optimizer"))
+            snapshot = NetworkStatusSnapshot(
+                snapshot_data=serialized,
+                trigger_event=trigger
+            )
+            session.add(snapshot)
+            # We can also keep updating SemanticKnowledge if other components rely on 'current_config'
+            # But primarily we use snapshots now.
         return True
     except Exception as e:
-        logger.error(f"Failed to update scenario in DB: {e}")
+        logger.error(f"Failed to save scenario snapshot: {e}")
         return False

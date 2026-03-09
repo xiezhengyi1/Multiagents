@@ -1,6 +1,48 @@
 import pandas as pd
 import json
-from tools.db_tool import get_current_scenario
+from langchain_core.tools import tool
+from tools.db_tool import get_current_scenario, _serialize_scenario_for_db
+from database.models import NetworkStatusSnapshot
+from database.connection import SessionLocal
+
+@tool
+def save_network_status_snapshot(trigger_event: str = "Manual") -> str:
+    """
+    Take a snapshot of the current network status (Apps, Slices, Nodes) and save it to the history database.
+    Useful for tracking system changes before/after optimization or periodically.
+    
+    Args:
+        trigger_event: The reason for taking this snapshot (e.g., 'Before-Optimization', 'Periodic-Monitor').
+        
+    Returns:
+        Status message indicating success or failure.
+    """
+    try:
+        apps, slices, nodes = get_current_scenario()
+        
+        # Serialize the full state
+        # Note: Ideally this should include richer metrics calculated in get_network_status
+        # For now we save the raw configuration state which contains load info
+        data = _serialize_scenario_for_db(apps, slices, nodes)
+        
+        # Save to DB
+        session = SessionLocal()
+        try:
+            snapshot = NetworkStatusSnapshot(
+                snapshot_data=data,
+                trigger_event=str(trigger_event)
+            )
+            session.add(snapshot)
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
+            
+        return "Success: Network status snapshot saved."
+    except Exception as e:
+        return f"Error saving snapshot: {str(e)}"
 
 def get_network_status():
     """

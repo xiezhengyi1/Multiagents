@@ -1,6 +1,7 @@
 import requests
 import json
 import time
+from langchain_core.tools import tool
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -89,6 +90,7 @@ def get_network_feedback(policy_id: str) -> str:
         else:
             return f"Status: Failed\nReason: Congestion\nMetrics: {json.dumps(metrics)}"
 
+@tool
 def get_ue_context(supi: str) -> str:
     """
     Query: 根据 SUPI 查询 PCF 数据库中的 UeContext 详细信息。

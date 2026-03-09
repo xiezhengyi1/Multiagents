@@ -224,4 +224,4 @@ if __name__ == "__main__":
     system = MultiAgentSystem()
     
     # 模拟一次对话
-    print(system.run_loop("我需要为新的云游戏应用'GameNow'申请一个低延迟切片，要求延迟小于10ms。supi:imsi-46001"))
+    print(system.run_loop("我需要修改云游戏应用'GameNow'的切片，要求延迟可以大于 20ms。supi:imsi-46001"))

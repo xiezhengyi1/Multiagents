@@ -1,12 +1,16 @@
 from typing import List, Optional, Dict, Any
 import re
+import json
 from pydantic import BaseModel, Field
-from langchain_core.prompts import PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import ToolMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from .basemodel import BaseAgent
 from utils.logger import setup_logger
 from .Prompt import IEA_SYSTEM_PROMPT
 from tools.pcf_tools import get_ue_context
+from tools.knowledge_tool import search_semantic_knowledge, get_knowledge_by_key
+
 
 
 # 定义输出结构
@@ -38,38 +42,93 @@ class IntentEncodingAgent(BaseAgent):
         super().__init__(model_name=model_name)
         self.parser = PydanticOutputParser(pydantic_object=UserIntent)
         self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[95m")  # 黄色日志
-        self.tools = [get_ue_context]
+        self.tools = [get_ue_context, search_semantic_knowledge, get_knowledge_by_key]
+        
+        # 1. 绑定工具到 LLM
+        self.llm_with_tools = self.llm.bind_tools(self.tools)
+        
+        # 2. 工具映射
+        self.tool_map = {tool.name: tool for tool in self.tools}
 
     def analyze_intent(self, user_input: str, context: str = "") -> UserIntent:
         """
         分析用户输入并转化为结构化意图
         """
         
-        prompt_template = IEA_SYSTEM_PROMPT
-
-        supi = self._extract_supi(user_input)
+        # 1. 初始化变量 (UE Context 由 Agent 自行获取)
         ue_context = ""
-        if supi:
-            try:
-                ue_context = get_ue_context(supi)
-            except Exception as e:
-                self.logger.warning(f"UE Context 查询失败: {e}")
 
-        merged_context = context
-        prompt = PromptTemplate(
-            template=prompt_template,
-            input_variables=["user_input", "context", "ue_context"],
-            partial_variables={"format_instructions": self.parser.get_format_instructions()}
+        # 2. 构建 Prompt
+        # 直接利用 ChatPromptTemplate 填充 IEA_SYSTEM_PROMPT 中的变量
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", IEA_SYSTEM_PROMPT)
+        ])
+        
+        formatted_messages = prompt.format_messages(
+            user_input=user_input, 
+            context=context, 
+            ue_context=ue_context,
+            format_instructions=self.parser.get_format_instructions()
         )
-
-        chain = prompt | self.llm | self.parser
+        
+        messages = formatted_messages
         
         try:
-            result = chain.invoke({"user_input": user_input, "context": merged_context, "ue_context": ue_context})
-            self.logger.info(f"LLM 意图分析结果: {result}")
-            return result
+            # 3. 手动执行 ReAct / ToolCall 循环
+            max_iterations = 5
+            iteration = 0
+            
+            while iteration < max_iterations:
+                response = self.llm_with_tools.invoke(messages)
+                messages.append(response)
+                
+                # 如果没有工具调用，说明已经生成了最终回复(希望是JSON)
+                if not response.tool_calls:
+                    output_str = response.content.strip()
+                    self.logger.info("LLM 回复内容，尝试解析为 JSON...")
+                    
+                    try:
+                        # 简单的 Markdown JSON 清理
+                        if "```json" in output_str:
+                            output_str = output_str.split("```json")[1].split("```")[0]
+                        elif "```" in output_str:
+                            output_str = output_str.split("```")[1].split("```")[0]
+                            
+                        result = self.parser.parse(output_str)
+                        self.logger.info(f"LLM 意图分析成功: {result.app_name}")
+                        return result
+                    except Exception as parse_err:
+                        self.logger.error(f"结果解析失败: {parse_err}. 原始内容: {output_str}")
+                        return None
+
+                # 处理工具调用
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["args"]
+                    tool_id = tool_call["id"]
+                    
+                    self.logger.info(f"LLM 决定调用工具: {tool_name} 参数: {tool_args}")
+                    
+                    if tool_name in self.tool_map:
+                        tool_instance = self.tool_map[tool_name]
+                        try:
+                            tool_result = tool_instance.invoke(tool_args)
+                            self.logger.info(f"工具 {tool_name} 执行结果: {tool_result}")
+                        except Exception as e:
+                            tool_result = f"工具执行异常: {e}"
+                    else:
+                        tool_result = f"Error: Tool {tool_name} not found."
+                    
+                    # 将工具结果添加回消息历史
+                    messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_id))
+                
+                iteration += 1
+            
+            self.logger.warning("达到最大迭代次数，未生成有效 JSON。")
+            return None
+
         except Exception as e:
-            self.logger.error(f"意图解析出错: {e}")
+            self.logger.error(f"意图解析整体流程出错: {e}")
             return None
 
     @staticmethod

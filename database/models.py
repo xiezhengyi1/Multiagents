@@ -34,7 +34,7 @@ class EpisodicExperience(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     
-    # 意图向量: 您的 Embedding 模型输出为 1024 维 (如 bge-large-zh 或 阿里某些模型)
+    # 意图向量: 您的 Embedding 模型输出为 1024 维 (如 text-embedding-v4)
     if Vector:
         intent_vector = Column(Vector(1024))
     else:
@@ -59,4 +59,27 @@ class SemanticKnowledge(Base):
     category = Column(String, nullable=True, index=True)  # e.g., "SmPolicyDecision", "UEProfile"
     value = Column(JSONB, nullable=False)
     description = Column(Text, nullable=True)
+    
+    # 向量字段: 用于模糊搜索
+    if Vector:
+        embedding = Column(Vector(1024))  # Consistent with text-embedding-v4
+    else:
+        embedding = Column(String) # Fallback
+
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class NetworkStatusSnapshot(Base):
+    """
+    表 D: 网络状态快照表 (Monitor History)
+    用于存储网络切片和节点在特定时间点的性能指标历史记录。
+    """
+    __tablename__ = "network_status_snapshot"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # 存储完整的网络状态 JSON (包含 slices, nodes 等详情)
+    snapshot_data = Column(JSONB, nullable=False)
+    
+    # 触发快照的原因，例如 "PeriodicMonitor", "Pre-Optimization", "Post-Optimization"
+    trigger_event = Column(String, nullable=True)
