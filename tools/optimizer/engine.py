@@ -2,7 +2,7 @@ import pulp
 import pandas as pd
 from typing import List, Tuple, Optional, Dict
 
-from ..models import App, Slice, Node, Flow, OptimizationConfig
+from .models import App, Slice, Node, Flow, OptimizationConfig, ServiceType, SLAProfile, Link, Path
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -12,6 +12,72 @@ class SliceOptimizationEngine:
     
     def __init__(self, config: OptimizationConfig = OptimizationConfig()):
         self.config = config
+
+    def _safe_pulp_value(self, expr, default: float = 0.0) -> float:
+        """关键步骤：统一处理求解失败/无解时的 None 值，避免结果格式化崩溃。"""
+        value = pulp.value(expr)
+        return float(value) if value is not None else float(default)
+
+    def _mec_overhead_by_sst(self, sst: int) -> float:
+        """关键步骤：根据切片 SST 返回 MEC 开销系数。"""
+        overhead = getattr(self.config, "mec_overhead", [1.0]) or [1.0]
+        idx = max(0, min(int(sst) - 1, len(overhead) - 1))
+        return float(overhead[idx])
+
+    def _create_common_variables(self, apps: List[App], slices: List[Slice]):
+        """关键步骤：统一创建三种求解模式共用的决策变量。"""
+        x = pulp.LpVariable.dicts(
+            "x",
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices),
+            cat='Binary'
+        )
+        B_act_ul = pulp.LpVariable.dicts(
+            "B_act_ul",
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices),
+            lowBound=0
+        )
+        B_act_dl = pulp.LpVariable.dicts(
+            "B_act_dl",
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices),
+            lowBound=0
+        )
+        dev = pulp.LpVariable.dicts("dev", (s.snssai for s in slices), lowBound=0)
+        change = pulp.LpVariable.dicts(
+            "change",
+            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices),
+            lowBound=0
+        )
+        return x, B_act_ul, B_act_dl, dev, change
+
+    def _solve_problem_and_collect(
+        self,
+        prob,
+        apps,
+        slices,
+        x,
+        B_act_ul,
+        B_act_dl,
+        term_load_raw,
+        term_sig_raw,
+        term_load,
+        term_sig,
+        term_exp,
+        term_qos,
+        term_tiebreak,
+    ):
+        """关键步骤：统一执行求解并返回结果与目标分解。"""
+        objective = (self.config.w1 * term_load) + (self.config.w2 * term_sig) + (self.config.w3 * (term_exp + term_qos)) + term_tiebreak
+        prob.setObjective(objective)
+        solver_time_limit = int(getattr(self.config, "solver_time_limit", 30) or 30)
+        solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=solver_time_limit)
+        prob.solve(solver)
+        status_str = pulp.LpStatus[prob.status]
+
+        flow_results, slice_results, _, objective_val = self._finalize_results(prob, apps, slices, x, B_act_ul, B_act_dl)
+        breakdown = self._build_objective_breakdown(
+            term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak, objective_val
+        )
+        return flow_results, slice_results, status_str, objective_val, breakdown
 
     def solve(self, apps: List[App], slices: List[Slice], nodes: List[Node]) -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float], Dict[str, float]]:
         """
@@ -24,31 +90,8 @@ class SliceOptimizationEngine:
 
         prob = pulp.LpProblem("5G_Slice_R_A_Layered", pulp.LpMinimize)
 
-        # 1. 变量定义
-        x = pulp.LpVariable.dicts(
-            "x", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            cat='Binary'
-        )
-        
-        B_act_ul = pulp.LpVariable.dicts(
-            "B_act_ul", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
-        
-        B_act_dl = pulp.LpVariable.dicts(
-            "B_act_dl", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
-
-        dev = pulp.LpVariable.dicts("dev", (s.snssai for s in slices), lowBound=0)
-        change = pulp.LpVariable.dicts(
-            "change", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
+        # 关键步骤：创建共用决策变量
+        x, B_act_ul, B_act_dl, dev, change = self._create_common_variables(apps, slices)
 
         # 2. 约束条件构建
         self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change)
@@ -60,18 +103,22 @@ class SliceOptimizationEngine:
             apps, slices, x, B_act_ul, B_act_dl, dev, change
         )
 
-        # 4. 单目标求解 (三权重)
-        objective = (self.config.w1 * term_load) + (self.config.w2 * term_sig) + (self.config.w3 * (term_exp + term_qos)) + term_tiebreak
-        prob.setObjective(objective)
-        solver = pulp.PULP_CBC_CMD(msg=0)
-        prob.solve(solver)
-        status_str = pulp.LpStatus[prob.status]
-        logger.info(f"求解完成. 状态: {status_str}")
-
-        flow_results, slice_results, _, objective_val = self._finalize_results(prob, apps, slices, x, B_act_ul, B_act_dl)
-        breakdown = self._build_objective_breakdown(
-            term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak, objective_val
+        flow_results, slice_results, status_str, objective_val, breakdown = self._solve_problem_and_collect(
+            prob,
+            apps,
+            slices,
+            x,
+            B_act_ul,
+            B_act_dl,
+            term_load_raw,
+            term_sig_raw,
+            term_load,
+            term_sig,
+            term_exp,
+            term_qos,
+            term_tiebreak,
         )
+        logger.info(f"求解完成. 状态: {status_str}")
         return flow_results, slice_results, status_str, objective_val, breakdown
 
     def solve_incremental(self, apps: List[App], slices: List[Slice], nodes: List[Node]) -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float], Dict[str, float]]:
@@ -83,27 +130,8 @@ class SliceOptimizationEngine:
 
         prob = pulp.LpProblem("5G_Slice_R_A_Incremental", pulp.LpMinimize)
 
-        x = pulp.LpVariable.dicts(
-            "x", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            cat='Binary'
-        )
-        B_act_ul = pulp.LpVariable.dicts(
-            "B_act_ul", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
-        B_act_dl = pulp.LpVariable.dicts(
-            "B_act_dl", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
-        dev = pulp.LpVariable.dicts("dev", (s.snssai for s in slices), lowBound=0)
-        change = pulp.LpVariable.dicts(
-            "change", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
+        # 关键步骤：创建共用决策变量
+        x, B_act_ul, B_act_dl, dev, change = self._create_common_variables(apps, slices)
 
         self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change)
         self._add_incremental_constraints(prob, apps, slices, x, B_act_ul, B_act_dl)
@@ -114,18 +142,22 @@ class SliceOptimizationEngine:
             apps, slices, x, B_act_ul, B_act_dl, dev, change
         )
 
-        objective = (self.config.w1 * term_load) + (self.config.w2 * term_sig) + (self.config.w3 * (term_exp + term_qos)) + term_tiebreak
-        prob.setObjective(objective)
-        solver = pulp.PULP_CBC_CMD(msg=0)
-        prob.solve(solver)
-
-        status_str = pulp.LpStatus[prob.status]
-        logger.info(f"增量求解完成. 状态: {status_str}")
-
-        flow_results, slice_results, _, objective_val = self._finalize_results(prob, apps, slices, x, B_act_ul, B_act_dl)
-        breakdown = self._build_objective_breakdown(
-            term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak, objective_val
+        flow_results, slice_results, status_str, objective_val, breakdown = self._solve_problem_and_collect(
+            prob,
+            apps,
+            slices,
+            x,
+            B_act_ul,
+            B_act_dl,
+            term_load_raw,
+            term_sig_raw,
+            term_load,
+            term_sig,
+            term_exp,
+            term_qos,
+            term_tiebreak,
         )
+        logger.info(f"增量求解完成. 状态: {status_str}")
         return flow_results, slice_results, status_str, objective_val, breakdown
 
     def solve_hybrid(self, apps: List[App], slices: List[Slice], nodes: List[Node]) -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float], Dict[str, float]]:
@@ -139,27 +171,8 @@ class SliceOptimizationEngine:
 
         prob = pulp.LpProblem("5G_Slice_R_A_Hybrid", pulp.LpMinimize)
 
-        x = pulp.LpVariable.dicts(
-            "x", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            cat='Binary'
-        )
-        B_act_ul = pulp.LpVariable.dicts(
-            "B_act_ul", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
-        B_act_dl = pulp.LpVariable.dicts(
-            "B_act_dl", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
-        dev = pulp.LpVariable.dicts("dev", (s.snssai for s in slices), lowBound=0)
-        change = pulp.LpVariable.dicts(
-            "change", 
-            ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices), 
-            lowBound=0
-        )
+        # 关键步骤：创建共用决策变量
+        x, B_act_ul, B_act_dl, dev, change = self._create_common_variables(apps, slices)
 
         # 核心差异：使用 Hybrid 约束（只固定 x，不固定 B_act）
         self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change)
@@ -171,18 +184,22 @@ class SliceOptimizationEngine:
             apps, slices, x, B_act_ul, B_act_dl, dev, change
         )
 
-        objective = (self.config.w1 * term_load) + (self.config.w2 * term_sig) + (self.config.w3 * (term_exp + term_qos)) + term_tiebreak
-        prob.setObjective(objective)
-        solver = pulp.PULP_CBC_CMD(msg=0)
-        prob.solve(solver)
-
-        status_str = pulp.LpStatus[prob.status]
-        logger.info(f"混合求解完成. 状态: {status_str}")
-
-        flow_results, slice_results, _, objective_val = self._finalize_results(prob, apps, slices, x, B_act_ul, B_act_dl)
-        breakdown = self._build_objective_breakdown(
-            term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak, objective_val
+        flow_results, slice_results, status_str, objective_val, breakdown = self._solve_problem_and_collect(
+            prob,
+            apps,
+            slices,
+            x,
+            B_act_ul,
+            B_act_dl,
+            term_load_raw,
+            term_sig_raw,
+            term_load,
+            term_sig,
+            term_exp,
+            term_qos,
+            term_tiebreak,
         )
+        logger.info(f"混合求解完成. 状态: {status_str}")
         return flow_results, slice_results, status_str, objective_val, breakdown
 
     def _finalize_results(self, prob, apps, slices, x, B_act_ul, B_act_dl):
@@ -247,24 +264,25 @@ class SliceOptimizationEngine:
         objective_val,
     ) -> Dict[str, float]:
         return {
-            "load_raw": float(pulp.value(term_load_raw) or 0.0),
-            "signal_raw": float(pulp.value(term_sig_raw) or 0.0),
-            "load_norm": float(pulp.value(term_load) or 0.0),
-            "signal_norm": float(pulp.value(term_sig) or 0.0),
-            "exp": float(pulp.value(term_exp) or 0.0),
-            "qos_norm": float(pulp.value(term_qos) or 0.0),
-            "tiebreak": float(pulp.value(term_tiebreak) or 0.0),
+            "load_raw": self._safe_pulp_value(term_load_raw),
+            "signal_raw": self._safe_pulp_value(term_sig_raw),
+            "load_norm": self._safe_pulp_value(term_load),
+            "signal_norm": self._safe_pulp_value(term_sig),
+            "exp": self._safe_pulp_value(term_exp),
+            "qos_norm": self._safe_pulp_value(term_qos),
+            "tiebreak": self._safe_pulp_value(term_tiebreak),
             "objective_total": float(objective_val or 0.0),
         }
 
     def _add_hybrid_constraints(self, prob, apps, slices, x):
         """混合模式约束：仅固定已有流的切片映射，允许调整带宽。"""
+        valid_snssais = {s.snssai for s in slices}
         for app in apps:
             for f in app.flows:
                 if not f.old_slice:
                     continue
                 # 容错：如果原切片已不在切片列表中，则当作新流处理（允许迁移）
-                if f.old_slice not in {s.snssai for s in slices}:
+                if f.old_slice not in valid_snssais:
                     continue
 
                 for s in slices:
@@ -275,12 +293,13 @@ class SliceOptimizationEngine:
 
     def _add_incremental_constraints(self, prob, apps, slices, x, B_act_ul, B_act_dl):
         """增量优化约束：固定已有流的切片映射，并在可行范围内保持历史带宽。"""
+        valid_snssais = {s.snssai for s in slices}
         for app in apps:
             for f in app.flows:
                 if not f.old_slice:
                     continue
 
-                if f.old_slice not in {s.snssai for s in slices}:
+                if f.old_slice not in valid_snssais:
                     continue
 
                 for s in slices:
@@ -360,24 +379,38 @@ class SliceOptimizationEngine:
         for node in nodes:
             # 计算托管切片上的流量总和
             hosted_snssais = [s.snssai for s in slices if s.name in node.slices_hosted]
-
-            current_node_cpu = sum((s.current_load_bw_ul + s.current_load_bw_dl) * self.config.alpha for s in slices if s.snssai in hosted_snssais)
-            current_node_mem = sum((s.current_load_bw_ul + s.current_load_bw_dl) * self.config.beta for s in slices if s.snssai in hosted_snssais)
-
             new_traffic_sum = pulp.lpSum(
                 B_act_ul[app.app_id, f.flow_id, s.snssai] + B_act_dl[app.app_id, f.flow_id, s.snssai]
                 for s in slices if s.snssai in hosted_snssais
                 for app in apps for f in app.flows
             )
-            
-            # C8: 物理节点 CPU
-            prob += current_node_cpu + new_traffic_sum * self.config.alpha <= node.cpu_capacity
 
-            # C9: 物理节点 Memory
-            prob += current_node_mem + new_traffic_sum * self.config.beta <= node.memory_capacity
+            if node.type == "CN":
+                # C8: 物理节点 CPU
+                prob += node.sim_cpu_utilization * node.cpu_capacity + new_traffic_sum * self.config.alpha_cn <= node.cpu_capacity
+
+            if node.type == "AN":
+                # C8: 物理节点 PRB
+                prob += new_traffic_sum * self.config.alpha_an + node.sim_cpu_utilization * node.cpu_capacity <= node.cpu_capacity
+                prob += new_traffic_sum * self.config.prb  + node.sim_prb_utilization * node.prb_capacity <= node.prb_capacity
+
+            if node.mec_capacity > 0 and hosted_snssais:
+                # C9: MEC 资源约束（根据节点持有切片的 SST 决定系数）
+                mec_load = pulp.lpSum(
+                    self._mec_overhead_by_sst(s.sst)
+                    * pulp.lpSum(
+                        B_act_ul[app.app_id, f.flow_id, s.snssai] + B_act_dl[app.app_id, f.flow_id, s.snssai]
+                        for app in apps for f in app.flows
+                    )
+                    for s in slices if s.snssai in hosted_snssais
+                )
+                prob += (1-node.sim_mec_utilization) * node.mec_capacity >= mec_load
+
+            
 
     def _format_results(self, apps, slices, x, B_act_ul, B_act_dl) -> pd.DataFrame:
         results = []
+        TOL = 1e-6
         for app in apps:
             for f in app.flows:
                 mapped_slice = None
@@ -385,10 +418,10 @@ class SliceOptimizationEngine:
                 allocated_bw_dl = 0.0
                 
                 for s in slices:
-                    if pulp.value(x[app.app_id, f.flow_id, s.snssai]) == 1:
+                    if self._safe_pulp_value(x[app.app_id, f.flow_id, s.snssai]) >= 1.0 - TOL:
                         mapped_slice = s.snssai # 记录 SNSSAI
-                        allocated_bw_ul = float(pulp.value(B_act_ul[app.app_id, f.flow_id, s.snssai]))
-                        allocated_bw_dl = float(pulp.value(B_act_dl[app.app_id, f.flow_id, s.snssai]))
+                        allocated_bw_ul = self._safe_pulp_value(B_act_ul[app.app_id, f.flow_id, s.snssai])
+                        allocated_bw_dl = self._safe_pulp_value(B_act_dl[app.app_id, f.flow_id, s.snssai])
                         break
                 
                 strategies = self._determine_strategy(f, mapped_slice, allocated_bw_ul, allocated_bw_dl)
@@ -413,11 +446,11 @@ class SliceOptimizationEngine:
         slice_stats = []
         for s in slices:
             allocated_to_flows_ul = sum(
-                pulp.value(B_act_ul[app.app_id, f.flow_id, s.snssai]) 
+                self._safe_pulp_value(B_act_ul[app.app_id, f.flow_id, s.snssai])
                 for app in apps for f in app.flows
             )
             allocated_to_flows_dl = sum(
-                pulp.value(B_act_dl[app.app_id, f.flow_id, s.snssai]) 
+                self._safe_pulp_value(B_act_dl[app.app_id, f.flow_id, s.snssai])
                 for app in apps for f in app.flows
             )
             
@@ -469,3 +502,368 @@ class SliceOptimizationEngine:
         if not strategies:
             strategies.append("保持")
         return strategies
+
+class IBNSOptimizationEngine:
+    """
+    Intent-Based Network Slicing (IBNS) Optimization Engine.
+    Implements P1 (Fulfillment) and P2 (Assurance) problems from the reference paper.
+    """
+    def __init__(self, config: OptimizationConfig = OptimizationConfig()):
+        self.config = config
+        # Default IBNS parameters
+        self.v_a = 0.1  # VNF cost at AN
+        self.v_n0 = 0.1 # VNF cost at CN
+        self.c_u = 0.05  # MEC cost
+        self.bandwidth_prb = 180000.0 # 180 kHz
+        self.distance_km = 1.0
+
+    def _safe_pulp_value(self, expr, default: float = 0.0) -> float:
+        """关键步骤：统一处理求解失败/无解时的 None 值，避免结果格式化崩溃。"""
+        value = pulp.value(expr)
+        return float(value) if value is not None else float(default)
+
+    def _effective_flow_throughput_bps(self, flow: Flow) -> float:
+        """
+        关键步骤：统一吞吐量需求建模。
+        学术上双向业务常受上下行最弱方向约束，采用调和平均近似双向等效吞吐：
+            R_eff = 2 * R_ul * R_dl / (R_ul + R_dl)
+        若提供了 packet_size/arrival_rate，则优先使用该业务生成率。
+        """
+        if flow.packet_size > 0 and flow.arrival_rate > 0:
+            return float(flow.packet_size * flow.arrival_rate)
+
+        r_ul = max(0.0, float(flow.bw_ul) * 1e6)
+        r_dl = max(0.0, float(flow.bw_dl) * 1e6)
+
+        if r_ul > 0 and r_dl > 0:
+            return (2.0 * r_ul * r_dl) / (r_ul + r_dl)
+        return max(r_ul, r_dl)
+
+    def calculate_snr(self, flow: Flow, an: Node) -> float:
+        # Placeholder for SNR calculation (Delta_{u,a})
+        # In a real scenario, this depends on location of user vs AN.
+        return 100.0
+
+    def calculate_transmission_rate(self, snr: float) -> float:
+        """Eq (4): eta = upsilon * log2(1 + delta)"""
+        import math
+        return self.bandwidth_prb * math.log2(1 + snr)
+
+    def solve_p1_fulfillment(self, 
+                             flows: List[Flow], 
+                             nodes: List[Node], 
+                             links: List[Link], 
+                             paths: List[Path],
+                             service_types: Dict[int, ServiceType]) -> pd.DataFrame:
+        """
+        Solves the P1 problem: Resource Fulfillment (Maximizing Throughput)
+        without SLA constraints.
+        """
+        return self._solve_optimization(flows, nodes, links, paths, service_types, p2_mode=False)
+
+    def solve_p2_assurance(self, 
+                           flows: List[Flow], 
+                           nodes: List[Node], 
+                           links: List[Link], 
+                           paths: List[Path],
+                           service_types: Dict[int, ServiceType],
+                           sla_profiles: Dict[int, SLAProfile]) -> pd.DataFrame:
+        """
+        Solves the P2 problem: Service Assurance (SLA Compliance)
+        adds SLA constraints to P1.
+        """
+        return self._solve_optimization(flows, nodes, links, paths, service_types, 
+                                      p2_mode=True, sla_profiles=sla_profiles)
+
+    def _solve_optimization(self, 
+                            flows: List[Flow], 
+                            nodes: List[Node], 
+                            links: List[Link], 
+                            paths: List[Path],
+                            service_types: Dict[int, ServiceType],
+                            p2_mode: bool = False,
+                            sla_profiles: Dict[int, SLAProfile] = None) -> pd.DataFrame:
+        
+        # Helper for unit conversion (bps -> Mbps) for compute constraints
+        def _dr_mbps(flow):
+            return self._effective_flow_throughput_bps(flow) / 1e6
+
+        prob = pulp.LpProblem("IBNS_Optimization", pulp.LpMaximize)
+
+        # Helpers
+        an_nodes = {n.id: n for n in nodes if n.is_an}
+        cn_node = next((n for n in nodes if n.is_cn), None)
+        
+        # Paths map: AN_ID -> List[Path]
+        paths_map = {}
+        for p in paths:
+            if p.an_id not in paths_map:
+                paths_map[p.an_id] = []
+            paths_map[p.an_id].append(p)
+            
+        link_map = {(l.u, l.v): l for l in links}
+
+        # Sets
+        U_set = range(len(flows))
+        A_set = list(an_nodes.keys())
+        flow_thr_bps = {u: self._effective_flow_throughput_bps(flows[u]) for u in U_set}
+        
+        # Variables
+        # I[(u, a)]
+        I = pulp.LpVariable.dicts("I", 
+                                  ((u, a) for u in U_set for a in A_set), 
+                                  cat='Binary')
+        
+        # T variables for path routing
+        T_vars = {}
+        for a in A_set:
+            if a in paths_map:
+                for p in paths_map[a]:
+                    T_vars[(a, p.id)] = pulp.LpVariable(f"t_a{a}_p{p.id}", lowBound=0)
+
+        # Objective: Maximize Throughput
+        prob += pulp.lpSum([
+            flow_thr_bps[u] * I[(u, a)] 
+            for u in U_set for a in A_set
+        ]), "Objective_Throughput"
+
+        # --- Constraints ---
+
+        # (3) UE Association: Each UE connected to at most 1 AN
+        for u in U_set:
+            prob += pulp.lpSum([I[(u, a)] for a in A_set]) <= 1, f"Assoc_UE_{u}"
+
+        # (5) AN PRB Capacity
+        # We need to allocate enough PRBs to satisfy BOTH throughput demand AND latency requirements.
+        # Effective Rate = max(DataRate, PacketSize / (Latency - Propagation - Routing))
+        req_rates = {} # Store for latency check
+        
+        for a in A_set:
+            an_node = an_nodes[a]
+            usage_exprs = []
+            for u in U_set:
+                flow = flows[u]
+                snr = self.calculate_snr(flow, an_node)
+                eta = self.calculate_transmission_rate(snr)
+                if eta <= 0: continue
+                
+                # Fix 3: packet_size=0 fallback
+                pkt_size = flow.packet_size if flow.packet_size > 0 else max(flow_thr_bps[u] * 0.001, 12000)
+
+                # Estimate delays to determine required rate for latency
+                d_prp = 0.0001 # 0.1ms
+                d_rot = 0.0001
+                if a in paths_map and paths_map[a]:
+                    path = paths_map[a][0]
+                    # d_rot logic
+                    path_delay = sum([pkt_size / link_map[l].capacity for l in path.links if l in link_map])
+                    if path_delay > 0: d_rot = path_delay
+                
+                max_trn_delay = flow.lat - d_prp - d_rot
+                if max_trn_delay <= 0:
+                    # Impossible to meet latency
+                    req_rate_lat = float('inf')
+                else:
+                    req_rate_lat = pkt_size / max_trn_delay
+                
+                # The effective rate we must allocate
+                eff_rate = max(flow_thr_bps[u], req_rate_lat)
+                req_rates[(u, a)] = (eff_rate, d_prp, d_rot) # Store for (15)
+
+                rho_needed = eff_rate / eta
+                usage_exprs.append( I[(u, a)] * rho_needed )
+            
+            prob += pulp.lpSum(usage_exprs) <= an_node.prb_capacity, f"PRB_Capacity_AN_{a}"
+
+        # (6) VNF Computation at AN
+        for a in A_set:
+            an_node = an_nodes[a]
+            prob += pulp.lpSum([
+                I[(u, a)] * _dr_mbps(flows[u]) * self.v_a 
+                for u in U_set
+            ]) <= an_node.cpu_capacity, f"VNF_Comp_AN_{a}"
+
+        # (7) VNF Computation at CN
+        if cn_node:
+             prob += pulp.lpSum([
+                I[(u, a)] * _dr_mbps(flows[u]) * self.v_n0
+                for u in U_set for a in A_set
+            ]) <= cn_node.cpu_capacity, f"VNF_Comp_CN"
+
+        # (8) MEC Computation at AN (Local)
+        for a in A_set:
+            an_node = an_nodes[a]
+            mec_usage = []
+            for u in U_set:
+                flow = flows[u]
+                if flow.service_type_id in service_types:
+                    srv = service_types[flow.service_type_id]
+                    # If Critical Latency (1 in critical_kpis), use AN MEC
+                    if 1 in srv.critical_kpis:
+                        mec_usage.append( I[(u, a)] * _dr_mbps(flow) * self.c_u )
+            
+            prob += pulp.lpSum(mec_usage) <= an_node.mec_capacity, f"MEC_Comp_AN_{a}"
+
+        # (9) MEC Computation at CN (Central)
+        if cn_node:
+            cn_mec_usage = []
+            for u in U_set:
+                flow = flows[u]
+                if flow.service_type_id in service_types:
+                    srv = service_types[flow.service_type_id]
+                    if 1 not in srv.critical_kpis:
+                         for a in A_set:
+                            cn_mec_usage.append( I[(u, a)] * _dr_mbps(flow) * self.c_u )
+            prob += pulp.lpSum(cn_mec_usage) <= cn_node.mec_capacity, f"MEC_Comp_CN"
+
+        # (10) TN Routing
+        for a in A_set:
+            if a in paths_map:
+                traffic_demand = pulp.lpSum([
+                    flow_thr_bps[u] * I[(u, a)] 
+                    for u in U_set
+                ])
+                path_supply = pulp.lpSum([
+                    T_vars[(a, p.id)] for p in paths_map[a]
+                ])
+                prob += path_supply == traffic_demand, f"TN_Routing_Demand_AN_{a}"
+
+        # (11) Link Capacity
+        for link_key, link in link_map.items():
+            link_load = []
+            for a in A_set:
+                if a in paths_map:
+                    for p in paths_map[a]:
+                        # Check if link is in path p.links (list of tuples)
+                        # We need to handle directionality or assume undirected match
+                        if link_key in p.links or (link_key[1], link_key[0]) in p.links: 
+                             # Assuming straightforward match for now
+                             link_load.append(T_vars[(a, p.id)])
+            if link_load:
+                prob += pulp.lpSum(link_load) <= link.capacity, f"Link_Cap_{link_key}"
+
+        # (15) Global Latency Constraint
+        lhs_terms = []
+        rhs_terms = []
+        
+        for u in U_set:
+            flow = flows[u]
+            # Fix 3 (continued): Need pkt_size here too
+            pkt_size = flow.packet_size if flow.packet_size > 0 else max(flow_thr_bps[u] * 0.001, 12000)
+            
+            for a in A_set:
+                snr = self.calculate_snr(flow, an_nodes[a])
+                eta = self.calculate_transmission_rate(snr)
+                if eta <= 0: continue
+                
+                # Retrieve parameters calculated in (5)
+                eff_rate, d_prp, d_rot = req_rates.get((u, a), (flow_thr_bps[u], 0.0001, 0.0001))
+                
+                # Check fundamental limits again (using the precomputed values)
+                if eff_rate > 1e12 or eff_rate <= 0: # Indicates infinity
+                    d_tot = 999.0 # Impossible
+                else:
+                    d_trn = pkt_size / (eff_rate + 1e-9)
+                    d_tot = d_trn + d_prp + d_rot
+                
+                # If calculated d_tot exceeds limit due to numerical issues
+                if d_tot > flow.lat + 1e-9:
+                    d_tot = 999.0
+                
+                # For constraint (15), we sum latency requirements vs achieved
+                lhs_terms.append(flow.lat * I[(u, a)])
+                rhs_terms.append(d_tot * I[(u, a)])
+        
+        prob += pulp.lpSum(lhs_terms) >= pulp.lpSum(rhs_terms), "Latency_Compliance"
+
+        # --- P2 Constraints (SLA) ---
+        if p2_mode and sla_profiles:
+            for s_id, srv in service_types.items():
+                 ues_in_slice = [u for u in U_set if flows[u].service_type_id == s_id]
+                 if not ues_in_slice: continue
+                 
+                 # Check if profile exists
+                 profile = next((p for p in sla_profiles.values() if p.service_type_id == s_id), None)
+                 if not profile: continue
+
+                 thresholds = profile.kpi_thresholds
+
+                 total_ues_count = len(ues_in_slice)
+                 
+                 # (23) Delay KPI - Fix 4
+                 if 1 in thresholds:
+                     tau = thresholds[1]
+                     for u in ues_in_slice:
+                        for a in A_set:
+                            if (u, a) in req_rates:
+                                eff_rate, d_prp, d_rot = req_rates[(u, a)]
+                                flow = flows[u]
+                                pkt_size = flow.packet_size if flow.packet_size > 0 else max(flow_thr_bps[u] * 0.001, 12000)
+                                d_trn = pkt_size / (eff_rate + 1e-9)
+                                d_tot = d_trn + d_prp + d_rot
+                                if d_tot > tau:
+                                    prob += I[(u, a)] == 0, f"SLA_Delay_Limit_{s_id}_{u}_{a}"
+
+                 # (24) Throughput KPI - Fix 5
+                 if 2 in thresholds:
+                     tau = thresholds[2] # Mbps
+                     prob += pulp.lpSum([
+                         flow_thr_bps[u] * I[(u, a)] 
+                         for u in ues_in_slice for a in A_set
+                     ]) >= tau * 1e6, f"SLA_Throughput_Slice_{s_id}"
+                 
+                 # (25) Reliability KPI - Fix 6
+                 if 3 in thresholds:
+                     tau = thresholds[3]
+                     prob += pulp.lpSum([
+                         I[(u,a)] for u in ues_in_slice for a in A_set
+                     ]) >= tau * total_ues_count, f"SLA_Reliability_Slice_{s_id}"
+
+                 # (26) Connection Density - Fix 7
+                 if 4 in thresholds:
+                     # tau = thresholds[4]
+                     prob += pulp.lpSum([
+                         I[(u, a)] for u in ues_in_slice for a in A_set
+                     ]) >= total_ues_count, f"SLA_Connection_Slice_{s_id}"
+        
+        # Solve
+        solver_time_limit = int(getattr(self.config, "solver_time_limit", 30) or 30)
+        status = prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=solver_time_limit))
+        
+        # Collect results
+        results = []
+        if status == pulp.LpStatusOptimal or status == 1: # 1 is Optimal in constants
+            for u in U_set:
+                flow = flows[u]
+                allocated = False
+                for a in A_set:
+                    if self._safe_pulp_value(I[(u, a)]) >= 1.0 - 1e-6:
+                        allocated = True
+                        # Find path used?
+                        # This is tricky as traffic is split on T vars, but we want to know which AN used.
+                        # Since I[(u,a)] is binary, we know the AN.
+                        # The path is internal to TN routing optimization.
+                        results.append({
+                            "Flow ID": flow.flow_id,
+                            "Service Type": service_types[flow.service_type_id].name if flow.service_type_id in service_types else "Unknown",
+                            "Allocated AN": an_nodes[a].name,
+                            "Status": "Served",
+                            "Throughput": flow_thr_bps[u],
+                            "Req BW UL": flow.bw_ul,
+                            "Req BW DL": flow.bw_dl
+                        })
+                        break
+                if not allocated:
+                    results.append({
+                        "Flow ID": flow.flow_id,
+                        "Service Type": service_types[flow.service_type_id].name if flow.service_type_id in service_types else "Unknown",
+                        "Allocated AN": "None",
+                        "Status": "Unserved",
+                        "Throughput": 0.0,
+                        "Req BW UL": flow.bw_ul,
+                        "Req BW DL": flow.bw_dl
+                    })
+        else:
+             logger.warning("Optimization failed to find optimal solution")
+        
+        return pd.DataFrame(results)
