@@ -1,4 +1,3 @@
-import logging
 import sys
 import os
 
@@ -10,10 +9,10 @@ sys.path.insert(0, parent_dir)
 from sqlalchemy import text
 from database.connection import engine, Base
 # Import models so Base metadata is populated
-from database.models import SessionContext, EpisodicExperience, SemanticKnowledge, NetworkStatusSnapshot
+from database.models import SessionContext, EpisodicExperience, SemanticKnowledge, NetworkStatusSnapshot, UeContextRecord
+from utils.logger import setup_logger
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 def init_db():
     if not engine:
@@ -30,13 +29,29 @@ def init_db():
         
         # Development helper: Explicitly drop semantic_knowledge to apply schema changes (e.g. adding embedding column)
         # In production, use Alembic for migrations.
-        try:
-            SemanticKnowledge.__table__.drop(bind=engine, checkfirst=True)
-            logger.info("Dropped existing semantic_knowledge table to apply schema updates.")
-        except Exception as e:
-            logger.warning(f"Could not drop semantic_knowledge table: {e}")
+        # try:
+        #     SemanticKnowledge.__table__.drop(bind=engine, checkfirst=True)
+        #     logger.info("Dropped existing semantic_knowledge table to apply schema updates.")
+        # except Exception as e:
+        #     logger.warning(f"Could not drop semantic_knowledge table: {e}")
 
         Base.metadata.create_all(bind=engine)
+
+        # 关键步骤: 为既有库补齐 network_status_snapshot 拆分列（仅新结构）
+        with engine.connect() as connection:
+            connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS app_data JSONB"))
+            connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS slice_data JSONB"))
+            connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS node_data JSONB"))
+            connection.execute(text("UPDATE network_status_snapshot SET app_data = '[]'::jsonb WHERE app_data IS NULL"))
+            connection.execute(text("UPDATE network_status_snapshot SET slice_data = '[]'::jsonb WHERE slice_data IS NULL"))
+            connection.execute(text("UPDATE network_status_snapshot SET node_data = '[]'::jsonb WHERE node_data IS NULL"))
+            connection.execute(text("ALTER TABLE network_status_snapshot DROP COLUMN IF EXISTS snapshot_data"))
+            connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS app_catalog JSONB"))
+            connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS flow_catalog JSONB"))
+            connection.execute(text("UPDATE ue_context SET app_catalog = '[]'::jsonb WHERE app_catalog IS NULL"))
+            connection.execute(text("UPDATE ue_context SET flow_catalog = '[]'::jsonb WHERE flow_catalog IS NULL"))
+            connection.commit()
+
         logger.info("Database tables created successfully.")
         
     except Exception as e:

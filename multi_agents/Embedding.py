@@ -1,12 +1,12 @@
 import os
 from typing import Dict, Any, List, Optional
 import json
-import logging
 from abc import ABC, abstractmethod
 from pydantic import BaseModel, Field
 from openai import OpenAI
+from utils.logger import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 class BaseEncoder(ABC):
     """编码器基类"""

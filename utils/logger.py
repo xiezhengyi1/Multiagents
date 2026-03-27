@@ -1,5 +1,8 @@
 import logging
 import sys
+import time
+from contextlib import contextmanager
+from typing import Any, Dict
 
 # ASCII 颜色代码
 class LogColors:
@@ -78,3 +81,34 @@ def setup_logger(name="MultiAgents", level=logging.INFO, default_msg_color: str 
     logger.propagate = False
 
     return logger
+
+
+def _format_fields(fields: Dict[str, Any]) -> str:
+    """关键步骤: 将结构化字段统一格式化为 k=v 片段。"""
+    if not fields:
+        return ""
+    parts = []
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    return " | " + ", ".join(parts)
+
+
+def log_event(logger: logging.Logger, event: str, level: int = logging.INFO, **fields: Any) -> None:
+    """统一事件日志输出。"""
+    logger.log(level, f"[EVENT] {event}{_format_fields(fields)}")
+
+
+def log_timing(logger: logging.Logger, metric: str, duration_s: float, level: int = logging.INFO, **fields: Any) -> None:
+    """统一耗时日志输出，单位为毫秒。"""
+    logger.log(level, f"[METRIC] {metric} | duration_ms={duration_s * 1000:.2f}{_format_fields(fields)}")
+
+
+@contextmanager
+def observe_time(logger: logging.Logger, metric: str, level: int = logging.INFO, **fields: Any):
+    """关键步骤: 上下文计时器，自动记录代码块耗时。"""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        log_timing(logger, metric, elapsed, level=level, **fields)

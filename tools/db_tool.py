@@ -1,13 +1,13 @@
-from typing import List, Tuple, Dict, Any, Optional, Union
-from dataclasses import asdict, dataclass, field
+from typing import List, Tuple, Dict, Any, Optional, Union, TYPE_CHECKING
+from dataclasses import asdict
 from contextlib import contextmanager
-import logging
-import json
 
 from database.connection import SessionLocal
-from database.models import SemanticKnowledge, NetworkStatusSnapshot
+from database.models import NetworkStatusSnapshot, SessionContext, UeContextRecord
 import sys
 import os
+if TYPE_CHECKING:
+    from tools.optimizer.models import App, Slice, Node
 
 try:
     from utils.logger import setup_logger
@@ -18,83 +18,99 @@ except ImportError:
 
 logger = setup_logger(__name__)
 
-@dataclass
-class Flow:
-    """定义应用内的单个数据流需求"""
-    name: str # 保留作为描述性名称
-    flow_id: str # 流唯一标识
-    bw_ul: float       # 上行带宽 (Mbps)
-    bw_dl: float       # 下行带宽 (Mbps)
-    gbr_ul: float      # 上行保证比特率 (Mbps)
-    gbr_dl: float      # 下行保证比特率 (Mbps)
-    lat: float      # 时延 (ms)
-    loss_req: float # 丢包率上限 (0~1)
-    jitter_req: float # 抖动上限 (ms)
-    priority: int   # 优先级 (数值越小越高)
-    old_slice: Optional[str] = None # 流的原切片名称 (实为 S-NSSAI)
-    old_allocated_bw_ul: Optional[float] = None # 上一次分配的实际上行带宽
-    old_allocated_bw_dl: Optional[float] = None # 上一次分配的实际下行带宽
-    supi: Optional[str] = None # 用户标识 (如 imsi-...)
 
-@dataclass
-class App:
-    """定义应用及其聚合需求"""
-    name: str # 保留作为描述性名称
-    app_id: str # 应用唯一标识
-    flows: List[Flow]
-    total_bw_ul: float = field(init=False)
-    total_bw_dl: float = field(init=False)
-    min_lat: float = field(init=False)
-    max_prio: int = field(init=False)
+def build_flow_description_from_five_tuple(five_tuple: Any) -> Optional[str]:
+    """Encode a flow five-tuple into the flowDescription string supported by PCC flowInfos."""
+    if not isinstance(five_tuple, (list, tuple)) or len(five_tuple) != 5:
+        return None
 
-    def __post_init__(self):
-        if not self.flows:
-            self.total_bw_ul = 0.0
-            self.total_bw_dl = 0.0
-            self.min_lat = float('inf')
-            self.max_prio = 0
-        else:
-            self.total_bw_ul = sum(f.bw_ul for f in self.flows)
-            self.total_bw_dl = sum(f.bw_dl for f in self.flows)
-            self.min_lat = min(f.lat for f in self.flows)
-            self.max_prio = max(f.priority for f in self.flows)
+    src_ip, dst_ip, src_port, dst_port, protocol = five_tuple
+    src_ip = str(src_ip or "").strip()
+    dst_ip = str(dst_ip or "").strip()
+    protocol = str(protocol or "ip").strip().lower() or "ip"
 
-@dataclass
-class Slice:
-    """定义网络切片资源与状态"""
-    name: str # 描述性名称
-    sst: int        # 切片服务类型
-    sd: str         # 切片微分器
-    snssai: str = field(init=False) # 唯一标识 (SST-SD), 自动生成
-    total_bw_ul: float # 总带宽容量
-    total_bw_dl: float # 总带宽容量
-    current_load_bw_ul: float # 当前基础负载
-    current_load_bw_dl: float # 当前基础负载
-    latency: float  # 链路传输时延
-    proc_delay: float # 处理时延
-    loss: float # 切片丢包率 (0~1)
-    jitter: float # 切片抖动 (ms)
-    reserved_bw: float # 不可抢占的保留带宽
+    if not src_ip or not dst_ip:
+        return None
 
-    def __post_init__(self):
-        # 自动生成 snssai 标识
-        self.snssai = f"{self.sst:02X}{self.sd}"
+    try:
+        src_port = int(src_port)
+        dst_port = int(dst_port)
+    except (TypeError, ValueError):
+        return None
 
-@dataclass
-class Node:
-    """定义物理节点资源"""
-    name: str
-    cpu_capacity: float
-    memory_capacity: float # 内存容量
-    slices_hosted: List[str] # 节点托管的切片列表
+    return f"permit out {protocol} from {src_ip} {src_port} to {dst_ip} {dst_port}"
 
 
-# 简单缓存：仅作为优化-下发-提交之间的短期桥接
-_SCENARIO_CACHE: Dict[str, Optional[List[Any]]] = {
-    "apps": None,
-    "slices": None,
-    "nodes": None
-}
+def build_flow_info_from_five_tuple(five_tuple: Any, *, flow_direction: str = "BIDIRECTIONAL") -> Optional[Dict[str, Any]]:
+    """Build a FlowInformation-compatible dict from a five tuple."""
+    flow_description = build_flow_description_from_five_tuple(five_tuple)
+    if not flow_description:
+        return None
+    return {
+        "flowDescription": flow_description,
+        "flowDirection": flow_direction,
+    }
+
+
+def _normalize_catalog_flow(app: Dict[str, Any], flow: Dict[str, Any]) -> Dict[str, Any]:
+    current_bw_ul = flow.get("old_allocated_bw_ul")
+    current_bw_dl = flow.get("old_allocated_bw_dl")
+    if current_bw_ul is None:
+        current_bw_ul = flow.get("bw_ul")
+    if current_bw_dl is None:
+        current_bw_dl = flow.get("bw_dl")
+
+    return {
+        "supi": app.get("supi"),
+        "app_name": app.get("name"),
+        "app_id": app.get("app_id"),
+        "flow_name": flow.get("name"),
+        "flow_id": flow.get("flow_id"),
+        "service_type": flow.get("service_type"),
+        "service_type_id": flow.get("service_type_id"),
+        "bw_ul": flow.get("bw_ul"),
+        "bw_dl": flow.get("bw_dl"),
+        "gbr_ul": flow.get("gbr_ul"),
+        "gbr_dl": flow.get("gbr_dl"),
+        "lat": flow.get("lat"),
+        "loss_req": flow.get("loss_req"),
+        "jitter_req": flow.get("jitter_req"),
+        "priority": flow.get("priority"),
+        "current_bw_ul": current_bw_ul,
+        "current_bw_dl": current_bw_dl,
+        "five_tuple": list(flow.get("five_tuple")) if isinstance(flow.get("five_tuple"), (list, tuple)) else None,
+    }
+
+
+def _build_catalogs_from_app_data(app_data: Any, supi: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    app_catalog: List[Dict[str, Any]] = []
+    flow_catalog: List[Dict[str, Any]] = []
+    if not isinstance(app_data, list) or not supi:
+        return app_catalog, flow_catalog
+
+    target_supi = str(supi).strip()
+    for app in app_data:
+        if not isinstance(app, dict):
+            continue
+        app_supi = str(app.get("supi") or "").strip()
+        if app_supi != target_supi:
+            continue
+
+        app_entry = {
+            "supi": target_supi,
+            "app_name": app.get("name"),
+            "app_id": app.get("app_id"),
+            "flow_count": len(app.get("flows") or []),
+        }
+        app_catalog.append(app_entry)
+
+        flows = app.get("flows") or []
+        for flow in flows:
+            if not isinstance(flow, dict):
+                continue
+            flow_catalog.append(_normalize_catalog_flow(app, flow))
+
+    return app_catalog, flow_catalog
 
 @contextmanager
 def session_scope():
@@ -110,25 +126,10 @@ def session_scope():
         session.close()
 
 
-def cache_scenario(apps: List[App], slices: List[Slice], nodes: List[Node]) -> None:
-    _SCENARIO_CACHE["apps"] = apps
-    _SCENARIO_CACHE["slices"] = slices
-    _SCENARIO_CACHE["nodes"] = nodes
-
-
-def get_cached_scenario() -> Tuple[Optional[List[App]], Optional[List[Slice]], Optional[List[Node]]]:
-    return _SCENARIO_CACHE.get("apps"), _SCENARIO_CACHE.get("slices"), _SCENARIO_CACHE.get("nodes")
-
-
-def clear_cached_scenario() -> None:
-    _SCENARIO_CACHE["apps"] = None
-    _SCENARIO_CACHE["slices"] = None
-    _SCENARIO_CACHE["nodes"] = None
-
-
-def _serialize_scenario_for_db(apps: List[App], slices: List[Slice], nodes: List[Node]) -> Dict[str, Any]:
+def _serialize_scenario_for_db(apps: List["App"], slices: List["Slice"], nodes: List["Node"]) -> Dict[str, Any]:
     """Serialize scenario data for DB storage (slice name removed)."""
     apps_data = [asdict(app) for app in apps]
+    nodes_data = [asdict(n) for n in nodes]
 
     slices_data = []
     for s in slices:
@@ -137,8 +138,6 @@ def _serialize_scenario_for_db(apps: List[App], slices: List[Slice], nodes: List
             del s_dict["name"]
         slices_data.append(s_dict)
 
-    nodes_data = [asdict(n) for n in nodes]
-
     return {
         "apps": apps_data,
         "slices": slices_data,
@@ -146,184 +145,138 @@ def _serialize_scenario_for_db(apps: List[App], slices: List[Slice], nodes: List
     }
 
 
-def serialize_scenario_for_api(apps: List[App], slices: List[Slice], nodes: List[Node]) -> Dict[str, Any]:
-    """Serialize scenario data for API/tool output (keep slice name)."""
+def _normalize_snapshot_payload(
+    app_data: Optional[Any],
+    slice_data: Optional[Any],
+    node_data: Optional[Any],
+) -> Dict[str, Any]:
+    """将拆分列还原为统一快照字典格式。"""
     return {
-        "apps": [asdict(app) for app in apps],
-        "slices": [asdict(s) for s in slices],
-        "nodes": [asdict(n) for n in nodes]
+        "apps": app_data if isinstance(app_data, list) else [],
+        "slices": slice_data if isinstance(slice_data, list) else [],
+        "nodes": node_data if isinstance(node_data, list) else [],
     }
 
-
-def _deserialize_scenario(data: Dict[str, Any]) -> Tuple[List[App], List[Slice], List[Node]]:
-    """Reconstruct objects from DB data."""
-    apps: List[App] = []
-    for app_dict in data.get("apps", []):
-        flows = []
-        for f_dict in app_dict.get("flows", []):
-            valid_keys = Flow.__annotations__.keys()
-            flow_kwargs = {k: v for k, v in f_dict.items() if k in valid_keys}
-            flows.append(Flow(**flow_kwargs))
-
-        valid_app_keys = ["name", "app_id"]
-        app_kwargs = {k: v for k, v in app_dict.items() if k in valid_app_keys}
-        apps.append(App(flows=flows, **app_kwargs))
-
-    slices: List[Slice] = []
-    for s_dict in data.get("slices", []):
-        sst = s_dict.get("sst", 0)
-        sd = s_dict.get("sd", "")
-        generated_name = f"Slice_{sst}_{sd}"
-
-        valid_slice_keys = [k for k in Slice.__annotations__ if k != "snssai"]
-        slice_kwargs = {k: v for k, v in s_dict.items() if k in valid_slice_keys}
-
-        if "name" not in slice_kwargs:
-            slice_kwargs["name"] = generated_name
-
-        slices.append(Slice(**slice_kwargs))
-
-    nodes: List[Node] = []
-    for n_dict in data.get("nodes", []):
-        nodes.append(Node(**n_dict))
-
-    return apps, slices, nodes
-
-
-def deserialize_scenario_payload(payload: Union[str, Dict[str, Any]]) -> Optional[Tuple[List[App], List[Slice], List[Node]]]:
-    """Deserialize scenario data from a tool payload (dict/JSON)."""
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            return None
-
-    if not isinstance(payload, dict):
-        return None
-
-    scenario = payload.get("scenario", payload)
-    if not isinstance(scenario, dict):
-        return None
-
-    if not all(k in scenario for k in ["apps", "slices", "nodes"]):
-        return None
-
-    return _deserialize_scenario(scenario)
-
-
-def _create_default_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
-    """Generate hardcoded default data with supi."""
-
-    def create_app(name, app_id, flows, base_supi_seed):
-        for i, f in enumerate(flows):
-            if f.flow_id == "f_default":
-                f.flow_id = f"{app_id}_f{i+1}_{f.name}"
-            else:
-                f.flow_id = f"{app_id}_{f.flow_id}"
-
-            f.old_allocated_bw_ul = f.bw_ul
-            f.old_allocated_bw_dl = f.bw_dl
-            f.supi = f"imsi-{base_supi_seed}-{i:04d}"
-
-        return App(name=name, app_id=app_id, flows=flows)
-
-    apps_data = [
-        create_app("Remote_Drive", "app_remote_drive", [
-            Flow("Control", "f_control", 2, 2, 0.5, 0.5, 5, 0.001, 1, 20, old_slice="02000001"),
-            Flow("Video_Feed", "f_video_feed", 8, 8, 4, 4, 20, 0.01, 5, 15, old_slice="02000001")
-        ], "20893001"),
-
-        create_app("4K_Video", "app_4k_video", [
-            Flow("Main_Stream", "f_main_stream", 35, 30, 10, 10, 50, 0.02, 10, 10, old_slice="01000001"),
-            Flow("Audio", "f_audio", 5, 5, 1, 1, 100, 0.01, 20, 5, old_slice="01000001")
-        ], "20893002"),
-
-        create_app("IoT_Sensor", "app_iot_sensor", [
-            Flow("Telemetry", "f_telemetry", 2, 2, 0.1, 0.1, 20, 0.005, 5, 10, old_slice="02000001")
-        ], "20893003"),
-
-        create_app("Web_Browse", "app_web_browse", [
-            Flow("HTTP", "f_http", 15, 20, 1, 1, 100, 0.03, 30, 1, old_slice="01000002")
-        ], "20893004"),
-
-        create_app("AR_Gaming", "app_ar_gaming", [
-            Flow("Render", "f_render", 20, 15, 5, 5, 20, 0.01, 5, 15, old_slice="01000001"),
-            Flow("Sync", "f_sync", 5, 6, 2, 2, 15, 0.005, 3, 15, old_slice="01000001")
-        ], "20893005"),
-
-        create_app("Factory_Robot", "app_factory_robot", [
-            Flow("Motion_Cmd", "f_motion_cmd", 5, 5, 2.5, 2.5, 5, 0.0001, 1, 100, old_slice="02000001")
-        ], "20893006"),
-
-        create_app("Smart_Meter", "app_smart_meter", [
-            Flow("Data_Report", "f_data_report", 0.5, 0.5, 0.05, 0.05, 200, 0.05, 50, 1, old_slice="01000002")
-        ], "20893007")
-    ]
-
-    slices_data = [
-        Slice("S1_Gold", sst=2, sd="000001", total_bw_ul=100, total_bw_dl=100, current_load_bw_ul=0, current_load_bw_dl=0, latency=3, proc_delay=1, loss=0.001, jitter=1.5, reserved_bw=20),
-        Slice("S2_Silver", sst=1, sd="000001", total_bw_ul=200, total_bw_dl=200, current_load_bw_ul=0, current_load_bw_dl=0, latency=10, proc_delay=2, loss=0.01, jitter=8, reserved_bw=50),
-        Slice("S3_Public", sst=1, sd="000002", total_bw_ul=150, total_bw_dl=150, current_load_bw_ul=0, current_load_bw_dl=0, latency=40, proc_delay=5, loss=0.03, jitter=25, reserved_bw=10),
-        Slice("S4_Platinum", sst=2, sd="000002", total_bw_ul=50, total_bw_dl=50, current_load_bw_ul=0, current_load_bw_dl=0, latency=1, proc_delay=0.5, loss=0.0005, jitter=0.8, reserved_bw=5),
-        Slice("S5_Massive", sst=3, sd="000001", total_bw_ul=30, total_bw_dl=30, current_load_bw_ul=0, current_load_bw_dl=0, latency=100, proc_delay=10, loss=0.05, jitter=60, reserved_bw=2)
-    ]
-
-    nodes_data = [
-        Node("Node_Edge", cpu_capacity=100, memory_capacity=200, slices_hosted=["S1_Gold", "S2_Silver", "S4_Platinum"]),
-        Node("Node_Core", cpu_capacity=300, memory_capacity=1000, slices_hosted=["S3_Public", "S5_Massive"])
-    ]
-
-    return apps_data, slices_data, nodes_data
-
-
-def get_initial_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
-    """Get scenario data. Priority: DB (NetworkStatusSnapshot) -> Default (and save to DB)."""
-    
-    # 1. Try to load latest snapshot from NetworkStatusSnapshot
+def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
+    """Read latest snapshot payload from DB only."""
     try:
         with session_scope() as session:
-            # Get the latest snapshot by timestamp
             latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
-            
-            if latest_snapshot and latest_snapshot.snapshot_data:
-                logger.info(f"Loaded scenario from NetworkStatusSnapshot (Timestamp: {latest_snapshot.timestamp}).")
-                snapshot_data = latest_snapshot.snapshot_data
-                apps, slices, nodes = _deserialize_scenario(snapshot_data)
-                cache_scenario(apps, slices, nodes)
-                return apps, slices, nodes
-                
+            if latest_snapshot:
+                logger.info(f"Loaded scenario snapshot (Timestamp: {latest_snapshot.timestamp}).")
+                return _normalize_snapshot_payload(
+                    app_data=latest_snapshot.app_data,
+                    slice_data=latest_snapshot.slice_data,
+                    node_data=latest_snapshot.node_data,
+                )
     except Exception as e:
-        logger.warning(f"Failed to load form NetworkStatusSnapshot: {e}")
+        logger.warning(f"Failed to load latest snapshot: {e}")
+    return None
 
-    # 2. Fallback to initialize defaults and save them
-    logger.info("Initializing NetworkStatusSnapshot with default scenario...")
-    apps, slices, nodes = _create_default_scenario()
-    serialized = _serialize_scenario_for_db(apps, slices, nodes)
+
+def get_latest_session_context(status: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Read the most recently updated session context row.
+
+    Note:
+        The current session_context table stores session state, not a full
+        turn-by-turn conversation transcript.
+    """
+    try:
+        with session_scope() as session:
+            query = session.query(SessionContext)
+            if status:
+                query = query.filter(SessionContext.status == str(status).strip())
+
+            latest_session = (
+                query.order_by(
+                    SessionContext.updated_at.desc(),
+                    SessionContext.created_at.desc(),
+                )
+                .first()
+            )
+            if not latest_session:
+                return None
+
+            logger.info(
+                "Loaded latest session context "
+                f"(session_id={latest_session.session_id}, updated_at={latest_session.updated_at})."
+            )
+            return {
+                "session_id": latest_session.session_id,
+                "current_step": latest_session.current_step,
+                "intent_data": latest_session.intent_data,
+                "policy_data": latest_session.policy_data,
+                "status": latest_session.status,
+                "created_at": latest_session.created_at.isoformat() if latest_session.created_at else None,
+                "updated_at": latest_session.updated_at.isoformat() if latest_session.updated_at else None,
+            }
+    except Exception as e:
+        logger.warning(f"Failed to load latest session context: {e}")
+        return None
+
+
+def create_session_context(
+    *,
+    current_step: str = "intent",
+    intent_data: Optional[Dict[str, Any]] = None,
+    policy_data: Optional[Dict[str, Any]] = None,
+    status: str = "active",
+) -> Optional[str]:
+    """Create a session_context row and return the generated session_id."""
+    try:
+        with session_scope() as session:
+            row = SessionContext(
+                current_step=current_step,
+                intent_data=intent_data,
+                policy_data=policy_data,
+                status=status,
+            )
+            session.add(row)
+            session.flush()
+            session_id = str(row.session_id)
+            logger.info(f"Created session context: {session_id}")
+            return session_id
+    except Exception as e:
+        logger.warning(f"Failed to create session context: {e}")
+        return None
+
+
+def update_session_context(
+    session_id: str,
+    *,
+    current_step: Optional[str] = None,
+    intent_data: Optional[Dict[str, Any]] = None,
+    policy_data: Optional[Dict[str, Any]] = None,
+    status: Optional[str] = None,
+) -> bool:
+    """Update an existing session_context row by session_id."""
+    if not session_id:
+        logger.warning("update_session_context skipped: session_id is empty")
+        return False
 
     try:
         with session_scope() as session:
-            # Save the initial state as a snapshot
-            snapshot = NetworkStatusSnapshot(
-                snapshot_data=serialized,
-                trigger_event="System-Init"
-            )
-            session.add(snapshot)
+            row = session.query(SessionContext).filter(SessionContext.session_id == session_id).first()
+            if row is None:
+                logger.warning(f"update_session_context skipped: session_id not found: {session_id}")
+                return False
+
+            if current_step is not None:
+                row.current_step = current_step
+            if intent_data is not None:
+                row.intent_data = intent_data
+            if policy_data is not None:
+                row.policy_data = policy_data
+            if status is not None:
+                row.status = status
+        return True
     except Exception as e:
-        logger.error(f"Failed to save default snapshot: {e}")
-
-    cache_scenario(apps, slices, nodes)
-    return apps, slices, nodes
+        logger.warning(f"Failed to update session context {session_id}: {e}")
+        return False
 
 
-def get_current_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
-    """Prefer cached scenario, fall back to DB/default initialization."""
-    apps, slices, nodes = get_cached_scenario()
-    if apps and slices and nodes:
-        return apps, slices, nodes
-    return get_initial_scenario()
-
-
-def update_scenario_in_db(apps: List[App], slices: List[Slice], nodes: List[Node], trigger: str = "Optimization-Result") -> bool:
+def update_scenario_in_db(apps: List["App"], slices: List["Slice"], nodes: List["Node"], trigger: str = "Optimization-Result") -> bool:
     """
     Persist scenario state as a new NetworkStatusSnapshot.
     Now we treat network state as time-series snapshots instead of just updating a single config row.
@@ -333,7 +286,9 @@ def update_scenario_in_db(apps: List[App], slices: List[Slice], nodes: List[Node
     try:
         with session_scope() as session:
             snapshot = NetworkStatusSnapshot(
-                snapshot_data=serialized,
+                app_data=serialized.get("apps", []),
+                slice_data=serialized.get("slices", []),
+                node_data=serialized.get("nodes", []),
                 trigger_event=trigger
             )
             session.add(snapshot)
@@ -343,3 +298,235 @@ def update_scenario_in_db(apps: List[App], slices: List[Slice], nodes: List[Node
     except Exception as e:
         logger.error(f"Failed to save scenario snapshot: {e}")
         return False
+
+def upsert_ue_context(
+    supi: str,
+    sm_policy_data: Optional[Dict[str, Any]] = None,
+    pcc_rules: Optional[Dict[str, Any]] = None,
+    qos_decs: Optional[Dict[str, Any]] = None,
+    sess_rules: Optional[Dict[str, Any]] = None,
+    traff_cont_decs: Optional[Dict[str, Any]] = None,
+    chg_decs: Optional[Dict[str, Any]] = None,
+    app_catalog: Optional[List[Dict[str, Any]]] = None,
+    flow_catalog: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """插入或更新UE上下文（关键策略字段版）。"""
+    if not supi:
+        logger.warning("upsert_ue_context skipped: supi is empty")
+        return False
+
+    try:
+        with session_scope() as session:
+            row = session.query(UeContextRecord).filter(UeContextRecord.supi == supi).first()
+            if row is None:
+                row = UeContextRecord(
+                    supi=supi,
+                    sm_policy_data=sm_policy_data,
+                    pcc_rules=pcc_rules,
+                    qos_decs=qos_decs,
+                    sess_rules=sess_rules,
+                    traff_cont_decs=traff_cont_decs,
+                    chg_decs=chg_decs,
+                    app_catalog=app_catalog,
+                    flow_catalog=flow_catalog,
+                )
+                session.add(row)
+            else:
+                if sm_policy_data is not None:
+                    row.sm_policy_data = sm_policy_data
+                if pcc_rules is not None:
+                    row.pcc_rules = pcc_rules
+                if qos_decs is not None:
+                    row.qos_decs = qos_decs
+                if sess_rules is not None:
+                    row.sess_rules = sess_rules
+                if traff_cont_decs is not None:
+                    row.traff_cont_decs = traff_cont_decs
+                if chg_decs is not None:
+                    row.chg_decs = chg_decs
+                if app_catalog is not None:
+                    row.app_catalog = app_catalog
+                if flow_catalog is not None:
+                    row.flow_catalog = flow_catalog
+        return True
+    except Exception as e:
+        logger.error(f"Failed to upsert UE context for {supi}: {e}")
+        return False
+
+
+def get_ue_context_by_supi(supi: str) -> Optional[Dict[str, Any]]:
+    """按SUPI读取UE上下文。"""
+    if not supi:
+        return None
+
+    try:
+        snapshot = get_latest_snapshot_data() or {}
+        snapshot_apps = snapshot.get("apps", []) if isinstance(snapshot, dict) else []
+        derived_app_catalog, derived_flow_catalog = _build_catalogs_from_app_data(snapshot_apps, supi)
+
+        with session_scope() as session:
+            row = session.query(UeContextRecord).filter(UeContextRecord.supi == supi).first()
+            if not row:
+                if not derived_app_catalog and not derived_flow_catalog:
+                    return None
+                return {
+                    "supi": supi,
+                    "smPolicyData": None,
+                    "pccRules": None,
+                    "qosDecs": None,
+                    "sessRules": None,
+                    "traffContDecs": None,
+                    "chgDecs": None,
+                    "app_catalog": derived_app_catalog,
+                    "flow_catalog": derived_flow_catalog,
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            return {
+                "supi": row.supi,
+                "smPolicyData": row.sm_policy_data,
+                "pccRules": row.pcc_rules,
+                "qosDecs": row.qos_decs,
+                "sessRules": row.sess_rules,
+                "traffContDecs": row.traff_cont_decs,
+                "chgDecs": row.chg_decs,
+                "app_catalog": row.app_catalog if row.app_catalog is not None else derived_app_catalog,
+                "flow_catalog": row.flow_catalog if row.flow_catalog is not None else derived_flow_catalog,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+    except Exception as e:
+        logger.error(f"Failed to get UE context for {supi}: {e}")
+        return None
+
+
+def list_ue_contexts(limit: int = 100) -> List[Dict[str, Any]]:
+    """列出UE上下文（按更新时间倒序）。"""
+    try:
+        with session_scope() as session:
+            rows = (
+                session.query(UeContextRecord)
+                .order_by(UeContextRecord.updated_at.desc())
+                .limit(max(1, int(limit)))
+                .all()
+            )
+            return [
+                {
+                    "supi": row.supi,
+                    "pccRules": row.pcc_rules,
+                    "qosDecs": row.qos_decs,
+                    "app_catalog": row.app_catalog,
+                    "flow_catalog": row.flow_catalog,
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                }
+                for row in rows
+            ]
+    except Exception as e:
+        logger.error(f"Failed to list UE contexts: {e}")
+        return []
+
+
+def get_ue_flow_catalog_by_supi(supi: str) -> Dict[str, Any]:
+    """Return the app/flow catalog for a UE, using snapshot app data as the source of truth."""
+    if not supi:
+        return {"supi": supi, "app_catalog": [], "flow_catalog": []}
+
+    ctx = get_ue_context_by_supi(supi)
+    if not ctx:
+        return {"supi": supi, "app_catalog": [], "flow_catalog": []}
+
+    return {
+        "supi": str(ctx.get("supi") or supi).strip(),
+        "app_catalog": ctx.get("app_catalog") or [],
+        "flow_catalog": ctx.get("flow_catalog") or [],
+    }
+
+
+def _extract_flow_id_from_pcc_rule_id(rule_id: Any) -> Optional[str]:
+    text = str(rule_id or "").strip()
+    if not text:
+        return None
+    if text.startswith("pcc-") and len(text) > 4:
+        return text[4:]
+    if text.startswith("flow-"):
+        return text
+    return None
+
+
+def _enrich_pcc_rules_with_flow_catalog(
+    pcc_rules: Optional[Dict[str, Any]],
+    flow_catalog: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(pcc_rules, dict) or not pcc_rules:
+        return pcc_rules
+
+    flow_map = {
+        str(flow.get("flow_id")): flow
+        for flow in flow_catalog
+        if isinstance(flow, dict) and flow.get("flow_id")
+    }
+
+    enriched_top: Dict[str, Any] = {}
+    for sm_policy_id, rule_map in pcc_rules.items():
+        if not isinstance(rule_map, dict):
+            enriched_top[sm_policy_id] = rule_map
+            continue
+
+        enriched_rule_map: Dict[str, Any] = {}
+        for rule_key, rule_obj in rule_map.items():
+            if not isinstance(rule_obj, dict):
+                enriched_rule_map[rule_key] = rule_obj
+                continue
+
+            enriched_rule = dict(rule_obj)
+            flow_id = _extract_flow_id_from_pcc_rule_id(enriched_rule.get("pccRuleId") or rule_key)
+            flow_entry = flow_map.get(flow_id) if flow_id else None
+            if flow_entry:
+                flow_info = build_flow_info_from_five_tuple(flow_entry.get("five_tuple"))
+                if flow_info:
+                    enriched_rule["flowInfos"] = [flow_info]
+            enriched_rule_map[rule_key] = enriched_rule
+
+        enriched_top[sm_policy_id] = enriched_rule_map
+
+    return enriched_top
+
+
+def sync_latest_snapshot_flow_catalog_to_ue_context() -> Dict[str, int]:
+    """
+    Rebuild per-UE app/flow catalogs from the latest snapshot and refresh PCC flowInfos
+    using five_tuple-derived flowDescription strings.
+    """
+    snapshot = get_latest_snapshot_data() or {}
+    app_data = snapshot.get("apps", []) if isinstance(snapshot, dict) else []
+    if not isinstance(app_data, list) or not app_data:
+        return {"ues": 0, "flows": 0}
+
+    supis = sorted(
+        {
+            str(app.get("supi") or "").strip()
+            for app in app_data
+            if isinstance(app, dict) and str(app.get("supi") or "").strip()
+        }
+    )
+
+    synced_ues = 0
+    synced_flows = 0
+    for supi in supis:
+        app_catalog, flow_catalog = _build_catalogs_from_app_data(app_data, supi)
+        if not app_catalog and not flow_catalog:
+            continue
+
+        existing = get_ue_context_by_supi(supi) or {}
+        enriched_pcc_rules = _enrich_pcc_rules_with_flow_catalog(existing.get("pccRules"), flow_catalog)
+        ok = upsert_ue_context(
+            supi=supi,
+            pcc_rules=enriched_pcc_rules,
+            app_catalog=app_catalog,
+            flow_catalog=flow_catalog,
+        )
+        if ok:
+            synced_ues += 1
+            synced_flows += len(flow_catalog)
+
+    return {"ues": synced_ues, "flows": synced_flows}

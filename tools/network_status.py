@@ -1,9 +1,11 @@
 import pandas as pd
 import json
 from langchain_core.tools import tool
-from tools.db_tool import get_current_scenario, _serialize_scenario_for_db
-from database.models import NetworkStatusSnapshot
 from database.connection import SessionLocal
+from database.models import NetworkStatusSnapshot
+from tools.db_tool import _serialize_scenario_for_db
+from tools.init_scenario import get_current_scenario
+from dataclasses import asdict
 
 @tool
 def save_network_status_snapshot(trigger_event: str = "Manual") -> str:
@@ -29,7 +31,9 @@ def save_network_status_snapshot(trigger_event: str = "Manual") -> str:
         session = SessionLocal()
         try:
             snapshot = NetworkStatusSnapshot(
-                snapshot_data=data,
+                app_data=data.get("apps", []),
+                slice_data=data.get("slices", []),
+                node_data=data.get("nodes", []),
                 trigger_event=str(trigger_event)
             )
             session.add(snapshot)
@@ -44,76 +48,64 @@ def save_network_status_snapshot(trigger_event: str = "Manual") -> str:
     except Exception as e:
         return f"Error saving snapshot: {str(e)}"
 
-def get_network_status():
+def get_network_status_full():
     """
-    获取当前网络切片和节点的状态摘要。
-    返回包含切片资源使用情况、节点状态的文本报告。
+    [底层工具专用] 获取当前网络全量对象。
+    直接返回(apps, slices, nodes)元组，供下游工具内部拼装。
     """
-    # 1. 获取场景数据 (优先缓存，否则DB/默认)
-    apps, slices, nodes = get_current_scenario()
+    return get_current_scenario()
 
-    # 2. 统计切片负载
-    # 切片本身可能有 base load (current_load_bw) 和 reserved_bw
-    # 还需要加上当前分配到该切片的所有 App Flow 的带宽
+def get_network_status_summary(flow_type_id: int = None) -> str:
+    """
+    [智能体专用] 获取当前网络切片和应用流的状态摘要。
+    只返回切片的资源使用率和业务数量，以及简化的 App 列表，大幅减少 Token 消耗。
+    """
+    apps, slices, nodes = get_current_scenario()
     
     slice_status_list = []
     
     for s in slices:
-        # 基础占用 (上下行)
-        base_used_ul = s.current_load_bw_ul + s.reserved_bw
-        base_used_dl = s.current_load_bw_dl + s.reserved_bw
+        # 如果指定了 flow_type_id，则只处理匹配的切片
+        if flow_type_id is not None and s.sst != flow_type_id:
+            continue
+            
+        # 简化的占用统计
+        dynamic_used_ul = sum(f.bw_ul for a in apps for f in a.flows if f.old_slice == s.snssai)
+        dynamic_used_dl = sum(f.bw_dl for a in apps for f in a.flows if f.old_slice == s.snssai)
+        active_flows_count = sum(1 for a in apps for f in a.flows if f.old_slice == s.snssai)
         
-        # 动态业务占用
-        # 遍历所有 App 的所有 Flow，检查其 old_slice 是否指向当前切片 s.snssai
-        dynamic_used_ul = 0.0
-        dynamic_used_dl = 0.0
-        active_flows_count = 0
-        
-        for app in apps:
-            for flow in app.flows:
-                if flow.old_slice == s.snssai:
-                    dynamic_used_ul += flow.bw_ul
-                    dynamic_used_dl += flow.bw_dl
-                    active_flows_count += 1
-        
-        total_used_ul = base_used_ul + dynamic_used_ul
-        total_used_dl = base_used_dl + dynamic_used_dl
+        total_used_ul = s.current_load_bw_ul + s.reserved_bw + dynamic_used_ul
+        total_used_dl = s.current_load_bw_dl + s.reserved_bw + dynamic_used_dl
         
         utilization_ul = (total_used_ul / s.total_bw_ul * 100) if s.total_bw_ul > 0 else 0.0
         utilization_dl = (total_used_dl / s.total_bw_dl * 100) if s.total_bw_dl > 0 else 0.0
         
-        remaining_ul = s.total_bw_ul - total_used_ul
-        remaining_dl = s.total_bw_dl - total_used_dl
-        
         slice_status_list.append({
-            "Slice Name": s.name,
-            "S-NSSAI": s.snssai,
-            "UL Total (Mbps)": s.total_bw_ul,
-            "UL Used (Mbps)": round(total_used_ul, 2),
-            "UL Usage (%)": round(utilization_ul, 1),
-            "DL Total (Mbps)": s.total_bw_dl,
-            "DL Used (Mbps)": round(total_used_dl, 2),
-            "DL Usage (%)": round(utilization_dl, 1),
-            "Latency (ms)": s.latency,
-            "Active Flows": active_flows_count
+            "name": s.name,
+            "snssai": s.snssai,
+            "sst": s.sst,
+            "usage_ul_pct": round(utilization_ul, 1),
+            "usage_dl_pct": round(utilization_dl, 1),
+            "active_flows": active_flows_count,
+            "latency_sla": s.latency
         })
 
-    # 3. 统计节点状态 (简单展示)
-    node_status_list = []
-    for n in nodes:
-        node_status_list.append({
-            "Node Name": n.name,
-            "Hosted Slices": ", ".join(n.slices_hosted),
-            "CPU Cap": n.cpu_capacity,
-            "Mem Cap": n.memory_capacity
+    # 简化的应用列表
+    app_summary_list = []
+    for a in apps:
+        if flow_type_id is not None and any(f.service_type_id != flow_type_id for f in a.flows):
+            continue
+        app_summary_list.append({
+            "app_id": a.app_id,
+            "app_name": a.name,
+            "flow_count": len(a.flows),
+            "total_bw_mbps": round(a.total_bw_ul + a.total_bw_dl, 2)
         })
         
-    # 4. 返回JSON格式
     return json.dumps({
-        "slice_status": slice_status_list,
-        "node_status": node_status_list,
-        "total_apps": len(apps)
-    }, ensure_ascii=False, indent=4)
+        "slices": slice_status_list,
+        "apps": app_summary_list
+    }, ensure_ascii=False, indent=2)
 
-if __name__ == "__main__":
-    print(get_network_status())
+# 兼容旧代码调用
+get_network_status = get_network_status_full

@@ -28,6 +28,15 @@ def _normalize_supi(raw_supi: Any) -> Optional[str]:
     return supi or None
 
 
+def _service_type_name_to_id(service_type: Any, default: int = 1) -> int:
+    mapping = {
+        "embb": 1,
+        "urllc": 2,
+        "mmtc": 3,
+    }
+    return mapping.get(str(service_type or "").strip().lower(), default)
+
+
 _ID_FORMAT = {
     "app": re.compile(r"^app-(\d{4})$"),
     "flow": re.compile(r"^flow-(\d{4})$"),
@@ -175,7 +184,10 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
                 priority=f_prio,
                 flow_id=current_f_id,
                 service_type=f_data.get('service_type', 'eMBB'),
-                service_type_id={"eMBB": 1, "URLLC": 2, "mMTC": 3}.get(f_data.get('service_type')),
+                service_type_id=_service_type_name_to_id(
+                    f_data.get('service_type', 'eMBB'),
+                    default=int(f_data.get('service_type_id', 1) or 1)
+                ),
                 old_slice=matched_old_flow.old_slice if matched_old_flow else None,
                 old_allocated_bw_ul=matched_old_flow.old_allocated_bw_ul if matched_old_flow else None,
                 old_allocated_bw_dl=matched_old_flow.old_allocated_bw_dl if matched_old_flow else None
@@ -227,9 +239,16 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
 
         slice_list = slice_stats_df.to_dict(orient='records')
         slice_status = []
+        target_ssts = {
+            _service_type_name_to_id(flow.get('service_type'), default=int(flow.get('service_type_id', 1) or 1))
+            for flow in new_app_data.get('flows', [])
+        } or {1}
         for s in slice_list:
-            print(s)
-            if s.get('SNSSAI', '')[1:2] != str(new_app_data.get('flows')[0].get('service_type_id', 2)):
+            try:
+                slice_sst = int(str(s.get('SNSSAI', ''))[:2], 16)
+            except Exception:
+                slice_sst = None
+            if slice_sst not in target_ssts:
                 continue
             slice_status.append(s)
 
@@ -267,7 +286,8 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
                 f"load={breakdown.get('load_norm', 0):.6f}, "
                 f"signal={breakdown.get('signal_norm', 0):.6f}, "
                 f"exp={breakdown.get('exp', 0):.6f}, "
-                f"qos={breakdown.get('qos_norm', 0):.6f}"
+                f"qos_core={breakdown.get('qos_core', 0):.6f}, "
+                f"qos_aux={breakdown.get('qos_aux', 0):.6f}"
             )
         
         # 1. 本次业务结果

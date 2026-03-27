@@ -16,7 +16,9 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from tools.db_tool import (
+    build_flow_info_from_five_tuple,
     get_latest_snapshot_data,
+    sync_latest_snapshot_flow_catalog_to_ue_context,
     update_scenario_in_db,
     upsert_ue_context,
 )
@@ -137,7 +139,7 @@ def _build_node_from_dict(n_dict: Dict[str, Any]) -> Node:
 # Default scenario structure provided by configuration
 DEFAULT_SCENARIO_APPS_JSON = [
     {"name": "Remote_Drive", "supi": "imsi-20893001", "flows": [{"lat": 12.0, "name": "Remote_Drive_video_1", "bw_dl": 18.0, "bw_ul": 16.0, "gbr_dl": 14.0, "gbr_ul": 12.0, "flow_id": "app_remote_drive_f1", "loss_req": 0.0005, "priority": 1, "old_slice": "01000001", "jitter_req": 2.0, "packet_size": 12000.0, "arrival_rate": 500.0, "service_type_id": 1, "old_allocated_bw_dl": 18.0, "old_allocated_bw_ul": 16.0}], "app_id": "app_remote_drive", "min_lat": 62.44, "max_prio": 4, "total_bw_dl": 35.97, "total_bw_ul": 33.91},
-    {"name": "4K_Video", "supi": "imsi-20893002", "flows": [{"lat": 35.0, "name": "4K_Video_control_1", "bw_dl": 45.0, "bw_ul": 6.0, "gbr_dl": 36.0, "gbr_ul": 3.0, "flow_id": "app_4k_video_f1", "loss_req": 0.003, "priority": 5, "old_slice": "01000002", "jitter_req": 12.0, "packet_size": 60000.0, "arrival_rate": 800.0, "service_type_id": 1, "old_allocated_bw_dl": 45.0, "old_allocated_bw_ul": 6.0}, {"lat": 25.0, "name": "4K_Video_control_2", "supi": "imsi-20893002", "bw_dl": 2.5, "bw_ul": 2.0, "gbr_dl": 1.2, "gbr_ul": 1.0, "flow_id": "app_4k_video_f2", "loss_req": 0.0015, "priority": 4, "old_slice": "02000001", "jitter_req": 6.0, "packet_size": 12000.0, "arrival_rate": 200.0, "service_type_id": 2, "old_allocated_bw_dl": 2.5, "old_allocated_bw_ul": 2.0}], "app_id": "app_4k_video", "min_lat": 5.69, "max_prio": 3, "total_bw_dl": 11.850000000000001, "total_bw_ul": 7.359999999999999},
+    {"name": "4K_Video", "supi": "imsi-20893002", "flows": [{"lat": 35.0, "name": "4K_Video_stream_1", "bw_dl": 45.0, "bw_ul": 6.0, "gbr_dl": 36.0, "gbr_ul": 3.0, "flow_id": "app_4k_video_f1", "loss_req": 0.003, "priority": 5, "old_slice": "01000002", "jitter_req": 12.0, "packet_size": 60000.0, "arrival_rate": 800.0, "service_type_id": 1, "old_allocated_bw_dl": 45.0, "old_allocated_bw_ul": 6.0}, {"lat": 25.0, "name": "4K_Video_control_2", "supi": "imsi-20893002", "bw_dl": 2.5, "bw_ul": 2.0, "gbr_dl": 1.2, "gbr_ul": 1.0, "flow_id": "app_4k_video_f2", "loss_req": 0.0015, "priority": 4, "old_slice": "02000001", "jitter_req": 6.0, "packet_size": 12000.0, "arrival_rate": 200.0, "service_type_id": 2, "old_allocated_bw_dl": 2.5, "old_allocated_bw_ul": 2.0}], "app_id": "app_4k_video", "min_lat": 5.69, "max_prio": 3, "total_bw_dl": 11.850000000000001, "total_bw_ul": 7.359999999999999},
     {"name": "IoT_Sensor", "supi": "imsi-20893003", "flows": [{"lat": 120.0, "name": "IoT_Sensor_video_1", "bw_dl": 8.0, "bw_ul": 5.0, "gbr_dl": 5.0, "gbr_ul": 3.0, "flow_id": "app_iot_sensor_f1", "loss_req": 0.02, "priority": 8, "old_slice": "01000001", "jitter_req": 30.0, "packet_size": 24000.0, "arrival_rate": 50.0, "service_type_id": 1, "old_allocated_bw_dl": 8.0, "old_allocated_bw_ul": 5.0}, {"lat": 80.0, "name": "IoT_Sensor_control_2", "supi": "imsi-20893003", "bw_dl": 0.8, "bw_ul": 1.2, "gbr_dl": 0.4, "gbr_ul": 0.8, "flow_id": "app_iot_sensor_f2", "loss_req": 0.01, "priority": 7, "old_slice": "01000002", "jitter_req": 20.0, "packet_size": 8000.0, "arrival_rate": 800.0, "service_type_id": 1, "old_allocated_bw_dl": 0.8, "old_allocated_bw_ul": 1.2}], "app_id": "app_iot_sensor", "min_lat": 10.82, "max_prio": 7, "total_bw_dl": 45.11, "total_bw_ul": 49.269999999999996},
     {"name": "Web_Browse", "supi": "imsi-20893004", "flows": [{"lat": 90.0, "name": "Web_Browse_control_1", "bw_dl": 6.0, "bw_ul": 1.0, "gbr_dl": 2.0, "gbr_ul": 0.5, "flow_id": "app_web_browse_f1", "loss_req": 0.03, "priority": 10, "old_slice": "02000002", "jitter_req": 35.0, "packet_size": 12000.0, "arrival_rate": 200.0, "service_type_id": 2, "old_allocated_bw_dl": 6.0, "old_allocated_bw_ul": 1.0}, {"lat": 110.0, "name": "Web_Browse_control_2", "supi": "imsi-20893004", "bw_dl": 4.0, "bw_ul": 0.8, "gbr_dl": 1.5, "gbr_ul": 0.4, "flow_id": "app_web_browse_f2", "loss_req": 0.04, "priority": 11, "old_slice": "03000001", "jitter_req": 45.0, "packet_size": 12000.0, "arrival_rate": 200.0, "service_type_id": 3, "old_allocated_bw_dl": 4.0, "old_allocated_bw_ul": 0.8}], "app_id": "app_web_browse", "min_lat": 6.55, "max_prio": 3, "total_bw_dl": 7.039999999999999, "total_bw_ul": 7.93},
     {"name": "AR_Gaming", "supi": "imsi-20893005", "flows": [{"lat": 8.0, "name": "AR_Gaming_control_1", "bw_dl": 12.0, "bw_ul": 8.0, "gbr_dl": 10.0, "gbr_ul": 6.0, "flow_id": "app_ar_gaming_f1", "loss_req": 0.0008, "priority": 2, "old_slice": "01000001", "jitter_req": 2.0, "packet_size": 8000.0, "arrival_rate": 50.0, "service_type_id": 1, "old_allocated_bw_dl": 12.0, "old_allocated_bw_ul": 8.0}, {"lat": 15.0, "name": "AR_Gaming_video_2", "supi": "imsi-20893005", "bw_dl": 55.0, "bw_ul": 18.0, "gbr_dl": 45.0, "gbr_ul": 12.0, "flow_id": "app_ar_gaming_f2", "loss_req": 0.0015, "priority": 3, "old_slice": "03000001", "jitter_req": 4.0, "packet_size": 24000.0, "arrival_rate": 100.0, "service_type_id": 3, "old_allocated_bw_dl": 55.0, "old_allocated_bw_ul": 18.0}], "app_id": "app_ar_gaming", "min_lat": 10.83, "max_prio": 9, "total_bw_dl": 36.21, "total_bw_ul": 16.18},
@@ -280,23 +282,65 @@ def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
                     "sess_rules": {},
                     "traff_cont_decs": {},
                     "chg_decs": {},
+                    "app_catalog": [],
+                    "flow_catalog": [],
                 }
+
+            if not any(item.get("app_id") == getattr(app, "app_id", None) for item in ue_payload[supi]["app_catalog"]):
+                ue_payload[supi]["app_catalog"].append(
+                    {
+                        "supi": supi,
+                        "app_name": getattr(app, "name", None),
+                        "app_id": getattr(app, "app_id", None),
+                        "flow_count": len(getattr(app, "flows", []) or []),
+                    }
+                )
 
             # 关键步骤：按 smPolicyId 分组，和 UeContext.smPolicyData 语义一致
             ue_payload[supi]["sm_policy_data"].setdefault(sm_policy_id, {})
             ue_payload[supi]["pcc_rules"].setdefault(sm_policy_id, {})
             ue_payload[supi]["qos_decs"].setdefault(sm_policy_id, {})
             ue_payload[supi]["sess_rules"].setdefault(sm_policy_id, {})
+            ue_payload[supi]["flow_catalog"].append(
+                {
+                    "supi": supi,
+                    "app_name": getattr(app, "name", None),
+                    "app_id": getattr(app, "app_id", None),
+                    "flow_name": getattr(flow, "name", None),
+                    "flow_id": flow_id,
+                    "service_type": getattr(flow, "service_type", None),
+                    "service_type_id": service_type_id,
+                    "bw_ul": getattr(flow, "bw_ul", None),
+                    "bw_dl": getattr(flow, "bw_dl", None),
+                    "gbr_ul": getattr(flow, "gbr_ul", None),
+                    "gbr_dl": getattr(flow, "gbr_dl", None),
+                    "lat": getattr(flow, "lat", None),
+                    "loss_req": getattr(flow, "loss_req", None),
+                    "jitter_req": getattr(flow, "jitter_req", None),
+                    "priority": getattr(flow, "priority", None),
+                    "current_bw_ul": getattr(flow, "old_allocated_bw_ul", None)
+                    if getattr(flow, "old_allocated_bw_ul", None) is not None
+                    else getattr(flow, "bw_ul", None),
+                    "current_bw_dl": getattr(flow, "old_allocated_bw_dl", None)
+                    if getattr(flow, "old_allocated_bw_dl", None) is not None
+                    else getattr(flow, "bw_dl", None),
+                    "five_tuple": list(getattr(flow, "five_tuple", None))
+                    if isinstance(getattr(flow, "five_tuple", None), (list, tuple))
+                    else None,
+                }
+            )
+
+            flow_info = build_flow_info_from_five_tuple(getattr(flow, "five_tuple", None))
+            if not flow_info:
+                flow_info = {
+                    "flowDescription": f"permit out ip from {supi} to any",
+                    "flowDirection": "BIDIRECTIONAL",
+                }
 
             ue_payload[supi]["pcc_rules"][sm_policy_id][pcc_rule_id] = {
                 "pccRuleId": pcc_rule_id,
                 "precedence": int(flow.priority),
-                "flowInfos": [
-                    {
-                        "flowDescription": f"permit out ip from {supi} to any",
-                        "flowDirection": "BIDIRECTIONAL",
-                    }
-                ],
+                "flowInfos": [flow_info],
                 "refQosData": [qos_id],
                 # 补充 TSCAI 信息 (如果 flow 有相关字段)
                 "tscaiInputDl": [{
@@ -341,11 +385,21 @@ def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
             sess_rules=payload["sess_rules"],
             traff_cont_decs=payload["traff_cont_decs"],
             chg_decs=payload["chg_decs"],
+            app_catalog=payload["app_catalog"],
+            flow_catalog=payload["flow_catalog"],
         )
         if ok:
             success += 1
 
     return success
+
+
+def sync_latest_flow_five_tuples_to_ue_context() -> Dict[str, int]:
+    """
+    Rebuild UE flow catalogs from the latest snapshot and refresh PCC flowInfos
+    so flowDescription matches the authoritative five_tuple when available.
+    """
+    return sync_latest_snapshot_flow_catalog_to_ue_context()
 
 def _deserialize_scenario(data: Dict[str, Any]) -> Tuple[List[App], List[Slice], List[Node]]:
     used_suffixes: set = set()
@@ -495,14 +549,18 @@ def get_initial_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     if snapshot_data:
         apps, slices, nodes = _deserialize_scenario(snapshot_data)
         seeded = _seed_ue_contexts_from_apps(apps)
+        sync_summary = sync_latest_flow_five_tuples_to_ue_context()
         print(f"[UEContext] seeded {seeded} UE records (from snapshot)")
+        print(f"[UEContext] synced five-tuples for {sync_summary['ues']} UEs / {sync_summary['flows']} flows (from snapshot)")
         cache_scenario(apps, slices, nodes)
         return apps, slices, nodes
 
     apps, slices, nodes = _create_default_scenario()
     update_scenario_in_db(apps, slices, nodes, trigger="System-Init")
     seeded = _seed_ue_contexts_from_apps(apps)
+    sync_summary = sync_latest_flow_five_tuples_to_ue_context()
     print(f"[UEContext] seeded {seeded} UE records (from default)")
+    print(f"[UEContext] synced five-tuples for {sync_summary['ues']} UEs / {sync_summary['flows']} flows (from default)")
     cache_scenario(apps, slices, nodes)
     return apps, slices, nodes
 
@@ -529,7 +587,9 @@ def initialize_scenario(reset: bool = False) -> dict:
         if not ok:
             raise RuntimeError("Failed to persist reset scenario into DB")
         seeded = _seed_ue_contexts_from_apps(apps)
+        sync_summary = sync_latest_flow_five_tuples_to_ue_context()
         print(f"[UEContext] seeded {seeded} UE records (from reset)")
+        print(f"[UEContext] synced five-tuples for {sync_summary['ues']} UEs / {sync_summary['flows']} flows (from reset)")
     else:
         apps, slices, nodes = get_initial_scenario()
 

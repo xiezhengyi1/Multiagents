@@ -24,6 +24,22 @@ class SliceOptimizationEngine:
         idx = max(0, min(int(sst) - 1, len(overhead) - 1))
         return float(overhead[idx])
 
+    def _service_type_to_sst(self, flow: Flow) -> Optional[int]:
+        service_type_id = getattr(flow, "service_type_id", None)
+        if service_type_id is not None:
+            try:
+                return int(service_type_id)
+            except (TypeError, ValueError):
+                pass
+
+        service_name = str(getattr(flow, "service_type", "") or "").strip().lower()
+        mapping = {
+            "embb": 1,
+            "urllc": 2,
+            "mmtc": 3,
+        }
+        return mapping.get(service_name)
+
     def _create_common_variables(self, apps: List[App], slices: List[Slice]):
         """关键步骤：统一创建三种求解模式共用的决策变量。"""
         x = pulp.LpVariable.dicts(
@@ -47,7 +63,32 @@ class SliceOptimizationEngine:
             ((a.app_id, f.flow_id, s.snssai) for a in apps for f in a.flows for s in slices),
             lowBound=0
         )
-        return x, B_act_ul, B_act_dl, dev, change
+        served = pulp.LpVariable.dicts(
+            "served",
+            ((a.app_id, f.flow_id) for a in apps for f in a.flows),
+            cat='Binary'
+        )
+        deficit_ul = pulp.LpVariable.dicts(
+            "deficit_ul",
+            ((a.app_id, f.flow_id) for a in apps for f in a.flows),
+            lowBound=0
+        )
+        deficit_dl = pulp.LpVariable.dicts(
+            "deficit_dl",
+            ((a.app_id, f.flow_id) for a in apps for f in a.flows),
+            lowBound=0
+        )
+        gbr_gap_ul = pulp.LpVariable.dicts(
+            "gbr_gap_ul",
+            ((a.app_id, f.flow_id) for a in apps for f in a.flows),
+            lowBound=0
+        )
+        gbr_gap_dl = pulp.LpVariable.dicts(
+            "gbr_gap_dl",
+            ((a.app_id, f.flow_id) for a in apps for f in a.flows),
+            lowBound=0
+        )
+        return x, B_act_ul, B_act_dl, dev, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
 
     def _solve_problem_and_collect(
         self,
@@ -57,16 +98,24 @@ class SliceOptimizationEngine:
         x,
         B_act_ul,
         B_act_dl,
+        served,
         term_load_raw,
         term_sig_raw,
         term_load,
         term_sig,
         term_exp,
-        term_qos,
+        term_qos_core,
+        term_qos_aux,
         term_tiebreak,
     ):
         """关键步骤：统一执行求解并返回结果与目标分解。"""
-        objective = (self.config.w1 * term_load) + (self.config.w2 * term_sig) + (self.config.w3 * (term_exp + term_qos)) + term_tiebreak
+        objective = (
+            (self.config.w1 * term_load)
+            + (self.config.w2 * term_sig)
+            + (self.config.w3 * (term_exp + term_qos_core))
+            + (self.config.w4 * term_qos_aux)
+            + term_tiebreak
+        )
         prob.setObjective(objective)
         solver_time_limit = int(getattr(self.config, "solver_time_limit", 30) or 30)
         solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=solver_time_limit)
@@ -75,7 +124,16 @@ class SliceOptimizationEngine:
 
         flow_results, slice_results, _, objective_val = self._finalize_results(prob, apps, slices, x, B_act_ul, B_act_dl)
         breakdown = self._build_objective_breakdown(
-            term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak, objective_val
+            served,
+            term_load_raw,
+            term_sig_raw,
+            term_load,
+            term_sig,
+            term_exp,
+            term_qos_core,
+            term_qos_aux,
+            term_tiebreak,
+            objective_val
         )
         return flow_results, slice_results, status_str, objective_val, breakdown
 
@@ -91,16 +149,16 @@ class SliceOptimizationEngine:
         prob = pulp.LpProblem("5G_Slice_R_A_Layered", pulp.LpMinimize)
 
         # 关键步骤：创建共用决策变量
-        x, B_act_ul, B_act_dl, dev, change = self._create_common_variables(apps, slices)
+        x, B_act_ul, B_act_dl, dev, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl = self._create_common_variables(apps, slices)
 
         # 2. 约束条件构建
-        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change)
+        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl)
         self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
         self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
 
         # 3. 构建目标函数项
-        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak = self._build_objectives(
-            apps, slices, x, B_act_ul, B_act_dl, dev, change
+        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak = self._build_objectives(
+            apps, slices, x, served, dev, change, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
         )
 
         flow_results, slice_results, status_str, objective_val, breakdown = self._solve_problem_and_collect(
@@ -110,12 +168,14 @@ class SliceOptimizationEngine:
             x,
             B_act_ul,
             B_act_dl,
+            served,
             term_load_raw,
             term_sig_raw,
             term_load,
             term_sig,
             term_exp,
-            term_qos,
+            term_qos_core,
+            term_qos_aux,
             term_tiebreak,
         )
         logger.info(f"求解完成. 状态: {status_str}")
@@ -131,15 +191,15 @@ class SliceOptimizationEngine:
         prob = pulp.LpProblem("5G_Slice_R_A_Incremental", pulp.LpMinimize)
 
         # 关键步骤：创建共用决策变量
-        x, B_act_ul, B_act_dl, dev, change = self._create_common_variables(apps, slices)
+        x, B_act_ul, B_act_dl, dev, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl = self._create_common_variables(apps, slices)
 
-        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change)
-        self._add_incremental_constraints(prob, apps, slices, x, B_act_ul, B_act_dl)
+        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl)
+        self._add_incremental_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, fix_bandwidth=True)
         self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
         self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
 
-        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak = self._build_objectives(
-            apps, slices, x, B_act_ul, B_act_dl, dev, change
+        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak = self._build_objectives(
+            apps, slices, x, served, dev, change, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
         )
 
         flow_results, slice_results, status_str, objective_val, breakdown = self._solve_problem_and_collect(
@@ -149,14 +209,19 @@ class SliceOptimizationEngine:
             x,
             B_act_ul,
             B_act_dl,
+            served,
             term_load_raw,
             term_sig_raw,
             term_load,
             term_sig,
             term_exp,
-            term_qos,
+            term_qos_core,
+            term_qos_aux,
             term_tiebreak,
         )
+        if status_str == "Infeasible":
+            logger.warning("Strict incremental infeasible, retrying with relaxed bandwidth preservation")
+            return self._solve_incremental_relaxed(apps, slices, nodes)
         logger.info(f"增量求解完成. 状态: {status_str}")
         return flow_results, slice_results, status_str, objective_val, breakdown
 
@@ -172,16 +237,16 @@ class SliceOptimizationEngine:
         prob = pulp.LpProblem("5G_Slice_R_A_Hybrid", pulp.LpMinimize)
 
         # 关键步骤：创建共用决策变量
-        x, B_act_ul, B_act_dl, dev, change = self._create_common_variables(apps, slices)
+        x, B_act_ul, B_act_dl, dev, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl = self._create_common_variables(apps, slices)
 
         # 核心差异：使用 Hybrid 约束（只固定 x，不固定 B_act）
-        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change)
+        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl)
         self._add_hybrid_constraints(prob, apps, slices, x)
         self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
         self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
 
-        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak = self._build_objectives(
-            apps, slices, x, B_act_ul, B_act_dl, dev, change
+        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak = self._build_objectives(
+            apps, slices, x, served, dev, change, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
         )
 
         flow_results, slice_results, status_str, objective_val, breakdown = self._solve_problem_and_collect(
@@ -191,12 +256,14 @@ class SliceOptimizationEngine:
             x,
             B_act_ul,
             B_act_dl,
+            served,
             term_load_raw,
             term_sig_raw,
             term_load,
             term_sig,
             term_exp,
-            term_qos,
+            term_qos_core,
+            term_qos_aux,
             term_tiebreak,
         )
         logger.info(f"混合求解完成. 状态: {status_str}")
@@ -208,41 +275,82 @@ class SliceOptimizationEngine:
         slice_results = self._format_slice_stats(apps, slices, B_act_ul, B_act_dl)
         objective_val = pulp.value(prob.objective) if prob.objective is not None else 0.0
         return flow_results, slice_results, status_str, objective_val
+
+    def _solve_incremental_relaxed(self, apps, slices, nodes):
+        prob = pulp.LpProblem("5G_Slice_R_A_Incremental_Relaxed", pulp.LpMinimize)
+        x, B_act_ul, B_act_dl, dev, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl = self._create_common_variables(apps, slices)
+
+        self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl)
+        self._add_incremental_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, fix_bandwidth=False)
+        self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
+        self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
+
+        term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak = self._build_objectives(
+            apps, slices, x, served, dev, change, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
+        )
+
+        flow_results, slice_results, status_str, objective_val, breakdown = self._solve_problem_and_collect(
+            prob,
+            apps,
+            slices,
+            x,
+            B_act_ul,
+            B_act_dl,
+            served,
+            term_load_raw,
+            term_sig_raw,
+            term_load,
+            term_sig,
+            term_exp,
+            term_qos_core,
+            term_qos_aux,
+            term_tiebreak,
+        )
+        breakdown["incremental_relaxed"] = 1.0
+        return flow_results, slice_results, f"{status_str} (relaxed incremental)", objective_val, breakdown
     
-    def _build_objectives(self, apps, slices, x, B_act_ul, B_act_dl, dev, change):
+    def _build_objectives(self, apps, slices, x, served, dev, change, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl):
         num_slices = max(1, len(slices))
         num_flows = max(1, sum(len(a.flows) for a in apps))
+        eps = 1e-9
 
-        # 用软约束替换硬约束，计算违约数量
-        term_qos = pulp.lpSum(
-            (
-                (1 if (s.latency + s.proc_delay > f.lat) else 0) + 
-                (1 if (f.loss_req > 0 and s.loss > f.loss_req) else 0) +
-                (1 if (f.jitter_req > 0 and s.jitter > f.jitter_req) else 0)
-            ) * x[app.app_id, f.flow_id, s.snssai]
+        term_qos_core = pulp.lpSum(
+            (1.0 / max(1, f.priority))
+            * (1 if (s.latency + s.proc_delay > f.lat) else 0)
+            * x[app.app_id, f.flow_id, s.snssai]
             for app in apps for f in app.flows for s in slices
-        )
+        ) / num_flows
+
+        term_qos_aux = pulp.lpSum(
+            (1.0 / max(1, f.priority))
+            * (
+                (1 if (f.loss_req > 0 and s.loss > f.loss_req) else 0)
+                + (1 if (f.jitter_req > 0 and s.jitter > f.jitter_req) else 0)
+            )
+            * x[app.app_id, f.flow_id, s.snssai]
+            for app in apps for f in app.flows for s in slices
+        ) / num_flows
 
         term_exp = pulp.lpSum(
-            (1.0 / f.priority if f.priority > 0 else 1.0) * (
-                (f.bw_ul - pulp.lpSum(B_act_ul[app.app_id, f.flow_id, s.snssai] for s in slices)) / f.bw_ul if f.bw_ul > 0 else 0 +
-                (f.bw_dl - pulp.lpSum(B_act_dl[app.app_id, f.flow_id, s.snssai] for s in slices)) / f.bw_dl if f.bw_dl > 0 else 0
-            ) 
+            (1.0 / max(1, f.priority)) * (
+                (1 - served[app.app_id, f.flow_id])
+                + (deficit_ul[app.app_id, f.flow_id] / max(float(f.bw_ul), eps) if f.bw_ul > 0 else 0)
+                + (deficit_dl[app.app_id, f.flow_id] / max(float(f.bw_dl), eps) if f.bw_dl > 0 else 0)
+                + 0.5 * (gbr_gap_ul[app.app_id, f.flow_id] / max(float(f.gbr_ul), eps) if f.gbr_ul > 0 else 0)
+                + 0.5 * (gbr_gap_dl[app.app_id, f.flow_id] / max(float(f.gbr_dl), eps) if f.gbr_dl > 0 else 0)
+            )
             for app in apps for f in app.flows
-        )
+        ) / num_flows
 
         term_load_raw = pulp.lpSum(dev[s.snssai] for s in slices)
         term_sig_raw = pulp.lpSum(
-            change[app.app_id, f.flow_id, s.snssai] 
+            change[app.app_id, f.flow_id, s.snssai]
             for app in apps for f in app.flows for s in slices
         )
-        
-        # 归一化
+
         term_load = term_load_raw / num_slices
         term_sig = term_sig_raw / num_flows
-        term_qos = term_qos / num_flows
 
-        # 唯一性: 极小扰动作为平局打破项 (不影响主目标)
         epsilon = 1e-6
         slice_index = {s.snssai: idx + 1 for idx, s in enumerate(slices)}
         term_tiebreak = epsilon * pulp.lpSum(
@@ -250,26 +358,30 @@ class SliceOptimizationEngine:
             for app in apps for f in app.flows for s in slices
         )
 
-        return term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos, term_tiebreak
+        return term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak
 
     def _build_objective_breakdown(
         self,
+        served,
         term_load_raw,
         term_sig_raw,
         term_load,
         term_sig,
         term_exp,
-        term_qos,
+        term_qos_core,
+        term_qos_aux,
         term_tiebreak,
         objective_val,
     ) -> Dict[str, float]:
         return {
+            "served_raw": self._safe_pulp_value(pulp.lpSum(v for v in served.values())),
             "load_raw": self._safe_pulp_value(term_load_raw),
             "signal_raw": self._safe_pulp_value(term_sig_raw),
             "load_norm": self._safe_pulp_value(term_load),
             "signal_norm": self._safe_pulp_value(term_sig),
             "exp": self._safe_pulp_value(term_exp),
-            "qos_norm": self._safe_pulp_value(term_qos),
+            "qos_core": self._safe_pulp_value(term_qos_core),
+            "qos_aux": self._safe_pulp_value(term_qos_aux),
             "tiebreak": self._safe_pulp_value(term_tiebreak),
             "objective_total": float(objective_val or 0.0),
         }
@@ -291,7 +403,7 @@ class SliceOptimizationEngine:
                     else:
                         prob += x[app.app_id, f.flow_id, s.snssai] == 0
 
-    def _add_incremental_constraints(self, prob, apps, slices, x, B_act_ul, B_act_dl):
+    def _add_incremental_constraints(self, prob, apps, slices, x, B_act_ul, B_act_dl, fix_bandwidth: bool = True):
         """增量优化约束：固定已有流的切片映射，并在可行范围内保持历史带宽。"""
         valid_snssais = {s.snssai for s in slices}
         for app in apps:
@@ -308,38 +420,36 @@ class SliceOptimizationEngine:
                     else:
                         prob += x[app.app_id, f.flow_id, s.snssai] == 0
 
-                # 若历史带宽存在且落在 [gbr, bw] 内则固定；否则保持可调
-                if f.old_allocated_bw_ul is not None:
+                if fix_bandwidth and f.old_allocated_bw_ul is not None:
                     fixed_ul = min(max(f.old_allocated_bw_ul, f.gbr_ul), f.bw_ul)
                     prob += B_act_ul[app.app_id, f.flow_id, f.old_slice] == fixed_ul
-                if f.old_allocated_bw_dl is not None:
+                if fix_bandwidth and f.old_allocated_bw_dl is not None:
                     fixed_dl = min(max(f.old_allocated_bw_dl, f.gbr_dl), f.bw_dl)
                     prob += B_act_dl[app.app_id, f.flow_id, f.old_slice] == fixed_dl
 
-    def _add_flow_constraints(self, prob, apps, slices, x, B_act_ul, B_act_dl, change):
+    def _add_flow_constraints(self, prob, apps, slices, x, B_act_ul, B_act_dl, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl):
         """添加流级别的约束"""
         for app in apps:
             for f in app.flows:
-                # C1: 每个 Flow 必须选择且仅选择一个切片
-                prob += pulp.lpSum(x[app.app_id, f.flow_id, s.snssai] for s in slices) == 1
-                
+                flow_key = (app.app_id, f.flow_id)
+                prob += pulp.lpSum(x[app.app_id, f.flow_id, s.snssai] for s in slices) == served[flow_key]
+
+                total_allocated_ul = pulp.lpSum(B_act_ul[app.app_id, f.flow_id, s.snssai] for s in slices)
+                total_allocated_dl = pulp.lpSum(B_act_dl[app.app_id, f.flow_id, s.snssai] for s in slices)
+
+                prob += total_allocated_ul + deficit_ul[flow_key] == f.bw_ul
+                prob += total_allocated_dl + deficit_dl[flow_key] == f.bw_dl
+                prob += total_allocated_ul + gbr_gap_ul[flow_key] >= f.gbr_ul
+                prob += total_allocated_dl + gbr_gap_dl[flow_key] >= f.gbr_dl
+
+                required_sst = self._service_type_to_sst(f)
                 for s in slices:
-                    # C2: [已放宽] URSP 类型兼容 -> 隐式控制
+                    compatible = 1 if (required_sst is None or required_sst == s.sst) else 0
+                    prob += x[app.app_id, f.flow_id, s.snssai] <= compatible
 
-                    # C3: 时延/丢包/抖动约束 -> 移至 Stage 1 目标函数 (软约束)
-                    # 避免因单个指标不满足导致无解
-                    # 仅保留硬性逻辑约束
-
-                    # C4: 上行带宽分配上限 & 下限保障
-                    # 强制要求: 如果分配了切片, 至少分配 GBR 的请求带宽
                     prob += B_act_ul[app.app_id, f.flow_id, s.snssai] <= x[app.app_id, f.flow_id, s.snssai] * f.bw_ul
-                    prob += B_act_ul[app.app_id, f.flow_id, s.snssai] >= x[app.app_id, f.flow_id, s.snssai] * f.gbr_ul
-                    
-                    # C5: 下行带宽分配上限 & 下限保障
                     prob += B_act_dl[app.app_id, f.flow_id, s.snssai] <= x[app.app_id, f.flow_id, s.snssai] * f.bw_dl
-                    prob += B_act_dl[app.app_id, f.flow_id, s.snssai] >= x[app.app_id, f.flow_id, s.snssai] * f.gbr_dl
-                    
-                    # C6: 线性化信令开销 |x - x_old|
+
                     is_old = 1 if f.old_slice == s.snssai else 0 
                     prob += change[app.app_id, f.flow_id, s.snssai] >= x[app.app_id, f.flow_id, s.snssai] - is_old
                     prob += change[app.app_id, f.flow_id, s.snssai] >= is_old - x[app.app_id, f.flow_id, s.snssai]
@@ -377,8 +487,8 @@ class SliceOptimizationEngine:
 
     def _add_node_constraints(self, prob, apps, slices, nodes, B_act_ul, B_act_dl):
         for node in nodes:
-            # 计算托管切片上的流量总和
-            hosted_snssais = [s.snssai for s in slices if s.name in node.slices_hosted]
+            hosted_set = set(node.slices_hosted or [])
+            hosted_snssais = [s.snssai for s in slices if s.snssai in hosted_set or s.name in hosted_set]
             new_traffic_sum = pulp.lpSum(
                 B_act_ul[app.app_id, f.flow_id, s.snssai] + B_act_dl[app.app_id, f.flow_id, s.snssai]
                 for s in slices if s.snssai in hosted_snssais
@@ -479,7 +589,7 @@ class SliceOptimizationEngine:
 
     def _determine_strategy(self, flow: Flow, mapped_slice: Optional[str], allocated_bw_ul: float, allocated_bw_dl: float) -> List[str]:
         strategies = []
-        if mapped_slice != flow.old_slice:
+        if flow.old_slice and mapped_slice and mapped_slice != flow.old_slice:
             strategies.append("策略B(重路由)")
         
         TOLERANCE = 0.01

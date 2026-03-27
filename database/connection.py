@@ -1,12 +1,12 @@
 import os
-import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
+from utils.logger import setup_logger
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 # Default to a local postgres instance if not provided
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/multiagents_db")
