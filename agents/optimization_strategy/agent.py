@@ -3,62 +3,82 @@ from __future__ import annotations
 from datetime import date, datetime
 from enum import Enum
 import json
-import re
 import time
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from langchain_core.messages import ToolMessage
-from langchain_core.output_parsers import PydanticOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.tools import tool
-from pydantic import BaseModel, Field, field_serializer
+from langchain.tools import ToolRuntime, tool
+from pydantic import BaseModel
 
+from agent_runtime import AgentRuntimeContext, AgentWorkspace, ArtifactCache, ArtifactEnvelope, ArtifactStore
+from agents.basemodel import BaseAgent
+from domain.collaboration import PlanningRequest
+from domain.policy_plan import OperationIntent, PolicyDraft, PolicyPlanDraft
 from model.SmPolicyDecision import SmPolicyDecision
 from model.UrspRuleRequest import UrspRuleRequest
 from tools.db_tool import build_flow_description_from_five_tuple, build_flow_info_from_five_tuple
 from tools.network_status import get_network_status_summary
 from tools.optimizer import optimize_network_slices
 from utils.logger import log_event, log_timing, setup_logger
-from .Prompt import OSA_SYSTEM_PROMPT
-from .basemodel import BaseAgent
+
+from .prompts import OSA_SYSTEM_PROMPT
 
 logger = setup_logger(__name__)
 
 
 @tool
-def fetch_network_status(flow_type_id: int) -> str:
+def fetch_network_status(
+    flow_type_id: int,
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
     """Fetch network status for a service type."""
     try:
         status = get_network_status_summary(flow_type_id=flow_type_id)
-        logger.info("Fetched network status.")
-        # logger.info(f"Network Status:\n{status}")
+        if runtime is not None:
+            ctx = runtime.context
+            logger.info(
+                "Fetched network status for agent=%s session=%s snapshot=%s",
+                ctx.agent_name,
+                ctx.session_id,
+                ctx.snapshot_id,
+            )
+        else:
+            logger.info("Fetched network status.")
         return status
     except Exception as exc:
-        return f"获取网络状态失败: {str(exc)}"
+        return f"Failed to fetch network status: {exc}"
 
 
 @tool
-def run_optimization_solver(w1: float, w2: float, w3: float, mode: str, app_details: str) -> str:
+def run_optimization_solver(
+    w1: float,
+    w2: float,
+    w3: float,
+    mode: str,
+    app_details: str,
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
     """
-    Invoke the optimizer.
-    Args:
-    - w1: Load balancing weight
-    - w2: Reconfiguration cost weight
-    - w3: Service experience weight
-    - mode: Optimization mode (full/incremental/hybrid)
-    - app_details: JSON string containing app and flow details (including QoS requirements)
-    
-    Returns:
-    - A JSON string containing the optimized strategy, including recommended actions and policy details.
+    Invoke the network optimizer and return a JSON string payload.
     """
     try:
         app_data = json.loads(app_details) if isinstance(app_details, str) else app_details
         result = optimize_network_slices(app_data, w1, w2, w3, mode=mode)
-        meta = result.get("meta", {})
-        logger.info(f"Optimization Solver Result:\n{meta.get('status')}")
-        return result
+        meta = result.get("meta", {}) if isinstance(result, dict) else {}
+        if runtime is not None:
+            ctx = runtime.context
+            logger.info(
+                "Optimization solver completed for agent=%s session=%s snapshot=%s status=%s",
+                ctx.agent_name,
+                ctx.session_id,
+                ctx.snapshot_id,
+                meta.get("status"),
+            )
+        else:
+            logger.info("Optimization solver completed with status=%s", meta.get("status"))
+        return json.dumps(_json_friendly(result), ensure_ascii=False)
     except Exception as exc:
-        return f"工具执行错误: {str(exc)}"
+        return f"Optimization solver failed: {exc}"
 
 
 def _json_friendly(value: Any) -> Any:
@@ -75,15 +95,6 @@ def _json_friendly(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
-
-
-def _extract_json_payload(text: str) -> str:
-    cleaned = (text or "").strip()
-    if "```json" in cleaned:
-        cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0]
-    elif "```" in cleaned:
-        cleaned = cleaned.split("```", 1)[1].split("```", 1)[0]
-    return cleaned.strip()
 
 
 def _strip_rule_prefix(candidate: Any) -> Optional[str]:
@@ -133,6 +144,15 @@ def _coerce_str(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _coerce_numeric_str(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    try:
+        return str(float(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _extract_ursp_flow_desc_from_five_tuple(five_tuple: Any) -> Optional[str]:
     if not isinstance(five_tuple, (list, tuple)) or len(five_tuple) != 5:
         return None
@@ -148,52 +168,64 @@ def _extract_ursp_flow_desc_from_five_tuple(five_tuple: Any) -> Optional[str]:
     return f"{protocol} {dst_ip} {dst_port}"
 
 
-class Strategy(BaseModel):
-    """OSA strategy envelope."""
-
-    recommended_actions: List[str] = Field(default_factory=list, description="Recommended actions")
-    supi: str = Field(default="", description="User SUPI")
-    app_id: str = Field(default="", description="Application ID")
-    flow_id: Optional[str] = Field(default=None, description="Flow ID")
-    target_type: str = Field(default="flow", description="Target scope")
-    policy_id: str = Field(default="", description="Unique policy ID")
-    policy_type: str = Field(..., description="Policy type")
-    policy_details: Dict[str, Any] = Field(default_factory=dict, description="Raw policy details")
-
-    @field_serializer("policy_details", when_used="always")
-    def _serialize_policy_details(self, value: Dict[str, Any]) -> Any:
-        return _json_friendly(value)
-
-
-class OutputStrategy(BaseModel):
-    """OSA output envelope."""
-
-    supi: str = Field(default="", description="User SUPI")
-    all_policies: List[Strategy] = Field(default_factory=list, description="All generated policies")
-
-
 class OptimizationStrategyAgent(BaseAgent):
     def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507"):
         super().__init__(model_name=model_name)
+        self.agent_name = "optimization_strategy"
+        self.workspace = AgentWorkspace.for_agent(self.agent_name)
+        self.cache = ArtifactCache(self.workspace)
+        self.artifact_store = ArtifactStore()
         self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[94m")
         self.tools = [run_optimization_solver, fetch_network_status]
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
-        self.tool_map = {tool_obj.name: tool_obj for tool_obj in self.tools}
-        self.output_parser = PydanticOutputParser(pydantic_object=OutputStrategy)
+        self.agent = self.create_structured_agent(
+            tools=self.tools,
+            system_prompt=OSA_SYSTEM_PROMPT,
+            response_format=PolicyPlanDraft,
+        )
 
-    def _normalize_tool_args_for_log(self, tool_args: Any) -> Any:
-        if not isinstance(tool_args, dict):
-            return tool_args
+    @staticmethod
+    def _build_request_message(
+        normalized_user_intent: Dict[str, Any],
+        coordination_context: Dict[str, Any],
+    ) -> str:
+        return (
+            "Operation intent:\n"
+            f"{json.dumps(normalized_user_intent, ensure_ascii=False)}\n\n"
+            "Collaboration context:\n"
+            f"{json.dumps(coordination_context, ensure_ascii=False)}\n\n"
+            "Fetch network status first, then run optimization and return a structured policy draft."
+        )
 
-        normalized = dict(tool_args)
-        for key in ["incremental_flows", "strategy_json", "app_details"]:
-            value = normalized.get(key)
-            if isinstance(value, str):
-                try:
-                    normalized[key] = json.loads(value)
-                except Exception:
-                    pass
-        return normalized
+    def _cache_received_request(self, planning_request: PlanningRequest) -> ArtifactEnvelope:
+        envelope = ArtifactEnvelope(
+            artifact_type="PlanningRequest",
+            source_agent="coordinator",
+            target_agent=self.agent_name,
+            session_id=str(planning_request.context.session_id or "").strip(),
+            snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
+            payload=planning_request.model_dump(mode="json"),
+        )
+        self.cache.cache_received(envelope)
+        return envelope
+
+    def _cache_produced_result(
+        self,
+        *,
+        request_envelope: ArtifactEnvelope,
+        policy_plan: PolicyPlanDraft,
+    ) -> None:
+        self.cache.cache_produced(
+            ArtifactEnvelope(
+                artifact_type="PolicyPlanDraft",
+                source_agent=self.agent_name,
+                target_agent=request_envelope.source_agent,
+                session_id=request_envelope.session_id,
+                snapshot_id=request_envelope.snapshot_id,
+                correlation_id=request_envelope.correlation_id,
+                upstream_artifact_ids=[request_envelope.artifact_id],
+                payload=policy_plan.model_dump(mode="json"),
+            )
+        )
 
     @staticmethod
     def _extract_flow_id_from_policy_data(data: Dict[str, Any]) -> Optional[str]:
@@ -274,14 +306,11 @@ class OptimizationStrategyAgent(BaseAgent):
         selected_pcc: Dict[str, Any],
         canonical_flow_id: Optional[str],
     ) -> List[Dict[str, Any]]:
-        existing = selected_pcc.get("flowInfos")
-        if isinstance(existing, list) and existing:
-            return _json_friendly(existing)
-
         if flow_ctx:
             flow_info = build_flow_info_from_five_tuple(flow_ctx.get("five_tuple"))
             if flow_info:
                 return [flow_info]
+
             flow_description = build_flow_description_from_five_tuple(flow_ctx.get("five_tuple"))
             if flow_description:
                 return [{"flowDescription": flow_description, "flowDirection": "BIDIRECTIONAL"}]
@@ -289,6 +318,10 @@ class OptimizationStrategyAgent(BaseAgent):
             description = str(flow_ctx.get("description") or flow_ctx.get("name") or canonical_flow_id or "flow").strip()
             if description:
                 return [{"flowDescription": description, "flowDirection": "BIDIRECTIONAL"}]
+
+        existing = selected_pcc.get("flowInfos")
+        if isinstance(existing, list) and existing:
+            return _json_friendly(existing)
 
         if canonical_flow_id:
             return [{"flowDescription": canonical_flow_id, "flowDirection": "BIDIRECTIONAL"}]
@@ -338,6 +371,7 @@ class OptimizationStrategyAgent(BaseAgent):
             flow_desc = _extract_ursp_flow_desc_from_five_tuple(flow_ctx.get("five_tuple"))
             if flow_desc:
                 flow_descs = [flow_desc]
+
         if flow_descs:
             traffic_desc["flowDescs"] = flow_descs
         else:
@@ -357,7 +391,7 @@ class OptimizationStrategyAgent(BaseAgent):
         traffic_desc: Optional[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         route_sets = details.get("routeSelParamSets")
-        precedence_default = _coerce_int(details.get("relatPrecedence")) or _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or 1
+        precedence = _coerce_int(details.get("relatPrecedence")) or _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or 1
         default_dnn = None
         if isinstance(traffic_desc, dict):
             dnns = traffic_desc.get("dnns")
@@ -369,11 +403,9 @@ class OptimizationStrategyAgent(BaseAgent):
             for route_set in route_sets:
                 if not isinstance(route_set, dict):
                     continue
-                precedence = _coerce_int(route_set.get("precedence")) or _coerce_int(route_set.get("priority")) or precedence_default
-                dnn = _coerce_str(route_set.get("dnn")) or default_dnn or "default"
                 normalized_route_set: Dict[str, Any] = {
-                    "dnn": dnn,
-                    "precedence": precedence,
+                    "dnn": _coerce_str(route_set.get("dnn")) or default_dnn or "default",
+                    "precedence": _coerce_int(route_set.get("precedence")) or _coerce_int(route_set.get("priority")) or precedence,
                 }
                 snssai = self._normalize_snssai(route_set.get("snssai"))
                 if snssai is not None:
@@ -383,14 +415,14 @@ class OptimizationStrategyAgent(BaseAgent):
         if normalized_route_sets:
             return normalized_route_sets
 
-        fallback_route_set: Dict[str, Any] = {
+        default_route_set: Dict[str, Any] = {
             "dnn": default_dnn or "default",
-            "precedence": precedence_default,
+            "precedence": precedence,
         }
         snssai = self._normalize_snssai(details.get("snssai"))
         if snssai is not None:
-            fallback_route_set["snssai"] = snssai
-        return [fallback_route_set]
+            default_route_set["snssai"] = snssai
+        return [default_route_set]
 
     def _normalize_sm_policy_details(
         self,
@@ -403,9 +435,9 @@ class OptimizationStrategyAgent(BaseAgent):
         pcc_rules = data.get("pccRules") or data.get("pcc_rules")
         qos_decs = data.get("qosDecs") or data.get("qos_decs")
         if not isinstance(pcc_rules, dict) or not pcc_rules:
-            raise ValueError("SmPolicyDecision 缺少 pccRules")
+            raise ValueError("SmPolicyDecision is missing pccRules.")
         if not isinstance(qos_decs, dict) or not qos_decs:
-            raise ValueError("SmPolicyDecision 缺少 qosDecs")
+            raise ValueError("SmPolicyDecision is missing qosDecs.")
 
         _, selected_pcc = self._pick_mapping_entry(pcc_rules, flow_id, "pccRuleId")
         _, selected_qos = self._pick_mapping_entry(qos_decs, flow_id, "qosId")
@@ -443,6 +475,7 @@ class OptimizationStrategyAgent(BaseAgent):
             pcc_payload["appId"] = _normalize_app_id(flow_ctx.get("app_id"))
         elif selected_pcc.get("appId"):
             pcc_payload["appId"] = _normalize_app_id(selected_pcc.get("appId"))
+
         for key in (
             "appDescriptor",
             "contVer",
@@ -472,9 +505,15 @@ class OptimizationStrategyAgent(BaseAgent):
 
         qos_payload: Dict[str, Any] = {
             "qosId": canonical_qos_id,
-            "priorityLevel": _coerce_int(selected_qos.get("priorityLevel")) or _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or 1,
-            "packetDelayBudget": _coerce_int(selected_qos.get("packetDelayBudget")) or _coerce_int(flow_ctx.get("lat") if flow_ctx else None) or 0,
-            "packetErrorRate": _coerce_str(selected_qos.get("packetErrorRate")) or _coerce_str(flow_ctx.get("loss_req") if flow_ctx else None) or "0.0",
+            "priorityLevel": _coerce_int(flow_ctx.get("priority") if flow_ctx else None)
+            or _coerce_int(selected_qos.get("priorityLevel"))
+            or 1,
+            "packetDelayBudget": _coerce_int(flow_ctx.get("lat") if flow_ctx else None)
+            or _coerce_int(selected_qos.get("packetDelayBudget"))
+            or 0,
+            "packetErrorRate": _coerce_str(flow_ctx.get("loss_req") if flow_ctx else None)
+            or _coerce_str(selected_qos.get("packetErrorRate"))
+            or "0.0",
         }
         for qos_key, flow_key in (
             ("maxbrUl", "bw_ul"),
@@ -482,15 +521,21 @@ class OptimizationStrategyAgent(BaseAgent):
             ("gbrUl", "gbr_ul"),
             ("gbrDl", "gbr_dl"),
         ):
-            qos_payload[qos_key] = _coerce_str(selected_qos.get(qos_key)) or _coerce_str(flow_ctx.get(flow_key) if flow_ctx else None)
+            qos_payload[qos_key] = (
+                _coerce_numeric_str(flow_ctx.get(flow_key) if flow_ctx else None)
+                or _coerce_numeric_str(selected_qos.get(qos_key))
+            )
+
         var5qi = selected_qos.get("var5qi", selected_qos.get("5qi"))
         if var5qi not in (None, ""):
             qos_payload["var5qi"] = _coerce_int(var5qi)
+
         arp = selected_qos.get("arp")
         if isinstance(arp, dict):
-            arp = _json_friendly(arp)
-            arp["priorityLevel"] = _coerce_int(arp.get("priorityLevel")) or qos_payload["priorityLevel"]
-            qos_payload["arp"] = arp
+            arp_payload = _json_friendly(arp)
+            arp_payload["priorityLevel"] = _coerce_int(arp_payload.get("priorityLevel")) or qos_payload["priorityLevel"]
+            qos_payload["arp"] = arp_payload
+
         for key in (
             "qnc",
             "averWindow",
@@ -547,153 +592,123 @@ class OptimizationStrategyAgent(BaseAgent):
         validated = UrspRuleRequest.model_validate(ursp_payload)
         return _json_friendly(validated), target_type
 
-    def _normalize_output_strategy(self, output: OutputStrategy, user_intent: Dict[str, Any]) -> OutputStrategy:
-        normalized_user_intent = _json_friendly(user_intent)
+    def _normalize_policy_plan_draft(
+        self,
+        draft: PolicyPlanDraft,
+        operation_intent: OperationIntent,
+    ) -> PolicyPlanDraft:
+        normalized_user_intent = _json_friendly(operation_intent.model_dump(mode="json"))
         normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
         user_flows = normalized_user_intent.get("flows") or []
-        flow_map = {}
+
+        flow_map: Dict[str, Dict[str, Any]] = {}
         for flow in user_flows:
             if isinstance(flow, dict) and flow.get("flow_id"):
                 normalized_flow = dict(flow)
                 normalized_flow["app_id"] = normalized_user_intent.get("app_id")
                 flow_map[str(flow.get("flow_id"))] = normalized_flow
+
         single_flow_id = next(iter(flow_map.keys())) if len(flow_map) == 1 else None
         base_supi = str(
-            output.supi
+            draft.supi
             or normalized_user_intent.get("supi")
             or next((flow.get("supi") for flow in user_flows if isinstance(flow, dict) and flow.get("supi")), "")
             or ""
         ).strip()
         base_app_id = _normalize_app_id(normalized_user_intent.get("app_id"))
 
-        normalized_policies: List[Strategy] = []
-        for index, strategy in enumerate(output.all_policies):
-            details_payload = _json_friendly(strategy.policy_details)
-            inferred_flow_id = strategy.flow_id or self._extract_flow_id_from_policy_data(details_payload) or single_flow_id
+        normalized_policies: List[PolicyDraft] = []
+        for index, policy_draft in enumerate(draft.all_policies):
+            details_payload = _json_friendly(policy_draft.policy_details)
+            inferred_flow_id = (
+                policy_draft.flow_id
+                or self._extract_flow_id_from_policy_data(details_payload)
+                or single_flow_id
+            )
             flow_ctx = flow_map.get(str(inferred_flow_id)) if inferred_flow_id else None
-            supi = str(strategy.supi or base_supi or (flow_ctx.get("supi") if flow_ctx else "") or "").strip()
-            app_id = _normalize_app_id(strategy.app_id or base_app_id or "")
-            target_type = strategy.target_type or ("flow" if inferred_flow_id else "app")
+            supi = str(policy_draft.supi or base_supi or (flow_ctx.get("supi") if flow_ctx else "") or "").strip()
+            app_id = _normalize_app_id(policy_draft.app_id or base_app_id or "")
+            target_type = policy_draft.target_type or ("flow" if inferred_flow_id else "app")
 
-            if strategy.policy_type == "SmPolicyDecision":
+            if policy_draft.policy_type == "SmPolicyDecision":
                 policy_details = self._normalize_sm_policy_details(details_payload, inferred_flow_id, flow_ctx)
-            elif strategy.policy_type == "UrspRuleRequest":
+            elif policy_draft.policy_type == "UrspRuleRequest":
                 details_payload["_flow_ctx"] = flow_ctx
                 policy_details, target_type = self._normalize_ursp_policy_details(details_payload, target_type)
             else:
-                raise ValueError(f"Unsupported policy_type: {strategy.policy_type}")
+                raise ValueError(f"Unsupported policy_type: {policy_draft.policy_type}")
 
-            policy_id = _build_policy_id(strategy.policy_type, app_id or "app", inferred_flow_id, target_type)
+            if target_type == "flow" and policy_draft.policy_type == "SmPolicyDecision" and not inferred_flow_id:
+                raise ValueError(f"Policy #{index + 1} is missing flow_id for a flow-scoped SmPolicyDecision.")
+
+            policy_id = _build_policy_id(policy_draft.policy_type, app_id or "app", inferred_flow_id, target_type)
             normalized_policies.append(
-                Strategy(
-                    recommended_actions=list(strategy.recommended_actions or []),
+                PolicyDraft(
+                    recommended_actions=list(policy_draft.recommended_actions or []),
                     supi=supi,
                     app_id=app_id,
                     flow_id=inferred_flow_id,
                     target_type=target_type,
                     policy_id=policy_id,
-                    policy_type=strategy.policy_type,
+                    policy_type=policy_draft.policy_type,
                     policy_details=policy_details,
                 )
             )
 
-            if target_type == "flow" and strategy.policy_type == "SmPolicyDecision" and not inferred_flow_id:
-                raise ValueError(f"策略 #{index + 1} 缺少 flow_id")
-
-        return OutputStrategy(supi=base_supi, all_policies=normalized_policies)
-
-    def _fallback_output(self, user_intent: Dict[str, Any], message: str) -> OutputStrategy:
-        supi = str(
-            user_intent.get("supi")
-            or next((flow.get("supi") for flow in user_intent.get("flows", []) if isinstance(flow, dict) and flow.get("supi")), "")
-            or ""
-        ).strip()
-        app_id = _normalize_app_id(user_intent.get("app_id"))
-        flow_id = None
-        flows = user_intent.get("flows") or []
-        if len(flows) == 1 and isinstance(flows[0], dict):
-            flow_id = flows[0].get("flow_id")
-
-        fallback_details = _json_friendly(SmPolicyDecision(pccRules={}, qosDecs={}))
-        return OutputStrategy(
-            supi=supi,
-            all_policies=[
-                Strategy(
-                    recommended_actions=[message],
-                    supi=supi,
-                    app_id=app_id,
-                    flow_id=flow_id,
-                    target_type="flow" if flow_id else "app",
-                    policy_id=_build_policy_id("SmPolicyDecision", app_id or "app", flow_id, "flow" if flow_id else "app"),
-                    policy_type="SmPolicyDecision",
-                    policy_details=fallback_details,
-                )
-            ],
+        return PolicyPlanDraft(
+            supi=base_supi,
+            session_id=str(draft.session_id or normalized_user_intent.get("session_id") or "").strip(),
+            snapshot_id=str(draft.snapshot_id or normalized_user_intent.get("snapshot_id") or "").strip(),
+            all_policies=normalized_policies,
         )
 
-    def generate_strategy(self, user_intent: Dict[str, Any]) -> OutputStrategy:
-        normalized_user_intent = _json_friendly(user_intent)
+    def generate_strategy(self, planning_request: PlanningRequest) -> PolicyPlanDraft:
+        if not isinstance(planning_request, PlanningRequest):
+            raise TypeError("generate_strategy expects a PlanningRequest instance")
+
+        request_envelope = self._cache_received_request(planning_request)
+        operation_intent = planning_request.operation_intent
+        normalized_user_intent = _json_friendly(operation_intent.model_dump(mode="json"))
         normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
-        intent_json = json.dumps(normalized_user_intent, ensure_ascii=False)
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", OSA_SYSTEM_PROMPT),
-                ("user", "用户意图:\n{intent_json}\n\n请先获取网络状态，再执行优化并返回结构化策略。"),
-            ]
-        )
-        messages = prompt.format_messages(
-            intent_json=intent_json,
-            format_instructions=self.output_parser.get_format_instructions(),
-        )
+        coordination_context = _json_friendly(planning_request.context.model_dump(mode="json"))
 
         total_start = time.perf_counter()
         log_event(self.logger, "osa_generate_start")
         try:
-            for iteration in range(5):
-                response = self.llm_with_tools.invoke(messages)
-                messages.append(response)
+            runtime_context = self.build_runtime_context(
+                agent_name=self.agent_name,
+                session_id=planning_request.context.session_id,
+                snapshot_id=planning_request.context.snapshot_id,
+                supi=operation_intent.supi,
+                thread_id=planning_request.context.session_id,
+            )
+            result = self.agent.invoke(
+                {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": self._build_request_message(
+                                normalized_user_intent=normalized_user_intent,
+                                coordination_context=coordination_context,
+                            ),
+                        }
+                    ]
+                },
+                context=runtime_context,
+            )
+            structured = result.get("structured_response")
+            if structured is None:
+                raise RuntimeError("OSA agent returned no structured_response.")
 
-                if not getattr(response, "tool_calls", None):
-                    log_event(self.logger, "osa_parse_output_start", iteration=iteration + 1)
-                    try:
-                        payload = _extract_json_payload(response.content)
-                        final_output = self.output_parser.parse(payload)
-                        normalized_output = self._normalize_output_strategy(final_output, normalized_user_intent)
-                        log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="success")
-                        return normalized_output
-                    except Exception as parse_err:
-                        self.logger.error(f"解析最终输出失败: {parse_err}. Content: {response.content}")
-                        log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="parse_failed")
-                        return self._fallback_output(normalized_user_intent, "Error parsing or normalizing agent output")
-
-                for tool_call in response.tool_calls:
-                    tool_name = tool_call["name"]
-                    tool_args = tool_call["args"]
-                    tool_id = tool_call["id"]
-
-                    log_args = self._normalize_tool_args_for_log(tool_args)
-                    self.logger.info(
-                        f"LLM 决定调用工具: {tool_name}\n参数: {json.dumps(log_args, ensure_ascii=False, indent=2)}"
-                    )
-
-                    if tool_name in self.tool_map:
-                        tool_instance = self.tool_map[tool_name]
-                        try:
-                            tool_start = time.perf_counter()
-                            tool_result = tool_instance.invoke(tool_args)
-                            log_timing(self.logger, "osa_tool_call", time.perf_counter() - tool_start, tool=tool_name)
-                        except Exception as exc:
-                            tool_result = f"工具执行异常: {exc}"
-                    else:
-                        tool_result = f"Error: Tool {tool_name} not found."
-
-                    messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_id))
-
-            self.logger.warning("达到最大迭代次数。")
-            log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="max_iterations")
-            return self._fallback_output(normalized_user_intent, "Max iterations reached")
-
+            final_output = PolicyPlanDraft.model_validate(structured)
+            normalized_output = self._normalize_policy_plan_draft(final_output, operation_intent)
+            self._cache_produced_result(
+                request_envelope=request_envelope,
+                policy_plan=normalized_output,
+            )
+            log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="success")
+            return normalized_output
         except Exception as exc:
-            self.logger.error(f"策略生成出错: {exc}")
+            self.logger.error(f"Failed to generate optimization strategy: {exc}")
             log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="error")
-            return self._fallback_output(normalized_user_intent, f"Agent execution error: {exc}")
+            raise

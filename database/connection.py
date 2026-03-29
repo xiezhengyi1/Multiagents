@@ -8,8 +8,20 @@ load_dotenv()
 
 logger = setup_logger(__name__)
 
-# Default to a local postgres instance if not provided
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/multiagents_db")
+DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/multiagents_db"
+RAW_DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+
+
+def to_sqlalchemy_url(database_url: str) -> str:
+    normalized = str(database_url or "").strip()
+    if normalized.startswith("postgresql+psycopg://"):
+        return normalized
+    if normalized.startswith("postgresql://"):
+        return normalized.replace("postgresql://", "postgresql+psycopg://", 1)
+    return normalized
+
+
+DATABASE_URL = to_sqlalchemy_url(RAW_DATABASE_URL)
 
 try:
     # Ensure client_encoding is utf8 to avoid encoding issues on Windows
@@ -36,3 +48,14 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+__all__ = [
+    "Base",
+    "DATABASE_URL",
+    "RAW_DATABASE_URL",
+    "SessionLocal",
+    "engine",
+    "get_db",
+    "to_sqlalchemy_url",
+]

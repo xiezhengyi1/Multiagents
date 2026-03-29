@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from tools.db_tool import create_session_context, get_latest_session_context, update_session_context
+from domain.collaboration import AgentHandoff, PlanningContext, PlanningRequest
+from domain.policy_plan import OperationIntent
+from tools.db_tool import create_session_context, get_latest_snapshot_metadata, update_session_context
 from utils.logger import log_event, log_timing, setup_logger
 
 if TYPE_CHECKING:
-    from multi_agents.IntentEncodingAgent import IntentEncodingAgent
-    from multi_agents.MemoryManager import MemoryManager
-    from multi_agents.OptimizationStrategyAgent import OptimizationStrategyAgent
-    from multi_agents.PolicyDispatchAgent import PolicyDispatchAgent
+    from agents.intent_encoding import IntentEncodingAgent
+    from agents.MemoryManager import MemoryManager
+    from agents.optimization_strategy import OptimizationStrategyAgent
+    from agents.policy_dispatch import PolicyDispatchAgent
 
 
 SUCCESS_STATUS = "Success"
@@ -47,6 +48,7 @@ class RoundTrace:
     intent: Dict[str, Any] = field(default_factory=dict)
     strategy: Dict[str, Any] = field(default_factory=dict)
     feedback: Dict[str, Any] = field(default_factory=dict)
+    handoffs: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -54,6 +56,7 @@ class RoundTrace:
             "intent": self.intent,
             "strategy": self.strategy,
             "feedback": self.feedback,
+            "handoffs": self.handoffs,
         }
 
 
@@ -106,9 +109,9 @@ class MultiAgentSystem:
 
         self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[96m")
         if ie_agent is None or os_agent is None or pd_agent is None:
-            from multi_agents.IntentEncodingAgent import IntentEncodingAgent
-            from multi_agents.OptimizationStrategyAgent import OptimizationStrategyAgent
-            from multi_agents.PolicyDispatchAgent import PolicyDispatchAgent
+            from agents.intent_encoding import IntentEncodingAgent
+            from agents.optimization_strategy import OptimizationStrategyAgent
+            from agents.policy_dispatch import PolicyDispatchAgent
 
             ie_agent = ie_agent or IntentEncodingAgent()
             os_agent = os_agent or OptimizationStrategyAgent()
@@ -120,22 +123,11 @@ class MultiAgentSystem:
         self.max_rounds = max_rounds
         self.memory_manager = memory_manager if memory_manager is not None else self._init_memory_manager()
 
-    def _init_memory_manager(self) -> Optional["MemoryManager"]:
-        try:
-            from multi_agents.MemoryManager import MemoryManager
-
-            long_term_file = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "database",
-                "long_term_memory.json",
-            )
-            return MemoryManager(
-                short_term_limit=max(20, self.max_rounds * 8),
-                long_term_file=long_term_file,
-            )
-        except Exception as exc:
-            self.logger.warning(f"MemoryManager unavailable, coordinator will run without it: {exc}")
-            return None
+    def _init_memory_manager(self) -> "MemoryManager":
+        from agents.MemoryManager import MemoryManager
+        return MemoryManager(
+            short_term_limit=max(20, self.max_rounds * 8),
+        )
 
     def _build_initial_session_payloads(self, user_input: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
         return (
@@ -152,7 +144,7 @@ class MultiAgentSystem:
             },
         )
 
-    def _safe_update_session_context(
+    def _update_session_context(
         self,
         session_id: Optional[str],
         *,
@@ -162,7 +154,7 @@ class MultiAgentSystem:
         status: Optional[str] = None,
     ) -> None:
         if not session_id:
-            return
+            raise RuntimeError("session_id is required before updating session context.")
         ok = update_session_context(
             session_id,
             current_step=current_step,
@@ -171,33 +163,22 @@ class MultiAgentSystem:
             status=status,
         )
         if not ok:
-            self.logger.warning(f"Failed to persist session context update for {session_id}.")
+            raise RuntimeError(f"Failed to persist session context update for {session_id}.")
 
     def _remember(self, role: str, payload: Any) -> None:
-        if self.memory_manager is None:
-            return
-
-        try:
-            if isinstance(payload, str):
-                content = payload
-            elif isinstance(payload, dict):
-                content = json.dumps(payload, ensure_ascii=False)
-            else:
-                content = json.dumps(_to_dict(payload), ensure_ascii=False)
-            self.memory_manager.add_memory(role, content)
-        except Exception as exc:
-            self.logger.warning(f"Failed to write memory for role={role}: {exc}")
+        if isinstance(payload, str):
+            content = payload
+        elif isinstance(payload, dict):
+            content = json.dumps(payload, ensure_ascii=False)
+        else:
+            content = json.dumps(_to_dict(payload), ensure_ascii=False)
+        if role == "IEA":
+            payload_dict = payload if isinstance(payload, dict) else _to_dict(payload)
+            self.memory_manager.bind_supi(str(payload_dict.get("supi") or "").strip() or None)
+        self.memory_manager.add_memory(role, content)
 
     def _build_memory_context(self, user_input: str) -> str:
-        if self.memory_manager is None:
-            return ""
-
-        try:
-            memory_bundle = self.memory_manager.retrieve(user_input)
-        except Exception as exc:
-            self.logger.warning(f"Failed to retrieve memory context: {exc}")
-            return ""
-
+        memory_bundle = self.memory_manager.retrieve(user_input)
         short_term = memory_bundle.get("short_term", []) if isinstance(memory_bundle, dict) else []
         long_term = memory_bundle.get("long_term", []) if isinstance(memory_bundle, dict) else []
         blocks: List[str] = []
@@ -220,31 +201,23 @@ class MultiAgentSystem:
         cleaned = [str(block).strip() for block in blocks if str(block or "").strip()]
         return "\n\n".join(cleaned)
 
-    def _extract_latest_intent_from_session_context(self) -> Optional[Dict[str, Any]]:
-        latest_session = get_latest_session_context()
-        if not isinstance(latest_session, dict):
-            return None
-
-        intent_data = latest_session.get("intent_data")
-        if not isinstance(intent_data, dict):
-            return None
-
-        latest_intent = intent_data.get("latest_intent")
-        if isinstance(latest_intent, dict) and latest_intent:
-            return latest_intent
-
-        history = intent_data.get("intent_history")
-        if isinstance(history, list):
-            for item in reversed(history):
-                if isinstance(item, dict) and isinstance(item.get("output"), dict):
-                    return item["output"]
-        return None
-
-    def _run_iea_with_retry(self, user_input: str, context: str = "") -> Any:
+    def _run_iea_with_retry(
+        self,
+        user_input: str,
+        *,
+        context: str = "",
+        session_id: str = "",
+        snapshot_id: str = "",
+    ) -> OperationIntent:
         last_error: Optional[Exception] = None
         for attempt in range(2):
             try:
-                intent_obj = self.ie_agent.analyze_intent(user_input, context=context)
+                intent_obj = self.ie_agent.analyze_operation_intent(
+                    user_input,
+                    context=context,
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                )
                 if intent_obj is None:
                     raise RuntimeError("IEA returned None")
                 if attempt == 1:
@@ -255,54 +228,41 @@ class MultiAgentSystem:
                 self.logger.warning(f"IEA failed on attempt {attempt + 1}/2: {exc}")
         raise RuntimeError(f"IEA failed after retry: {last_error}")
 
-    def _run_osa_with_retry(self, intent: Dict[str, Any]) -> Any:
-        primary_error: Optional[Exception] = None
-        try:
-            strategy_obj = self.os_agent.generate_strategy(intent)
-            if strategy_obj is None:
-                raise RuntimeError("OSA returned None")
-            return strategy_obj
-        except Exception as exc:
-            primary_error = exc
-            self.logger.warning(f"OSA failed on first attempt: {exc}")
-
-        fallback_intent = self._extract_latest_intent_from_session_context()
-        if not isinstance(fallback_intent, dict) or not fallback_intent:
-            raise RuntimeError(f"OSA failed and no latest intent_data was available for retry: {primary_error}")
-
-        try:
-            strategy_obj = self.os_agent.generate_strategy(fallback_intent)
-            if strategy_obj is None:
-                raise RuntimeError("OSA returned None on retry")
-            self.logger.info("OSA succeeded on retry using latest session_context.intent_data.")
-            return strategy_obj
-        except Exception as retry_exc:
-            raise RuntimeError(
-                f"OSA failed after retry. first_error={primary_error}; retry_error={retry_exc}"
-            ) from retry_exc
+    def _run_osa_with_retry(self, planning_request: PlanningRequest) -> Any:
+        last_error: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                strategy_obj = self.os_agent.generate_strategy(planning_request)
+                if strategy_obj is None:
+                    raise RuntimeError("OSA returned None")
+                if attempt == 1:
+                    self.logger.info("OSA succeeded on retry with the same planning request.")
+                return strategy_obj
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning(f"OSA failed on attempt {attempt + 1}/2: {exc}")
+        raise RuntimeError(f"OSA failed after retry: {last_error}")
 
     @staticmethod
-    def _normalize_intent_payload(intent_obj: Any, user_input: str) -> Dict[str, Any]:
-        intent = _to_dict(intent_obj)
-        supi = str(intent.get("supi") or "").strip()
+    def _require_snapshot_metadata() -> Dict[str, Any]:
+        snapshot_meta = get_latest_snapshot_metadata()
+        if not isinstance(snapshot_meta, dict):
+            raise RuntimeError("No network snapshot available for planning.")
+        snapshot_id = str(snapshot_meta.get("snapshot_id") or "").strip()
+        if not snapshot_id:
+            raise RuntimeError("Latest network snapshot is missing snapshot_id.")
+        return snapshot_meta
+
+    @staticmethod
+    def _validate_resolved_intent(intent: Any) -> None:
+        intent_payload = _to_dict(intent)
+        supi = str(intent_payload.get("supi") or "").strip()
         if not supi:
             raise ValueError(
                 "UE input is assumed to contain SUPI, but IEA output does not contain a valid supi."
             )
-
-        flows = intent.get("flows") or []
-        for flow in flows:
-            if isinstance(flow, dict) and not flow.get("supi"):
-                flow["supi"] = supi
-
-        intent["supi"] = supi
-        intent.setdefault("raw_input", user_input)
-        return intent
-
-    @staticmethod
-    def _validate_resolved_intent(intent: Dict[str, Any]) -> None:
-        resolution_status = str(intent.get("resolution_status") or "").strip().lower()
-        flows = intent.get("flows") or []
+        resolution_status = str(intent_payload.get("resolution_status") or "").strip().lower()
+        flows = intent_payload.get("flows") or []
         unresolved_flows = [
             flow for flow in flows
             if str(flow.get("resolution_status") or "").strip().lower() != SUCCESS_STATUS.lower()
@@ -340,6 +300,54 @@ class MultiAgentSystem:
             return feedback_block
         return f"{previous_context}\n\n{feedback_block}"
 
+    @staticmethod
+    def _build_planning_request(
+        *,
+        round_index: int,
+        operation_intent: OperationIntent,
+        session_id: str,
+        snapshot_id: str,
+        snapshot_metadata: Dict[str, Any],
+        memory_context: str,
+        feedback_context: str,
+        handoff_history: List[Dict[str, Any]],
+    ) -> PlanningRequest:
+        return PlanningRequest(
+            operation_intent=operation_intent,
+            context=PlanningContext(
+                round_index=round_index,
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                snapshot_metadata=snapshot_metadata,
+                memory_context=memory_context,
+                feedback_context=feedback_context,
+                handoff_history=handoff_history,
+            ),
+        )
+
+    @staticmethod
+    def _build_handoff(
+        *,
+        round_index: int,
+        source_agent: str,
+        target_agent: str,
+        artifact_type: str,
+        session_id: str,
+        snapshot_id: str,
+        summary: str,
+        payload: Any,
+    ) -> AgentHandoff:
+        return AgentHandoff(
+            round_index=round_index,
+            source_agent=source_agent,
+            target_agent=target_agent,
+            artifact_type=artifact_type,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            summary=summary,
+            payload=_to_dict(payload),
+        )
+
     def run(self, user_input: str) -> CoordinationResult:
         if not str(user_input).strip():
             raise ValueError("user_input must not be empty")
@@ -348,8 +356,8 @@ class MultiAgentSystem:
         log_event(self.logger, "coordinator_run_start", max_rounds=self.max_rounds)
 
         round_traces: List[RoundTrace] = []
+        collaboration_history: List[Dict[str, Any]] = []
         feedback_context = ""
-        memory_context = self._build_memory_context(user_input)
         final_feedback: Dict[str, Any] = _build_failure_feedback("Coordinator exited before PDA feedback.")
         final_supi = ""
         intent_session_data, policy_session_data = self._build_initial_session_payloads(user_input)
@@ -359,16 +367,31 @@ class MultiAgentSystem:
             policy_data=policy_session_data,
             status="active",
         )
-        self._remember("user", {"input": user_input})
+        if not session_id:
+            raise RuntimeError("Failed to create session context.")
+        self.memory_manager.bind_thread(session_id)
+        user_memory_written = False
 
         for round_index in range(1, self.max_rounds + 1):
             round_start = time.perf_counter()
             log_event(self.logger, "coordinator_round_start", round=round_index)
+            round_handoffs: List[AgentHandoff] = []
 
             try:
+                snapshot_meta = self._require_snapshot_metadata()
+                snapshot_id = str(snapshot_meta["snapshot_id"])
+                memory_context = self._build_memory_context(user_input)
+                if not user_memory_written:
+                    self._remember("user", {"input": user_input})
+                    user_memory_written = True
                 iea_context = self._merge_context_blocks(memory_context, feedback_context)
-                intent_obj = self._run_iea_with_retry(user_input, context=iea_context)
-                intent = self._normalize_intent_payload(intent_obj, user_input)
+                intent_obj = self._run_iea_with_retry(
+                    user_input,
+                    context=iea_context,
+                    session_id=session_id or "",
+                    snapshot_id=snapshot_id,
+                )
+                intent = _to_dict(intent_obj)
                 self._remember("IEA", intent)
                 intent_session_data["latest_intent"] = intent
                 intent_session_data["intent_history"].append(
@@ -378,7 +401,7 @@ class MultiAgentSystem:
                         "output": intent,
                     }
                 )
-                self._safe_update_session_context(
+                self._update_session_context(
                     session_id,
                     current_step="intent",
                     intent_data=intent_session_data,
@@ -387,10 +410,36 @@ class MultiAgentSystem:
                 )
                 self._validate_resolved_intent(intent)
                 final_supi = intent["supi"]
+                planning_request = self._build_planning_request(
+                    round_index=round_index,
+                    operation_intent=intent_obj,
+                    session_id=session_id or "",
+                    snapshot_id=snapshot_id,
+                    snapshot_metadata=snapshot_meta,
+                    memory_context=memory_context,
+                    feedback_context=feedback_context,
+                    handoff_history=list(collaboration_history),
+                )
+                round_handoffs.append(
+                    self._build_handoff(
+                        round_index=round_index,
+                        source_agent="IEA",
+                        target_agent="OSA",
+                        artifact_type="PlanningRequest",
+                        session_id=planning_request.context.session_id,
+                        snapshot_id=planning_request.context.snapshot_id,
+                        summary=(
+                            f"Resolved {len(intent_obj.flows)} flow(s) for SUPI {intent_obj.supi} "
+                            f"at round {round_index}."
+                        ),
+                        payload=planning_request,
+                    )
+                )
 
-                strategy_obj = self._run_osa_with_retry(intent)
+                strategy_obj = self._run_osa_with_retry(planning_request)
                 strategy = _to_dict(strategy_obj)
                 self._remember("OSA", strategy)
+                policy_session_data["snapshot"] = snapshot_meta
                 policy_session_data["latest_strategy"] = strategy
                 policy_session_data["strategy_history"].append(
                     {
@@ -399,12 +448,24 @@ class MultiAgentSystem:
                         "output": strategy,
                     }
                 )
-                self._safe_update_session_context(
+                self._update_session_context(
                     session_id,
                     current_step="generation",
                     intent_data=intent_session_data,
                     policy_data=policy_session_data,
                     status="active",
+                )
+                round_handoffs.append(
+                    self._build_handoff(
+                        round_index=round_index,
+                        source_agent="OSA",
+                        target_agent="PDA",
+                        artifact_type="PolicyPlanDraft",
+                        session_id=str(strategy_obj.session_id or session_id or ""),
+                        snapshot_id=str(strategy_obj.snapshot_id or snapshot_id),
+                        summary=f"Prepared {len(strategy_obj.all_policies)} policy draft(s) for execution.",
+                        payload=strategy_obj,
+                    )
                 )
 
                 feedback_obj = self.pd_agent.execute_and_evaluate(strategy_obj)
@@ -427,13 +488,14 @@ class MultiAgentSystem:
                         intent=intent,
                         strategy=strategy,
                         feedback=feedback,
+                        handoffs=[handoff.model_dump(mode="json") for handoff in round_handoffs],
                     )
                 )
                 final_feedback = feedback
 
                 status = str(feedback.get("execution_status") or "").strip()
                 persisted_status = "completed" if status == SUCCESS_STATUS else "active"
-                self._safe_update_session_context(
+                self._update_session_context(
                     session_id,
                     current_step="execution",
                     intent_data=intent_session_data,
@@ -449,6 +511,7 @@ class MultiAgentSystem:
                 )
 
                 if status == SUCCESS_STATUS:
+                    collaboration_history.extend([handoff.model_dump(mode="json") for handoff in round_handoffs])
                     log_timing(
                         self.logger,
                         "coordinator_run_total",
@@ -465,6 +528,24 @@ class MultiAgentSystem:
                         round_traces=round_traces,
                     )
 
+                if round_index < self.max_rounds:
+                    round_handoffs.append(
+                        self._build_handoff(
+                            round_index=round_index,
+                            source_agent="PDA",
+                            target_agent="IEA",
+                            artifact_type="FeedbackReport",
+                            session_id=session_id or "",
+                            snapshot_id=snapshot_id,
+                            summary=(
+                                "Execution failed and feedback was handed back to IEA "
+                                "for the next closed-loop round."
+                            ),
+                            payload=feedback_obj,
+                        )
+                    )
+                    round_traces[-1].handoffs = [handoff.model_dump(mode="json") for handoff in round_handoffs]
+                collaboration_history.extend([handoff.model_dump(mode="json") for handoff in round_handoffs])
                 feedback_context = self._build_feedback_context(feedback_context, feedback, round_index)
             except Exception as exc:
                 failure_feedback = _build_failure_feedback(str(exc))
@@ -478,7 +559,7 @@ class MultiAgentSystem:
                         "output": failure_feedback,
                     }
                 )
-                self._safe_update_session_context(
+                self._update_session_context(
                     session_id,
                     current_step="execution",
                     intent_data=intent_session_data,
@@ -489,6 +570,7 @@ class MultiAgentSystem:
                     RoundTrace(
                         round_index=round_index,
                         feedback=failure_feedback,
+                        handoffs=[handoff.model_dump(mode="json") for handoff in round_handoffs],
                     )
                 )
                 log_timing(
@@ -521,7 +603,7 @@ class MultiAgentSystem:
             time.perf_counter() - total_start,
             status="max_rounds",
         )
-        self._safe_update_session_context(
+        self._update_session_context(
             session_id,
             current_step="execution",
             intent_data=intent_session_data,
@@ -557,7 +639,7 @@ class MultiAgentSystem:
             f"PDA status: {result.final_status}."
         )
 def main() -> None:
-    user_input = "请降低视频流的带宽，supi: imsi-20893002"
+    user_input = "please reduce video flow bandwidth, supi: imsi-20893002"
     coordinator = MultiAgentSystem(max_rounds=3)
     result = coordinator.run(user_input)
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))

@@ -1,6 +1,10 @@
 import pandas as pd
 import json
-from langchain_core.tools import tool
+from typing import Optional
+
+from langchain.tools import ToolRuntime, tool
+
+from agent_runtime import AgentRuntimeContext
 from database.connection import SessionLocal
 from database.models import NetworkStatusSnapshot
 from tools.db_tool import _serialize_scenario_for_db
@@ -8,7 +12,10 @@ from tools.init_scenario import get_current_scenario
 from dataclasses import asdict
 
 @tool
-def save_network_status_snapshot(trigger_event: str = "Manual") -> str:
+def save_network_status_snapshot(
+    trigger_event: str = "Manual",
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
     """
     Take a snapshot of the current network status (Apps, Slices, Nodes) and save it to the history database.
     Useful for tracking system changes before/after optimization or periodically.
@@ -44,7 +51,11 @@ def save_network_status_snapshot(trigger_event: str = "Manual") -> str:
         finally:
             session.close()
             
-        return "Success: Network status snapshot saved."
+        prefix = ""
+        if runtime is not None:
+            ctx = runtime.context
+            prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
+        return f"{prefix}Success: Network status snapshot saved."
     except Exception as e:
         return f"Error saving snapshot: {str(e)}"
 

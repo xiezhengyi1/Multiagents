@@ -1,7 +1,4 @@
-"""tools 对外稳定入口。
-
-关键步骤：上层模块优先从本模块导入，避免深路径耦合。
-"""
+"""Stable public entry points for tool-layer helpers."""
 
 import importlib
 
@@ -65,9 +62,18 @@ def update_session_context(*args, **kwargs):
     from .db_tool import update_session_context as _impl
     return _impl(*args, **kwargs)
 
+
+def get_latest_snapshot_metadata(*args, **kwargs):
+    from .db_tool import get_latest_snapshot_metadata as _impl
+    return _impl(*args, **kwargs)
+
+
+def get_snapshot_data_by_id(*args, **kwargs):
+    from .db_tool import get_snapshot_data_by_id as _impl
+    return _impl(*args, **kwargs)
+
+
 __all__ = [
-    "normalize_app_input_with_ue_contexts",
-    "validate_input_contract",
     "get_current_scenario",
     "get_initial_scenario",
     "cache_scenario",
@@ -76,16 +82,16 @@ __all__ = [
     "serialize_scenario_for_api",
     "deserialize_scenario_payload",
     "get_network_status",
-    "run_joint_simulation",
     "update_ue_context_after_policy",
     "get_latest_session_context",
+    "get_latest_snapshot_metadata",
+    "get_snapshot_data_by_id",
     "create_session_context",
     "update_session_context",
 ]
 
 
 def __getattr__(name):
-    # 兼容历史路径：允许 tools.db_tool / tools.pcf_tools 被动态访问
-    if name in {"db_tool", "pcf_tools", "io_handler", "init_scenario", "ran_scheduler", "optimizer", "common"}:
+    if name in {"db_tool", "pcf_tools", "init_scenario", "optimizer", "common"}:
         return importlib.import_module(f"tools.{name}")
     raise AttributeError(f"module 'tools' has no attribute '{name}'")

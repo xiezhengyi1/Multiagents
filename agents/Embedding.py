@@ -1,8 +1,6 @@
 import os
 from typing import Dict, Any, List, Optional
-import json
 from abc import ABC, abstractmethod
-from pydantic import BaseModel, Field
 from openai import OpenAI
 from utils.logger import setup_logger
 

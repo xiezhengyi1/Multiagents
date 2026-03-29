@@ -157,21 +157,75 @@ def _normalize_snapshot_payload(
         "nodes": node_data if isinstance(node_data, list) else [],
     }
 
+
+def _snapshot_row_to_payload(row: Any) -> Dict[str, Any]:
+    return {
+        "snapshot_id": str(row.id),
+        "timestamp": row.timestamp.isoformat() if getattr(row, "timestamp", None) else None,
+        "trigger_event": getattr(row, "trigger_event", None),
+        **_normalize_snapshot_payload(
+            app_data=getattr(row, "app_data", None),
+            slice_data=getattr(row, "slice_data", None),
+            node_data=getattr(row, "node_data", None),
+        ),
+    }
+
 def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
     """Read latest snapshot payload from DB only."""
     try:
         with session_scope() as session:
             latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
             if latest_snapshot:
-                logger.info(f"Loaded scenario snapshot (Timestamp: {latest_snapshot.timestamp}).")
-                return _normalize_snapshot_payload(
-                    app_data=latest_snapshot.app_data,
-                    slice_data=latest_snapshot.slice_data,
-                    node_data=latest_snapshot.node_data,
-                )
+                logger.debug(f"Loaded scenario snapshot (Timestamp: {latest_snapshot.timestamp}).")
+                payload = _snapshot_row_to_payload(latest_snapshot)
+                return {
+                    "apps": payload["apps"],
+                    "slices": payload["slices"],
+                    "nodes": payload["nodes"],
+                }
     except Exception as e:
         logger.warning(f"Failed to load latest snapshot: {e}")
     return None
+
+
+def get_latest_snapshot_metadata() -> Optional[Dict[str, Any]]:
+    """Return metadata for the latest network snapshot."""
+    try:
+        with session_scope() as session:
+            latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
+            if not latest_snapshot:
+                return None
+            return {
+                "snapshot_id": str(latest_snapshot.id),
+                "timestamp": latest_snapshot.timestamp.isoformat() if latest_snapshot.timestamp else None,
+                "trigger_event": latest_snapshot.trigger_event,
+            }
+    except Exception as e:
+        logger.warning(f"Failed to load latest snapshot metadata: {e}")
+        return None
+
+
+def get_snapshot_data_by_id(snapshot_id: Union[str, int]) -> Optional[Dict[str, Any]]:
+    """Read a specific snapshot payload by snapshot id."""
+    normalized_snapshot_id = str(snapshot_id or "").strip()
+    if not normalized_snapshot_id:
+        return None
+
+    try:
+        snapshot_id_int = int(normalized_snapshot_id)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid snapshot_id: {snapshot_id}")
+        return None
+
+    try:
+        with session_scope() as session:
+            snapshot = session.query(NetworkStatusSnapshot).filter(NetworkStatusSnapshot.id == snapshot_id_int).first()
+            if not snapshot:
+                return None
+            return _snapshot_row_to_payload(snapshot)
+    except Exception as e:
+        logger.warning(f"Failed to load snapshot {snapshot_id}: {e}")
+        return None
 
 
 def get_latest_session_context(status: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -307,6 +361,7 @@ def upsert_ue_context(
     sess_rules: Optional[Dict[str, Any]] = None,
     traff_cont_decs: Optional[Dict[str, Any]] = None,
     chg_decs: Optional[Dict[str, Any]] = None,
+    ursp_rules: Optional[Dict[str, Any]] = None,
     app_catalog: Optional[List[Dict[str, Any]]] = None,
     flow_catalog: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
@@ -327,6 +382,7 @@ def upsert_ue_context(
                     sess_rules=sess_rules,
                     traff_cont_decs=traff_cont_decs,
                     chg_decs=chg_decs,
+                    ursp_rules=ursp_rules,
                     app_catalog=app_catalog,
                     flow_catalog=flow_catalog,
                 )
@@ -344,6 +400,8 @@ def upsert_ue_context(
                     row.traff_cont_decs = traff_cont_decs
                 if chg_decs is not None:
                     row.chg_decs = chg_decs
+                if ursp_rules is not None:
+                    row.ursp_rules = ursp_rules
                 if app_catalog is not None:
                     row.app_catalog = app_catalog
                 if flow_catalog is not None:
@@ -377,6 +435,7 @@ def get_ue_context_by_supi(supi: str) -> Optional[Dict[str, Any]]:
                     "sessRules": None,
                     "traffContDecs": None,
                     "chgDecs": None,
+                    "urspRules": None,
                     "app_catalog": derived_app_catalog,
                     "flow_catalog": derived_flow_catalog,
                     "created_at": None,
@@ -390,6 +449,7 @@ def get_ue_context_by_supi(supi: str) -> Optional[Dict[str, Any]]:
                 "sessRules": row.sess_rules,
                 "traffContDecs": row.traff_cont_decs,
                 "chgDecs": row.chg_decs,
+                "urspRules": row.ursp_rules,
                 "app_catalog": row.app_catalog if row.app_catalog is not None else derived_app_catalog,
                 "flow_catalog": row.flow_catalog if row.flow_catalog is not None else derived_flow_catalog,
                 "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -415,6 +475,7 @@ def list_ue_contexts(limit: int = 100) -> List[Dict[str, Any]]:
                     "supi": row.supi,
                     "pccRules": row.pcc_rules,
                     "qosDecs": row.qos_decs,
+                    "urspRules": row.ursp_rules,
                     "app_catalog": row.app_catalog,
                     "flow_catalog": row.flow_catalog,
                     "updated_at": row.updated_at.isoformat() if row.updated_at else None,

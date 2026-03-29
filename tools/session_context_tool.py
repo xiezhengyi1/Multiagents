@@ -1,13 +1,17 @@
 import json
 from typing import Optional
 
-from langchain_core.tools import tool
+from langchain.tools import ToolRuntime, tool
 
+from agent_runtime import AgentRuntimeContext
 from tools.db_tool import get_latest_session_context
 
 
 @tool
-def load_latest_session_context(status: Optional[str] = None) -> str:
+def load_latest_session_context(
+    status: Optional[str] = None,
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
     """
     Load the latest session context from the session_context table.
 
@@ -23,7 +27,9 @@ def load_latest_session_context(status: Optional[str] = None) -> str:
             return f"No session_context row found for status={status}."
         return "No session_context row found."
 
-    return (
-        "Latest session context loaded from DB:\n"
-        f"{json.dumps(latest, ensure_ascii=False, indent=2)}"
-    )
+    prefix = ""
+    if runtime is not None:
+        ctx = runtime.context
+        prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
+
+    return f"{prefix}Latest session context loaded from DB:\n{json.dumps(latest, ensure_ascii=False, indent=2)}"

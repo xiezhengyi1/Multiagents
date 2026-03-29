@@ -8,6 +8,7 @@ sys.path.insert(0, parent_dir)
 
 from sqlalchemy import text
 from database.connection import engine, Base
+from database.langchain_pg import ensure_semantic_knowledge_collection, setup_langgraph_postgres
 # Import models so Base metadata is populated
 from database.models import SessionContext, EpisodicExperience, SemanticKnowledge, NetworkStatusSnapshot, UeContextRecord
 from utils.logger import setup_logger
@@ -16,8 +17,7 @@ logger = setup_logger(__name__)
 
 def init_db():
     if not engine:
-        logger.error("Database engine not configured.")
-        return
+        raise RuntimeError("Database engine not configured.")
 
     try:
         with engine.connect() as connection:
@@ -27,14 +27,6 @@ def init_db():
             
         logger.info("Creating tables...")
         
-        # Development helper: Explicitly drop semantic_knowledge to apply schema changes (e.g. adding embedding column)
-        # In production, use Alembic for migrations.
-        # try:
-        #     SemanticKnowledge.__table__.drop(bind=engine, checkfirst=True)
-        #     logger.info("Dropped existing semantic_knowledge table to apply schema updates.")
-        # except Exception as e:
-        #     logger.warning(f"Could not drop semantic_knowledge table: {e}")
-
         Base.metadata.create_all(bind=engine)
 
         # 关键步骤: 为既有库补齐 network_status_snapshot 拆分列（仅新结构）
@@ -48,15 +40,23 @@ def init_db():
             connection.execute(text("ALTER TABLE network_status_snapshot DROP COLUMN IF EXISTS snapshot_data"))
             connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS app_catalog JSONB"))
             connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS flow_catalog JSONB"))
+            connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS ursp_rules JSONB"))
             connection.execute(text("UPDATE ue_context SET app_catalog = '[]'::jsonb WHERE app_catalog IS NULL"))
             connection.execute(text("UPDATE ue_context SET flow_catalog = '[]'::jsonb WHERE flow_catalog IS NULL"))
+            connection.execute(text("UPDATE ue_context SET ursp_rules = '{}'::jsonb WHERE ursp_rules IS NULL"))
             connection.commit()
+
+        logger.info("Initializing semantic knowledge PGVector collection...")
+        ensure_semantic_knowledge_collection()
+
+        logger.info("Initializing LangGraph postgres backends...")
+        setup_langgraph_postgres()
 
         logger.info("Database tables created successfully.")
         
     except Exception as e:
-        # Use repr to avoid UnicodeDecodeError on Windows if system locale is non-utf8
         logger.error(f"Error initializing database: {repr(e)}")
+        raise
 
 if __name__ == "__main__":
     print("Initializing Database...")

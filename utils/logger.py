@@ -34,11 +34,14 @@ class ColoredFormatter(logging.Formatter):
         formatter = logging.Formatter(prefix + "%(message)s" + LogColors.RESET, datefmt="%Y-%m-%d %H:%M:%S")
 
         original_msg = record.msg
+        original_args = record.args
         try:
             record.msg = f"{msg_color}{record.getMessage()}{LogColors.RESET}"
+            record.args = ()
             return formatter.format(record)
         finally:
             record.msg = original_msg
+            record.args = original_args
 
 def setup_logger(name="MultiAgents", level=logging.INFO, default_msg_color: str = None):
     """

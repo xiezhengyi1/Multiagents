@@ -1,349 +1,210 @@
-import time
-import random
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any, Dict, Optional
 
-# 配置
-HOST = 'localhost'
+
+HOST = "localhost"
 PORT = 8000
 
-# policy_id -> 最近一次RAN模拟结果摘要
-RAN_ALLOCATION_CACHE: Dict[str, Dict[str, Any]] = {}
+POLICY_EXECUTION_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-def _flatten_flows_from_apps(apps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """从 snapshot/apps 中提取 flow 列表。"""
-    flows: List[Dict[str, Any]] = []
-    for app in apps:
-        app_flows = app.get("flows", []) if isinstance(app, dict) else []
-        for flow in app_flows:
-            if isinstance(flow, dict):
-                flows.append(flow)
-    return flows
+def _coerce_non_empty(value: Any, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    return text
 
 
-def _normalize_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """为 JointSimulator 补齐节点关键字段。"""
-    out: List[Dict[str, Any]] = []
-    for idx, node in enumerate(nodes):
-        if not isinstance(node, dict):
-            continue
-        item = dict(node)
-        item.setdefault("name", f"Node_{idx}")
-        item.setdefault("id", idx)
-        item.setdefault("type", "Generic")
-        item.setdefault("cpu_capacity", 100.0)
-        item.setdefault("memory_capacity", 256.0)
-        item.setdefault("mec_capacity", 20.0)
-        item.setdefault("prb_capacity", 135.0)
-        item.setdefault("slices_hosted", [])
-        out.append(item)
-    return out
+def _extract_flow_id(policy_details: Dict[str, Any]) -> str:
+    direct_flow_id = str(policy_details.get("flow_id") or "").strip()
+    if direct_flow_id:
+        return direct_flow_id
+
+    pcc_rules = policy_details.get("pccRules")
+    if isinstance(pcc_rules, dict) and pcc_rules:
+        first_key = next(iter(pcc_rules.keys()))
+        first_rule = pcc_rules[first_key]
+        if isinstance(first_rule, dict):
+            flow_id = str(first_rule.get("flow_id") or "").strip()
+            if flow_id:
+                return flow_id
+            pcc_rule_id = str(first_rule.get("pccRuleId") or first_key).strip()
+            if pcc_rule_id.startswith("pcc-") and len(pcc_rule_id) > 4:
+                return pcc_rule_id[4:]
+
+    qos_decs = policy_details.get("qosDecs")
+    if isinstance(qos_decs, dict) and qos_decs:
+        first_key = str(next(iter(qos_decs.keys()))).strip()
+        if first_key.startswith("qos-") and len(first_key) > 4:
+            return first_key[4:]
+
+    return ""
 
 
-def _default_service_types(flows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """当输入缺失 service_types 时，按 flow.service_type_id 生成默认服务类型。"""
-    service_ids = sorted({int(f.get("service_type_id", 1)) for f in flows if isinstance(f, dict)})
-    if not service_ids:
-        service_ids = [1]
-    return [
-        {
-            "id": sid,
-            "name": f"service_{sid}",
-            "critical_kpis": [1, 2, 3],
-        }
-        for sid in service_ids
-    ]
-
-
-def _extract_input_from_request(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """从请求体提取联合仿真输入。"""
+def _validate_dispatch_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
-        return {}
+        raise ValueError("request body must be a JSON object")
 
-    flows_data = payload.get("flows")
-    if not flows_data and isinstance(payload.get("apps"), list):
-        flows_data = _flatten_flows_from_apps(payload.get("apps", []))
+    request_id = _coerce_non_empty(payload.get("request_id"), "request_id")
+    session_id = str(payload.get("session_id") or "").strip()
+    snapshot_id = str(payload.get("snapshot_id") or "").strip()
+    policy_id = _coerce_non_empty(payload.get("policy_id"), "policy_id")
+    policy_type = _coerce_non_empty(payload.get("policy_type"), "policy_type")
+    policy_details = payload.get("policy_details")
+
+    if not isinstance(policy_details, dict):
+        raise ValueError("policy_details must be an object")
+
+    nested_policy_id = str(policy_details.get("policy_id") or "").strip()
+    if nested_policy_id and nested_policy_id != policy_id:
+        raise ValueError("top-level policy_id does not match policy_details.policy_id")
 
     return {
-        "flows_data": flows_data if isinstance(flows_data, list) else [],
-        "nodes_data": payload.get("nodes") if isinstance(payload.get("nodes"), list) else [],
-        "service_types_data": payload.get("service_types") if isinstance(payload.get("service_types"), list) else [],
-        "sla_profiles_data": payload.get("sla_profiles") if isinstance(payload.get("sla_profiles"), list) else [],
+        "request_id": request_id,
+        "session_id": session_id,
+        "snapshot_id": snapshot_id,
+        "policy_id": policy_id,
+        "policy_type": policy_type,
+        "policy_details": policy_details,
+        "flow_id": _extract_flow_id(policy_details),
     }
 
 
-def _extract_input_from_snapshot(snapshot_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """从 DB 快照中提取联合仿真输入。"""
-    if not isinstance(snapshot_data, dict):
-        return {}
-
-    apps = snapshot_data.get("apps", [])
-    flows_data = _flatten_flows_from_apps(apps) if isinstance(apps, list) else []
-
+def _build_ack(payload: Dict[str, Any]) -> Dict[str, Any]:
+    applied_at = time.time()
     return {
-        "flows_data": flows_data,
-        "nodes_data": snapshot_data.get("nodes") if isinstance(snapshot_data.get("nodes"), list) else [],
-        "service_types_data": snapshot_data.get("service_types") if isinstance(snapshot_data.get("service_types"), list) else [],
-        "sla_profiles_data": snapshot_data.get("sla_profiles") if isinstance(snapshot_data.get("sla_profiles"), list) else [],
+        "request_id": payload["request_id"],
+        "policy_id": payload["policy_id"],
+        "expected": 1,
+        "received": 1,
+        "completed": True,
+        "results": [
+            {
+                "eventType": "policy_applied",
+                "policy_id": payload["policy_id"],
+                "policy_type": payload["policy_type"],
+                "session_id": payload["session_id"],
+                "snapshot_id": payload["snapshot_id"],
+                "flow_id": payload["flow_id"],
+                "applied_at": applied_at,
+                "status": "applied",
+            }
+        ],
     }
 
 
-def _merge_request_with_db(
-    request_input: Dict[str, Any],
-    db_input: Dict[str, Any],
-) -> Tuple[Dict[str, Any], str]:
-    """请求体优先，数据库兜底。"""
-    merged: Dict[str, Any] = {}
-    source_used = set()
-
-    for key in ("flows_data", "nodes_data", "service_types_data", "sla_profiles_data"):
-        req_val = request_input.get(key, [])
-        db_val = db_input.get(key, [])
-
-        if req_val:
-            merged[key] = req_val
-            source_used.add("request")
-        elif db_val:
-            merged[key] = db_val
-            source_used.add("db")
-        else:
-            merged[key] = []
-
-    if source_used == {"request"}:
-        source = "request"
-    elif source_used == {"db"}:
-        source = "db"
-    elif source_used == {"request", "db"}:
-        source = "mixed"
-    else:
-        source = "none"
-
-    return merged, source
-
-
-def _prepare_joint_inputs(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, str]:
-    """准备 JointSimulator.run 需要的输入。"""
-    request_input = _extract_input_from_request(payload)
-
-    # 关键步骤: 请求体优先，缺失项从 DB 快照兜底
-    db_input: Dict[str, Any] = {}
-    try:
-        from tools.db_tool import get_latest_snapshot_data
-        snapshot_data = get_latest_snapshot_data()
-        db_input = _extract_input_from_snapshot(snapshot_data)
-    except Exception as exc:
-        print(f"[MockServer] DB快照读取失败: {exc}")
-
-    merged, source = _merge_request_with_db(request_input, db_input)
-
-    flows = merged.get("flows_data", [])
-    nodes = _normalize_nodes(merged.get("nodes_data", []))
-    service_types = merged.get("service_types_data", [])
-    sla_profiles = merged.get("sla_profiles_data", [])
-
-    if not flows:
-        return None, source, "no_flows"
-
-    if not service_types:
-        service_types = _default_service_types(flows)
-
-    if not nodes:
-        # 最小可运行拓扑: 1 CN + 1 AN
-        nodes = [
-            {
-                "name": "CN_default",
-                "id": 0,
-                "type": "CN",
-                "cpu_capacity": 1000.0,
-                "memory_capacity": 1000.0,
-                "mec_capacity": 200.0,
-                "prb_capacity": 0.0,
-                "slices_hosted": [],
-            },
-            {
-                "name": "AN_default",
-                "id": 1,
-                "type": "AN",
-                "cpu_capacity": 500.0,
-                "memory_capacity": 500.0,
-                "mec_capacity": 100.0,
-                "prb_capacity": 135.0,
-                "slices_hosted": [],
-            },
-        ]
-
+def _build_monitor_record(payload: Dict[str, Any], ack: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "flows_data": flows,
-        "nodes_data": nodes,
-        "service_types_data": service_types,
-        "sla_profiles_data": sla_profiles,
-    }, source, "ok"
+        "status": "success",
+        "policy_id": payload["policy_id"],
+        "policy_type": payload["policy_type"],
+        "session_id": payload["session_id"],
+        "snapshot_id": payload["snapshot_id"],
+        "flow_id": payload["flow_id"],
+        "timestamp": time.time(),
+        "monitoring_data": {
+            "ack_completed": ack["completed"],
+            "applied_results": len(ack["results"]),
+        },
+        "compliance_status": "COMPLIANT",
+    }
 
-
-def _simulate_ran_allocation_for_policy(
-    policy_id: str,
-    payload: Dict[str, Any],
-    runner: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """收到策略后触发一次RAN资源分配模拟。"""
-    joint_inputs, source, prepare_status = _prepare_joint_inputs(payload)
-    ts = time.time()
-
-    if not joint_inputs:
-        result = {
-            "policy_id": policy_id,
-            "timestamp": ts,
-            "input_source": source,
-            "ran_status": "skipped",
-            "summary": f"RAN模拟跳过: {prepare_status}",
-        }
-        RAN_ALLOCATION_CACHE[policy_id] = result
-        return result
-
-    try:
-        if runner is None:
-            from tools.ran_scheduler.joint_simulator import JointSimulator
-            from tools.ran_scheduler.config import JointSimConfig
-
-            # 关键步骤: mock server 场景用 p1 模式提升兼容性，减少对SLA完整度的依赖
-            cfg = JointSimConfig(cn_mode='p1', ran_num_steps=200, save_hist=False)
-            sim = JointSimulator(cfg)
-
-            def default_runner(inputs: Dict[str, Any]) -> Dict[str, Any]:
-                return sim.run(
-                    flows_data=inputs["flows_data"],
-                    nodes_data=inputs["nodes_data"],
-                    service_types_data=inputs["service_types_data"],
-                    sla_profiles_data=inputs["sla_profiles_data"] or None,
-                )
-
-            runner = default_runner
-
-        sim_result = runner(joint_inputs)
-        overall = sim_result.get("ran_kpi", {}).get("overall", {}) if isinstance(sim_result, dict) else {}
-        e2e = sim_result.get("e2e_feedback", {}) if isinstance(sim_result, dict) else {}
-        status = sim_result.get("status", "error") if isinstance(sim_result, dict) else "error"
-
-        result = {
-            "policy_id": policy_id,
-            "timestamp": ts,
-            "input_source": source,
-            "ran_status": "success" if status == "success" else status,
-            "summary": e2e.get("summary", sim_result.get("message", "RAN simulation done") if isinstance(sim_result, dict) else "RAN simulation done"),
-            "active_slices": int(overall.get("num_active_slices", 0)),
-            "active_ues": int(overall.get("num_active_ues", 0)),
-            "overall_sla_pass": bool(e2e.get("overall_sla_pass", False)),
-        }
-        RAN_ALLOCATION_CACHE[policy_id] = result
-        return result
-    except Exception as exc:
-        result = {
-            "policy_id": policy_id,
-            "timestamp": ts,
-            "input_source": source,
-            "ran_status": "error",
-            "summary": f"RAN模拟失败: {exc}",
-        }
-        RAN_ALLOCATION_CACHE[policy_id] = result
-        return result
 
 class MockPCFHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        """处理策略下发请求"""
-        if self.path == '/pcf/policies':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            
-            try:
-                data = json.loads(post_data.decode('utf-8'))
-                policy_id = data.get('policy_id', f"pol-{int(time.time())}")
+    def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-                # 关键步骤: 在CN侧策略接收后，触发一次RAN侧资源分配模拟
-                ran_result = _simulate_ran_allocation_for_policy(policy_id, data)
-                print(
-                    "[MockServer][RAN] "
-                    f"policy_id={policy_id}, "
-                    f"input_source={ran_result.get('input_source')}, "
-                    f"ran_status={ran_result.get('ran_status')}, "
-                    f"summary={ran_result.get('summary')}"
-                )
-                
-                # 模拟处理延迟
-                time.sleep(0.5)
-                
-                response = {
-                    "code": 201,
-                    "message": "Policy Created Successfully",
-                    "data": {
-                        "policy_id": policy_id,
-                        "status": "ACTIVE"
-                    }
-                }
-                
-                self.send_response(201)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode('utf-8'))
-                print(f"[MockServer] 收到策略下发: ID={policy_id}")
-                
-            except Exception as e:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(str(e).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(content_length)
+        if not raw:
+            raise ValueError("request body is empty")
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
 
-    def do_GET(self):
-        """处理状态查询请求"""
-        if self.path.startswith('/monitor/status/'):
-            policy_id = self.path.split('/')[-1]
-            ran_hint = RAN_ALLOCATION_CACHE.get(policy_id)
-            
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            # 随机生成一些网络波动
-            is_good = random.choice([True, True, True, False]) # 75% 概率正常
-            
-            feedback = {
-                "policy_id": policy_id,
-                "timestamp": time.time(),
-                "monitoring_data": {
-                    "throughput": "500 Mbps" if is_good else "20 Mbps",
-                    "latency": "10ms" if is_good else "150ms",
-                    "jitter": "2ms" if is_good else "25ms",
-                    "packet_loss": "0.00%" if is_good else "2.5%"
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def do_POST(self) -> None:
+        if self.path != "/pcf/policies":
+            self._send_json(404, {"status": "failed", "error": "not found"})
+            return
+
+        try:
+            raw_payload = self._read_json_body()
+            payload = _validate_dispatch_payload(raw_payload)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"status": "failed", "error": str(exc)})
+            return
+
+        ack = _build_ack(payload)
+        monitor_record = _build_monitor_record(payload, ack)
+        POLICY_EXECUTION_CACHE[payload["policy_id"]] = {
+            "payload": payload,
+            "ack": ack,
+            "monitor": monitor_record,
+        }
+
+        self._send_json(
+            201,
+            {
+                "status": "success",
+                "request_id": payload["request_id"],
+                "session_id": payload["session_id"],
+                "snapshot_id": payload["snapshot_id"],
+                "policy_id": payload["policy_id"],
+                "policy_type": payload["policy_type"],
+                "ack": ack,
+                "message": "Policy accepted.",
+            },
+        )
+
+    def do_GET(self) -> None:
+        if not self.path.startswith("/monitor/status/"):
+            self._send_json(404, {"status": "failed", "error": "not found"})
+            return
+
+        policy_id = self.path.rsplit("/", 1)[-1].strip()
+        if not policy_id:
+            self._send_json(400, {"status": "failed", "error": "policy_id is required"})
+            return
+
+        cached = POLICY_EXECUTION_CACHE.get(policy_id)
+        if not cached:
+            self._send_json(
+                404,
+                {
+                    "status": "failed",
+                    "policy_id": policy_id,
+                    "error": "policy_id not found",
                 },
-                "status": "COMPLIANT" if is_good else "NON_COMPLIANT"
-            }
-            
-            self.wfile.write(json.dumps(feedback).encode('utf-8'))
-            print(f"[MockServer] 返回监测数据 (Good={is_good}) for {policy_id}")
-            if ran_hint:
-                print(
-                    "[MockServer][RAN-Cache] "
-                    f"policy_id={policy_id}, "
-                    f"ran_status={ran_hint.get('ran_status')}, "
-                    f"summary={ran_hint.get('summary')}"
-                )
-        else:
-            self.send_response(404)
-            self.end_headers()
+            )
+            return
 
-def run():
+        self._send_json(200, cached["monitor"])
+
+
+def run() -> None:
     server_address = (HOST, PORT)
     httpd = HTTPServer(server_address, MockPCFHandler)
-    print(f"Mock PCF-SMF-UPF Server running on http://{HOST}:{PORT}")
+    print(f"Mock PCF server running on http://{HOST}:{PORT}")
     print("Press Ctrl+C to stop.")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
-    httpd.server_close()
+    finally:
+        httpd.server_close()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     run()

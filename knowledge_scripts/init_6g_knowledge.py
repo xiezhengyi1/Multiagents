@@ -1,174 +1,110 @@
-import sys
+from __future__ import annotations
+
 import os
-import json
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+import sys
+
 from dotenv import load_dotenv
 
-# Add project root to python path to allow importing modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
 
-from database.connection import engine
-from database.models import SemanticKnowledge, Base
-# Import NaturalLanguageEncoder from Embedding.py (ensure consistency)
-from multi_agents.Embedding import NaturalLanguageEncoder
+from database.langchain_pg import build_semantic_knowledge_document, get_semantic_knowledge_store
 from utils.logger import setup_logger
 
-# Load environment variables
 load_dotenv()
 
 logger = setup_logger(__name__)
 
-Session = sessionmaker(bind=engine)
 
 def init_knowledge(knowledge_items):
-    """Populate Semantic Knowledge with default 6G/5G domain data"""
-    
-    # Ensure environment variables for DashScope if not already set, 
-    # to support NaturalLanguageEncoder which relies on OpenAI client or specific env vars.
-    if not os.getenv("OPENAI_BASE_URL"):
-         # Default DashScope compatible endpoint
-         os.environ["OPENAI_BASE_URL"] = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    
-    # If DASHSCOPE_API_KEY is present but OPENAI_API_KEY is not, set OPENAI_API_KEY
-    if not os.getenv("OPENAI_API_KEY") and os.getenv("DASHSCOPE_API_KEY"):
-         os.environ["OPENAI_API_KEY"] = os.getenv("DASHSCOPE_API_KEY")
-
-    session = Session()
-    try:
-        # Use NaturalLanguageEncoder from Embedding.py
-        encoder = NaturalLanguageEncoder()
-        logger.info(f"Initialized NaturalLanguageEncoder with model: {encoder.embedding_model_name}")
-    except Exception as e:
-        logger.error(f"Failed to initialize encoder: {e}")
-        return
-
-    # Combined knowledge data from all sources
+    """Populate the semantic knowledge PGVector collection with default 6G/5G domain data."""
+    store = get_semantic_knowledge_store()
+    documents = []
+    ids = []
 
     for item in knowledge_items:
-        # Create text for embedding (combine key, category, description, and potentially value content)
-        text_to_embed = f"Key: {item['key']}. Category: {item['category']}. Description: {item['description']}"
-        # Adding value summary can help if semantic search queries detailed specs
-        if isinstance(item.get('value'), dict):
-             # Convert simple dict to string representation for embedding context
-             val_str = ", ".join([f"{k}: {v}" for k,v in item['value'].items() if isinstance(v, (str, int, float))])
-             text_to_embed += f". Details: {val_str}"
+        documents.append(
+            build_semantic_knowledge_document(
+                key=item["key"],
+                category=item.get("category"),
+                description=item.get("description"),
+                value=item.get("value"),
+            )
+        )
+        ids.append(str(item["key"]))
 
-        logger.info(f"Processing item: {item['key']}")
-        
-        try:
-            # Use NaturalLanguageEncoder to get vector
-            # encode returns: {"raw_text": ..., "detected_keywords": ..., "vector": ...}
-            result = encoder.encode(text_to_embed)
-            vector = result.get("vector")
-            
-            if not vector:
-                logger.warning(f"No embedding vector generated for {item['key']}")
-                continue
+    store.add_documents(documents, ids=ids)
+    logger.info("Knowledge collection initialized with %s items.", len(ids))
 
-            # Upsert logic
-            existing = session.query(SemanticKnowledge).filter_by(key=item['key']).first()
-            if existing:
-                existing.category = item['category']
-                existing.description = item['description']
-                existing.value = item['value']
-                existing.embedding = vector            
-                existing.updated_at = datetime.utcnow()
-                logger.info(f"Updated {item['key']}")
-            else:
-                new_entry = SemanticKnowledge(
-                    key=item['key'],
-                    category=item['category'],
-                    description=item['description'],
-                    value=item['value'],
-                    embedding=vector
-                )
-                session.add(new_entry)
-                logger.info(f"Inserted {item['key']}")
-                
-        except Exception as e:
-            logger.error(f"Failed to process {item['key']}: {e}")
-            continue
-
-    try:
-        session.commit()
-        logger.info("Knowledge Base initialization complete.")
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Transaction failed: {e}")
-    finally:
-        session.close()
 
 if __name__ == "__main__":
     knowledge_items = [
-        # --- Slice Profiles (切片模板) ---
+        # --- Slice Profiles (鍒囩墖妯℃澘) ---
         {
             "key": "Slice_eMBB_Standard",
-            "category": "Slice_Profile", 
+            "category": "Slice_Profile",
             "description": "Standard eMBB (Enhanced Mobile Broadband) Slice. Optimized for high data rates, 4K/8K video streaming, and virtual reality (VR). Focuses on maximizing throughput.",
             "value": {
-                "sst": 1, 
-                "sd": "000001", 
+                "sst": 1,
+                "sd": "000001",
                 "max_throughput_ul": "500Mbps",
                 "max_throughput_dl": "2Gbps",
                 "latency": "10-20ms",
-                "mobility": "High"
-            }
+                "mobility": "High",
+            },
         },
         {
             "key": "Slice_URLLC_Ind_Auto",
-            "category": "Slice_Profile", 
+            "category": "Slice_Profile",
             "description": "URLLC Slice for Industrial Automation. Extremely low latency and high reliability for factory robots, PLC control, and motion synchronization.",
             "value": {
-                "sst": 1, 
-                "sd": "000002", 
+                "sst": 1,
+                "sd": "000002",
                 "max_throughput_ul": "100Mbps",
                 "max_throughput_dl": "100Mbps",
                 "isolation_level": "High",
                 "availability": "99.9999%",
-                "latency": "<5ms"
-            }
+                "latency": "<5ms",
+            },
         },
         {
             "key": "Slice_mMTC_SmartCity",
-            "category": "Slice_Profile", 
+            "category": "Slice_Profile",
             "description": "mMTC (Massive Machine Type Communications) Slice for Smart Cities. Designed for massive connection density, low power consumption, and small data packets (sensors, meters).",
             "value": {
-                "sst": 2, 
-                "sd": "000003", 
+                "sst": 2,
+                "sd": "000003",
                 "connection_density": "1,000,000 devices/km2",
                 "max_throughput": "1Mbps",
-                "energy_efficiency": "High"
-            }
+                "energy_efficiency": "High",
+            },
         },
         {
             "key": "Slice_V2X_Advanced",
-            "category": "Slice_Profile", 
+            "category": "Slice_Profile",
             "description": "V2X (Vehicle-to-Everything) Slice. supports autonomous driving, platooning, and sensor sharing. Requires high reliability and low latency with high mobility support.",
             "value": {
-                "sst": 3, 
-                "sd": "000004", 
+                "sst": 3,
+                "sd": "000004",
                 "latency": "3-10ms",
                 "reliability": "99.999%",
-                "mobility": "Up to 500km/h"
-            }
+                "mobility": "Up to 500km/h",
+            },
         },
         {
             "key": "Slice_Compute_AI",
-            "category": "Slice_Profile", 
+            "category": "Slice_Profile",
             "description": "6G Compute-Native Slice. Integated sensing and computation for AI model training and inference offloading. High uplink for data ingestion.",
             "value": {
-                "sst": 4, 
-                "sd": "000005", 
+                "sst": 4,
+                "sd": "000005",
                 "type": "Compute-Aware",
                 "uplink_priority": "High",
                 "compute_guarantee": "Reserved",
-                "edge_integration": "Native"
-            }
+                "edge_integration": "Native",
+            },
         },
-
-        # --- QoS Configurations (QoS 配置模板) ---
         {
             "key": "QoS_Config_VoNR",
             "category": "QoS_Config",
@@ -177,30 +113,30 @@ if __name__ == "__main__":
                 "5qi": 1,
                 "arp": {"priority_level": 15, "pre_emption_capability": "disabled", "pre_emption_vulnerability": "enabled"},
                 "gbr": {"ul": "128kbps", "dl": "128kbps"},
-                "mbr": {"ul": "256kbps", "dl": "256kbps"}
-            }
+                "mbr": {"ul": "256kbps", "dl": "256kbps"},
+            },
         },
         {
             "key": "QoS_Config_CloudGaming",
             "category": "QoS_Config",
             "description": "QoS Profile for Real-time Cloud Gaming. Requires high bandwidth and relatively low latency for interaction.",
             "value": {
-                "5qi": 3, # GBR, Real-time Gaming
+                "5qi": 3,
                 "arp": {"priority_level": 7, "pre_emption_capability": "enabled", "pre_emption_vulnerability": "disabled"},
                 "gbr": {"ul": "5Mbps", "dl": "25Mbps"},
-                "mbr": {"ul": "10Mbps", "dl": "50Mbps"}
-            }
+                "mbr": {"ul": "10Mbps", "dl": "50Mbps"},
+            },
         },
         {
             "key": "QoS_Config_RemoteSurgery",
             "category": "QoS_Config",
             "description": "Critical Mission QoS for Remote Surgery. Absolute priority, ultra-low latency, zero packet loss tolerance.",
             "value": {
-                "5qi": 82, # Delay Critical GBR
+                "5qi": 82,
                 "arp": {"priority_level": 1, "pre_emption_capability": "enabled", "pre_emption_vulnerability": "disabled"},
-                "gbr": {"ul": "50Mbps", "dl": "50Mbps"}, # High res video feedback
-                "packet_delay_budget": "10ms"
-            }
+                "gbr": {"ul": "50Mbps", "dl": "50Mbps"},
+                "packet_delay_budget": "10ms",
+            },
         },
         {
             "key": "QoS_Config_SmartGrid_Diff_Prot",
@@ -210,21 +146,19 @@ if __name__ == "__main__":
                 "5qi": 83,
                 "arp": {"priority_level": 2, "pre_emption_capability": "disabled", "pre_emption_vulnerability": "disabled"},
                 "reliability": "99.9999%",
-                "latency": "5ms"
-            }
+                "latency": "5ms",
+            },
         },
         {
             "key": "QoS_Config_Buffered_Video",
             "category": "QoS_Config",
             "description": "Standard buffered video streaming (YouTube, Netflix, etc.). Non-GBR, high throughput, delay tolerant.",
             "value": {
-                "5qi": 6, # Non-GBR
+                "5qi": 6,
                 "arp": {"priority_level": 6, "pre_emption_capability": "disabled", "pre_emption_vulnerability": "enabled"},
-                "ambr": "Unlimited"
-            }
+                "ambr": "Unlimited",
+            },
         },
-
-        # --- 5QI Definitions (5QI 模板) ---
         {
             "key": "5QI_1_Voice",
             "category": "Standard_Def",
@@ -235,8 +169,8 @@ if __name__ == "__main__":
                 "priority_level": 20,
                 "packet_delay_budget": "100ms",
                 "packet_error_rate": "10^-2",
-                "example_services": "Conversational Voice"
-            }
+                "example_services": "Conversational Voice",
+            },
         },
         {
             "key": "5QI_5_IMS",
@@ -248,8 +182,8 @@ if __name__ == "__main__":
                 "priority_level": 10,
                 "packet_delay_budget": "100ms",
                 "packet_error_rate": "10^-6",
-                "example_services": "IMS Signaling"
-            }
+                "example_services": "IMS Signaling",
+            },
         },
         {
             "key": "5QI_9_Default",
@@ -261,8 +195,8 @@ if __name__ == "__main__":
                 "priority_level": 90,
                 "packet_delay_budget": "300ms",
                 "packet_error_rate": "10^-6",
-                "example_services": "Bursty Video, Internet"
-            }
+                "example_services": "Bursty Video, Internet",
+            },
         },
         {
             "key": "5QI_82_URLLC",
@@ -274,10 +208,10 @@ if __name__ == "__main__":
                 "priority_level": 19,
                 "packet_delay_budget": "10ms",
                 "packet_error_rate": "10^-5",
-                "default_averaging_window": "2000ms"
-            }
+                "default_averaging_window": "2000ms",
+            },
         },
-         {
+        {
             "key": "5QI_84_Intel_Transport",
             "category": "Standard_Def",
             "description": "5QI Value 84. Service Type: Intelligent Transport Systems. Delay Critical GBR.",
@@ -286,11 +220,9 @@ if __name__ == "__main__":
                 "resource_type": "Delay Critical GBR",
                 "priority_level": 24,
                 "packet_delay_budget": "30ms",
-                "packet_error_rate": "10^-5"
-            }
+                "packet_error_rate": "10^-5",
+            },
         },
-
-        # --- 6G Scenarios (6G 场景知识) ---
         {
             "key": "6G_Scenario_Holographic_Comm",
             "category": "6G_Scenario",
@@ -299,8 +231,8 @@ if __name__ == "__main__":
                 "throughput": ">1 Tbps",
                 "latency": "<1ms (sub-ms)",
                 "jitter": "Zero-jitter",
-                "sync": "Strict synchronization required"
-            }
+                "sync": "Strict synchronization required",
+            },
         },
         {
             "key": "6G_Scenario_Digital_Twin",
@@ -309,8 +241,8 @@ if __name__ == "__main__":
             "value": {
                 "requirements": "Massive sensing data upload, real-time rendering downlink",
                 "latency": "<10ms round-trip",
-                "data_volume": "Petabytes/day"
-            }
+                "data_volume": "Petabytes/day",
+            },
         },
         {
             "key": "6G_Scenario_Tactile_Internet",
@@ -319,8 +251,8 @@ if __name__ == "__main__":
             "value": {
                 "latency": "<1ms",
                 "reliability": "99.99999%",
-                "control_loop": "1kHz update rate"
-            }
+                "control_loop": "1kHz update rate",
+            },
         },
         {
             "key": "6G_Scenario_NTN",
@@ -329,8 +261,8 @@ if __name__ == "__main__":
             "value": {
                 "topology": "LEO/GEO Satellites + HAPS",
                 "challenge": "High propagation delay, Doppler shift",
-                "handover": "Frequent satellite handover"
-            }
+                "handover": "Frequent satellite handover",
+            },
         },
         {
             "key": "6G_Scenario_Semantic_Comm",
@@ -339,8 +271,8 @@ if __name__ == "__main__":
             "value": {
                 "efficiency": "10x-100x improvement over Shannon capacity",
                 "architecture": "AI-Encoder/Decoder pair",
-                "metric": "Semantic Error Rate (SER)"
-            }
-        }
+                "metric": "Semantic Error Rate (SER)",
+            },
+        },
     ]
     init_knowledge(knowledge_items)

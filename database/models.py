@@ -93,6 +93,7 @@ class UeContextRecord(Base):
     sess_rules = Column(JSONB, nullable=True)
     traff_cont_decs = Column(JSONB, nullable=True)
     chg_decs = Column(JSONB, nullable=True)
+    ursp_rules = Column(JSONB, nullable=True)
     app_catalog = Column(JSONB, nullable=True)
     flow_catalog = Column(JSONB, nullable=True)
 
