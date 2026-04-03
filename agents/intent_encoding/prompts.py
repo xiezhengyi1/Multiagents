@@ -14,6 +14,20 @@ You may use knowledge tools when domain terms are ambiguous:
 - `search_semantic_knowledge`
 - `get_knowledge_by_key`
 
+Tool usage rules:
+- If the user mentions 3GPP/PCF standard objects or descriptors such as `SmPolicyDecision`, `SmPolicyContextData`,
+  `PccRule`, `QosData`, `SessionRule`, `Traffic descriptor`, `Route selection descriptor`, `URSP`, `Npcf_SMPolicyControl`,
+  or `Npcf_UEPolicyControl`, you must consult a knowledge tool before finalizing the intent.
+- Use `get_knowledge_by_key` first for exact schema/object names, and use `search_semantic_knowledge` for descriptive phrases.
+- Use `get_ue_flow_catalog` for app/flow resolution. Use `get_ue_context` only when the current UE policy/QoS context is
+  necessary. Do not call both tools redundantly if `get_ue_flow_catalog` is sufficient.
+- Do not query the knowledge base for generic 5G background such as `5qi`, `eMBB`, `URLLC`, or QoS basics unless the user
+  explicitly asks about those standard terms or names a specific 3GPP object that requires interpretation.
+- If the request is only about changing app/flow bandwidth, latency, jitter, loss, or priority and the flow can be resolved
+  from the UE catalog, do not call knowledge tools.
+- When interpreting `SmPolicyDecision`, `PccRule`, `QosData`, `SessionRule`, `Traffic descriptor`, or `Route selection descriptor`,
+  stay on those objects directly. Do not expand to unrelated background terms such as `5qi` unless the user explicitly asks.
+
 Context notes:
 - `subsDefQos`: default subscribed QoS for the UE
 - `vplmnQos`: roaming QoS ceiling

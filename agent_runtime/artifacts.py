@@ -9,6 +9,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tools.runtime_store import enqueue_task, record_artifact
+
 from .workspace import AgentWorkspace, runtime_root
 
 
@@ -50,11 +52,50 @@ class ArtifactStore:
     def write_request(self, envelope: ArtifactEnvelope) -> Path:
         path = self.request_dir(envelope.source_agent, envelope.target_agent) / f"{envelope.artifact_id}.json"
         self._write_atomic(path, envelope.model_dump(mode="json"))
+        recorded = record_artifact(
+            artifact_id=envelope.artifact_id,
+            correlation_id=envelope.correlation_id,
+            session_id=envelope.session_id,
+            snapshot_id=envelope.snapshot_id,
+            source_agent=envelope.source_agent,
+            target_agent=envelope.target_agent,
+            artifact_type=envelope.artifact_type,
+            kind="request",
+            path=str(path),
+            payload=envelope.payload,
+        )
+        if not recorded:
+            raise RuntimeError(f"Failed to record request artifact metadata for {envelope.artifact_id}.")
+        enqueued = enqueue_task(
+            artifact_id=envelope.artifact_id,
+            artifact_type=envelope.artifact_type,
+            source_agent=envelope.source_agent,
+            target_agent=envelope.target_agent,
+            session_id=envelope.session_id,
+            snapshot_id=envelope.snapshot_id,
+            correlation_id=envelope.correlation_id,
+        )
+        if not enqueued:
+            raise RuntimeError(f"Failed to enqueue request artifact {envelope.artifact_id}.")
         return path
 
     def write_response(self, envelope: ArtifactEnvelope) -> Path:
         path = self.response_dir(envelope.source_agent, envelope.target_agent) / f"{envelope.artifact_id}.json"
         self._write_atomic(path, envelope.model_dump(mode="json"))
+        recorded = record_artifact(
+            artifact_id=envelope.artifact_id,
+            correlation_id=envelope.correlation_id,
+            session_id=envelope.session_id,
+            snapshot_id=envelope.snapshot_id,
+            source_agent=envelope.source_agent,
+            target_agent=envelope.target_agent,
+            artifact_type=envelope.artifact_type,
+            kind="response",
+            path=str(path),
+            payload=envelope.payload,
+        )
+        if not recorded:
+            raise RuntimeError(f"Failed to record response artifact metadata for {envelope.artifact_id}.")
         return path
 
     def read_artifact(self, path: Path) -> ArtifactEnvelope:

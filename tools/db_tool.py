@@ -171,7 +171,22 @@ def _snapshot_row_to_payload(row: Any) -> Dict[str, Any]:
     }
 
 def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
-    """Read latest snapshot payload from DB only."""
+    """Read latest snapshot payload from the graph snapshot when available."""
+    try:
+        from tools.network_graph import get_latest_graph
+
+        graph = get_latest_graph()
+        if graph is not None:
+            payload = graph.to_compatibility_snapshot()
+            return {
+                "snapshot_id": payload.get("snapshot_id"),
+                "apps": payload["apps"],
+                "slices": payload["slices"],
+                "nodes": payload["nodes"],
+            }
+    except Exception as e:
+        logger.warning(f"Failed to load latest graph-backed snapshot: {e}")
+
     try:
         with session_scope() as session:
             latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
@@ -189,7 +204,16 @@ def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
 
 
 def get_latest_snapshot_metadata() -> Optional[Dict[str, Any]]:
-    """Return metadata for the latest network snapshot."""
+    """Return metadata for the latest bound graph snapshot when available."""
+    try:
+        from tools.network_graph import get_latest_graph_snapshot_metadata
+
+        metadata = get_latest_graph_snapshot_metadata()
+        if isinstance(metadata, dict):
+            return metadata
+    except Exception as e:
+        logger.warning(f"Failed to load latest graph snapshot metadata: {e}")
+
     try:
         with session_scope() as session:
             latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
@@ -206,10 +230,20 @@ def get_latest_snapshot_metadata() -> Optional[Dict[str, Any]]:
 
 
 def get_snapshot_data_by_id(snapshot_id: Union[str, int]) -> Optional[Dict[str, Any]]:
-    """Read a specific snapshot payload by snapshot id."""
+    """Read a specific graph snapshot payload by snapshot id."""
     normalized_snapshot_id = str(snapshot_id or "").strip()
     if not normalized_snapshot_id:
         return None
+
+    try:
+        from tools.network_graph import get_graph_snapshot_payload, NetworkGraph
+
+        payload = get_graph_snapshot_payload(normalized_snapshot_id)
+        if isinstance(payload, dict) and payload:
+            graph = NetworkGraph.from_payload(payload)
+            return graph.to_compatibility_snapshot()
+    except Exception as e:
+        logger.warning(f"Failed to load graph snapshot {snapshot_id}: {e}")
 
     try:
         snapshot_id_int = int(normalized_snapshot_id)
@@ -282,6 +316,7 @@ def create_session_context(
         with session_scope() as session:
             row = SessionContext(
                 current_step=current_step,
+                current_stage=current_step,
                 intent_data=intent_data,
                 policy_data=policy_data,
                 status=status,
@@ -318,6 +353,7 @@ def update_session_context(
 
             if current_step is not None:
                 row.current_step = current_step
+                row.current_stage = current_step
             if intent_data is not None:
                 row.intent_data = intent_data
             if policy_data is not None:
@@ -335,19 +371,18 @@ def update_scenario_in_db(apps: List["App"], slices: List["Slice"], nodes: List[
     Persist scenario state as a new NetworkStatusSnapshot.
     Now we treat network state as time-series snapshots instead of just updating a single config row.
     """
-    serialized = _serialize_scenario_for_db(apps, slices, nodes)
-
     try:
-        with session_scope() as session:
-            snapshot = NetworkStatusSnapshot(
-                app_data=serialized.get("apps", []),
-                slice_data=serialized.get("slices", []),
-                node_data=serialized.get("nodes", []),
-                trigger_event=trigger
-            )
-            session.add(snapshot)
-            # We can also keep updating SemanticKnowledge if other components rely on 'current_config'
-            # But primarily we use snapshots now.
+        from uuid import uuid4
+        from tools.network_graph import build_and_persist_graph_from_scenario
+
+        snapshot_id = f"graph-{uuid4()}"
+        build_and_persist_graph_from_scenario(
+            apps,
+            slices,
+            nodes,
+            snapshot_id=snapshot_id,
+            trigger_event=trigger,
+        )
         return True
     except Exception as e:
         logger.error(f"Failed to save scenario snapshot: {e}")

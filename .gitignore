@@ -8,6 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+.vscode
 
 # 运行存储
 runtime
+
+# 知识库
+data

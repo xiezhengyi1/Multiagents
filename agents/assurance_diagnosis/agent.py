@@ -4,16 +4,25 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from agent_runtime import AgentWorkspace, ArtifactCache, ArtifactEnvelope, ArtifactStore
+from agents.worker import ArtifactWorkerMixin
 
 from .contracts import AssuranceDiagnosisRequest, AssuranceDiagnosisResult
 
 
-class AssuranceDiagnosisAgent:
+class AssuranceDiagnosisAgent(ArtifactWorkerMixin):
     def __init__(self) -> None:
         self.agent_name = "assurance_diagnosis"
-        self.workspace = AgentWorkspace.for_agent(self.agent_name)
-        self.cache = ArtifactCache(self.workspace)
-        self.artifact_store = ArtifactStore()
+        self.init_worker_runtime()
+
+    def expected_request_type(self) -> str:
+        return "AssuranceDiagnosisRequest"
+
+    def response_artifact_type(self) -> str:
+        return "AssuranceDiagnosisResult"
+
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> AssuranceDiagnosisResult:
+        request = AssuranceDiagnosisRequest.model_validate(envelope.payload)
+        return self.run(request)
 
     def run(self, request: AssuranceDiagnosisRequest) -> AssuranceDiagnosisResult:
         execution_feedback = request.execution_feedback or {}
@@ -116,24 +125,4 @@ class AssuranceDiagnosisAgent:
         )
 
     def run_from_artifact(self, request_path: Path) -> Path:
-        envelope = self.artifact_store.read_artifact(request_path)
-        if envelope.target_agent != self.agent_name:
-            raise ValueError(f"artifact target_agent mismatch: expected {self.agent_name}, got {envelope.target_agent}")
-
-        self.cache.cache_received(envelope)
-        request = AssuranceDiagnosisRequest.model_validate(envelope.payload)
-        result = self.run(request)
-
-        response_envelope = ArtifactEnvelope(
-            artifact_type="AssuranceDiagnosisResult",
-            source_agent=self.agent_name,
-            target_agent=envelope.source_agent,
-            session_id=request.session_id,
-            snapshot_id=request.snapshot_id,
-            correlation_id=envelope.correlation_id,
-            upstream_artifact_ids=[envelope.artifact_id],
-            payload=result.model_dump(mode="json"),
-        )
-        response_path = self.artifact_store.write_response(response_envelope)
-        self.cache.cache_produced(response_envelope)
-        return response_path
+        return self.consume_request_artifact(request_path)

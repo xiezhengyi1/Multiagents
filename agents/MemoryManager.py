@@ -9,7 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.memory import InMemoryStore
 
-from agents.basemodel import BaseAgent
+from agents.BaseAgent import BaseAgent
 from database.connection import RAW_DATABASE_URL
 from database.langchain_pg import get_embedding_dimensions, get_openai_embeddings
 from utils.logger import setup_logger

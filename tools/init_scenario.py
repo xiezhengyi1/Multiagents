@@ -449,6 +449,13 @@ def deserialize_scenario_payload(payload: Union[str, Dict[str, Any]]) -> Optiona
     return _deserialize_scenario(scenario)
 
 
+def _snapshot_requires_graph_bootstrap(snapshot_data: Optional[Dict[str, Any]]) -> bool:
+    """Legacy snapshot payloads do not carry a graph snapshot id."""
+    if not isinstance(snapshot_data, dict):
+        return False
+    return not str(snapshot_data.get("snapshot_id") or "").strip()
+
+
 def _create_default_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     """Generate deterministic default scenario:
     - 5 AN
@@ -548,6 +555,10 @@ def get_initial_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     snapshot_data = get_latest_snapshot_data()
     if snapshot_data:
         apps, slices, nodes = _deserialize_scenario(snapshot_data)
+        if _snapshot_requires_graph_bootstrap(snapshot_data):
+            ok = update_scenario_in_db(apps, slices, nodes, trigger="System-Init-LegacySnapshot")
+            if not ok:
+                raise RuntimeError("Failed to generate network graph for legacy snapshot during initialization")
         seeded = _seed_ue_contexts_from_apps(apps)
         sync_summary = sync_latest_flow_five_tuples_to_ue_context()
         print(f"[UEContext] seeded {seeded} UE records (from snapshot)")

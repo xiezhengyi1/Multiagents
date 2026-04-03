@@ -10,7 +10,21 @@ from sqlalchemy import text
 from database.connection import engine, Base
 from database.langchain_pg import ensure_semantic_knowledge_collection, setup_langgraph_postgres
 # Import models so Base metadata is populated
-from database.models import SessionContext, EpisodicExperience, SemanticKnowledge, NetworkStatusSnapshot, UeContextRecord
+from database.models import (
+    AgentArtifact,
+    AgentHandoffRecord,
+    AgentTask,
+    EpisodicExperience,
+    GraphEdge,
+    GraphMetric,
+    GraphNode,
+    NetworkGraphSnapshot,
+    NetworkStatusSnapshot,
+    SemanticKnowledge,
+    SessionContext,
+    SessionStageResult,
+    UeContextRecord,
+)
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -44,6 +58,12 @@ def init_db():
             connection.execute(text("UPDATE ue_context SET app_catalog = '[]'::jsonb WHERE app_catalog IS NULL"))
             connection.execute(text("UPDATE ue_context SET flow_catalog = '[]'::jsonb WHERE flow_catalog IS NULL"))
             connection.execute(text("UPDATE ue_context SET ursp_rules = '{}'::jsonb WHERE ursp_rules IS NULL"))
+            connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS current_stage VARCHAR"))
+            connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS current_snapshot_id VARCHAR"))
+            connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS current_artifact_id VARCHAR"))
+            connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS round_index INTEGER DEFAULT 0"))
+            connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS last_error TEXT"))
+            connection.execute(text("UPDATE session_context SET current_stage = current_step WHERE current_stage IS NULL"))
             connection.commit()
 
         logger.info("Initializing semantic knowledge PGVector collection...")

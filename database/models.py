@@ -1,10 +1,14 @@
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, Float, Text, DateTime, Integer
+from datetime import UTC, datetime
+from sqlalchemy import Column, String, Float, Text, DateTime, Integer, ForeignKey, Boolean, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from pgvector.sqlalchemy import Vector
 
 from .connection import Base
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 class SessionContext(Base):
     """
@@ -14,12 +18,88 @@ class SessionContext(Base):
     __tablename__ = "session_context"
 
     session_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    current_step = Column(String)  # 枚举: intent, generation, execution
+    current_step = Column(String)  # 兼容旧字段
+    current_stage = Column(String, nullable=True)
+    current_snapshot_id = Column(String, nullable=True)
+    current_artifact_id = Column(String, nullable=True)
+    round_index = Column(Integer, default=0)
+    last_error = Column(Text, nullable=True)
     intent_data = Column(JSONB, nullable=True)  # 用户原始意图数据
     policy_data = Column(JSONB, nullable=True)  # 生成的策略数据
     status = Column(String, default="active")  # active, completed, failed
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class AgentTask(Base):
+    __tablename__ = "agent_task"
+
+    task_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    artifact_id = Column(String, nullable=False, index=True)
+    session_id = Column(String, nullable=True, index=True)
+    snapshot_id = Column(String, nullable=True, index=True)
+    correlation_id = Column(String, nullable=True, index=True)
+    source_agent = Column(String, nullable=False)
+    target_agent = Column(String, nullable=False, index=True)
+    artifact_type = Column(String, nullable=False)
+    status = Column(String, default="queued", index=True)
+    lease_owner = Column(String, nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+    attempts = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=3)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("artifact_id", "target_agent", name="uq_agent_task_artifact_target"),
+    )
+
+
+class AgentArtifact(Base):
+    __tablename__ = "agent_artifact"
+
+    artifact_id = Column(String, primary_key=True)
+    correlation_id = Column(String, nullable=True, index=True)
+    session_id = Column(String, nullable=True, index=True)
+    snapshot_id = Column(String, nullable=True, index=True)
+    source_agent = Column(String, nullable=False)
+    target_agent = Column(String, nullable=False, index=True)
+    artifact_type = Column(String, nullable=False)
+    kind = Column(String, nullable=False)  # request or response
+    path = Column(Text, nullable=False)
+    payload_summary = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class AgentHandoffRecord(Base):
+    __tablename__ = "agent_handoff"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, nullable=True, index=True)
+    snapshot_id = Column(String, nullable=True, index=True)
+    round_index = Column(Integer, default=0)
+    source_agent = Column(String, nullable=False)
+    target_agent = Column(String, nullable=False)
+    artifact_id = Column(String, nullable=True, index=True)
+    artifact_type = Column(String, nullable=False)
+    summary = Column(Text, nullable=True)
+    handoff_payload = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class SessionStageResult(Base):
+    __tablename__ = "session_stage_result"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String, nullable=False, index=True)
+    snapshot_id = Column(String, nullable=True, index=True)
+    round_index = Column(Integer, default=0)
+    stage_name = Column(String, nullable=False, index=True)
+    artifact_id = Column(String, nullable=True, index=True)
+    status = Column(String, nullable=False)
+    payload = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
 
 class EpisodicExperience(Base):
     """
@@ -38,7 +118,7 @@ class EpisodicExperience(Base):
     environment_state = Column(JSONB)  # 执行时的资源情况
     feedback_metrics = Column(JSONB)   # 成功率/延迟变化等
     reward_score = Column(Float)       # 评价该策略的好坏
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
 
 class SemanticKnowledge(Base):
     """
@@ -55,7 +135,7 @@ class SemanticKnowledge(Base):
     # 向量字段
     embedding = Column(Vector(1024))
 
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 class NetworkStatusSnapshot(Base):
     """
@@ -65,7 +145,7 @@ class NetworkStatusSnapshot(Base):
     __tablename__ = "network_status_snapshot"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime, default=_utcnow, index=True)
 
     # 关键步骤: 拆分存储为切片、APP、节点三列，便于独立查询与演进
     slice_data = Column(JSONB, nullable=False, default=list)
@@ -74,6 +154,60 @@ class NetworkStatusSnapshot(Base):
 
     # 触发快照的原因，例如 "PeriodicMonitor", "Pre-Optimization", "Post-Optimization"
     trigger_event = Column(String, nullable=True)
+
+
+class NetworkGraphSnapshot(Base):
+    __tablename__ = "network_graph_snapshot"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String, unique=True, nullable=False, index=True, default=lambda: str(uuid.uuid4()))
+    base_network_snapshot_id = Column(String, nullable=True, index=True)
+    trigger_event = Column(String, nullable=True)
+    graph_summary = Column(JSONB, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+
+class GraphNode(Base):
+    __tablename__ = "graph_node"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String, ForeignKey("network_graph_snapshot.snapshot_id"), nullable=False, index=True)
+    node_key = Column(String, nullable=False)
+    node_type = Column(String, nullable=False, index=True)
+    label = Column(String, nullable=True)
+    properties = Column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "node_key", name="uq_graph_node_snapshot_key"),
+    )
+
+
+class GraphEdge(Base):
+    __tablename__ = "graph_edge"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String, ForeignKey("network_graph_snapshot.snapshot_id"), nullable=False, index=True)
+    edge_key = Column(String, nullable=False)
+    edge_type = Column(String, nullable=False, index=True)
+    source_key = Column(String, nullable=False, index=True)
+    target_key = Column(String, nullable=False, index=True)
+    properties = Column(JSONB, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "edge_key", name="uq_graph_edge_snapshot_key"),
+    )
+
+
+class GraphMetric(Base):
+    __tablename__ = "graph_metric"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String, ForeignKey("network_graph_snapshot.snapshot_id"), nullable=False, index=True)
+    owner_type = Column(String, nullable=False)  # node or edge
+    owner_key = Column(String, nullable=False, index=True)
+    metric_name = Column(String, nullable=False, index=True)
+    metric_value = Column(JSONB, nullable=True)
+    observed_at = Column(DateTime, default=_utcnow, index=True)
 
 class UeContextRecord(Base):
     """
@@ -97,5 +231,5 @@ class UeContextRecord(Base):
     app_catalog = Column(JSONB, nullable=True)
     flow_catalog = Column(JSONB, nullable=True)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)

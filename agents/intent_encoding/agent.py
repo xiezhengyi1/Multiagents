@@ -4,19 +4,21 @@ import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-from agent_runtime import AgentWorkspace, ArtifactCache, ArtifactEnvelope, ArtifactStore
-from agents.basemodel import BaseAgent
+from agent_runtime import ArtifactEnvelope
+from agents.BaseAgent import BaseAgent
+from agents.worker import ArtifactWorkerMixin
 from domain.policy_plan import FlowSelector, OperationIntent
 from tools.db_tool import get_ue_flow_catalog_by_supi
 from tools.knowledge_tool import get_knowledge_by_key, search_semantic_knowledge
 from tools.pcf_tools import get_ue_context, get_ue_flow_catalog
-from utils.logger import log_event, log_timing, setup_logger
+from utils.logger import log_event, log_timing
 
 from .contracts import FlowIntent, UserIntent
 from .prompts import IEA_SYSTEM_PROMPT
 
 
-class IntentEncodingAgent(BaseAgent):
+class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
+    agent_name = "intent_encoding"
     FLOW_KEYWORDS: Dict[str, Set[str]] = {
         "video": {"video", "视频"},
         "control": {"control", "控制"},
@@ -31,15 +33,28 @@ class IntentEncodingAgent(BaseAgent):
     def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507"):
         super().__init__(model_name=model_name)
         self.agent_name = "intent_encoding"
-        self.workspace = AgentWorkspace.for_agent(self.agent_name)
-        self.cache = ArtifactCache(self.workspace)
-        self.artifact_store = ArtifactStore()
-        self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[95m")
+        self.initialize_agent_runtime(logger_color="\033[95m")
         self.tools = [get_ue_context, get_ue_flow_catalog, search_semantic_knowledge, get_knowledge_by_key]
         self.agent = self.create_structured_agent(
             tools=self.tools,
             system_prompt=IEA_SYSTEM_PROMPT,
             response_format=UserIntent,
+        )
+
+    def expected_request_type(self) -> str:
+        return "OperationIntentRequest"
+
+    def response_artifact_type(self) -> str:
+        return "OperationIntent"
+
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> OperationIntent:
+        payload = envelope.payload or {}
+        return self.analyze_intent_to_operation(
+            user_input=str(payload.get("user_input") or ""),
+            context=str(payload.get("context") or ""),
+            session_id=envelope.session_id,
+            snapshot_id=envelope.snapshot_id,
+            request_envelope=envelope,
         )
 
     @staticmethod
@@ -58,19 +73,15 @@ class IntentEncodingAgent(BaseAgent):
         session_id: str,
         snapshot_id: str,
     ) -> ArtifactEnvelope:
-        envelope = ArtifactEnvelope(
+        return self.cache_received_artifact(
             artifact_type="OperationIntentRequest",
-            source_agent="coordinator",
-            target_agent=self.agent_name,
-            session_id=str(session_id or "").strip(),
-            snapshot_id=str(snapshot_id or "").strip(),
             payload={
                 "user_input": str(user_input),
                 "context": str(context or ""),
             },
+            session_id=session_id,
+            snapshot_id=snapshot_id,
         )
-        self.cache.cache_received(envelope)
-        return envelope
 
     def _cache_produced_result(
         self,
@@ -78,17 +89,10 @@ class IntentEncodingAgent(BaseAgent):
         request_envelope: ArtifactEnvelope,
         operation_intent: OperationIntent,
     ) -> None:
-        self.cache.cache_produced(
-            ArtifactEnvelope(
-                artifact_type="OperationIntent",
-                source_agent=self.agent_name,
-                target_agent=request_envelope.source_agent,
-                session_id=request_envelope.session_id,
-                snapshot_id=request_envelope.snapshot_id,
-                correlation_id=request_envelope.correlation_id,
-                upstream_artifact_ids=[request_envelope.artifact_id],
-                payload=operation_intent.model_dump(mode="json"),
-            )
+        self.cache_produced_artifact(
+            artifact_type="OperationIntent",
+            request_envelope=request_envelope,
+            payload=operation_intent,
         )
 
     def analyze_intent(
@@ -99,6 +103,7 @@ class IntentEncodingAgent(BaseAgent):
         session_id: str = "",
         snapshot_id: str = "",
     ) -> UserIntent:
+        self.ensure_worker_runtime_initialized()
         if not str(user_input).strip():
             raise ValueError("user_input must not be empty")
 
@@ -143,6 +148,23 @@ class IntentEncodingAgent(BaseAgent):
             session_id=session_id,
             snapshot_id=snapshot_id,
         )
+        return self.analyze_intent_to_operation(
+            user_input=user_input,
+            context=context,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            request_envelope=request_envelope,
+        )
+
+    def analyze_intent_to_operation(
+        self,
+        *,
+        user_input: str,
+        context: str = "",
+        session_id: str = "",
+        snapshot_id: str = "",
+        request_envelope: ArtifactEnvelope,
+    ) -> OperationIntent:
         user_intent = self.analyze_intent(
             user_input,
             context=context,

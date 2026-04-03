@@ -391,6 +391,8 @@ class SliceOptimizationEngine:
         valid_snssais = {s.snssai for s in slices}
         for app in apps:
             for f in app.flows:
+                if getattr(f, "optimize_requested", False):
+                    continue
                 if not f.old_slice:
                     continue
                 # 容错：如果原切片已不在切片列表中，则当作新流处理（允许迁移）
@@ -408,6 +410,8 @@ class SliceOptimizationEngine:
         valid_snssais = {s.snssai for s in slices}
         for app in apps:
             for f in app.flows:
+                if getattr(f, "optimize_requested", False):
+                    continue
                 if not f.old_slice:
                     continue
 

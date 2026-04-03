@@ -1,6 +1,6 @@
 import re
 import secrets
-from typing import List, Union, Dict, Any, Optional
+from typing import List, Union, Dict, Any, Optional, Set
 from .models import App, Flow, OptimizationConfig, ServiceType, SLAProfile, Link, Path, Node
 from .engine import SliceOptimizationEngine, IBNSOptimizationEngine
 from tools.init_scenario import get_current_scenario, cache_scenario, serialize_scenario_for_api
@@ -95,164 +95,220 @@ def _normalize_or_generate_id(raw_id: Any, prefix: str, used_suffixes: set) -> s
     suffix = _allocate_unique_suffix(used_suffixes)
     return f"{prefix}-{suffix}"
 
-def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float, w4: float = 0.0, mode: str = 'full', return_json: bool = True) -> Union[str, Dict[str, Any]]:
+
+def _normalize_flow_list(raw_flows: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_flows, list):
+        raise TypeError("new_app_data['flows'] must be a list of flow dictionaries")
+
+    normalized_flows: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw_flows):
+        if not isinstance(item, dict):
+            raise TypeError(f"flow at index {index} must be a dictionary")
+        normalized_flows.append(dict(item))
+    return normalized_flows
+
+
+def _collapse_payload_to_app_dict(raw_payload: Any) -> Dict[str, Any]:
+    if isinstance(raw_payload, list):
+        payload: Dict[str, Any] = {"flows": _normalize_flow_list(raw_payload)}
+    elif isinstance(raw_payload, dict):
+        payload = dict(raw_payload)
+        if "app_name" in payload and "name" not in payload:
+            payload["name"] = payload["app_name"]
+        payload["flows"] = _normalize_flow_list(payload.get("flows", []))
+    else:
+        raise TypeError("new_app_data must be a dict or a list of flow dictionaries")
+
+    flows = payload["flows"]
+    if not flows:
+        raise ValueError("new_app_data must include at least one flow")
+
+    flow_app_ids = {str(flow.get("app_id")).strip() for flow in flows if str(flow.get("app_id") or "").strip()}
+    if len(flow_app_ids) > 1:
+        raise ValueError("all flows in one optimization request must belong to the same app_id")
+    if "app_id" not in payload and flow_app_ids:
+        payload["app_id"] = next(iter(flow_app_ids))
+
+    flow_supis = {str(flow.get("supi")).strip() for flow in flows if str(flow.get("supi") or "").strip()}
+    if len(flow_supis) > 1:
+        raise ValueError("all flows in one optimization request must belong to the same supi")
+    if "supi" not in payload and flow_supis:
+        payload["supi"] = next(iter(flow_supis))
+
+    flow_app_names = {str(flow.get("app_name")).strip() for flow in flows if str(flow.get("app_name") or "").strip()}
+    if len(flow_app_names) > 1:
+        raise ValueError("all flows in one optimization request must belong to the same app_name")
+    if "name" not in payload and flow_app_names:
+        payload["name"] = next(iter(flow_app_names))
+
+    return payload
+
+
+def optimize_network_slices(new_app_data: Union[dict, List[dict]], w1: float, w2: float, w3: float, w4: float = 0.0, mode: str = 'full', return_json: bool = True) -> Union[str, Dict[str, Any]]:
     """
-    执行网络切片资源优化求解
-    :param mode: 'full' (全量), 'incremental' (严格增量), 'hybrid' (增量+挤占)
-    :param return_json: 是否返回结构化字典数据而不是字符串报告
+    Execute slice optimization for one target app.
+
+    Accepted input shapes:
+    - {"app_id": ..., "name": ..., "supi": ..., "flows": [...]}
+    - [{flow...}, {flow...}, ...] for multiple flows under one app
     """
     try:
         apps, slices, nodes = get_current_scenario()
         used_suffixes = _collect_used_id_suffixes(apps)
-        
-        # B. 应用身份识别
-        target_app_id = new_app_data.get('app_id')
-        target_app_name = new_app_data.get('name', 'NewApp')
-        
-        # 查找现有应用 (ID优先，Name其次)
-        existing_app = next((a for a in apps if (target_app_id and a.app_id == target_app_id) or a.name == target_app_name), None)
-        if existing_app:
-            _discard_suffix(existing_app.app_id, "app", used_suffixes)
-            for f in existing_app.flows:
-                _discard_suffix(getattr(f, 'flow_id', None), "flow", used_suffixes)
-            final_app_id = _normalize_or_generate_id(
-                existing_app.app_id,
-                "app",
-                used_suffixes,
-            )
+        normalized_payload = _collapse_payload_to_app_dict(new_app_data)
+        requested_flows_payload = normalized_payload["flows"]
+
+        target_app_id = normalized_payload.get("app_id")
+        target_app_name = normalized_payload.get("name")
+
+        existing_app = next(
+            (app for app in apps if (target_app_id and app.app_id == target_app_id) or (target_app_name and app.name == target_app_name)),
+            None,
+        )
+        if existing_app is not None:
+            final_app_id = existing_app.app_id
         else:
-            final_app_id = _normalize_or_generate_id(
-                target_app_id,
-                "app",
-                used_suffixes,
-            )
+            if not target_app_id and not target_app_name:
+                raise ValueError("new app payload must include app_id or app_name when the target app does not already exist")
+            final_app_id = _normalize_or_generate_id(target_app_id, "app", used_suffixes)
 
-        app_supi = _normalize_supi(new_app_data.get('supi'))
+        if not target_app_name:
+            target_app_name = existing_app.name if existing_app is not None else "NewApp"
+
+        app_supi = _normalize_supi(normalized_payload.get("supi"))
         if app_supi is None and existing_app is not None:
-            app_supi = _normalize_supi(getattr(existing_app, 'supi', None))
+            app_supi = _normalize_supi(getattr(existing_app, "supi", None))
 
-        # C. 流构建与匹配 (Flow Construction & Mapping)
         existing_flow_map: Dict[str, Flow] = {}
-        existing_flow_map_raw: Dict[str, Flow] = {}
-        if existing_app:
-            for f in existing_app.flows:
-                raw_existing_fid = getattr(f, 'flow_id', None)
+        if existing_app is not None:
+            for old_flow in existing_app.flows:
+                raw_existing_fid = getattr(old_flow, "flow_id", None)
                 if raw_existing_fid is not None:
-                    existing_flow_map_raw[str(raw_existing_fid).strip()] = f
-                normalized_existing_fid = _normalize_or_generate_id(
-                    raw_existing_fid,
-                    "flow",
-                    used_suffixes,
-                )
-                existing_flow_map[normalized_existing_fid] = f
-        new_flows_obj = []
-        
-        for i, f_data in enumerate(new_app_data.get('flows', [])):
-            # 1. 基础属性解析
-            bw_ul_val = f_data.get('bw_ul', 0)
-            bw_dl_val = f_data.get('bw_dl', 0)
-            f_desc = f_data.get('name', f'flow_{i}')
-            f_prio = f_data.get('priority', 10)
-            f_lat = f_data.get('lat', 100)
-            f_loss = f_data.get('loss_req', 0.05)
-            f_jitter = f_data.get('jitter_req', 50)
-            f_gbr_ul = f_data.get('gbr_ul', bw_ul_val)
-            f_gbr_dl = f_data.get('gbr_dl', bw_dl_val)
-            
-            # 2. 确定 Flow ID（统一格式: flow-xxxxxxxx）
-            raw_fid = f_data.get('flow_id')
-            current_f_id = _normalize_or_generate_id(
-                raw_fid,
-                "flow",
-                used_suffixes,
-            )
-            
-            # 3. 继承旧状态
-            matched_old_flow = existing_flow_map.get(current_f_id)
-            if matched_old_flow is None and raw_fid is not None:
-                matched_old_flow = existing_flow_map_raw.get(str(raw_fid).strip())
- 
-            new_flows_obj.append(Flow(
-                name=f_desc,
-                bw_ul=bw_ul_val,
-                bw_dl=bw_dl_val,
-                gbr_ul=f_gbr_ul,
-                gbr_dl=f_gbr_dl,
-                lat=f_lat,
-                loss_req=f_loss,
-                jitter_req=f_jitter,
-                priority=f_prio,
-                flow_id=current_f_id,
-                service_type=f_data.get('service_type', 'eMBB'),
-                service_type_id=_service_type_name_to_id(
-                    f_data.get('service_type', 'eMBB'),
-                    default=int(f_data.get('service_type_id', 1) or 1)
-                ),
-                old_slice=matched_old_flow.old_slice if matched_old_flow else None,
-                old_allocated_bw_ul=matched_old_flow.old_allocated_bw_ul if matched_old_flow else None,
-                old_allocated_bw_dl=matched_old_flow.old_allocated_bw_dl if matched_old_flow else None
-            ))
+                    existing_flow_map[str(raw_existing_fid).strip()] = old_flow
 
-        # D. 构建新 App 对象
-        new_app = App(
+        merged_flows: List[Flow] = []
+        requested_flow_ids: Set[str] = set()
+        matched_existing_flow_ids: Set[str] = set()
+
+        for index, flow_payload in enumerate(requested_flows_payload):
+            raw_fid = str(flow_payload.get("flow_id") or "").strip() or None
+            matched_old_flow = existing_flow_map.get(raw_fid) if raw_fid is not None else None
+
+            if matched_old_flow is not None:
+                current_f_id = matched_old_flow.flow_id
+                matched_existing_flow_ids.add(matched_old_flow.flow_id)
+            else:
+                current_f_id = _normalize_or_generate_id(raw_fid, "flow", used_suffixes)
+            requested_flow_ids.add(current_f_id)
+
+            bw_ul_val = flow_payload.get("bw_ul", matched_old_flow.bw_ul if matched_old_flow else 0)
+            bw_dl_val = flow_payload.get("bw_dl", matched_old_flow.bw_dl if matched_old_flow else 0)
+            gbr_ul_val = flow_payload.get("gbr_ul", matched_old_flow.gbr_ul if matched_old_flow else bw_ul_val)
+            gbr_dl_val = flow_payload.get("gbr_dl", matched_old_flow.gbr_dl if matched_old_flow else bw_dl_val)
+            lat_val = flow_payload.get("lat", matched_old_flow.lat if matched_old_flow else 100)
+            loss_val = flow_payload.get("loss_req", matched_old_flow.loss_req if matched_old_flow else 0.05)
+            jitter_val = flow_payload.get("jitter_req", matched_old_flow.jitter_req if matched_old_flow else 50)
+            priority_val = flow_payload.get("priority", matched_old_flow.priority if matched_old_flow else 10)
+            service_type = flow_payload.get("service_type", matched_old_flow.service_type if matched_old_flow else "eMBB")
+            service_type_id = _service_type_name_to_id(
+                service_type,
+                default=int(
+                    flow_payload.get(
+                        "service_type_id",
+                        matched_old_flow.service_type_id if matched_old_flow else 1,
+                    ) or 1
+                ),
+            )
+
+            merged_flows.append(
+                Flow(
+                    name=flow_payload.get("name", f"flow_{index}"),
+                    flow_id=current_f_id,
+                    service_type=service_type,
+                    bw_ul=bw_ul_val,
+                    bw_dl=bw_dl_val,
+                    gbr_ul=gbr_ul_val,
+                    gbr_dl=gbr_dl_val,
+                    lat=lat_val,
+                    loss_req=loss_val,
+                    jitter_req=jitter_val,
+                    priority=priority_val,
+                    service_type_id=service_type_id,
+                    old_slice=matched_old_flow.old_slice if matched_old_flow else None,
+                    old_allocated_bw_ul=matched_old_flow.old_allocated_bw_ul if matched_old_flow else None,
+                    old_allocated_bw_dl=matched_old_flow.old_allocated_bw_dl if matched_old_flow else None,
+                    optimize_requested=True,
+                )
+            )
+
+        if existing_app is not None:
+            for old_flow in existing_app.flows:
+                if old_flow.flow_id not in matched_existing_flow_ids:
+                    old_flow.optimize_requested = False
+                    merged_flows.append(old_flow)
+
+        target_app = App(
             name=target_app_name,
             app_id=final_app_id,
             supi=app_supi,
-            flows=new_flows_obj,
+            flows=merged_flows,
         )
-        
-        # E. 调用求解引擎
+
         config = OptimizationConfig(w1=w1, w2=w2, w3=w3, w4=w4)
         engine = SliceOptimizationEngine(config)
-        
-        active_apps = [a for a in apps if a.app_id != final_app_id and a.name != target_app_name]
-        updated_apps_list = active_apps + [new_app]
-        
+
+        if existing_app is not None:
+            active_apps = [app for app in apps if app.app_id != existing_app.app_id]
+        else:
+            active_apps = list(apps)
+        updated_apps_list = active_apps + [target_app]
+
         if mode == 'incremental':
             results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve_incremental(updated_apps_list, slices, nodes)
         elif mode == 'hybrid':
             results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve_hybrid(updated_apps_list, slices, nodes)
-        else: # full
+        else:
             results_df, slice_stats_df, status_str, objective_val, breakdown = engine.solve(updated_apps_list, slices, nodes)
-        
+
         if results_df.empty:
-            return "求解器未返回结果 (Empty Result)。" if not return_json else {"error": "Empty Result"}
+            return {"error": "Empty Result"} if return_json else "求解器未返回结果 (Empty Result)。"
 
-        # F. 更新内存快照 (不在优化器内维护全局变量)
         for _, row in results_df.iterrows():
-            r_app_id = row['App ID']
-            r_flow_id = row['Flow ID']
-            r_new_slice = row['New Slice']
-            r_act_bw_ul = row['Act BW UL']
-            r_act_bw_dl = row['Act BW DL']
+            r_app_id = row["App ID"]
+            r_flow_id = row["Flow ID"]
+            r_new_slice = row["New Slice"]
+            r_act_bw_ul = row["Act BW UL"]
+            r_act_bw_dl = row["Act BW DL"]
 
-            target_app_obj = next((a for a in updated_apps_list if a.app_id == r_app_id), None)
-            if target_app_obj:
-                target_flow_obj = next((f for f in target_app_obj.flows if f.flow_id == r_flow_id), None)
-                if target_flow_obj:
-                    target_flow_obj.old_slice = r_new_slice
-                    target_flow_obj.old_allocated_bw_ul = r_act_bw_ul
-                    target_flow_obj.old_allocated_bw_dl = r_act_bw_dl
+            cached_app = next((app for app in updated_apps_list if app.app_id == r_app_id), None)
+            if cached_app is None:
+                continue
+            cached_flow = next((flow for flow in cached_app.flows if flow.flow_id == r_flow_id), None)
+            if cached_flow is None:
+                continue
+            cached_flow.old_slice = r_new_slice
+            cached_flow.old_allocated_bw_ul = r_act_bw_ul
+            cached_flow.old_allocated_bw_dl = r_act_bw_dl
 
-        # 缓存最新场景（供后续下发成功后的提交工具使用）
         cache_scenario(updated_apps_list, slices, nodes)
 
-        slice_list = slice_stats_df.to_dict(orient='records')
         slice_status = []
         target_ssts = {
-            _service_type_name_to_id(flow.get('service_type'), default=int(flow.get('service_type_id', 1) or 1))
-            for flow in new_app_data.get('flows', [])
+            _service_type_name_to_id(flow.get("service_type"), default=int(flow.get("service_type_id", 1) or 1))
+            for flow in requested_flows_payload
         } or {1}
-        for s in slice_list:
+        for slice_row in slice_stats_df.to_dict(orient="records"):
             try:
-                slice_sst = int(str(s.get('SNSSAI', ''))[:2], 16)
+                slice_sst = int(str(slice_row.get("SNSSAI", ""))[:2], 16)
             except Exception:
                 slice_sst = None
-            if slice_sst not in target_ssts:
-                continue
-            slice_status.append(s)
+            if slice_sst in target_ssts:
+                slice_status.append(slice_row)
 
-        # G. 生成报告
+        is_target_mask = (results_df["App ID"] == final_app_id) & results_df["Flow ID"].isin(requested_flow_ids)
+        target_flow_records = results_df[is_target_mask].to_dict(orient="records")
+        impacted_records = results_df[(~is_target_mask) & (results_df["Strategies"] != "淇濇寔")].to_dict(orient="records")
+
         if return_json:
             return {
                 "meta": {
@@ -260,66 +316,58 @@ def optimize_network_slices(new_app_data: dict, w1: float, w2: float, w3: float,
                     "objective_value": float(objective_val) if objective_val is not None else None,
                     "mode": mode,
                     "params": {"w1": w1, "w2": w2, "w3": w3, "w4": w4},
-                    "breakdown": breakdown
+                    "breakdown": breakdown,
                 },
                 "target_app": {
                     "app_id": final_app_id,
                     "name": target_app_name,
-                    "flows": results_df[results_df['App ID'] == final_app_id].to_dict(orient='records')
+                    "flows": target_flow_records,
                 },
-                "impacted_flows": results_df[(results_df['App ID'] != final_app_id) & (results_df['Strategies'] != "保持")].to_dict(orient='records'),
+                "impacted_flows": impacted_records,
                 "slice_stats": slice_status,
-                # "scenario": serialize_scenario_for_api(updated_apps_list, slices, nodes)
             }
 
         output = []
-        output.append(f"--- 优化求解报告 (Flow Level) ---")
-        output.append(f"参数: w1={w1}, w2={w2}, w3={w3}, w4={w4}")
-        mode_map = {'full': '全量优化', 'incremental': '严格增量', 'hybrid': '混合/挤占模式'}
-        output.append(f"模式: {mode_map.get(mode, mode)}")
-
-        output.append(f"求解状态: {status_str}")
-        output.append(f"目标函数值: {objective_val if objective_val is not None else 'N/A'}")
+        output.append("--- Optimization Report (Flow Level) ---")
+        output.append(f"Params: w1={w1}, w2={w2}, w3={w3}, w4={w4}")
+        mode_map = {"full": "full", "incremental": "incremental", "hybrid": "hybrid"}
+        output.append(f"Mode: {mode_map.get(mode, mode)}")
+        output.append(f"Status: {status_str}")
+        output.append(f"Objective: {objective_val if objective_val is not None else 'N/A'}")
         if breakdown:
             output.append(
-                "目标项分解: "
+                "Breakdown: "
                 f"load={breakdown.get('load_norm', 0):.6f}, "
                 f"signal={breakdown.get('signal_norm', 0):.6f}, "
                 f"exp={breakdown.get('exp', 0):.6f}, "
                 f"qos_core={breakdown.get('qos_core', 0):.6f}, "
                 f"qos_aux={breakdown.get('qos_aux', 0):.6f}"
             )
-        
-        # 1. 本次业务结果
-        my_results = results_df[results_df['App ID'] == final_app_id]
-        if not my_results.empty:
-            output.append(f"业务 '{target_app_name}' (ID: {final_app_id}) 分配详情:")
-            for _, row in my_results.iterrows():
-                strategy_note = f", 策略: {row['Strategies']}" if row['Strategies'] != "保持" else ""
-                output.append(
-                    f"  - 流 [{row['Flow Name']}]（ID：{row['Flow ID']}） -> 切片: {row['New Slice'] or '未分配'} "
-                    f"(分配带宽 UL: {row['Act BW UL']}/{row['Req BW UL']}M, DL: {row['Act BW DL']}/{row['Req BW DL']}M{strategy_note})"
-                )
-        else:
-            output.append(f"警告: 结果中未找到目标业务 {target_app_name}")
 
-        # 2. 其他受影响业务
-        other_results = results_df[results_df['App ID'] != final_app_id]
-        impacted_mask = other_results['Strategies'] != "保持"
-        impacted_df = other_results[impacted_mask]
-        
+        my_results = results_df[is_target_mask]
+        if not my_results.empty:
+            output.append(f"Target app '{target_app_name}' (ID: {final_app_id}):")
+            for _, row in my_results.iterrows():
+                strategy_note = f", strategy: {row['Strategies']}" if row["Strategies"] != "淇濇寔" else ""
+                output.append(
+                    f"  - flow [{row['Flow Name']}] (ID: {row['Flow ID']}) -> slice: {row['New Slice'] or 'unassigned'} "
+                    f"(UL: {row['Act BW UL']}/{row['Req BW UL']}M, DL: {row['Act BW DL']}/{row['Req BW DL']}M{strategy_note})"
+                )
+
+        impacted_df = results_df[(~is_target_mask) & (results_df["Strategies"] != "淇濇寔")]
         if not impacted_df.empty:
-            output.append("\n其他受影响的业务流:")
+            output.append("Impacted flows:")
             for _, row in impacted_df.iterrows():
                 output.append(
                     f"  - {row['App']} / [{row['Flow Name']}] -> {row['New Slice']} "
-                    f"(策略: {row['Strategies']})"
+                    f"(strategy: {row['Strategies']})"
                 )
 
-        output.append("\n各切片资源状态:")
+        output.append("Slice stats:")
         for _, row in slice_stats_df.iterrows():
-            output.append(f"  - {row['Slice']} ({row['SNSSAI']}): 上行负载 {row['Load UL (%)']}% (剩余 {row['Rem UL (M)']}M) / 下行负载 {row['Load DL (%)']}% (剩余 {row['Rem DL (M)']}M)")
-
+            output.append(
+                f"  - {row['Slice']} ({row['SNSSAI']}): UL load {row['Load UL (%)']}% / DL load {row['Load DL (%)']}%"
+            )
         return "\n".join(output)
     except Exception as e:
         logger.error(f"优化过程发生异常: {e}", exc_info=True)

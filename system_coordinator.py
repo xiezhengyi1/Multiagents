@@ -2,20 +2,31 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
+from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from agent_runtime import ArtifactEnvelope, ArtifactStore
+from agents.assurance_diagnosis import AssuranceDiagnosisAgent, AssuranceDiagnosisRequest, AssuranceDiagnosisResult
+from agents.conflict_resolution import ConflictResolutionAgent, ConflictResolutionRequest, ConflictResolutionResult
 from domain.collaboration import AgentHandoff, PlanningContext, PlanningRequest
-from domain.policy_plan import OperationIntent
+from domain.policy_plan import OperationIntent, PolicyPlanDraft
 from tools.db_tool import create_session_context, get_latest_snapshot_metadata, update_session_context
+from tools.runtime_store import (
+    create_or_update_session,
+    record_episodic_experience,
+    record_handoff,
+    record_stage_result,
+)
 from utils.logger import log_event, log_timing, setup_logger
+from workflows.runtime_registry import RuntimeAgentRegistry
 
 if TYPE_CHECKING:
     from agents.intent_encoding import IntentEncodingAgent
     from agents.MemoryManager import MemoryManager
     from agents.optimization_strategy import OptimizationStrategyAgent
-    from agents.policy_dispatch import PolicyDispatchAgent
+    from agents.policy_dispatch import FeedbackReport, PolicyDispatchAgent
 
 
 SUCCESS_STATUS = "Success"
@@ -27,9 +38,13 @@ def _to_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         return value
     if hasattr(value, "model_dump"):
-        return value.model_dump(mode="json")
+        dumped = value.model_dump(mode="json")
+        if isinstance(dumped, dict):
+            return dumped
     if hasattr(value, "dict"):
-        return value.dict()
+        dumped = value.dict()
+        if isinstance(dumped, dict):
+            return dumped
     raise TypeError(f"Unsupported payload type: {type(value).__name__}")
 
 
@@ -42,12 +57,35 @@ def _build_failure_feedback(message: str, suggestion: str = "Check coordinator l
     }
 
 
+def _parse_pda_metrics(feedback: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    raw_metrics = str(feedback.get("performance_metrics") or "").strip()
+    if not raw_metrics or raw_metrics == "N/A":
+        return [], []
+    try:
+        payload = json.loads(raw_metrics)
+    except json.JSONDecodeError:
+        return [], []
+    dispatch_results = payload.get("dispatch_results", []) if isinstance(payload, dict) else []
+    assurance_results = payload.get("assurance_results", []) if isinstance(payload, dict) else []
+    return (
+        dispatch_results if isinstance(dispatch_results, list) else [],
+        assurance_results if isinstance(assurance_results, list) else [],
+    )
+
+
+def _require_store_write(ok: bool, action: str) -> None:
+    if not ok:
+        raise RuntimeError(f"Failed to persist {action}.")
+
+
 @dataclass
 class RoundTrace:
     round_index: int
     intent: Dict[str, Any] = field(default_factory=dict)
     strategy: Dict[str, Any] = field(default_factory=dict)
     feedback: Dict[str, Any] = field(default_factory=dict)
+    conflict_resolution: Dict[str, Any] = field(default_factory=dict)
+    assurance_diagnosis: Dict[str, Any] = field(default_factory=dict)
     handoffs: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -56,6 +94,8 @@ class RoundTrace:
             "intent": self.intent,
             "strategy": self.strategy,
             "feedback": self.feedback,
+            "conflict_resolution": self.conflict_resolution,
+            "assurance_diagnosis": self.assurance_diagnosis,
             "handoffs": self.handoffs,
         }
 
@@ -82,25 +122,54 @@ class CoordinationResult:
         }
 
 
+class LegacyWorkerAdapter:
+    def __init__(self, agent_name: str, legacy_agent: object, artifact_type: str, response_type: str, runner: str) -> None:
+        self.agent_name = agent_name
+        self.legacy_agent = legacy_agent
+        self._artifact_type = artifact_type
+        self._response_type = response_type
+        self._runner = runner
+        self.artifact_store = ArtifactStore()
+
+    def consume_request_artifact(self, request_path: Path) -> Path:
+        envelope = self.artifact_store.read_artifact(request_path)
+        if self._runner == "iea":
+            payload = envelope.payload or {}
+            result = self.legacy_agent.analyze_operation_intent(
+                str(payload.get("user_input") or ""),
+                context=str(payload.get("context") or ""),
+                session_id=envelope.session_id,
+                snapshot_id=envelope.snapshot_id,
+            )
+        elif self._runner == "osa":
+            result = self.legacy_agent.generate_strategy(PlanningRequest.model_validate(envelope.payload))
+        elif self._runner == "pda":
+            result = self.legacy_agent.execute_and_evaluate(PolicyPlanDraft.model_validate(envelope.payload))
+        else:
+            raise ValueError(f"Unsupported legacy runner: {self._runner}")
+
+        response = ArtifactEnvelope(
+            artifact_type=self._response_type,
+            source_agent=self.agent_name,
+            target_agent=envelope.source_agent,
+            session_id=envelope.session_id,
+            snapshot_id=envelope.snapshot_id,
+            correlation_id=envelope.correlation_id,
+            upstream_artifact_ids=[envelope.artifact_id],
+            payload=_to_dict(result),
+        )
+        return self.artifact_store.write_response(response)
+
+
 class MultiAgentSystem:
-    """
-    Minimal coordinator for the IEA -> OSA -> PDA closed loop.
-
-    Notes:
-    1. Each round always starts from IEA and ends at PDA.
-    2. PDA feedback is injected into the next IEA round as context.
-    3. The loop stops immediately when PDA returns execution_status == "Success".
-    4. This coordinator assumes the UE input includes a SUPI. If IEA does not
-       return a SUPI, the round is treated as failed because the upstream
-       assumption was not satisfied by the extracted structure.
-    """
-
     def __init__(
         self,
         ie_agent: Optional["IntentEncodingAgent"] = None,
         memory_manager: Optional["MemoryManager"] = None,
         os_agent: Optional["OptimizationStrategyAgent"] = None,
         pd_agent: Optional["PolicyDispatchAgent"] = None,
+        cr_agent: Optional[ConflictResolutionAgent] = None,
+        ad_agent: Optional[AssuranceDiagnosisAgent] = None,
         *,
         max_rounds: int = 3,
     ) -> None:
@@ -120,56 +189,34 @@ class MultiAgentSystem:
         self.ie_agent = ie_agent
         self.os_agent = os_agent
         self.pd_agent = pd_agent
+        self.cr_agent = cr_agent or ConflictResolutionAgent()
+        self.ad_agent = ad_agent or AssuranceDiagnosisAgent()
         self.max_rounds = max_rounds
         self.memory_manager = memory_manager if memory_manager is not None else self._init_memory_manager()
+        self.artifact_store = ArtifactStore()
+        self.registry = RuntimeAgentRegistry(max_workers=8)
+        self._register_workers()
+
+    def _register_workers(self) -> None:
+        if not hasattr(self.ie_agent, "consume_request_artifact"):
+            self.ie_agent = LegacyWorkerAdapter("intent_encoding", self.ie_agent, "OperationIntentRequest", "OperationIntent", "iea")
+        if not hasattr(self.os_agent, "consume_request_artifact"):
+            self.os_agent = LegacyWorkerAdapter("optimization_strategy", self.os_agent, "PlanningRequest", "PolicyPlanDraft", "osa")
+        if not hasattr(self.pd_agent, "consume_request_artifact"):
+            self.pd_agent = LegacyWorkerAdapter("policy_dispatch", self.pd_agent, "PolicyPlanDraft", "FeedbackReport", "pda")
+        self.registry.register(self.ie_agent, input_types=["OperationIntentRequest"], output_types=["OperationIntent"], concurrency=4, blocking=True)
+        self.registry.register(self.os_agent, input_types=["PlanningRequest"], output_types=["PolicyPlanDraft"], concurrency=4, blocking=True)
+        self.registry.register(self.pd_agent, input_types=["PolicyPlanDraft"], output_types=["FeedbackReport"], concurrency=4, blocking=True)
+        self.registry.register(self.cr_agent, input_types=["ConflictResolutionRequest"], output_types=["ConflictResolutionResult"], concurrency=4, blocking=False)
+        self.registry.register(self.ad_agent, input_types=["AssuranceDiagnosisRequest"], output_types=["AssuranceDiagnosisResult"], concurrency=4, blocking=False)
 
     def _init_memory_manager(self) -> "MemoryManager":
         from agents.MemoryManager import MemoryManager
-        return MemoryManager(
-            short_term_limit=max(20, self.max_rounds * 8),
-        )
-
-    def _build_initial_session_payloads(self, user_input: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        return (
-            {
-                "original_input": user_input,
-                "latest_intent": None,
-                "intent_history": [],
-            },
-            {
-                "latest_strategy": None,
-                "latest_feedback": None,
-                "strategy_history": [],
-                "feedback_history": [],
-            },
-        )
-
-    def _update_session_context(
-        self,
-        session_id: Optional[str],
-        *,
-        current_step: Optional[str] = None,
-        intent_data: Optional[Dict[str, Any]] = None,
-        policy_data: Optional[Dict[str, Any]] = None,
-        status: Optional[str] = None,
-    ) -> None:
-        if not session_id:
-            raise RuntimeError("session_id is required before updating session context.")
-        ok = update_session_context(
-            session_id,
-            current_step=current_step,
-            intent_data=intent_data,
-            policy_data=policy_data,
-            status=status,
-        )
-        if not ok:
-            raise RuntimeError(f"Failed to persist session context update for {session_id}.")
+        return MemoryManager(short_term_limit=max(20, self.max_rounds * 8))
 
     def _remember(self, role: str, payload: Any) -> None:
         if isinstance(payload, str):
             content = payload
-        elif isinstance(payload, dict):
-            content = json.dumps(payload, ensure_ascii=False)
         else:
             content = json.dumps(_to_dict(payload), ensure_ascii=False)
         if role == "IEA":
@@ -182,109 +229,15 @@ class MultiAgentSystem:
         short_term = memory_bundle.get("short_term", []) if isinstance(memory_bundle, dict) else []
         long_term = memory_bundle.get("long_term", []) if isinstance(memory_bundle, dict) else []
         blocks: List[str] = []
-
         if short_term:
-            short_lines = []
-            for item in short_term[-5:]:
-                if isinstance(item, dict):
-                    short_lines.append(f"{item.get('role', 'unknown')}: {item.get('content', '')}")
-            if short_lines:
-                blocks.append("[Memory][Short-Term]\n" + "\n".join(short_lines))
-
+            blocks.append("[Memory][Short-Term]\n" + "\n".join(f"{item.get('role', 'unknown')}: {item.get('content', '')}" for item in short_term[-5:] if isinstance(item, dict)))
         if long_term:
             blocks.append("[Memory][Long-Term]\n" + "\n".join(str(item) for item in long_term))
-
-        return "\n\n".join(blocks)
+        return "\n\n".join(block for block in blocks if block.strip())
 
     @staticmethod
     def _merge_context_blocks(*blocks: str) -> str:
-        cleaned = [str(block).strip() for block in blocks if str(block or "").strip()]
-        return "\n\n".join(cleaned)
-
-    def _run_iea_with_retry(
-        self,
-        user_input: str,
-        *,
-        context: str = "",
-        session_id: str = "",
-        snapshot_id: str = "",
-    ) -> OperationIntent:
-        last_error: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                intent_obj = self.ie_agent.analyze_operation_intent(
-                    user_input,
-                    context=context,
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
-                )
-                if intent_obj is None:
-                    raise RuntimeError("IEA returned None")
-                if attempt == 1:
-                    self.logger.info("IEA succeeded on retry.")
-                return intent_obj
-            except Exception as exc:
-                last_error = exc
-                self.logger.warning(f"IEA failed on attempt {attempt + 1}/2: {exc}")
-        raise RuntimeError(f"IEA failed after retry: {last_error}")
-
-    def _run_osa_with_retry(self, planning_request: PlanningRequest) -> Any:
-        last_error: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                strategy_obj = self.os_agent.generate_strategy(planning_request)
-                if strategy_obj is None:
-                    raise RuntimeError("OSA returned None")
-                if attempt == 1:
-                    self.logger.info("OSA succeeded on retry with the same planning request.")
-                return strategy_obj
-            except Exception as exc:
-                last_error = exc
-                self.logger.warning(f"OSA failed on attempt {attempt + 1}/2: {exc}")
-        raise RuntimeError(f"OSA failed after retry: {last_error}")
-
-    @staticmethod
-    def _require_snapshot_metadata() -> Dict[str, Any]:
-        snapshot_meta = get_latest_snapshot_metadata()
-        if not isinstance(snapshot_meta, dict):
-            raise RuntimeError("No network snapshot available for planning.")
-        snapshot_id = str(snapshot_meta.get("snapshot_id") or "").strip()
-        if not snapshot_id:
-            raise RuntimeError("Latest network snapshot is missing snapshot_id.")
-        return snapshot_meta
-
-    @staticmethod
-    def _validate_resolved_intent(intent: Any) -> None:
-        intent_payload = _to_dict(intent)
-        supi = str(intent_payload.get("supi") or "").strip()
-        if not supi:
-            raise ValueError(
-                "UE input is assumed to contain SUPI, but IEA output does not contain a valid supi."
-            )
-        resolution_status = str(intent_payload.get("resolution_status") or "").strip().lower()
-        flows = intent_payload.get("flows") or []
-        unresolved_flows = [
-            flow for flow in flows
-            if str(flow.get("resolution_status") or "").strip().lower() != SUCCESS_STATUS.lower()
-            and str(flow.get("resolution_status") or "").strip().lower() != "resolved"
-        ]
-
-        if resolution_status == "resolved" and not unresolved_flows:
-            return
-
-        details: List[str] = []
-        for flow in unresolved_flows:
-            flow_name = str(flow.get("name") or "unknown")
-            flow_status = str(flow.get("resolution_status") or "unmatched")
-            candidates = flow.get("resolution_candidates") or []
-            if candidates:
-                details.append(f"{flow_name}: {flow_status} (candidates: {', '.join(map(str, candidates))})")
-            else:
-                details.append(f"{flow_name}: {flow_status}")
-
-        if not details:
-            raise ValueError(f"Intent resolution failed: status={resolution_status or 'unmatched'}")
-        raise ValueError("Intent resolution failed: " + "; ".join(details))
+        return "\n\n".join(str(block).strip() for block in blocks if str(block or "").strip())
 
     @staticmethod
     def _build_feedback_context(previous_context: str, feedback: Dict[str, Any], round_index: int) -> str:
@@ -296,34 +249,7 @@ class MultiAgentSystem:
             f"correction_suggestion: {feedback.get('correction_suggestion', '')}\n"
             "Use this feedback to refine the next round of intent understanding."
         )
-        if not previous_context:
-            return feedback_block
-        return f"{previous_context}\n\n{feedback_block}"
-
-    @staticmethod
-    def _build_planning_request(
-        *,
-        round_index: int,
-        operation_intent: OperationIntent,
-        session_id: str,
-        snapshot_id: str,
-        snapshot_metadata: Dict[str, Any],
-        memory_context: str,
-        feedback_context: str,
-        handoff_history: List[Dict[str, Any]],
-    ) -> PlanningRequest:
-        return PlanningRequest(
-            operation_intent=operation_intent,
-            context=PlanningContext(
-                round_index=round_index,
-                session_id=session_id,
-                snapshot_id=snapshot_id,
-                snapshot_metadata=snapshot_metadata,
-                memory_context=memory_context,
-                feedback_context=feedback_context,
-                handoff_history=handoff_history,
-            ),
-        )
+        return feedback_block if not previous_context else f"{previous_context}\n\n{feedback_block}"
 
     @staticmethod
     def _build_handoff(
@@ -348,175 +274,289 @@ class MultiAgentSystem:
             payload=_to_dict(payload),
         )
 
+    @staticmethod
+    def _validate_resolved_intent(intent: Dict[str, Any]) -> None:
+        supi = str(intent.get("supi") or "").strip()
+        if not supi:
+            raise ValueError("UE input is assumed to contain SUPI, but IEA output does not contain a valid supi.")
+        resolution_status = str(intent.get("resolution_status") or "").strip().lower()
+        flows = intent.get("flows") or []
+        unresolved_flows = [
+            flow for flow in flows
+            if str(flow.get("resolution_status") or "").strip().lower() not in {"success", "resolved"}
+        ]
+        if resolution_status == "resolved" and not unresolved_flows:
+            return
+        details = []
+        for flow in unresolved_flows:
+            flow_name = str(flow.get("name") or "unknown")
+            flow_status = str(flow.get("resolution_status") or "unmatched")
+            candidates = flow.get("resolution_candidates") or []
+            details.append(f"{flow_name}: {flow_status}" + (f" (candidates: {', '.join(map(str, candidates))})" if candidates else ""))
+        raise ValueError("Intent resolution failed: " + "; ".join(details or [resolution_status or "unmatched"]))
+
+    def _write_request(self, envelope: ArtifactEnvelope) -> Path:
+        return self.artifact_store.write_request(envelope)
+
+    def _dispatch(self, agent_name: str, request_envelope: ArtifactEnvelope) -> Future:
+        request_path = self._write_request(request_envelope)
+        return self.registry.submit_artifact(agent_name, request_path)
+
+    def _await_response(self, future: Future) -> ArtifactEnvelope:
+        response_path = future.result()
+        return self.artifact_store.read_artifact(response_path)
+
+    def _update_session_control(self, session_id: str, *, status: str, current_stage: str, current_snapshot_id: str, current_artifact_id: str = "", round_index: int = 0, last_error: str = "") -> None:
+        create_or_update_session(
+            session_id,
+            status=status,
+            current_stage=current_stage,
+            current_snapshot_id=current_snapshot_id,
+            current_artifact_id=current_artifact_id,
+            round_index=round_index,
+            last_error=last_error or None,
+        )
+        ok = update_session_context(
+            session_id,
+            current_step=current_stage,
+            status=status,
+        )
+        if not ok:
+            raise RuntimeError(f"Failed to persist session context update for {session_id}.")
+
+    def _build_planning_request(
+        self,
+        *,
+        round_index: int,
+        operation_intent: OperationIntent,
+        session_id: str,
+        snapshot_id: str,
+        snapshot_metadata: Dict[str, Any],
+        memory_context: str,
+        feedback_context: str,
+        handoff_history: List[Dict[str, Any]],
+    ) -> PlanningRequest:
+        return PlanningRequest(
+            operation_intent=operation_intent,
+            context=PlanningContext(
+                round_index=round_index,
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                snapshot_metadata=snapshot_metadata,
+                memory_context=memory_context,
+                feedback_context=feedback_context,
+                handoff_history=handoff_history,
+            ),
+        )
+
     def run(self, user_input: str) -> CoordinationResult:
         if not str(user_input).strip():
             raise ValueError("user_input must not be empty")
-
-        total_start = time.perf_counter()
         log_event(self.logger, "coordinator_run_start", max_rounds=self.max_rounds)
 
+        final_feedback: Dict[str, Any] = _build_failure_feedback("Coordinator exited before PDA feedback.")
+        final_supi = ""
         round_traces: List[RoundTrace] = []
         collaboration_history: List[Dict[str, Any]] = []
         feedback_context = ""
-        final_feedback: Dict[str, Any] = _build_failure_feedback("Coordinator exited before PDA feedback.")
-        final_supi = ""
-        intent_session_data, policy_session_data = self._build_initial_session_payloads(user_input)
-        session_id = create_session_context(
-            current_step="intent",
-            intent_data=intent_session_data,
-            policy_data=policy_session_data,
-            status="active",
-        )
+        session_id = create_session_context(current_step="intent", intent_data={"original_input": user_input}, policy_data={}, status="active")
         if not session_id:
             raise RuntimeError("Failed to create session context.")
         self.memory_manager.bind_thread(session_id)
-        user_memory_written = False
+        create_or_update_session(session_id, status="active", current_stage="intent", round_index=0)
+        self._remember("user", {"input": user_input})
 
         for round_index in range(1, self.max_rounds + 1):
-            round_start = time.perf_counter()
-            log_event(self.logger, "coordinator_round_start", round=round_index)
             round_handoffs: List[AgentHandoff] = []
-
             try:
-                snapshot_meta = self._require_snapshot_metadata()
-                snapshot_id = str(snapshot_meta["snapshot_id"])
+                snapshot_meta = get_latest_snapshot_metadata()
+                if not isinstance(snapshot_meta, dict):
+                    raise RuntimeError("No network snapshot available for planning.")
+                snapshot_id = str(snapshot_meta.get("snapshot_id") or "").strip()
+                if not snapshot_id:
+                    raise RuntimeError("Latest network snapshot is missing snapshot_id.")
                 memory_context = self._build_memory_context(user_input)
-                if not user_memory_written:
-                    self._remember("user", {"input": user_input})
-                    user_memory_written = True
                 iea_context = self._merge_context_blocks(memory_context, feedback_context)
-                intent_obj = self._run_iea_with_retry(
-                    user_input,
-                    context=iea_context,
-                    session_id=session_id or "",
-                    snapshot_id=snapshot_id,
-                )
-                intent = _to_dict(intent_obj)
-                self._remember("IEA", intent)
-                intent_session_data["latest_intent"] = intent
-                intent_session_data["intent_history"].append(
-                    {
-                        "round_index": round_index,
-                        "agent": "IEA",
-                        "output": intent,
-                    }
-                )
-                self._update_session_context(
-                    session_id,
-                    current_step="intent",
-                    intent_data=intent_session_data,
-                    policy_data=policy_session_data,
-                    status="active",
-                )
+
+                ie_response = None
+                for attempt in range(2):
+                    ie_request = ArtifactEnvelope(
+                        artifact_type="OperationIntentRequest",
+                        source_agent="coordinator",
+                        target_agent="intent_encoding",
+                        session_id=session_id,
+                        snapshot_id=snapshot_id,
+                        payload={"user_input": user_input, "context": iea_context},
+                    )
+                    self._update_session_control(session_id, status="active", current_stage="intent", current_snapshot_id=snapshot_id, current_artifact_id=ie_request.artifact_id, round_index=round_index)
+                    try:
+                        ie_response = self._await_response(self._dispatch("intent_encoding", ie_request))
+                        break
+                    except Exception:
+                        if attempt == 1:
+                            raise
+                if ie_response is None:
+                    raise RuntimeError("IEA returned no response artifact.")
+                intent_obj = OperationIntent.model_validate(ie_response.payload)
+                intent = intent_obj.model_dump(mode="json")
                 self._validate_resolved_intent(intent)
-                final_supi = intent["supi"]
+                final_supi = intent_obj.supi
+                self._remember("IEA", intent)
+                _require_store_write(
+                    record_stage_result(session_id=session_id, snapshot_id=snapshot_id, round_index=round_index, stage_name="IEA", artifact_id=ie_response.artifact_id, status="succeeded", payload=intent),
+                    "IEA stage result",
+                )
+
                 planning_request = self._build_planning_request(
                     round_index=round_index,
                     operation_intent=intent_obj,
-                    session_id=session_id or "",
+                    session_id=session_id,
                     snapshot_id=snapshot_id,
                     snapshot_metadata=snapshot_meta,
                     memory_context=memory_context,
                     feedback_context=feedback_context,
                     handoff_history=list(collaboration_history),
                 )
-                round_handoffs.append(
-                    self._build_handoff(
-                        round_index=round_index,
-                        source_agent="IEA",
-                        target_agent="OSA",
+                round_handoffs.append(self._build_handoff(round_index=round_index, source_agent="IEA", target_agent="OSA", artifact_type="PlanningRequest", session_id=session_id, snapshot_id=snapshot_id, summary=f"Resolved {len(intent_obj.flows)} flow(s) for SUPI {intent_obj.supi}.", payload=planning_request))
+
+                osa_response = None
+                for attempt in range(2):
+                    osa_request = ArtifactEnvelope(
                         artifact_type="PlanningRequest",
-                        session_id=planning_request.context.session_id,
-                        snapshot_id=planning_request.context.snapshot_id,
-                        summary=(
-                            f"Resolved {len(intent_obj.flows)} flow(s) for SUPI {intent_obj.supi} "
-                            f"at round {round_index}."
-                        ),
-                        payload=planning_request,
+                        source_agent="intent_encoding",
+                        target_agent="optimization_strategy",
+                        session_id=session_id,
+                        snapshot_id=snapshot_id,
+                        correlation_id=ie_response.correlation_id,
+                        upstream_artifact_ids=[ie_response.artifact_id],
+                        payload=planning_request.model_dump(mode="json"),
                     )
-                )
-
-                strategy_obj = self._run_osa_with_retry(planning_request)
-                strategy = _to_dict(strategy_obj)
+                    self._update_session_control(session_id, status="active", current_stage="generation", current_snapshot_id=snapshot_id, current_artifact_id=osa_request.artifact_id, round_index=round_index)
+                    try:
+                        osa_response = self._await_response(self._dispatch("optimization_strategy", osa_request))
+                        break
+                    except Exception:
+                        if attempt == 1:
+                            raise
+                if osa_response is None:
+                    raise RuntimeError("OSA returned no response artifact.")
+                strategy_obj = PolicyPlanDraft.model_validate(osa_response.payload)
+                strategy = strategy_obj.model_dump(mode="json")
                 self._remember("OSA", strategy)
-                policy_session_data["snapshot"] = snapshot_meta
-                policy_session_data["latest_strategy"] = strategy
-                policy_session_data["strategy_history"].append(
-                    {
-                        "round_index": round_index,
-                        "agent": "OSA",
-                        "output": strategy,
-                    }
+                _require_store_write(
+                    record_stage_result(session_id=session_id, snapshot_id=snapshot_id, round_index=round_index, stage_name="OSA", artifact_id=osa_response.artifact_id, status="succeeded", payload=strategy),
+                    "OSA stage result",
                 )
-                self._update_session_context(
-                    session_id,
-                    current_step="generation",
-                    intent_data=intent_session_data,
-                    policy_data=policy_session_data,
-                    status="active",
+                round_handoffs.append(self._build_handoff(round_index=round_index, source_agent="OSA", target_agent="PDA", artifact_type="PolicyPlanDraft", session_id=session_id, snapshot_id=snapshot_id, summary=f"Prepared {len(strategy_obj.all_policies)} policy draft(s) for execution.", payload=strategy_obj))
+
+                pda_request = ArtifactEnvelope(
+                    artifact_type="PolicyPlanDraft",
+                    source_agent="optimization_strategy",
+                    target_agent="policy_dispatch",
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    correlation_id=osa_response.correlation_id,
+                    upstream_artifact_ids=[osa_response.artifact_id],
+                    payload=strategy,
                 )
-                round_handoffs.append(
-                    self._build_handoff(
-                        round_index=round_index,
-                        source_agent="OSA",
-                        target_agent="PDA",
-                        artifact_type="PolicyPlanDraft",
-                        session_id=str(strategy_obj.session_id or session_id or ""),
-                        snapshot_id=str(strategy_obj.snapshot_id or snapshot_id),
-                        summary=f"Prepared {len(strategy_obj.all_policies)} policy draft(s) for execution.",
-                        payload=strategy_obj,
-                    )
+                cr_request = ArtifactEnvelope(
+                    artifact_type="ConflictResolutionRequest",
+                    source_agent="optimization_strategy",
+                    target_agent="conflict_resolution",
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    correlation_id=osa_response.correlation_id,
+                    upstream_artifact_ids=[osa_response.artifact_id],
+                    payload=ConflictResolutionRequest(
+                        candidate_policies=strategy.get("all_policies", []),
+                        session_id=session_id,
+                        snapshot_id=snapshot_id,
+                        upstream_context={"planning_request": planning_request.model_dump(mode="json")},
+                    ).model_dump(mode="json"),
                 )
 
-                feedback_obj = self.pd_agent.execute_and_evaluate(strategy_obj)
-                if feedback_obj is None:
-                    raise RuntimeError("PDA returned None")
-                feedback = _to_dict(feedback_obj)
-                self._remember("PDA", feedback)
-                policy_session_data["latest_feedback"] = feedback
-                policy_session_data["feedback_history"].append(
-                    {
-                        "round_index": round_index,
-                        "agent": "PDA",
-                        "output": feedback,
-                    }
+                pda_future = self._dispatch("policy_dispatch", pda_request)
+                cr_future = self._dispatch("conflict_resolution", cr_request)
+                pda_response = self._await_response(pda_future)
+                cr_response = self._await_response(cr_future)
+                feedback_obj = _to_dict(pda_response.payload)
+                conflict_obj = ConflictResolutionResult.model_validate(cr_response.payload).model_dump(mode="json")
+                final_feedback = feedback_obj
+                self._remember("PDA", feedback_obj)
+                _require_store_write(
+                    record_stage_result(session_id=session_id, snapshot_id=snapshot_id, round_index=round_index, stage_name="PDA", artifact_id=pda_response.artifact_id, status="succeeded", payload=feedback_obj),
+                    "PDA stage result",
+                )
+                _require_store_write(
+                    record_stage_result(session_id=session_id, snapshot_id=snapshot_id, round_index=round_index, stage_name="CR", artifact_id=cr_response.artifact_id, status=str(conflict_obj.get("status") or "succeeded"), payload=conflict_obj),
+                    "CR stage result",
                 )
 
-                round_traces.append(
-                    RoundTrace(
-                        round_index=round_index,
-                        intent=intent,
-                        strategy=strategy,
-                        feedback=feedback,
-                        handoffs=[handoff.model_dump(mode="json") for handoff in round_handoffs],
-                    )
+                dispatch_receipts, assurance_results = _parse_pda_metrics(feedback_obj)
+                ad_request = ArtifactEnvelope(
+                    artifact_type="AssuranceDiagnosisRequest",
+                    source_agent="policy_dispatch",
+                    target_agent="assurance_diagnosis",
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    correlation_id=pda_response.correlation_id,
+                    upstream_artifact_ids=[pda_response.artifact_id, cr_response.artifact_id],
+                    payload=AssuranceDiagnosisRequest(
+                        execution_feedback=feedback_obj,
+                        dispatch_receipts=dispatch_receipts,
+                        assurance_verdicts=assurance_results,
+                        telemetry_snapshot={"snapshot_id": snapshot_id},
+                        session_id=session_id,
+                        snapshot_id=snapshot_id,
+                        upstream_context={"conflict_resolution": conflict_obj},
+                    ).model_dump(mode="json"),
                 )
-                final_feedback = feedback
-
-                status = str(feedback.get("execution_status") or "").strip()
-                persisted_status = "completed" if status == SUCCESS_STATUS else "active"
-                self._update_session_context(
-                    session_id,
-                    current_step="execution",
-                    intent_data=intent_session_data,
-                    policy_data=policy_session_data,
-                    status=persisted_status,
-                )
-                log_timing(
-                    self.logger,
-                    "coordinator_round_total",
-                    time.perf_counter() - round_start,
-                    round=round_index,
-                    status=status or "unknown",
+                ad_response = self._await_response(self._dispatch("assurance_diagnosis", ad_request))
+                diagnosis_obj = AssuranceDiagnosisResult.model_validate(ad_response.payload).model_dump(mode="json")
+                _require_store_write(
+                    record_stage_result(session_id=session_id, snapshot_id=snapshot_id, round_index=round_index, stage_name="AD", artifact_id=ad_response.artifact_id, status=str(diagnosis_obj.get("status") or "succeeded"), payload=diagnosis_obj),
+                    "AD stage result",
                 )
 
+                status = str(feedback_obj.get("execution_status") or "").strip()
                 if status == SUCCESS_STATUS:
-                    collaboration_history.extend([handoff.model_dump(mode="json") for handoff in round_handoffs])
-                    log_timing(
-                        self.logger,
-                        "coordinator_run_total",
-                        time.perf_counter() - total_start,
-                        status="success",
+                    for handoff in round_handoffs:
+                        collaboration_history.append(handoff.model_dump(mode="json"))
+                        _require_store_write(
+                            record_handoff(
+                                session_id=handoff.session_id,
+                                snapshot_id=handoff.snapshot_id,
+                                round_index=handoff.round_index,
+                                source_agent=handoff.source_agent,
+                                target_agent=handoff.target_agent,
+                                artifact_id="",
+                                artifact_type=handoff.artifact_type,
+                                summary=handoff.summary,
+                                payload=handoff.payload,
+                            ),
+                            f"handoff {handoff.source_agent}->{handoff.target_agent}",
+                        )
+                    round_traces.append(
+                        RoundTrace(
+                            round_index=round_index,
+                            intent=intent,
+                            strategy=strategy,
+                            feedback=feedback_obj,
+                            conflict_resolution=conflict_obj,
+                            assurance_diagnosis=diagnosis_obj,
+                            handoffs=[handoff.model_dump(mode="json") for handoff in round_handoffs],
+                        )
+                    )
+                    self._update_session_control(session_id, status="completed", current_stage="execution", current_snapshot_id=snapshot_id, current_artifact_id=pda_response.artifact_id, round_index=round_index)
+                    _require_store_write(
+                        record_episodic_experience(
+                            raw_intent=user_input,
+                            applied_policy=strategy,
+                            environment_state={"snapshot_id": snapshot_id},
+                            feedback_metrics=feedback_obj,
+                            reward_score=1.0,
+                        ),
+                        "episodic experience",
                     )
                     return CoordinationResult(
                         completed=True,
@@ -528,64 +568,53 @@ class MultiAgentSystem:
                         round_traces=round_traces,
                     )
 
-                if round_index < self.max_rounds:
-                    round_handoffs.append(
-                        self._build_handoff(
-                            round_index=round_index,
-                            source_agent="PDA",
-                            target_agent="IEA",
-                            artifact_type="FeedbackReport",
-                            session_id=session_id or "",
-                            snapshot_id=snapshot_id,
-                            summary=(
-                                "Execution failed and feedback was handed back to IEA "
-                                "for the next closed-loop round."
-                            ),
-                            payload=feedback_obj,
-                        )
+                round_handoffs.append(
+                    self._build_handoff(
+                        round_index=round_index,
+                        source_agent="PDA",
+                        target_agent="IEA",
+                        artifact_type="FeedbackReport",
+                        session_id=session_id,
+                        snapshot_id=snapshot_id,
+                        summary="Execution failed and feedback was handed back to IEA for the next round.",
+                        payload=feedback_obj,
                     )
-                    round_traces[-1].handoffs = [handoff.model_dump(mode="json") for handoff in round_handoffs]
-                collaboration_history.extend([handoff.model_dump(mode="json") for handoff in round_handoffs])
-                feedback_context = self._build_feedback_context(feedback_context, feedback, round_index)
-            except Exception as exc:
-                failure_feedback = _build_failure_feedback(str(exc))
-                final_feedback = failure_feedback
-                self._remember("Coordinator", failure_feedback)
-                policy_session_data["latest_feedback"] = failure_feedback
-                policy_session_data["feedback_history"].append(
-                    {
-                        "round_index": round_index,
-                        "agent": "Coordinator",
-                        "output": failure_feedback,
-                    }
                 )
-                self._update_session_context(
-                    session_id,
-                    current_step="execution",
-                    intent_data=intent_session_data,
-                    policy_data=policy_session_data,
-                    status="failed",
-                )
+                for handoff in round_handoffs:
+                    collaboration_history.append(handoff.model_dump(mode="json"))
+                    _require_store_write(
+                        record_handoff(
+                            session_id=handoff.session_id,
+                            snapshot_id=handoff.snapshot_id,
+                            round_index=handoff.round_index,
+                            source_agent=handoff.source_agent,
+                            target_agent=handoff.target_agent,
+                            artifact_id="",
+                            artifact_type=handoff.artifact_type,
+                            summary=handoff.summary,
+                            payload=handoff.payload,
+                        ),
+                        f"handoff {handoff.source_agent}->{handoff.target_agent}",
+                    )
                 round_traces.append(
                     RoundTrace(
                         round_index=round_index,
-                        feedback=failure_feedback,
+                        intent=intent,
+                        strategy=strategy,
+                        feedback=feedback_obj,
+                        conflict_resolution=conflict_obj,
+                        assurance_diagnosis=diagnosis_obj,
                         handoffs=[handoff.model_dump(mode="json") for handoff in round_handoffs],
                     )
                 )
-                log_timing(
-                    self.logger,
-                    "coordinator_round_total",
-                    time.perf_counter() - round_start,
-                    round=round_index,
-                    status="error",
-                )
-                log_timing(
-                    self.logger,
-                    "coordinator_run_total",
-                    time.perf_counter() - total_start,
-                    status="error",
-                )
+                feedback_context = self._build_feedback_context(feedback_context, feedback_obj, round_index)
+                self._update_session_control(session_id, status="active", current_stage="execution", current_snapshot_id=snapshot_id, current_artifact_id=pda_response.artifact_id, round_index=round_index)
+            except Exception as exc:
+                final_feedback = _build_failure_feedback(str(exc))
+                self._remember("Coordinator", final_feedback)
+                create_or_update_session(session_id, status="failed", last_error=str(exc))
+                update_session_context(session_id, current_step="execution", status="failed")
+                round_traces.append(RoundTrace(round_index=round_index, feedback=final_feedback))
                 return CoordinationResult(
                     completed=False,
                     final_status="Failed",
@@ -597,19 +626,8 @@ class MultiAgentSystem:
                 )
 
         final_status = str(final_feedback.get("execution_status") or "Failed").strip() or "Failed"
-        log_timing(
-            self.logger,
-            "coordinator_run_total",
-            time.perf_counter() - total_start,
-            status="max_rounds",
-        )
-        self._update_session_context(
-            session_id,
-            current_step="execution",
-            intent_data=intent_session_data,
-            policy_data=policy_session_data,
-            status="completed" if final_status == SUCCESS_STATUS else "failed",
-        )
+        create_or_update_session(session_id, status="completed" if final_status == SUCCESS_STATUS else "failed")
+        update_session_context(session_id, current_step="execution", status="completed" if final_status == SUCCESS_STATUS else "failed")
         return CoordinationResult(
             completed=final_status == SUCCESS_STATUS,
             final_status=final_status,
@@ -623,29 +641,25 @@ class MultiAgentSystem:
     def run_loop(self, user_input: str) -> str:
         result = self.run(user_input)
         if result.completed:
-            return (
-                f"Coordinator completed in {result.rounds_executed} round(s) for SUPI {result.supi}. "
-                f"PDA status: {result.final_status}."
-            )
-
+            return f"Coordinator completed in {result.rounds_executed} round(s) for SUPI {result.supi}. PDA status: {result.final_status}."
         suggestion = str(result.final_feedback.get("correction_suggestion") or "").strip()
-        if suggestion:
-            return (
-                f"Coordinator stopped after {result.rounds_executed} round(s) for SUPI {result.supi or 'unknown'}. "
-                f"PDA status: {result.final_status}. Suggestion: {suggestion}"
-            )
         return (
             f"Coordinator stopped after {result.rounds_executed} round(s) for SUPI {result.supi or 'unknown'}. "
-            f"PDA status: {result.final_status}."
+            f"PDA status: {result.final_status}." + (f" Suggestion: {suggestion}" if suggestion else "")
         )
+
+
 def main() -> None:
-    user_input = "please reduce video flow bandwidth, supi: imsi-20893002"
-    coordinator = MultiAgentSystem(max_rounds=3)
-    result = coordinator.run(user_input)
+    parser = argparse.ArgumentParser(description="Run the multi-agent closed loop")
+    parser.add_argument("--user-input", default="please reduce video flow bandwidth, supi: imsi-20893002")
+    parser.add_argument("--max-rounds", type=int, default=3)
+    args = parser.parse_args()
+    coordinator = MultiAgentSystem(max_rounds=args.max_rounds)
+    result = coordinator.run(args.user_input)
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
-    main()
-    # from tools.init_scenario import init_main,sync_latest_flow_five_tuples_to_ue_context
-    # sync_latest_flow_five_tuples_to_ue_context()
+    # main()
+    from tools.init_scenario import init_main
+    init_main()

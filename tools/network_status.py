@@ -1,15 +1,13 @@
-import pandas as pd
 import json
+from uuid import uuid4
 from typing import Optional
 
 from langchain.tools import ToolRuntime, tool
 
 from agent_runtime import AgentRuntimeContext
-from database.connection import SessionLocal
-from database.models import NetworkStatusSnapshot
-from tools.db_tool import _serialize_scenario_for_db
 from tools.init_scenario import get_current_scenario
 from dataclasses import asdict
+from tools.network_graph import build_and_persist_graph_from_scenario, get_latest_graph
 
 @tool
 def save_network_status_snapshot(
@@ -28,34 +26,20 @@ def save_network_status_snapshot(
     """
     try:
         apps, slices, nodes = get_current_scenario()
-        
-        # Serialize the full state
-        # Note: Ideally this should include richer metrics calculated in get_network_status
-        # For now we save the raw configuration state which contains load info
-        data = _serialize_scenario_for_db(apps, slices, nodes)
-        
-        # Save to DB
-        session = SessionLocal()
-        try:
-            snapshot = NetworkStatusSnapshot(
-                app_data=data.get("apps", []),
-                slice_data=data.get("slices", []),
-                node_data=data.get("nodes", []),
-                trigger_event=str(trigger_event)
-            )
-            session.add(snapshot)
-            session.commit()
-        except Exception as e:
-            session.rollback()
-            raise e
-        finally:
-            session.close()
+        snapshot_id = f"graph-{uuid4()}"
+        build_and_persist_graph_from_scenario(
+            apps=apps,
+            slices=slices,
+            nodes=nodes,
+            snapshot_id=snapshot_id,
+            trigger_event=str(trigger_event),
+        )
             
         prefix = ""
         if runtime is not None:
             ctx = runtime.context
             prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
-        return f"{prefix}Success: Network status snapshot saved."
+        return f"{prefix}Success: Network graph snapshot saved. snapshot_id={snapshot_id}"
     except Exception as e:
         return f"Error saving snapshot: {str(e)}"
 
@@ -71,46 +55,76 @@ def get_network_status_summary(flow_type_id: int = None) -> str:
     [智能体专用] 获取当前网络切片和应用流的状态摘要。
     只返回切片的资源使用率和业务数量，以及简化的 App 列表，大幅减少 Token 消耗。
     """
-    apps, slices, nodes = get_current_scenario()
+    graph = get_latest_graph()
+    if graph is not None:
+        snapshot = graph.to_compatibility_snapshot()
+        apps = snapshot.get("apps", [])
+        slices = snapshot.get("slices", [])
+        nodes = snapshot.get("nodes", [])
+    else:
+        apps, slices, nodes = get_current_scenario()
+        apps = [asdict(item) for item in apps]
+        slices = [asdict(item) for item in slices]
+        nodes = [asdict(item) for item in nodes]
     
     slice_status_list = []
     
     for s in slices:
         # 如果指定了 flow_type_id，则只处理匹配的切片
-        if flow_type_id is not None and s.sst != flow_type_id:
+        sst = s.get("sst") if isinstance(s, dict) else getattr(s, "sst", None)
+        if flow_type_id is not None and sst != flow_type_id:
             continue
             
         # 简化的占用统计
-        dynamic_used_ul = sum(f.bw_ul for a in apps for f in a.flows if f.old_slice == s.snssai)
-        dynamic_used_dl = sum(f.bw_dl for a in apps for f in a.flows if f.old_slice == s.snssai)
-        active_flows_count = sum(1 for a in apps for f in a.flows if f.old_slice == s.snssai)
+        slice_snssai = s.get("snssai") if isinstance(s, dict) else getattr(s, "snssai", None)
+        dynamic_used_ul = sum(
+            float(flow.get("bw_ul") or 0.0)
+            for a in apps
+            for flow in (a.get("flows", []) if isinstance(a, dict) else [])
+            if str(flow.get("old_slice") or "").strip() == str(slice_snssai or "").strip()
+        )
+        dynamic_used_dl = sum(
+            float(flow.get("bw_dl") or 0.0)
+            for a in apps
+            for flow in (a.get("flows", []) if isinstance(a, dict) else [])
+            if str(flow.get("old_slice") or "").strip() == str(slice_snssai or "").strip()
+        )
+        active_flows_count = sum(
+            1
+            for a in apps
+            for flow in (a.get("flows", []) if isinstance(a, dict) else [])
+            if str(flow.get("old_slice") or "").strip() == str(slice_snssai or "").strip()
+        )
         
-        total_used_ul = s.current_load_bw_ul + s.reserved_bw + dynamic_used_ul
-        total_used_dl = s.current_load_bw_dl + s.reserved_bw + dynamic_used_dl
+        total_used_ul = float((s.get("current_load_bw_ul") if isinstance(s, dict) else getattr(s, "current_load_bw_ul", 0.0)) or 0.0) + float((s.get("reserved_bw") if isinstance(s, dict) else getattr(s, "reserved_bw", 0.0)) or 0.0) + dynamic_used_ul
+        total_used_dl = float((s.get("current_load_bw_dl") if isinstance(s, dict) else getattr(s, "current_load_bw_dl", 0.0)) or 0.0) + float((s.get("reserved_bw") if isinstance(s, dict) else getattr(s, "reserved_bw", 0.0)) or 0.0) + dynamic_used_dl
         
-        utilization_ul = (total_used_ul / s.total_bw_ul * 100) if s.total_bw_ul > 0 else 0.0
-        utilization_dl = (total_used_dl / s.total_bw_dl * 100) if s.total_bw_dl > 0 else 0.0
+        total_bw_ul = float((s.get("total_bw_ul") if isinstance(s, dict) else getattr(s, "total_bw_ul", 0.0)) or 0.0)
+        total_bw_dl = float((s.get("total_bw_dl") if isinstance(s, dict) else getattr(s, "total_bw_dl", 0.0)) or 0.0)
+        utilization_ul = (total_used_ul / total_bw_ul * 100) if total_bw_ul > 0 else 0.0
+        utilization_dl = (total_used_dl / total_bw_dl * 100) if total_bw_dl > 0 else 0.0
         
         slice_status_list.append({
-            "name": s.name,
-            "snssai": s.snssai,
-            "sst": s.sst,
+            "name": s.get("name") if isinstance(s, dict) else getattr(s, "name", None),
+            "snssai": slice_snssai,
+            "sst": sst,
             "usage_ul_pct": round(utilization_ul, 1),
             "usage_dl_pct": round(utilization_dl, 1),
             "active_flows": active_flows_count,
-            "latency_sla": s.latency
+            "latency_sla": s.get("latency") if isinstance(s, dict) else getattr(s, "latency", None)
         })
 
     # 简化的应用列表
     app_summary_list = []
     for a in apps:
-        if flow_type_id is not None and any(f.service_type_id != flow_type_id for f in a.flows):
+        flows = a.get("flows", []) if isinstance(a, dict) else []
+        if flow_type_id is not None and any(int(flow.get("service_type_id") or 0) != flow_type_id for flow in flows):
             continue
         app_summary_list.append({
-            "app_id": a.app_id,
-            "app_name": a.name,
-            "flow_count": len(a.flows),
-            "total_bw_mbps": round(a.total_bw_ul + a.total_bw_dl, 2)
+            "app_id": a.get("app_id") if isinstance(a, dict) else None,
+            "app_name": a.get("name") if isinstance(a, dict) else None,
+            "flow_count": len(flows),
+            "total_bw_mbps": round(sum(float(flow.get("bw_ul") or 0.0) + float(flow.get("bw_dl") or 0.0) for flow in flows), 2)
         })
         
     return json.dumps({
@@ -120,3 +134,6 @@ def get_network_status_summary(flow_type_id: int = None) -> str:
 
 # 兼容旧代码调用
 get_network_status = get_network_status_full
+
+if __name__ == "__main__":
+    save_network_status_snapshot(trigger_event="Manual-Test")

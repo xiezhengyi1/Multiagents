@@ -16,6 +16,15 @@ PCF_BASE_URL = "http://localhost:8000"
 PCF_REQUEST_TIMEOUT_SEC = 5
 
 
+def _trim_ue_context_for_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise TypeError("payload must be a dict")
+    trimmed = dict(payload)
+    trimmed.pop("app_catalog", None)
+    trimmed.pop("flow_catalog", None)
+    return trimmed
+
+
 def _parse_policy_details(policy_json: Any) -> Dict[str, Any]:
     if isinstance(policy_json, dict):
         payload = policy_json
@@ -210,6 +219,8 @@ def get_ue_context(
 
     if db_ctx:
         return f"{prefix}UE Context Retrieved From DB:\n{json.dumps(db_ctx, ensure_ascii=False, indent=2)}"
+        # trimmed = _trim_ue_context_for_agent(db_ctx)
+        # return f"{prefix}UE Context Retrieved From DB:\n{json.dumps(trimmed, ensure_ascii=False, indent=2)}"
     return f"UE Context Not Found for SUPI: {normalized_supi}"
 
 

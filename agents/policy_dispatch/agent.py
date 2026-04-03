@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from langchain.tools import ToolRuntime, tool
 from pydantic import BaseModel, Field
 
-from agent_runtime import AgentRuntimeContext, AgentWorkspace, ArtifactCache, ArtifactEnvelope, ArtifactStore
+from agent_runtime import AgentRuntimeContext, ArtifactEnvelope
 from domain.policy_compiler import PolicyCompiler
 from tools.db_tool import (
     get_latest_snapshot_data,
@@ -16,11 +16,11 @@ from tools.db_tool import (
     upsert_ue_context,
 )
 from tools.pcf_tools import dispatch_policy_to_pcf, dispatch_policy_to_pcf_request
-from utils.logger import setup_logger
 from workflows.assurance_evaluator import AssuranceEvaluator
 from workflows.execution_controller import ExecutionController
 
-from agents.basemodel import BaseAgent
+from agents.BaseAgent import BaseAgent
+from agents.worker import ArtifactWorkerMixin
 
 
 @tool
@@ -143,16 +143,26 @@ class FeedbackReport(BaseModel):
     correction_suggestion: str = Field(description="Actionable remediation guidance")
 
 
-class PolicyDispatchAgent(BaseAgent):
+class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
+    agent_name = "policy_dispatch"
     def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507"):
         super().__init__(model_name=model_name)
         self.agent_name = "policy_dispatch"
-        self.workspace = AgentWorkspace.for_agent(self.agent_name)
-        self.cache = ArtifactCache(self.workspace)
-        self.artifact_store = ArtifactStore()
-        self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[92m")
+        self.initialize_agent_runtime(logger_color="\033[92m")
         self.tools = [tool_dispatch_policy, tool_update_db_after_success, tool_evaluate_sla]
         self.tool_map = {tool_obj.name: tool_obj for tool_obj in self.tools}
+
+    def expected_request_type(self) -> str:
+        return "PolicyPlanDraft"
+
+    def response_artifact_type(self) -> str:
+        return "FeedbackReport"
+
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> FeedbackReport:
+        return self.execute_and_evaluate_from_request(
+            strategy_output=envelope.payload,
+            request_envelope=envelope,
+        )
 
     def _build_execution_controller(self) -> ExecutionController:
         return ExecutionController(
@@ -174,16 +184,12 @@ class PolicyDispatchAgent(BaseAgent):
             if hasattr(strategy_output, "model_dump")
             else PolicyCompiler.json_friendly(strategy_output)
         )
-        envelope = ArtifactEnvelope(
+        return self.cache_received_artifact(
             artifact_type="PolicyPlanDraft",
-            source_agent="coordinator",
-            target_agent=self.agent_name,
+            payload=payload if isinstance(payload, dict) else {"value": payload},
             session_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
             snapshot_id=str(getattr(strategy_output, "snapshot_id", "") or "").strip(),
-            payload=payload if isinstance(payload, dict) else {"value": payload},
         )
-        self.cache.cache_received(envelope)
-        return envelope
 
     def _cache_produced_result(
         self,
@@ -191,21 +197,26 @@ class PolicyDispatchAgent(BaseAgent):
         request_envelope: ArtifactEnvelope,
         feedback_report: FeedbackReport,
     ) -> None:
-        self.cache.cache_produced(
-            ArtifactEnvelope(
-                artifact_type="FeedbackReport",
-                source_agent=self.agent_name,
-                target_agent=request_envelope.source_agent,
-                session_id=request_envelope.session_id,
-                snapshot_id=request_envelope.snapshot_id,
-                correlation_id=request_envelope.correlation_id,
-                upstream_artifact_ids=[request_envelope.artifact_id],
-                payload=feedback_report.model_dump(mode="json"),
-            )
+        self.cache_produced_artifact(
+            artifact_type="FeedbackReport",
+            request_envelope=request_envelope,
+            payload=feedback_report,
         )
 
     def execute_and_evaluate(self, strategy_output: Any) -> FeedbackReport:
+        self.ensure_worker_runtime_initialized()
         request_envelope = self._cache_received_request(strategy_output)
+        return self.execute_and_evaluate_from_request(
+            strategy_output=strategy_output,
+            request_envelope=request_envelope,
+        )
+
+    def execute_and_evaluate_from_request(
+        self,
+        *,
+        strategy_output: Any,
+        request_envelope: ArtifactEnvelope,
+    ) -> FeedbackReport:
         outcome = self._build_execution_controller().execute(strategy_output)
         feedback_report = FeedbackReport(**outcome.to_dict())
         self._cache_produced_result(

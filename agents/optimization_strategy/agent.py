@@ -10,8 +10,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain.tools import ToolRuntime, tool
 from pydantic import BaseModel
 
-from agent_runtime import AgentRuntimeContext, AgentWorkspace, ArtifactCache, ArtifactEnvelope, ArtifactStore
-from agents.basemodel import BaseAgent
+from agent_runtime import AgentRuntimeContext, ArtifactEnvelope
+from agents.BaseAgent import BaseAgent
+from agents.worker import ArtifactWorkerMixin
 from domain.collaboration import PlanningRequest
 from domain.policy_plan import OperationIntent, PolicyDraft, PolicyPlanDraft
 from model.SmPolicyDecision import SmPolicyDecision
@@ -168,19 +169,30 @@ def _extract_ursp_flow_desc_from_five_tuple(five_tuple: Any) -> Optional[str]:
     return f"{protocol} {dst_ip} {dst_port}"
 
 
-class OptimizationStrategyAgent(BaseAgent):
+class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
+    agent_name = "optimization_strategy"
     def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507"):
         super().__init__(model_name=model_name)
         self.agent_name = "optimization_strategy"
-        self.workspace = AgentWorkspace.for_agent(self.agent_name)
-        self.cache = ArtifactCache(self.workspace)
-        self.artifact_store = ArtifactStore()
-        self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[94m")
+        self.initialize_agent_runtime(logger_color="\033[94m")
         self.tools = [run_optimization_solver, fetch_network_status]
         self.agent = self.create_structured_agent(
             tools=self.tools,
             system_prompt=OSA_SYSTEM_PROMPT,
             response_format=PolicyPlanDraft,
+        )
+
+    def expected_request_type(self) -> str:
+        return "PlanningRequest"
+
+    def response_artifact_type(self) -> str:
+        return "PolicyPlanDraft"
+
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> PolicyPlanDraft:
+        planning_request = PlanningRequest.model_validate(envelope.payload)
+        return self.generate_strategy_from_request(
+            planning_request=planning_request,
+            request_envelope=envelope,
         )
 
     @staticmethod
@@ -197,16 +209,12 @@ class OptimizationStrategyAgent(BaseAgent):
         )
 
     def _cache_received_request(self, planning_request: PlanningRequest) -> ArtifactEnvelope:
-        envelope = ArtifactEnvelope(
+        return self.cache_received_artifact(
             artifact_type="PlanningRequest",
-            source_agent="coordinator",
-            target_agent=self.agent_name,
-            session_id=str(planning_request.context.session_id or "").strip(),
-            snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
-            payload=planning_request.model_dump(mode="json"),
+            payload=planning_request,
+            session_id=planning_request.context.session_id,
+            snapshot_id=planning_request.context.snapshot_id,
         )
-        self.cache.cache_received(envelope)
-        return envelope
 
     def _cache_produced_result(
         self,
@@ -214,17 +222,10 @@ class OptimizationStrategyAgent(BaseAgent):
         request_envelope: ArtifactEnvelope,
         policy_plan: PolicyPlanDraft,
     ) -> None:
-        self.cache.cache_produced(
-            ArtifactEnvelope(
-                artifact_type="PolicyPlanDraft",
-                source_agent=self.agent_name,
-                target_agent=request_envelope.source_agent,
-                session_id=request_envelope.session_id,
-                snapshot_id=request_envelope.snapshot_id,
-                correlation_id=request_envelope.correlation_id,
-                upstream_artifact_ids=[request_envelope.artifact_id],
-                payload=policy_plan.model_dump(mode="json"),
-            )
+        self.cache_produced_artifact(
+            artifact_type="PolicyPlanDraft",
+            request_envelope=request_envelope,
+            payload=policy_plan,
         )
 
     @staticmethod
@@ -663,10 +664,21 @@ class OptimizationStrategyAgent(BaseAgent):
         )
 
     def generate_strategy(self, planning_request: PlanningRequest) -> PolicyPlanDraft:
+        self.ensure_worker_runtime_initialized()
         if not isinstance(planning_request, PlanningRequest):
             raise TypeError("generate_strategy expects a PlanningRequest instance")
-
         request_envelope = self._cache_received_request(planning_request)
+        return self.generate_strategy_from_request(
+            planning_request=planning_request,
+            request_envelope=request_envelope,
+        )
+
+    def generate_strategy_from_request(
+        self,
+        *,
+        planning_request: PlanningRequest,
+        request_envelope: ArtifactEnvelope,
+    ) -> PolicyPlanDraft:
         operation_intent = planning_request.operation_intent
         normalized_user_intent = _json_friendly(operation_intent.model_dump(mode="json"))
         normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
