@@ -7,7 +7,7 @@ from database.models import NetworkStatusSnapshot, SessionContext, UeContextReco
 import sys
 import os
 if TYPE_CHECKING:
-    from tools.optimizer.models import App, Slice, Node
+    from agents.tools.optimizer.models import App, Slice, Node
 
 try:
     from utils.logger import setup_logger
@@ -173,7 +173,7 @@ def _snapshot_row_to_payload(row: Any) -> Dict[str, Any]:
 def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
     """Read latest snapshot payload from the graph snapshot when available."""
     try:
-        from tools.network_graph import get_latest_graph
+        from agents.tools.network_graph import get_latest_graph
 
         graph = get_latest_graph()
         if graph is not None:
@@ -206,7 +206,7 @@ def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
 def get_latest_snapshot_metadata() -> Optional[Dict[str, Any]]:
     """Return metadata for the latest bound graph snapshot when available."""
     try:
-        from tools.network_graph import get_latest_graph_snapshot_metadata
+        from agents.tools.network_graph import get_latest_graph_snapshot_metadata
 
         metadata = get_latest_graph_snapshot_metadata()
         if isinstance(metadata, dict):
@@ -236,7 +236,7 @@ def get_snapshot_data_by_id(snapshot_id: Union[str, int]) -> Optional[Dict[str, 
         return None
 
     try:
-        from tools.network_graph import get_graph_snapshot_payload, NetworkGraph
+        from agents.tools.network_graph import get_graph_snapshot_payload, NetworkGraph
 
         payload = get_graph_snapshot_payload(normalized_snapshot_id)
         if isinstance(payload, dict) and payload:
@@ -373,7 +373,7 @@ def update_scenario_in_db(apps: List["App"], slices: List["Slice"], nodes: List[
     """
     try:
         from uuid import uuid4
-        from tools.network_graph import build_and_persist_graph_from_scenario
+        from agents.tools.network_graph import build_and_persist_graph_from_scenario
 
         snapshot_id = f"graph-{uuid4()}"
         build_and_persist_graph_from_scenario(

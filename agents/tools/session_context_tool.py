@@ -4,7 +4,7 @@ from typing import Optional
 from langchain.tools import ToolRuntime, tool
 
 from agent_runtime import AgentRuntimeContext
-from tools.db_tool import get_latest_session_context
+from agents.tools.db_tool import get_latest_session_context
 
 
 @tool

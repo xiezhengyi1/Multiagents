@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import networkx as nx
 
 from database.models import GraphEdge, GraphMetric, GraphNode, NetworkGraphSnapshot, NetworkStatusSnapshot
-from tools.db_tool import session_scope
+from agents.tools.db_tool import session_scope
 from utils.logger import setup_logger
 
 

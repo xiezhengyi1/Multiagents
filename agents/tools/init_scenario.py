@@ -15,14 +15,14 @@ import secrets
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from tools.db_tool import (
+from agents.tools.db_tool import (
     build_flow_info_from_five_tuple,
     get_latest_snapshot_data,
     sync_latest_snapshot_flow_catalog_to_ue_context,
     update_scenario_in_db,
     upsert_ue_context,
 )
-from tools.optimizer.models import App, Flow, Node, Slice
+from agents.tools.optimizer.models import App, Flow, Node, Slice
 
 
 def _filter_dataclass_kwargs(src: Dict[str, Any], cls, exclude: Optional[set] = None) -> Dict[str, Any]:

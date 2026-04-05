@@ -5,9 +5,9 @@ from typing import Optional
 from langchain.tools import ToolRuntime, tool
 
 from agent_runtime import AgentRuntimeContext
-from tools.init_scenario import get_current_scenario
+from agents.tools.init_scenario import get_current_scenario
 from dataclasses import asdict
-from tools.network_graph import build_and_persist_graph_from_scenario, get_latest_graph
+from agents.tools.network_graph import build_and_persist_graph_from_scenario, get_latest_graph
 
 @tool
 def save_network_status_snapshot(

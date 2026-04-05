@@ -6,7 +6,7 @@ import requests
 from langchain.tools import ToolRuntime, tool
 
 from agent_runtime import AgentRuntimeContext
-from tools.db_tool import get_ue_context_by_supi, get_ue_flow_catalog_by_supi
+from agents.tools.db_tool import get_ue_context_by_supi, get_ue_flow_catalog_by_supi
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
