@@ -73,6 +73,14 @@ def get_snapshot_data_by_id(*args, **kwargs):
     return _impl(*args, **kwargs)
 
 
+from .wrapper_think import think_tool as think
+from .pcf_tools import get_ue_context
+from .pcf_tools import get_ue_flow_catalog
+from .pcf_tools import search_flow_targets_by_name
+from .knowledge_tool import search_semantic_knowledge
+from .knowledge_tool import get_knowledge_by_key
+from .user_interaction_tool import ask_user_clarification
+
 __all__ = [
     "get_current_scenario",
     "get_initial_scenario",
@@ -88,6 +96,13 @@ __all__ = [
     "get_snapshot_data_by_id",
     "create_session_context",
     "update_session_context",
+    "think",
+    "get_ue_context",
+    "get_ue_flow_catalog",
+    "search_flow_targets_by_name",
+    "search_semantic_knowledge",
+    "get_knowledge_by_key",
+    "ask_user_clarification",
 ]
 
 

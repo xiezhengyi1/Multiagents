@@ -11,12 +11,25 @@ from database.models import (
     SessionContext,
     SessionStageResult,
 )
-from agents.tools.db_tool import session_scope
+from database.connection import SessionLocal
 from utils.logger import setup_logger
 
 
 logger = setup_logger(__name__)
 
+from contextlib import contextmanager
+
+@contextmanager
+def session_scope():
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)

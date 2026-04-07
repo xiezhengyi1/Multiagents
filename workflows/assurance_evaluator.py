@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Optional
 
 from domain.policy_plan import AssuranceVerdict
-from tools.network_graph import NetworkGraph
+from agents.tools.network_graph import NetworkGraph
 
 
 class AssuranceEvaluator:

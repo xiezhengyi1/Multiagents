@@ -1,3 +1,3 @@
-from .agent import FlowIntent, IntentEncodingAgent, UserIntent
+from .agent import IntentEncodingAgent
 
-__all__ = ["FlowIntent", "IntentEncodingAgent", "UserIntent"]
+__all__ = ["IntentEncodingAgent"]

@@ -4,23 +4,24 @@ import json
 from typing import Any, Dict, List, Optional
 
 from langchain.tools import ToolRuntime, tool
-from pydantic import BaseModel, Field
 
 from agent_runtime import AgentRuntimeContext, ArtifactEnvelope
 from domain.policy_compiler import PolicyCompiler
-from tools.db_tool import (
+from agents.tools.db_tool import (
     get_latest_snapshot_data,
     get_snapshot_data_by_id,
     get_ue_context_by_supi,
     get_ue_flow_catalog_by_supi,
     upsert_ue_context,
 )
-from tools.pcf_tools import dispatch_policy_to_pcf, dispatch_policy_to_pcf_request
+from agents.tools.pcf_tools import dispatch_policy_to_pcf, dispatch_policy_to_pcf_request
 from workflows.assurance_evaluator import AssuranceEvaluator
 from workflows.execution_controller import ExecutionController
 
 from agents.BaseAgent import BaseAgent
 from agents.worker import ArtifactWorkerMixin
+
+from .contracts import FeedbackReport
 
 
 @tool
@@ -136,12 +137,52 @@ def tool_update_db_after_success(
     return "database update success" if ok else "database update failed"
 
 
-class FeedbackReport(BaseModel):
-    execution_status: str = Field(description="Overall execution status: Success, Partial Success, or Failed")
-    performance_metrics: str = Field(description="Summary of execution receipts and SLA results")
-    violation_details: str = Field(description="Explicit failure or violation details, or None")
-    correction_suggestion: str = Field(description="Actionable remediation guidance")
+@tool
+def tool_feedback_to_iea(
+    supi: str,
+    reason: str,
+    correction_suggestion: str,
+    policy_id: str = "",
+    flow_id: str = "",
+    dispatch_attempts: int = 0,
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
+    """Build a machine-readable feedback payload for Intent Encoding Agent."""
+    payload = {
+        "target_agent": "intent_encoding",
+        "feedback_type": "intent_resolution",
+        "supi": str(supi or "").strip(),
+        "policy_id": str(policy_id or "").strip(),
+        "flow_id": str(flow_id or "").strip(),
+        "reason": str(reason or "").strip(),
+        "correction_suggestion": str(correction_suggestion or "").strip(),
+        "dispatch_attempts": int(dispatch_attempts or 0),
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
+
+@tool
+def tool_feedback_to_osa(
+    supi: str,
+    reason: str,
+    correction_suggestion: str,
+    policy_id: str = "",
+    flow_id: str = "",
+    dispatch_attempts: int = 0,
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
+    """Build a machine-readable feedback payload for Optimization Strategy Agent."""
+    payload = {
+        "target_agent": "optimization_strategy",
+        "feedback_type": "policy_plan_adjustment",
+        "supi": str(supi or "").strip(),
+        "policy_id": str(policy_id or "").strip(),
+        "flow_id": str(flow_id or "").strip(),
+        "reason": str(reason or "").strip(),
+        "correction_suggestion": str(correction_suggestion or "").strip(),
+        "dispatch_attempts": int(dispatch_attempts or 0),
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "policy_dispatch"
@@ -149,7 +190,13 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
         super().__init__(model_name=model_name)
         self.agent_name = "policy_dispatch"
         self.initialize_agent_runtime(logger_color="\033[92m")
-        self.tools = [tool_dispatch_policy, tool_update_db_after_success, tool_evaluate_sla]
+        self.tools = [
+            tool_dispatch_policy,
+            tool_update_db_after_success,
+            tool_evaluate_sla,
+            tool_feedback_to_iea,
+            tool_feedback_to_osa,
+        ]
         self.tool_map = {tool_obj.name: tool_obj for tool_obj in self.tools}
 
     def expected_request_type(self) -> str:
@@ -218,12 +265,45 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
         request_envelope: ArtifactEnvelope,
     ) -> FeedbackReport:
         outcome = self._build_execution_controller().execute(strategy_output)
-        feedback_report = FeedbackReport(**outcome.to_dict())
+        feedback_payload = self._build_feedback_payload(strategy_output=strategy_output, outcome=outcome)
+        outcome_payload = outcome.to_dict()
+        if feedback_payload:
+            outcome_payload["feedback_payload"] = feedback_payload
+        feedback_report = FeedbackReport(**outcome_payload)
         self._cache_produced_result(
             request_envelope=request_envelope,
             feedback_report=feedback_report,
         )
         return feedback_report
+
+    def _build_feedback_payload(self, *, strategy_output: Any, outcome: Any) -> Dict[str, Any]:
+        if str(getattr(outcome, "recommended_action", "") or "").strip() != "feedback":
+            return getattr(outcome, "feedback_payload", {}) or {}
+
+        seed = getattr(outcome, "feedback_payload", {}) or {}
+        tool_input = {
+            "supi": str(getattr(strategy_output, "supi", "") or seed.get("supi") or "").strip(),
+            "reason": str(getattr(outcome, "violation_details", "") or seed.get("error") or "").strip(),
+            "correction_suggestion": str(getattr(outcome, "correction_suggestion", "") or "").strip(),
+            "policy_id": str(seed.get("policy_id") or "").strip(),
+            "flow_id": str(seed.get("flow_id") or "").strip(),
+            "dispatch_attempts": int(getattr(outcome, "dispatch_attempts", 0) or 0),
+        }
+
+        recommended_consumer = str(getattr(outcome, "recommended_consumer", "") or "").strip()
+        if recommended_consumer == "intent_encoding":
+            payload_text = tool_feedback_to_iea.invoke(tool_input)
+        elif recommended_consumer == "optimization_strategy":
+            payload_text = tool_feedback_to_osa.invoke(tool_input)
+        else:
+            return seed
+
+        payload = self._extract_json_payload_from_dispatch_output(payload_text)
+        if not isinstance(payload, dict):
+            return seed
+        if seed:
+            payload["controller_feedback"] = seed
+        return payload
 
     @staticmethod
     def _extract_json_payload_from_dispatch_output(dispatch_output: str) -> Optional[Dict[str, Any]]:

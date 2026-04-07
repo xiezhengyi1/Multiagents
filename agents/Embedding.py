@@ -6,6 +6,25 @@ from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+
+# 中文标注：全局共享 OpenAI 客户端，避免重复初始化
+def _get_shared_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    if not api_key:
+        raise RuntimeError("Missing API key: set OPENAI_API_KEY or DASHSCOPE_API_KEY")
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+_SHARED_CLIENT: Optional[OpenAI] = None
+
+
+def get_embedding_client() -> OpenAI:
+    global _SHARED_CLIENT
+    if _SHARED_CLIENT is None:
+        _SHARED_CLIENT = _get_shared_openai_client()
+    return _SHARED_CLIENT
+
 class BaseEncoder(ABC):
     """编码器基类"""
     @abstractmethod
@@ -15,28 +34,12 @@ class BaseEncoder(ABC):
 class NaturalLanguageEncoder(BaseEncoder):
     """
     自然语言编码器 (NL Encoder)
-    功能：
-    1. 预处理文本（去除无关字符、标准化术语）。
-    2. (可选) 提取显式意图关键词（如 "带宽", "时延", "游戏" 等）。
-    3. (可选) 将文本转化为 Embedding 向量（如果需要与数据进行向量空间对齐）。
-    
-    当前实现：
-    - 关键词提取与标准化。
-    - 文本向量化 (Embedding)。
     """
-    def __init__(self, embedding_model=None):        
-        # 初始化 Embedding 模型
-        self.embedding_model = embedding_model
-        self.embedding_model_name = "text-embedding-v4"  # 默认模型名
-        if self.embedding_model is None and OpenAI:
-            try:
-                self.embedding_model = OpenAI(
-                    api_key=os.getenv("OPENAI_API_KEY"),  # 使用 OPENAI_API_KEY
-                    base_url=os.getenv("OPENAI_BASE_URL")  # 使用 OPENAI_BASE_URL
-                )
-                self.embedding_model_name = "text-embedding-v4" 
-            except Exception as e:
-                logger.warning(f"无法初始化默认 OpenAI 客户端: {e}")
+    EMBEDDING_MODEL_NAME = "text-embedding-v4"
+
+    def __init__(self, embedding_model=None):
+        # 中文标注：共享客户端，初始化失败直接抛出
+        self.embedding_model = embedding_model or get_embedding_client()
 
     def encode(self, text: str) -> Dict[str, Any]:
         """
@@ -66,25 +69,14 @@ class NaturalLanguageEncoder(BaseEncoder):
             if k in text_clean:
                 detected_keywords.append(v)
 
-        # 2. 向量化
+        # 2. 向量化 - 中文标注：失败直接抛出，不再静默返回空向量
         vector = []
-        if self.embedding_model and text_clean:
-            try:
-                # 尝试指定维度参数，如果模型支持
-                dims_kwargs = {}
-                # 如果是 text-embedding-3 家族，支持 dimensions 参数
-                # dims_kwargs = {"dimensions": 1024} 
-
-                completion = self.embedding_model.embeddings.create(
-                    model=self.embedding_model_name,
-                    input=text_clean,
-                    **dims_kwargs
-                )
-                # 提取向量数据
-                if completion.data:
-                    vector = completion.data[0].embedding
-            except Exception as e:
-                logger.error(f"向量化失败: {e}")
+        if text_clean:
+            completion = self.embedding_model.embeddings.create(
+                model=self.EMBEDDING_MODEL_NAME,
+                input=text_clean,
+            )
+            vector = completion.data[0].embedding
 
         # 4. 构造输出
         return {
@@ -94,27 +86,12 @@ class NaturalLanguageEncoder(BaseEncoder):
         }
 
 class UserDataEncoder(BaseEncoder):
-    """
-    用户数据编码器 (Data Encoder)
-    功能：
-    1. 解析 UeContext 用户上下文。
-    2. 将结构化数据转化为文本描述。
-    3. 使用 Embedding 模型将文本转化为向量，以便与意图向量在同一空间进行计算。
-    """
+    """用户数据编码器 (Data Encoder)"""
+    EMBEDDING_MODEL_NAME = "text-embedding-v4"
+
     def __init__(self, embedding_model=None):
-         # 复用 NLP Encoder 的模型逻辑，建立统一语义空间
-        self.embedding_model = embedding_model
-        self.embedding_model_name = "text-embedding-v4"
-        if self.embedding_model is None and OpenAI:
-            try:
-                self.embedding_model = OpenAI(
-                    api_key=os.getenv("DASHSCOPE_API_KEY"),
-                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-                )
-                # 显式指定维度为 1024 的模型，如果 dashscope 支持参数设置更好
-                # 目前 text-embedding-v3 是 1024, v4 也是可选，这里假设模型产生 1024
-            except Exception as e:
-                logger.warning(f"UserDataEncoder 无法初始化默认 OpenAI 客户端: {e}")
+        # 中文标注：共享客户端，初始化失败直接抛出
+        self.embedding_model = embedding_model or get_embedding_client()
 
     def encode(self, user_context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -160,18 +137,14 @@ class UserDataEncoder(BaseEncoder):
 
         text_repr = " ".join(text_parts)
 
-        # 2. 向量化
+        # 2. 向量化 - 中文标注：失败直接抛出
         vector = []
-        if self.embedding_model and text_repr:
-            try:
-                completion = self.embedding_model.embeddings.create(
-                    model=self.embedding_model_name,
-                    input=text_repr
-                )
-                if completion.data:
-                    vector = completion.data[0].embedding
-            except Exception as e:
-                logger.error(f"UserDataEncoder 向量化失败: {e}")
+        if text_repr:
+            completion = self.embedding_model.embeddings.create(
+                model=self.EMBEDDING_MODEL_NAME,
+                input=text_repr
+            )
+            vector = completion.data[0].embedding
 
         return {
             "text_repr": text_repr,

@@ -579,8 +579,10 @@ def search_semantic_knowledge(
             errors,
             include_selection_guide=True,
         )
+    except FileNotFoundError:
+        raise
     except Exception as exc:
-        return f"{_log_prefix(runtime)} Error executing knowledge search: {exc}"
+        raise RuntimeError(f"{_log_prefix(runtime)} Knowledge search failed for '{normalized_query}': {exc}") from exc
 
 
 @tool
@@ -614,8 +616,10 @@ def get_knowledge_by_key(
             return f"Knowledge item not found for key: {normalized_key}"
         cross_spec = _expand_cross_spec_candidates(exact, domain, normalized_key)
         return _format_results(normalized_key, _dedupe_candidates([*exact, *cross_spec], limit=6), [])
+    except FileNotFoundError:
+        raise
     except Exception as exc:
-        return f"{_log_prefix(runtime)} Error retrieving key {normalized_key}: {exc}"
+        raise RuntimeError(f"{_log_prefix(runtime)} Key lookup failed for '{normalized_key}': {exc}") from exc
 
 
 __all__ = ["get_knowledge_by_key", "search_semantic_knowledge"]

@@ -5,8 +5,8 @@ from typing import Any, Dict, Optional
 import requests
 from langchain.tools import ToolRuntime, tool
 
-from agent_runtime import AgentRuntimeContext
-from agents.tools.db_tool import get_ue_context_by_supi, get_ue_flow_catalog_by_supi
+from agent_runtime.context import AgentRuntimeContext
+from agents.tools.db_tool import get_ue_context_by_supi, get_ue_flow_catalog_by_supi, search_flow_targets_by_semantic
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -196,7 +196,7 @@ def get_network_feedback(policy_id: str) -> str:
 
 @tool
 def get_ue_context(
-    supi: str,
+    supi: str = "",
     runtime: ToolRuntime[AgentRuntimeContext] = None,
 ) -> str:
     """
@@ -226,7 +226,7 @@ def get_ue_context(
 
 @tool
 def get_ue_flow_catalog(
-    supi: str,
+    supi: str = "",
     runtime: ToolRuntime[AgentRuntimeContext] = None,
 ) -> str:
     """
@@ -243,3 +243,32 @@ def get_ue_flow_catalog(
         ctx = runtime.context
         prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
     return f"{prefix}UE Flow Catalog Retrieved:\n {result}"
+
+
+@tool
+def search_flow_targets_by_name(
+    app_name: str = "",
+    flow_name: str = "",
+    limit: int = 5,
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
+    """
+    Semantically search the latest snapshot for flow targets by app_name and/or flow_name.
+    Use this when the user names an app or flow but does not provide a SUPI.
+    """
+    normalized_app_name = str(app_name or "").strip()
+    normalized_flow_name = str(flow_name or "").strip()
+    if not normalized_app_name and not normalized_flow_name:
+        return "Semantic Flow Target Search Failed: app_name or flow_name is required"
+
+    payload = search_flow_targets_by_semantic(
+        app_name=normalized_app_name,
+        flow_name=normalized_flow_name,
+        limit=limit,
+    )
+    result = json.dumps(payload, ensure_ascii=False, indent=2)
+    prefix = ""
+    if runtime is not None:
+        ctx = runtime.context
+        prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
+    return f"{prefix}Semantic Flow Target Search Retrieved:\n {result}"

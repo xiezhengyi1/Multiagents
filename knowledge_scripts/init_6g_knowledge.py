@@ -9,7 +9,11 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from database.langchain_pg import build_semantic_knowledge_document, get_semantic_knowledge_store
+from database.langchain_pg import (
+    build_semantic_knowledge_document,
+    ensure_semantic_knowledge_collection,
+    get_semantic_knowledge_store,
+)
 from utils.logger import setup_logger
 
 load_dotenv()
@@ -17,9 +21,13 @@ load_dotenv()
 logger = setup_logger(__name__)
 
 
-def init_knowledge(knowledge_items):
-    """Populate the semantic knowledge PGVector collection with default 6G/5G domain data."""
+def init_knowledge(knowledge_items: list[dict]) -> int:
+    """Rebuild the semantic knowledge PGVector collection with default 6G/5G domain data."""
+    store = ensure_semantic_knowledge_collection()
+    store.delete_collection()
     store = get_semantic_knowledge_store()
+    store.create_collection()
+
     documents = []
     ids = []
 
@@ -34,8 +42,12 @@ def init_knowledge(knowledge_items):
         )
         ids.append(str(item["key"]))
 
+    if not documents:
+        raise ValueError("knowledge_items must not be empty.")
+
     store.add_documents(documents, ids=ids)
-    logger.info("Knowledge collection initialized with %s items.", len(ids))
+    logger.info("Knowledge PGVector collection rebuilt with %s items.", len(ids))
+    return len(ids)
 
 
 if __name__ == "__main__":
@@ -275,4 +287,5 @@ if __name__ == "__main__":
             },
         },
     ]
-    init_knowledge(knowledge_items)
+    count = init_knowledge(knowledge_items)
+    print(f"Initialized {count} semantic knowledge documents into PGVector.")

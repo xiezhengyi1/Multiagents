@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from tools.runtime_store import enqueue_task, record_artifact
+from .runtime_store import enqueue_task, record_artifact
 
 from .workspace import AgentWorkspace, runtime_root
 

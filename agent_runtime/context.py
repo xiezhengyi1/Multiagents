@@ -11,6 +11,7 @@ class AgentRuntimeContext:
     snapshot_id: str
     supi: Optional[str]
     thread_id: str
+    allow_user_interaction: bool = False
 
 
 __all__ = ["AgentRuntimeContext"]

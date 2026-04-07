@@ -17,9 +17,13 @@ from domain.collaboration import PlanningRequest
 from domain.policy_plan import OperationIntent, PolicyDraft, PolicyPlanDraft
 from model.SmPolicyDecision import SmPolicyDecision
 from model.UrspRuleRequest import UrspRuleRequest
-from tools.db_tool import build_flow_description_from_five_tuple, build_flow_info_from_five_tuple
-from tools.network_status import get_network_status_summary
-from tools.optimizer import optimize_network_slices
+from agents.tools import think
+from agents.tools.db_tool import (
+    build_flow_description_from_five_tuple,
+    build_flow_info_from_five_tuple,
+)
+from agents.tools.network_status import get_network_status_summary
+from agents.tools.optimizer import optimize_network_slices
 from utils.logger import log_event, log_timing, setup_logger
 
 from .prompts import OSA_SYSTEM_PROMPT
@@ -99,9 +103,8 @@ def _json_friendly(value: Any) -> Any:
 
 
 def _strip_rule_prefix(candidate: Any) -> Optional[str]:
-    if candidate is None:
-        return None
-    text = str(candidate).strip()
+    """移除规则ID中的常见前缀。"""
+    text = str(candidate or "").strip()
     if not text:
         return None
     for prefix in ("pcc-", "qos-", "sess-", "smp-", "ursp-"):
@@ -111,19 +114,17 @@ def _strip_rule_prefix(candidate: Any) -> Optional[str]:
 
 
 def _build_policy_id(policy_type: str, app_id: str, flow_id: Optional[str], target_type: str) -> str:
+    """构建标准化的策略ID。"""
     prefix = "ursp" if policy_type == "UrspRuleRequest" else "smp"
-    if target_type == "flow" and flow_id:
-        return f"{prefix}-{app_id}-{flow_id}"
-    return f"{prefix}-{app_id}"
+    return f"{prefix}-{app_id}-{flow_id}" if target_type == "flow" and flow_id else f"{prefix}-{app_id}"
 
 
 def _normalize_app_id(app_id: Any) -> str:
+    """将应用ID格式化为标准 app-xxx 格式。"""
     text = str(app_id or "").strip()
     if not text:
         return ""
-    if text.startswith("app_"):
-        return f"app-{text[4:].replace('_', '-')}"
-    if text.startswith("app-"):
+    if text.startswith(("app_", "app-")):
         return f"app-{text[4:].replace('_', '-')}"
     if re.fullmatch(r"app\d+", text, flags=re.IGNORECASE):
         return f"app-{text[3:]}"
@@ -131,6 +132,7 @@ def _normalize_app_id(app_id: Any) -> str:
 
 
 def _coerce_int(value: Any) -> Optional[int]:
+    """尝试将值转换为整数。"""
     if value in (None, ""):
         return None
     try:
@@ -140,12 +142,12 @@ def _coerce_int(value: Any) -> Optional[int]:
 
 
 def _coerce_str(value: Any) -> Optional[str]:
-    if value in (None, ""):
-        return None
-    return str(value)
+    """尝试将值转换为字符串。"""
+    return None if value in (None, "") else str(value)
 
 
 def _coerce_numeric_str(value: Any) -> Optional[str]:
+    """尝试将数值转换为字符串，保留原有格式。"""
     if value in (None, ""):
         return None
     try:
@@ -155,31 +157,30 @@ def _coerce_numeric_str(value: Any) -> Optional[str]:
 
 
 def _extract_ursp_flow_desc_from_five_tuple(five_tuple: Any) -> Optional[str]:
+    """从五元组中提取 URSP 流描述符。"""
     if not isinstance(five_tuple, (list, tuple)) or len(five_tuple) != 5:
         return None
     _, dst_ip, _, dst_port, protocol = five_tuple
-    dst_ip = str(dst_ip or "").strip()
-    protocol = str(protocol or "").strip().upper()
+    dst_ip, protocol = str(dst_ip or "").strip(), str(protocol or "").strip().upper()
     try:
         dst_port = int(dst_port)
     except (TypeError, ValueError):
         return None
-    if not dst_ip or not protocol:
-        return None
-    return f"{protocol} {dst_ip} {dst_port}"
+    return f"{protocol} {dst_ip} {dst_port}" if dst_ip and protocol else None
 
 
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "optimization_strategy"
+
     def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507"):
         super().__init__(model_name=model_name)
         self.agent_name = "optimization_strategy"
         self.initialize_agent_runtime(logger_color="\033[94m")
-        self.tools = [run_optimization_solver, fetch_network_status]
-        self.agent = self.create_structured_agent(
+        self.tools = [think, fetch_network_status, run_optimization_solver]
+        self.agent = self.create_json_agent(
             tools=self.tools,
             system_prompt=OSA_SYSTEM_PROMPT,
-            response_format=PolicyPlanDraft,
+            response_model=PolicyPlanDraft,
         )
 
     def expected_request_type(self) -> str:
@@ -193,19 +194,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         return self.generate_strategy_from_request(
             planning_request=planning_request,
             request_envelope=envelope,
-        )
-
-    @staticmethod
-    def _build_request_message(
-        normalized_user_intent: Dict[str, Any],
-        coordination_context: Dict[str, Any],
-    ) -> str:
-        return (
-            "Operation intent:\n"
-            f"{json.dumps(normalized_user_intent, ensure_ascii=False)}\n\n"
-            "Collaboration context:\n"
-            f"{json.dumps(coordination_context, ensure_ascii=False)}\n\n"
-            "Fetch network status first, then run optimization and return a structured policy draft."
         )
 
     def _cache_received_request(self, planning_request: PlanningRequest) -> ArtifactEnvelope:
@@ -230,76 +218,33 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _extract_flow_id_from_policy_data(data: Dict[str, Any]) -> Optional[str]:
-        flow_id = _strip_rule_prefix(data.get("flow_id") or data.get("flowId"))
-        if flow_id:
+        """尝试从顶层或内嵌的规则字典中提取flow_id。"""
+        if flow_id := _strip_rule_prefix(data.get("flow_id") or data.get("flowId")):
             return flow_id
 
         for mapping_name, id_field in (("qosDecs", "qosId"), ("pccRules", "pccRuleId"), ("sessRules", "sessRuleId")):
             mapping = data.get(mapping_name) or data.get(mapping_name[0].lower() + mapping_name[1:])
-            if not isinstance(mapping, dict) or not mapping:
-                continue
-
-            for key, item in mapping.items():
-                key_flow_id = _strip_rule_prefix(key)
-                if key_flow_id:
-                    return key_flow_id
-                if isinstance(item, dict):
-                    item_flow_id = _strip_rule_prefix(item.get(id_field))
-                    if item_flow_id:
+            if isinstance(mapping, dict):
+                for key, item in mapping.items():
+                    if key_flow_id := _strip_rule_prefix(key):
+                        return key_flow_id
+                    if isinstance(item, dict) and (item_flow_id := _strip_rule_prefix(item.get(id_field))):
                         return item_flow_id
         return None
 
     @staticmethod
     def _pick_mapping_entry(mapping: Dict[str, Any], flow_id: Optional[str], id_field: str) -> Tuple[str, Dict[str, Any]]:
+        """从映射中选取匹配指定flow_id的项，或默认第一项。"""
         if not isinstance(mapping, dict) or not mapping:
             return "", {}
 
         if flow_id:
             for key, item in mapping.items():
-                if _strip_rule_prefix(key) == flow_id:
-                    return str(key), _json_friendly(item)
-                if isinstance(item, dict) and _strip_rule_prefix(item.get(id_field)) == flow_id:
+                if _strip_rule_prefix(key) == flow_id or (isinstance(item, dict) and _strip_rule_prefix(item.get(id_field)) == flow_id):
                     return str(key), _json_friendly(item)
 
         first_key = next(iter(mapping.keys()))
         return str(first_key), _json_friendly(mapping[first_key])
-
-    @staticmethod
-    def _normalize_ursp_app_descs(data: Dict[str, Any]) -> Dict[str, Any]:
-        traffic_desc = data.get("trafficDesc")
-        if not isinstance(traffic_desc, dict):
-            return data
-
-        app_descs = traffic_desc.get("appDescs")
-        if isinstance(app_descs, dict) and "osId" in app_descs and "appIds" in app_descs:
-            os_id = str(app_descs["osId"])
-            traffic_desc["appDescs"] = {
-                os_id: {
-                    "osId": os_id,
-                    "appIds": app_descs["appIds"],
-                }
-            }
-        elif isinstance(app_descs, list):
-            traffic_desc.pop("appDescs", None)
-        return data
-
-    @staticmethod
-    def _normalize_snssai(value: Any) -> Any:
-        if isinstance(value, dict):
-            return value
-        text = str(value or "").strip()
-        if len(text) >= 3 and text.isdigit():
-            if len(text) >= 8:
-                return {"sst": int(text[:2]), "sd": text[2:8]}
-            return {"sst": int(text[:1]), "sd": text[1:] or None}
-        return value
-
-    @staticmethod
-    def _pick_first_dict(*values: Any) -> Dict[str, Any]:
-        for value in values:
-            if isinstance(value, dict):
-                return _json_friendly(value)
-        return {}
 
     @staticmethod
     def _build_flow_infos(
@@ -307,45 +252,21 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         selected_pcc: Dict[str, Any],
         canonical_flow_id: Optional[str],
     ) -> List[Dict[str, Any]]:
+        """基于上下文/解析的规则生成 flowInfos。"""
         if flow_ctx:
-            flow_info = build_flow_info_from_five_tuple(flow_ctx.get("five_tuple"))
-            if flow_info:
-                return [flow_info]
+            five_tuple = flow_ctx.get("five_tuple")
+            if info := build_flow_info_from_five_tuple(five_tuple):
+                return [info]
+            if desc := build_flow_description_from_five_tuple(five_tuple):
+                return [{"flowDescription": desc, "flowDirection": "BIDIRECTIONAL"}]
+            if fallback_desc := str(flow_ctx.get("description") or flow_ctx.get("name") or canonical_flow_id or "flow").strip():
+                return [{"flowDescription": fallback_desc, "flowDirection": "BIDIRECTIONAL"}]
 
-            flow_description = build_flow_description_from_five_tuple(flow_ctx.get("five_tuple"))
-            if flow_description:
-                return [{"flowDescription": flow_description, "flowDirection": "BIDIRECTIONAL"}]
+        if existing := selected_pcc.get("flowInfos"):
+            if isinstance(existing, list):
+                return _json_friendly(existing)
 
-            description = str(flow_ctx.get("description") or flow_ctx.get("name") or canonical_flow_id or "flow").strip()
-            if description:
-                return [{"flowDescription": description, "flowDirection": "BIDIRECTIONAL"}]
-
-        existing = selected_pcc.get("flowInfos")
-        if isinstance(existing, list) and existing:
-            return _json_friendly(existing)
-
-        if canonical_flow_id:
-            return [{"flowDescription": canonical_flow_id, "flowDirection": "BIDIRECTIONAL"}]
-        return []
-
-    @staticmethod
-    def _normalize_traffic_desc_flow_descs(flow_descs: Any) -> List[str]:
-        normalized: List[str] = []
-        if not isinstance(flow_descs, list):
-            return normalized
-
-        for item in flow_descs:
-            if isinstance(item, str) and item.strip():
-                normalized.append(item.strip())
-                continue
-            if not isinstance(item, dict):
-                continue
-            protocol = str(item.get("protocol") or "").strip().upper()
-            server_ip = str(item.get("serverIp") or item.get("server_ip") or "").strip()
-            server_port = item.get("serverPort") or item.get("server_port")
-            if protocol and server_ip and server_port not in (None, ""):
-                normalized.append(f"{protocol} {server_ip} {server_port}")
-        return normalized
+        return [{"flowDescription": canonical_flow_id, "flowDirection": "BIDIRECTIONAL"}] if canonical_flow_id else []
 
     def _build_traffic_desc(self, details: Dict[str, Any], flow_ctx: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         top_level = details.get("trafficDesc")
@@ -357,7 +278,9 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     nested = route_set.get("trafficDesc")
                     break
 
-        traffic_desc = self._pick_first_dict(top_level, nested)
+        traffic_desc = _json_friendly(top_level) if isinstance(top_level, dict) else {}
+        if not traffic_desc and isinstance(nested, dict):
+            traffic_desc = _json_friendly(nested)
         if not traffic_desc and flow_ctx:
             flow_desc = _extract_ursp_flow_desc_from_five_tuple(flow_ctx.get("five_tuple"))
             if flow_desc:
@@ -366,8 +289,27 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         if not traffic_desc:
             return None
 
-        traffic_desc = self._normalize_ursp_app_descs({"trafficDesc": traffic_desc}).get("trafficDesc", {})
-        flow_descs = self._normalize_traffic_desc_flow_descs(traffic_desc.get("flowDescs"))
+        app_descs = traffic_desc.get("appDescs")
+        if isinstance(app_descs, dict) and "osId" in app_descs and "appIds" in app_descs:
+            os_id = str(app_descs["osId"])
+            traffic_desc["appDescs"] = {os_id: {"osId": os_id, "appIds": app_descs["appIds"]}}
+        elif isinstance(app_descs, list):
+            traffic_desc.pop("appDescs", None)
+
+        flow_descs: List[str] = []
+        raw_flow_descs = traffic_desc.get("flowDescs")
+        if isinstance(raw_flow_descs, list):
+            for item in raw_flow_descs:
+                if isinstance(item, str) and item.strip():
+                    flow_descs.append(item.strip())
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                protocol = str(item.get("protocol") or "").strip().upper()
+                server_ip = str(item.get("serverIp") or item.get("server_ip") or "").strip()
+                server_port = item.get("serverPort") or item.get("server_port")
+                if protocol and server_ip and server_port not in (None, ""):
+                    flow_descs.append(f"{protocol} {server_ip} {server_port}")
         if not flow_descs and flow_ctx:
             flow_desc = _extract_ursp_flow_desc_from_five_tuple(flow_ctx.get("five_tuple"))
             if flow_desc:
@@ -391,184 +333,104 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         flow_ctx: Optional[Dict[str, Any]],
         traffic_desc: Optional[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        route_sets = details.get("routeSelParamSets")
-        precedence = _coerce_int(details.get("relatPrecedence")) or _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or 1
-        default_dnn = None
-        if isinstance(traffic_desc, dict):
-            dnns = traffic_desc.get("dnns")
-            if isinstance(dnns, list) and dnns:
-                default_dnn = dnns[0]
+        """构建并标准化 routeSelParamSets，提取 DNN 和 S-NSSAI 信息。"""
+        def normalize_snssai(value: Any) -> Any:
+            if isinstance(value, dict):
+                return value
+            text = str(value or "").strip()
+            if len(text) < 3 or not text.isdigit():
+                return value
+            return {"sst": int(text[:2]), "sd": text[2:8]} if len(text) >= 8 else {"sst": int(text[:1]), "sd": text[1:] or None}
 
-        normalized_route_sets: List[Dict[str, Any]] = []
-        if isinstance(route_sets, list):
-            for route_set in route_sets:
-                if not isinstance(route_set, dict):
-                    continue
-                normalized_route_set: Dict[str, Any] = {
-                    "dnn": _coerce_str(route_set.get("dnn")) or default_dnn or "default",
-                    "precedence": _coerce_int(route_set.get("precedence")) or _coerce_int(route_set.get("priority")) or precedence,
-                }
-                snssai = self._normalize_snssai(route_set.get("snssai"))
-                if snssai is not None:
-                    normalized_route_set["snssai"] = snssai
-                normalized_route_sets.append(normalized_route_set)
+        precedence = _coerce_int(details.get("relatPrecedence")) or _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or 1
+        default_dnn = dnns[0] if isinstance(traffic_desc, dict) and isinstance(dnns := traffic_desc.get("dnns"), list) and dnns else None
+
+        normalized_route_sets = [
+            {
+                "dnn": _coerce_str(rs.get("dnn")) or default_dnn or "default",
+                "precedence": _coerce_int(rs.get("precedence")) or _coerce_int(rs.get("priority")) or precedence,
+                **({"snssai": snssai} if (snssai := normalize_snssai(rs.get("snssai"))) is not None else {})
+            }
+            for rs in (details.get("routeSelParamSets") or []) if isinstance(rs, dict)
+        ]
 
         if normalized_route_sets:
             return normalized_route_sets
 
-        default_route_set: Dict[str, Any] = {
-            "dnn": default_dnn or "default",
-            "precedence": precedence,
-        }
-        snssai = self._normalize_snssai(details.get("snssai"))
-        if snssai is not None:
-            default_route_set["snssai"] = snssai
-        return [default_route_set]
+        default_rs: Dict[str, Any] = {"dnn": default_dnn or "default", "precedence": precedence}
+        if (snssai := normalize_snssai(details.get("snssai"))) is not None:
+            default_rs["snssai"] = snssai
+        return [default_rs]
 
     def _normalize_sm_policy_details(
-        self,
-        details: Dict[str, Any],
-        flow_id: Optional[str],
-        flow_ctx: Optional[Dict[str, Any]],
+        self, details: Dict[str, Any], flow_id: Optional[str], flow_ctx: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
+        """标准化 SM Policy details，合并上下文信息。"""
         data = _json_friendly(details)
-
-        pcc_rules = data.get("pccRules") or data.get("pcc_rules")
-        qos_decs = data.get("qosDecs") or data.get("qos_decs")
-        if not isinstance(pcc_rules, dict) or not pcc_rules:
+        if not isinstance(pcc := data.get("pccRules") or data.get("pcc_rules"), dict) or not pcc:
             raise ValueError("SmPolicyDecision is missing pccRules.")
-        if not isinstance(qos_decs, dict) or not qos_decs:
+        if not isinstance(qos := data.get("qosDecs") or data.get("qos_decs"), dict) or not qos:
             raise ValueError("SmPolicyDecision is missing qosDecs.")
 
-        _, selected_pcc = self._pick_mapping_entry(pcc_rules, flow_id, "pccRuleId")
-        _, selected_qos = self._pick_mapping_entry(qos_decs, flow_id, "qosId")
+        _, sel_pcc = self._pick_mapping_entry(pcc, flow_id, "pccRuleId")
+        _, sel_qos = self._pick_mapping_entry(qos, flow_id, "qosId")
 
-        canonical_flow_id = flow_id or self._extract_flow_id_from_policy_data(data)
-        canonical_pcc_id = f"pcc-{canonical_flow_id}" if canonical_flow_id else str(selected_pcc.get("pccRuleId") or "pcc-default")
-        canonical_qos_id = f"qos-{canonical_flow_id}" if canonical_flow_id else str(selected_qos.get("qosId") or "qos-default")
+        c_flow_id = flow_id or self._extract_flow_id_from_policy_data(data)
+        c_pcc_id = f"pcc-{c_flow_id}" if c_flow_id else str(sel_pcc.get("pccRuleId") or "pcc-default")
+        c_qos_id = f"qos-{c_flow_id}" if c_flow_id else str(sel_qos.get("qosId") or "qos-default")
 
-        for key in (
-            "priorityLevel",
-            "packetDelayBudget",
-            "packetErrorRate",
-            "maxbrUl",
-            "maxbrDl",
-            "gbrUl",
-            "gbrDl",
-            "arp",
-            "5qi",
-            "var5qi",
-            "jitterReq",
-        ):
-            if key in selected_pcc and key not in selected_qos:
-                selected_qos[key] = selected_pcc.get(key)
-        selected_qos.pop("refQosData", None)
+        for k in ("priorityLevel", "packetDelayBudget", "packetErrorRate", "maxbrUl", "maxbrDl", "gbrUl", "gbrDl", "arp", "5qi", "var5qi", "jitterReq"):
+            if k in sel_pcc and k not in sel_qos:
+                sel_qos[k] = sel_pcc[k]
+        sel_qos.pop("refQosData", None)
 
-        pcc_payload: Dict[str, Any] = {
-            "pccRuleId": canonical_pcc_id,
-            "precedence": _coerce_int(selected_pcc.get("precedence")) or _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or 1,
-            "refQosData": [canonical_qos_id],
+        pcc_payload = {
+            "pccRuleId": c_pcc_id,
+            "precedence": _coerce_int(sel_pcc.get("precedence")) or _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or 1,
+            "refQosData": [c_qos_id],
         }
-        flow_infos = self._build_flow_infos(flow_ctx, selected_pcc, canonical_flow_id)
-        if flow_infos:
-            pcc_payload["flowInfos"] = flow_infos
-        if flow_ctx and flow_ctx.get("app_id"):
-            pcc_payload["appId"] = _normalize_app_id(flow_ctx.get("app_id"))
-        elif selected_pcc.get("appId"):
-            pcc_payload["appId"] = _normalize_app_id(selected_pcc.get("appId"))
+        if (infos := self._build_flow_infos(flow_ctx, sel_pcc, c_flow_id)):
+            pcc_payload["flowInfos"] = infos
+        
+        if (app_id := (flow_ctx.get("app_id") if flow_ctx else None) or sel_pcc.get("appId")):
+            pcc_payload["appId"] = _normalize_app_id(app_id)
 
-        for key in (
-            "appDescriptor",
-            "contVer",
-            "afSigProtocol",
-            "appReloc",
-            "easRedisInd",
-            "refAltQosParams",
-            "refTcData",
-            "refChgData",
-            "refChgN3gData",
-            "refUmData",
-            "refUmN3gData",
-            "refCondData",
-            "refQosMon",
-            "addrPreserInd",
-            "tscaiInputDl",
-            "tscaiInputUl",
-            "tscaiTimeDom",
-            "ddNotifCtrl",
-            "ddNotifCtrl2",
-            "disUeNotif",
-            "packFiltAllPrec",
-        ):
-            value = selected_pcc.get(key)
-            if value not in (None, "", [], {}):
-                pcc_payload[key] = value
+        for k in ("appDescriptor", "contVer", "afSigProtocol", "appReloc", "easRedisInd", "refAltQosParams", "refTcData", "refChgData", "refChgN3gData", "refUmData", "refUmN3gData", "refCondData", "refQosMon", "addrPreserInd", "tscaiInputDl", "tscaiInputUl", "tscaiTimeDom", "ddNotifCtrl", "ddNotifCtrl2", "disUeNotif", "packFiltAllPrec"):
+            if (val := sel_pcc.get(k)) not in (None, "", [], {}):
+                pcc_payload[k] = val
 
-        qos_payload: Dict[str, Any] = {
-            "qosId": canonical_qos_id,
-            "priorityLevel": _coerce_int(flow_ctx.get("priority") if flow_ctx else None)
-            or _coerce_int(selected_qos.get("priorityLevel"))
-            or 1,
-            "packetDelayBudget": _coerce_int(flow_ctx.get("lat") if flow_ctx else None)
-            or _coerce_int(selected_qos.get("packetDelayBudget"))
-            or 0,
-            "packetErrorRate": _coerce_str(flow_ctx.get("loss_req") if flow_ctx else None)
-            or _coerce_str(selected_qos.get("packetErrorRate"))
-            or "0.0",
+        qos_payload = {
+            "qosId": c_qos_id,
+            "priorityLevel": _coerce_int(flow_ctx.get("priority") if flow_ctx else None) or _coerce_int(sel_qos.get("priorityLevel")) or 1,
+            "packetDelayBudget": _coerce_int(flow_ctx.get("lat") if flow_ctx else None) or _coerce_int(sel_qos.get("packetDelayBudget")) or 0,
+            "packetErrorRate": _coerce_str(flow_ctx.get("loss_req") if flow_ctx else None) or _coerce_str(sel_qos.get("packetErrorRate")) or "0.0",
         }
-        for qos_key, flow_key in (
-            ("maxbrUl", "bw_ul"),
-            ("maxbrDl", "bw_dl"),
-            ("gbrUl", "gbr_ul"),
-            ("gbrDl", "gbr_dl"),
-        ):
-            qos_payload[qos_key] = (
-                _coerce_numeric_str(flow_ctx.get(flow_key) if flow_ctx else None)
-                or _coerce_numeric_str(selected_qos.get(qos_key))
-            )
+        for qk, fk in (("maxbrUl", "bw_ul"), ("maxbrDl", "bw_dl"), ("gbrUl", "gbr_ul"), ("gbrDl", "gbr_dl")):
+            qos_payload[qk] = _coerce_numeric_str(flow_ctx.get(fk) if flow_ctx else None) or _coerce_numeric_str(sel_qos.get(qk))
 
-        var5qi = selected_qos.get("var5qi", selected_qos.get("5qi"))
-        if var5qi not in (None, ""):
+        if (var5qi := sel_qos.get("var5qi", sel_qos.get("5qi"))) not in (None, ""):
             qos_payload["var5qi"] = _coerce_int(var5qi)
 
-        arp = selected_qos.get("arp")
-        if isinstance(arp, dict):
+        if isinstance(arp := sel_qos.get("arp"), dict):
             arp_payload = _json_friendly(arp)
             arp_payload["priorityLevel"] = _coerce_int(arp_payload.get("priorityLevel")) or qos_payload["priorityLevel"]
             qos_payload["arp"] = arp_payload
 
-        for key in (
-            "qnc",
-            "averWindow",
-            "maxDataBurstVol",
-            "reflectiveQos",
-            "sharingKeyDl",
-            "sharingKeyUl",
-            "maxPacketLossRateDl",
-            "maxPacketLossRateUl",
-            "defQosFlowIndication",
-            "extMaxDataBurstVol",
-        ):
-            value = selected_qos.get(key)
-            if value not in (None, "", [], {}):
-                qos_payload[key] = value
+        for k in ("qnc", "averWindow", "maxDataBurstVol", "reflectiveQos", "sharingKeyDl", "sharingKeyUl", "maxPacketLossRateDl", "maxPacketLossRateUl", "defQosFlowIndication", "extMaxDataBurstVol"):
+            if (val := sel_qos.get(k)) not in (None, "", [], {}):
+                qos_payload[k] = val
 
-        normalized: Dict[str, Any] = {
-            "pccRules": {canonical_pcc_id: pcc_payload},
-            "qosDecs": {canonical_qos_id: qos_payload},
-        }
+        normalized: Dict[str, Any] = {"pccRules": {c_pcc_id: pcc_payload}, "qosDecs": {c_qos_id: qos_payload}}
 
-        sess_rules = data.get("sessRules") or data.get("sess_rules")
-        if canonical_flow_id and isinstance(sess_rules, dict) and sess_rules:
-            _, selected_sess = self._pick_mapping_entry(sess_rules, canonical_flow_id, "sessRuleId")
-            canonical_sess_id = f"sess-{canonical_flow_id}"
-            selected_sess["sessRuleId"] = canonical_sess_id
-            normalized["sessRules"] = {canonical_sess_id: selected_sess}
+        if c_flow_id and isinstance(sess := data.get("sessRules") or data.get("sess_rules"), dict) and sess:
+            _, sel_sess = self._pick_mapping_entry(sess, c_flow_id, "sessRuleId")
+            sel_sess["sessRuleId"] = c_sess_id = f"sess-{c_flow_id}"
+            normalized["sessRules"] = {c_sess_id: sel_sess}
 
-        validated = SmPolicyDecision.model_validate(_json_friendly(normalized))
-        return _json_friendly(validated)
+        return _json_friendly(SmPolicyDecision.model_validate(_json_friendly(normalized)))
 
     def _normalize_ursp_policy_details(self, details: Dict[str, Any], target_type: str) -> Tuple[Dict[str, Any], str]:
+        """标准化 URSP policy details。"""
         data = _json_friendly(details)
         flow_ctx = data.pop("_flow_ctx", None) if isinstance(data, dict) else None
         if not isinstance(flow_ctx, dict):
@@ -576,91 +438,64 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
 
         traffic_desc = self._build_traffic_desc(data, flow_ctx)
         route_sets = self._build_route_selection_parameter_sets(data, flow_ctx, traffic_desc)
-        relat_precedence = _coerce_int(data.get("relatPrecedence"))
-        if relat_precedence is None and route_sets:
-            relat_precedence = _coerce_int(route_sets[0].get("precedence")) or 1
+        relat_precedence = _coerce_int(data.get("relatPrecedence")) or (_coerce_int(route_sets[0].get("precedence")) if route_sets else None) or 1
 
         if target_type == "flow" and not traffic_desc:
             target_type = "app"
 
-        ursp_payload: Dict[str, Any] = {
-            "relatPrecedence": relat_precedence or 1,
-            "routeSelParamSets": route_sets,
-        }
+        ursp_payload: Dict[str, Any] = {"relatPrecedence": relat_precedence, "routeSelParamSets": route_sets}
         if traffic_desc:
             ursp_payload["trafficDesc"] = traffic_desc
 
-        validated = UrspRuleRequest.model_validate(ursp_payload)
-        return _json_friendly(validated), target_type
+        return _json_friendly(UrspRuleRequest.model_validate(ursp_payload)), target_type
 
     def _normalize_policy_plan_draft(
-        self,
-        draft: PolicyPlanDraft,
-        operation_intent: OperationIntent,
+        self, draft: PolicyPlanDraft, operation_intent: OperationIntent
     ) -> PolicyPlanDraft:
-        normalized_user_intent = _json_friendly(operation_intent.model_dump(mode="json"))
-        normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
-        user_flows = normalized_user_intent.get("flows") or []
-
-        flow_map: Dict[str, Dict[str, Any]] = {}
-        for flow in user_flows:
-            if isinstance(flow, dict) and flow.get("flow_id"):
-                normalized_flow = dict(flow)
-                normalized_flow["app_id"] = normalized_user_intent.get("app_id")
-                flow_map[str(flow.get("flow_id"))] = normalized_flow
-
+        """标准化 PolicyPlanDraft，补全 flow_id/supi/app_id 等关键字段。"""
+        ui = _json_friendly(operation_intent.model_dump(mode="json"))
+        base_app_id = ui["app_id"] = _normalize_app_id(ui.get("app_id"))
+        
+        flow_map = {
+            str(f["flow_id"]): {**f, "app_id": base_app_id}
+            for f in ui.get("flows", []) if isinstance(f, dict) and f.get("flow_id")
+        }
         single_flow_id = next(iter(flow_map.keys())) if len(flow_map) == 1 else None
-        base_supi = str(
-            draft.supi
-            or normalized_user_intent.get("supi")
-            or next((flow.get("supi") for flow in user_flows if isinstance(flow, dict) and flow.get("supi")), "")
-            or ""
-        ).strip()
-        base_app_id = _normalize_app_id(normalized_user_intent.get("app_id"))
 
-        normalized_policies: List[PolicyDraft] = []
-        for index, policy_draft in enumerate(draft.all_policies):
-            details_payload = _json_friendly(policy_draft.policy_details)
-            inferred_flow_id = (
-                policy_draft.flow_id
-                or self._extract_flow_id_from_policy_data(details_payload)
-                or single_flow_id
-            )
-            flow_ctx = flow_map.get(str(inferred_flow_id)) if inferred_flow_id else None
-            supi = str(policy_draft.supi or base_supi or (flow_ctx.get("supi") if flow_ctx else "") or "").strip()
-            app_id = _normalize_app_id(policy_draft.app_id or base_app_id or "")
-            target_type = policy_draft.target_type or ("flow" if inferred_flow_id else "app")
+        base_supi = str(draft.supi or ui.get("supi") or next((f.get("supi") for f in ui.get("flows", []) if isinstance(f, dict) and f.get("supi")), "") or "").strip()
 
-            if policy_draft.policy_type == "SmPolicyDecision":
-                policy_details = self._normalize_sm_policy_details(details_payload, inferred_flow_id, flow_ctx)
-            elif policy_draft.policy_type == "UrspRuleRequest":
-                details_payload["_flow_ctx"] = flow_ctx
-                policy_details, target_type = self._normalize_ursp_policy_details(details_payload, target_type)
+        normalized_policies = []
+        for i, pd in enumerate(draft.all_policies):
+            details = _json_friendly(pd.policy_details)
+            f_id = pd.flow_id or self._extract_flow_id_from_policy_data(details) or single_flow_id
+            flow_ctx = flow_map.get(str(f_id)) if f_id else None
+            
+            supi = str(pd.supi or base_supi or (flow_ctx.get("supi") if flow_ctx else "") or "").strip()
+            app_id = _normalize_app_id(pd.app_id or base_app_id or "")
+            target_type = pd.target_type or ("flow" if f_id else "app")
+
+            if pd.policy_type == "SmPolicyDecision":
+                norm_details = self._normalize_sm_policy_details(details, f_id, flow_ctx)
+            elif pd.policy_type == "UrspRuleRequest":
+                details["_flow_ctx"] = flow_ctx
+                norm_details, target_type = self._normalize_ursp_policy_details(details, target_type)
             else:
-                raise ValueError(f"Unsupported policy_type: {policy_draft.policy_type}")
+                raise ValueError(f"Unsupported policy_type: {pd.policy_type}")
 
-            if target_type == "flow" and policy_draft.policy_type == "SmPolicyDecision" and not inferred_flow_id:
-                raise ValueError(f"Policy #{index + 1} is missing flow_id for a flow-scoped SmPolicyDecision.")
+            if target_type == "flow" and pd.policy_type == "SmPolicyDecision" and not f_id:
+                raise ValueError(f"Policy #{i + 1} is missing flow_id for a flow-scoped SmPolicyDecision.")
 
-            policy_id = _build_policy_id(policy_draft.policy_type, app_id or "app", inferred_flow_id, target_type)
             normalized_policies.append(
                 PolicyDraft(
-                    recommended_actions=list(policy_draft.recommended_actions or []),
-                    supi=supi,
-                    app_id=app_id,
-                    flow_id=inferred_flow_id,
-                    target_type=target_type,
-                    policy_id=policy_id,
-                    policy_type=policy_draft.policy_type,
-                    policy_details=policy_details,
+                    recommended_actions=list(pd.recommended_actions or []), supi=supi, app_id=app_id,
+                    flow_id=f_id, target_type=target_type, policy_id=_build_policy_id(pd.policy_type, app_id or "app", f_id, target_type),
+                    policy_type=pd.policy_type, policy_details=norm_details,
                 )
             )
 
         return PolicyPlanDraft(
-            supi=base_supi,
-            session_id=str(draft.session_id or normalized_user_intent.get("session_id") or "").strip(),
-            snapshot_id=str(draft.snapshot_id or normalized_user_intent.get("snapshot_id") or "").strip(),
-            all_policies=normalized_policies,
+            supi=base_supi, session_id=str(draft.session_id or ui.get("session_id") or "").strip(),
+            snapshot_id=str(draft.snapshot_id or ui.get("snapshot_id") or "").strip(), all_policies=normalized_policies
         )
 
     def generate_strategy(self, planning_request: PlanningRequest) -> PolicyPlanDraft:
@@ -694,24 +529,25 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 supi=operation_intent.supi,
                 thread_id=planning_request.context.session_id,
             )
-            result = self.agent.invoke(
+            messages = [
                 {
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": self._build_request_message(
-                                normalized_user_intent=normalized_user_intent,
-                                coordination_context=coordination_context,
-                            ),
-                        }
-                    ]
-                },
-                context=runtime_context,
+                    "role": "user",
+                    "content": (
+                        "Operation intent:\n"
+                        f"{json.dumps(normalized_user_intent, ensure_ascii=False)}\n\n"
+                        "Collaboration context:\n"
+                        f"{json.dumps(coordination_context, ensure_ascii=False)}\n\n"
+                        "Fetch network status first, then run optimization and return a structured policy draft."
+                    ),
+                }
+            ]
+            self._pending_invoke_messages = messages
+            structured = self.invoke_json_response(
+                system_prompt=OSA_SYSTEM_PROMPT,
+                user_prompt=messages[-1]["content"],
+                response_model=PolicyPlanDraft,
+                runtime_context=runtime_context,
             )
-            structured = result.get("structured_response")
-            if structured is None:
-                raise RuntimeError("OSA agent returned no structured_response.")
-
             final_output = PolicyPlanDraft.model_validate(structured)
             normalized_output = self._normalize_policy_plan_draft(final_output, operation_intent)
             self._cache_produced_result(
@@ -724,3 +560,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             self.logger.error(f"Failed to generate optimization strategy: {exc}")
             log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="error")
             raise
+        finally:
+            if hasattr(self, "_pending_invoke_messages"):
+                delattr(self, "_pending_invoke_messages")

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 from uuid import uuid4
 
-from tools.runtime_store import acquire_task_lease, complete_task, enqueue_task, get_task_status
+from .runtime_store import acquire_task_lease, complete_task, enqueue_task, get_task_status
 
 from .artifacts import ArtifactEnvelope, ArtifactStore
 from .workspace import runtime_root

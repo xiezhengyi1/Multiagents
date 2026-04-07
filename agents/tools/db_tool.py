@@ -1,6 +1,8 @@
 from typing import List, Tuple, Dict, Any, Optional, Union, TYPE_CHECKING
 from dataclasses import asdict
 from contextlib import contextmanager
+from difflib import SequenceMatcher
+import re
 
 from database.connection import SessionLocal
 from database.models import NetworkStatusSnapshot, SessionContext, UeContextRecord
@@ -111,6 +113,113 @@ def _build_catalogs_from_app_data(app_data: Any, supi: str) -> Tuple[List[Dict[s
             flow_catalog.append(_normalize_catalog_flow(app, flow))
 
     return app_catalog, flow_catalog
+
+
+def _normalize_semantic_lookup_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", " ", str(value or "").strip().lower()).strip()
+
+
+def _compact_semantic_lookup_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").strip().lower())
+
+
+def _token_overlap_score(query: str, target: str) -> float:
+    query_tokens = {token for token in _normalize_semantic_lookup_text(query).split() if token}
+    target_tokens = {token for token in _normalize_semantic_lookup_text(target).split() if token}
+    if not query_tokens or not target_tokens:
+        return 0.0
+    return len(query_tokens & target_tokens) / len(query_tokens)
+
+
+def _semantic_name_score(query: Any, target: Any) -> float:
+    normalized_query = _normalize_semantic_lookup_text(query)
+    normalized_target = _normalize_semantic_lookup_text(target)
+    if not normalized_query or not normalized_target:
+        return 0.0
+
+    compact_query = _compact_semantic_lookup_text(query)
+    compact_target = _compact_semantic_lookup_text(target)
+    if compact_query and compact_query == compact_target:
+        return 1.0
+
+    scores = [
+        SequenceMatcher(None, normalized_query, normalized_target).ratio(),
+        _token_overlap_score(normalized_query, normalized_target),
+    ]
+    if compact_query and compact_target and (compact_query in compact_target or compact_target in compact_query):
+        scores.append(0.95)
+    return max(scores)
+
+
+def search_flow_targets_by_semantic(
+    *,
+    app_name: str = "",
+    flow_name: str = "",
+    limit: int = 5,
+    min_score: float = 0.35,
+) -> Dict[str, Any]:
+    normalized_app_name = str(app_name or "").strip()
+    normalized_flow_name = str(flow_name or "").strip()
+    if not normalized_app_name and not normalized_flow_name:
+        return {
+            "query": {"app_name": normalized_app_name, "flow_name": normalized_flow_name},
+            "candidate_count": 0,
+            "candidates": [],
+        }
+
+    snapshot = get_latest_snapshot_data() or {}
+    app_data = snapshot.get("apps", []) if isinstance(snapshot, dict) else []
+    candidates: List[Dict[str, Any]] = []
+
+    for app in app_data:
+        if not isinstance(app, dict):
+            continue
+        flows = app.get("flows") or []
+        app_score = _semantic_name_score(normalized_app_name, app.get("name")) if normalized_app_name else 0.0
+        for flow in flows:
+            if not isinstance(flow, dict):
+                continue
+            flow_score = _semantic_name_score(normalized_flow_name, flow.get("name")) if normalized_flow_name else 0.0
+            if normalized_app_name and normalized_flow_name:
+                combined_component_threshold = max(min_score, 0.5)
+                if app_score < combined_component_threshold or flow_score < combined_component_threshold:
+                    continue
+                overall_score = (app_score * 0.45) + (flow_score * 0.55)
+            elif normalized_app_name:
+                overall_score = app_score
+            else:
+                overall_score = flow_score
+            if overall_score < min_score:
+                continue
+
+            candidate = _normalize_catalog_flow(app, flow)
+            candidate.update(
+                {
+                    "match_score": round(overall_score, 4),
+                    "app_name_score": round(app_score, 4),
+                    "flow_name_score": round(flow_score, 4),
+                }
+            )
+            candidates.append(candidate)
+
+    candidates.sort(
+        key=lambda item: (
+            float(item.get("match_score") or 0.0),
+            float(item.get("flow_name_score") or 0.0),
+            float(item.get("app_name_score") or 0.0),
+            str(item.get("supi") or ""),
+            str(item.get("app_id") or ""),
+            str(item.get("flow_id") or ""),
+        ),
+        reverse=True,
+    )
+
+    bounded_limit = max(1, int(limit or 5))
+    return {
+        "query": {"app_name": normalized_app_name, "flow_name": normalized_flow_name},
+        "candidate_count": len(candidates),
+        "candidates": candidates[:bounded_limit],
+    }
 
 @contextmanager
 def session_scope():
@@ -485,8 +594,8 @@ def get_ue_context_by_supi(supi: str) -> Optional[Dict[str, Any]]:
                 "traffContDecs": row.traff_cont_decs,
                 "chgDecs": row.chg_decs,
                 "urspRules": row.ursp_rules,
-                "app_catalog": row.app_catalog if row.app_catalog is not None else derived_app_catalog,
-                "flow_catalog": row.flow_catalog if row.flow_catalog is not None else derived_flow_catalog,
+                "app_catalog": derived_app_catalog or row.app_catalog or [],
+                "flow_catalog": derived_flow_catalog or row.flow_catalog or [],
                 "created_at": row.created_at.isoformat() if row.created_at else None,
                 "updated_at": row.updated_at.isoformat() if row.updated_at else None,
             }
