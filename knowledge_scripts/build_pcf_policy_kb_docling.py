@@ -22,6 +22,7 @@ from database.langchain_pg import build_pgvector_document, rebuild_pgvector_coll
 from knowledge_scripts.build_pcf_policy_kb import (
     SPEC_OBJECT_MAP_JSON as LEGACY_SPEC_OBJECT_MAP_JSON,
     TERM_ALIAS_MAP_JSON as LEGACY_TERM_ALIAS_MAP_JSON,
+    _infer_strategy_domains,
     MANIFEST_PATH,
     build_auxiliary_maps,
     build_eval_queries,
@@ -29,6 +30,7 @@ from knowledge_scripts.build_pcf_policy_kb import (
     build_glossary_records,
     default_sources,
     infer_object_tags,
+    is_minimal_source,
     is_probable_heading,
     load_jsonl,
     make_metadata,
@@ -49,6 +51,7 @@ DOCLING_SCHEMA_JSONL = DOCLING_PROCESSED_ROOT / "schema.jsonl"
 DOCLING_GLOSSARY_JSONL = DOCLING_PROCESSED_ROOT / "glossary.jsonl"
 DOCLING_SPEC_OBJECT_MAP_JSON = DOCLING_PROCESSED_ROOT / "spec_object_map.json"
 DOCLING_TERM_ALIAS_MAP_JSON = DOCLING_PROCESSED_ROOT / "term_alias_map.json"
+DOCLING_CLAUSE_EXACT_INDEX_JSON = DOCLING_PROCESSED_ROOT / "clause_exact_index.json"
 DOCLING_SCHEMA_EXACT_INDEX_JSON = DOCLING_PROCESSED_ROOT / "schema_exact_index.json"
 DOCLING_GLOSSARY_EXACT_INDEX_JSON = DOCLING_PROCESSED_ROOT / "glossary_exact_index.json"
 DOCLING_RETRIEVAL_EVAL_JSON = DOCLING_PROCESSED_ROOT / "retrieval_eval_queries.json"
@@ -113,6 +116,7 @@ def _load_pdf_sources(manifest: Optional[Iterable[Dict[str, Any]]] = None) -> Li
         normalized = dict(source)
         normalized["local_path"] = str(local_path)
         pdf_sources.append(normalized)
+    pdf_sources = [source for source in pdf_sources if is_minimal_source(source)]
     if not pdf_sources:
         raise RuntimeError("No PCF PDF sources were found for docling processing.")
     return pdf_sources
@@ -227,9 +231,10 @@ def extract_pdf_sections_with_docling(source: Dict[str, Any]) -> List[Dict[str, 
     segments: List[Dict[str, Any]] = []
     records: List[Dict[str, Any]] = []
     current_page = 1
+    record_counter = 0
 
     def flush_section(last_page: int) -> None:
-        nonlocal segments, body_buffer
+        nonlocal segments, body_buffer, record_counter
         _append_body_segment(segments=segments, body_buffer=body_buffer, page_no=last_page)
         if not section_number:
             segments = []
@@ -259,9 +264,10 @@ def extract_pdf_sections_with_docling(source: Dict[str, Any]) -> List[Dict[str, 
             )
             kind = "tbl" if segment["kind"] == "table" else "clause"
             for chunk_index, chunk in enumerate(split_large_section(segment["text"]), start=1):
+                record_counter += 1
                 records.append(
                     {
-                        "id": f"{source['spec_id']}-{section_number}-{kind}-{segment_index}-{chunk_index}",
+                        "id": f"{source['spec_id']}-{section_number}-{kind}-{segment_index}-{chunk_index}-{record_counter}",
                         "page_content": chunk,
                         "metadata": metadata,
                     }
@@ -423,8 +429,10 @@ def build_corpus_from_docling(manifest: Optional[Iterable[Dict[str, Any]]] = Non
     write_jsonl(DOCLING_GLOSSARY_JSONL, glossary_records)
     _write_auxiliary_maps_to_docling_outputs(clause_records, schema_records, glossary_records)
 
+    clause_exact = build_exact_index(clause_records, index_name="clause_exact")
     schema_exact = build_exact_index(schema_records, index_name="schema_exact")
     glossary_exact = build_exact_index(glossary_records, index_name="glossary_exact")
+    DOCLING_CLAUSE_EXACT_INDEX_JSON.write_text(json.dumps(clause_exact, ensure_ascii=False, indent=2), encoding="utf-8")
     DOCLING_SCHEMA_EXACT_INDEX_JSON.write_text(json.dumps(schema_exact, ensure_ascii=False, indent=2), encoding="utf-8")
     DOCLING_GLOSSARY_EXACT_INDEX_JSON.write_text(json.dumps(glossary_exact, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -446,18 +454,80 @@ def _records_to_documents(records: Iterable[Dict[str, Any]]) -> List[Any]:
     return [build_pgvector_document(page_content=record["page_content"], metadata=record["metadata"]) for record in records]
 
 
+def _with_strategy_domains(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized_records: List[Dict[str, Any]] = []
+    for record in records:
+        normalized = dict(record)
+        metadata = dict(normalized.get("metadata") or {})
+        if not metadata.get("strategy_domains"):
+            searchable_text = "\n".join(
+                part
+                for part in (
+                    str(metadata.get("canonical_title") or "").strip(),
+                    str(metadata.get("clause_title") or "").strip(),
+                    str(normalized.get("page_content") or "")[:1200],
+                )
+                if part
+            )
+            metadata["strategy_domains"] = _infer_strategy_domains(
+                source_policy_domain=str(metadata.get("policy_domain") or ""),
+                object_tags=list(metadata.get("object_tags") or []),
+                searchable_text=searchable_text,
+            )
+        normalized["metadata"] = metadata
+        normalized_records.append(normalized)
+    return normalized_records
+
+
+def _filter_minimal_records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    allowed_spec_ids = {"23.503", "24.526", "29.512", "29.525", "glossary"}
+    filtered: List[Dict[str, Any]] = []
+    for record in records:
+        metadata = record.get("metadata") or {}
+        source_id = str(metadata.get("source_id") or "").strip()
+        spec_id = str(metadata.get("spec_id") or "").strip()
+        if source_id and is_minimal_source({"source_id": source_id}):
+            filtered.append(record)
+            continue
+        if spec_id in allowed_spec_ids:
+            filtered.append(record)
+    return filtered
+
+
+def _dedupe_records_by_id(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    chosen: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        record_id = str(record.get("id") or "").strip()
+        if not record_id:
+            continue
+        current = chosen.get(record_id)
+        if current is None or len(str(record.get("page_content") or "")) > len(str(current.get("page_content") or "")):
+            chosen[record_id] = record
+    return list(chosen.values())
+
+
+def _prepare_records_for_ingest(path: Path) -> List[Dict[str, Any]]:
+    return _dedupe_records_by_id(
+        _filter_minimal_records(
+            _with_strategy_domains(
+                normalize_records_for_embedding(load_jsonl(path))
+            )
+        )
+    )
+
+
 def ingest_docling_corpus() -> Dict[str, int]:
-    clause_records = normalize_records_for_embedding(load_jsonl(DOCLING_CLAUSE_JSONL))
-    schema_records = normalize_records_for_embedding(load_jsonl(DOCLING_SCHEMA_JSONL))
-    glossary_records = normalize_records_for_embedding(load_jsonl(DOCLING_GLOSSARY_JSONL))
+    clause_records = _prepare_records_for_ingest(DOCLING_CLAUSE_JSONL)
+    schema_records = _prepare_records_for_ingest(DOCLING_SCHEMA_JSONL)
+    glossary_records = _prepare_records_for_ingest(DOCLING_GLOSSARY_JSONL)
 
     if not clause_records or not glossary_records:
         raise RuntimeError("Docling processed corpus is incomplete. Run build first.")
 
-    sm_clause_records = [record for record in clause_records if record["metadata"]["policy_domain"] in {"sm_policy", "shared"}]
-    ursp_clause_records = [record for record in clause_records if record["metadata"]["policy_domain"] in {"ursp", "shared"}]
-    sm_schema_records = [record for record in schema_records if record["metadata"]["policy_domain"] in {"sm_policy", "shared"}]
-    ursp_schema_records = [record for record in schema_records if record["metadata"]["policy_domain"] in {"ursp", "shared"}]
+    sm_clause_records = [record for record in clause_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
+    ursp_clause_records = [record for record in clause_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
+    sm_schema_records = [record for record in schema_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
+    ursp_schema_records = [record for record in schema_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
 
     targets = [
         (PCF_SM_POLICY_CLAUSES_DOCLING_COLLECTION, sm_clause_records),
@@ -469,7 +539,8 @@ def ingest_docling_corpus() -> Dict[str, int]:
     stats: Dict[str, int] = {}
     for collection_name, records in targets:
         store = rebuild_pgvector_collection(collection_name=collection_name)
-        store.add_documents(_records_to_documents(records), ids=[record["id"] for record in records])
+        if records:
+            store.add_documents(_records_to_documents(records), ids=[record["id"] for record in records])
         stats[collection_name] = len(records)
         logger.info("Ingested %s documents into %s.", len(records), collection_name)
     return stats

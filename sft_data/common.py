@@ -195,3 +195,11 @@ def load_trace_records(trace_file: Path, trace_model: Type[BaseModel]) -> List[B
         rows.append(payload)
 
     return [trace_model.model_validate(row) for row in rows]
+
+
+def load_projected_trace_records(trace_file: Path) -> List[BaseModel]:
+    from agent_runtime.trace.models import RunTreeTraceRecord
+    from agent_runtime.trace.projectors import project_trace_to_training_trace
+
+    run_trees = load_trace_records(trace_file, RunTreeTraceRecord)
+    return [project_trace_to_training_trace(run) for run in run_trees]

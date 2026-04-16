@@ -168,16 +168,46 @@ class Node:
 
 
 @dataclass
+class AMPolicyState:
+    """关键步骤：记录当前 AM 策略的旧状态，供 MILP 计算变更代价。"""
+    old_allowed_snssais: List[str] = field(default_factory=list)
+    old_target_snssais: List[str] = field(default_factory=list)
+    old_rfsp: int = 1
+    old_triggers: List[str] = field(default_factory=list)
+    old_ue_ambr_ul: float = 0.0
+    old_ue_ambr_dl: float = 0.0
+    # 可选参数
+    rfsp_max: int = 8
+    ambr_headroom: float = 0.2
+    # 各 trigger 的预期信令频率权重
+    trigger_signal_costs: Dict[str, float] = field(default_factory=lambda: {
+        "LOC_CH": 1.0,
+        "PRA_CH": 0.6,
+        "ALLOWED_NSSAI_CH": 0.3,
+        "RFSP_CH": 0.2,
+        "UE_AMBR_CH": 0.2,
+        "NWDAF_DATA_CH": 0.4,
+    })
+    mandatory_triggers: List[str] = field(default_factory=lambda: ["LOC_CH"])
+
+
+@dataclass
 class OptimizationConfig:
     rho: float = 0.8
     w1: float = 100.0
     w2: float = 50.0
     w3: float = 1000.0
     w4: float = 0.0
+    # 关键步骤：AM 优化目标权重
+    w5: float = 30.0   # AM 策略变更成本
+    w6: float = 10.0   # Trigger 信令开销
+    w7: float = 5.0    # AMBR 紧致性
     alpha_cn: float = 0.04
     alpha_an: float = 0.01
     beta: float = 0.05
     prb: float = 0.18
     mec_overhead: List[float] = field(default_factory=lambda: [1, 4, 8])
     enable_sla_constraints: bool = True
+    enable_am_optimization: bool = False
+    am_policy_state: Optional[AMPolicyState] = None
     solver_time_limit: int = 30

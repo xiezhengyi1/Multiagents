@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -55,7 +55,7 @@ class AgenticRlTraceRecord(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
-class MinimalTraceRecord(BaseModel):
+class ProjectedTraceRecord(BaseModel):
     trace_id: str
     timestamp: str
     agent_name: str
@@ -70,6 +70,85 @@ class MinimalTraceRecord(BaseModel):
     structured_response: Any
     status: str
     error: Optional[str] = None
+    scenario_id: Optional[str] = None
+    scenario_tags: List[str] = Field(default_factory=list)
+    path_label: Optional[str] = None
+    advisor_decision: Any = None
+    compiler_output: Any = None
+
+
+class WorkflowTrajectoryRecord(BaseModel):
+    workflow_id: str
+    record_index: Optional[int] = None
+    scenario_id: Optional[str] = None
+    scenario_tags: List[str] = Field(default_factory=list)
+    session_id: str
+    snapshot_id: str
+    status: str
+    completed: bool
+    user_input: str
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    context: str = ""
+    global_intent: Any = None
+    unified_plan: Any = None
+    qos_feedback: Any = None
+    mobility_feedback: Any = None
+    diagnosis: Any = None
+    round_count: int = 0
+    retry_count: int = 0
+    round_traces: List[Dict[str, Any]] = Field(default_factory=list)
+    agent_trajectories: Dict[str, List[ProjectedTraceRecord]] = Field(default_factory=dict)
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_results: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ScenarioSpecRecord(BaseModel):
+    scenario_id: str
+    seed: int
+    domain_type: Literal["qos_only", "mobility_only", "joint"]
+    difficulty: Literal["zero_ambiguity", "ambiguous", "incomplete_context", "conflict", "dispatch_fail", "partial_success", "tradeoff"]
+    retry_shape: Literal["one_shot_success", "retry_qos", "retry_mobility", "retry_cross_domain", "stop_incomplete_context"]
+    user_input: str
+    expected_behavior: Dict[str, Any] = Field(default_factory=dict)
+    mutations: List[str] = Field(default_factory=list)
+    mock_env: Dict[str, str] = Field(default_factory=dict)
+    tags: List[str] = Field(default_factory=list)
+
+
+class MainIntentSftRecord(BaseModel):
+    sample_id: str
+    task: str = "main_intent_sft"
+    agent: str = "main_control"
+    input: Dict[str, Any]
+    target: Dict[str, Any]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class IeAdvisorSftRecord(BaseModel):
+    sample_id: str
+    task: str = "iea_advisor_sft"
+    agent: str = "intent_encoding"
+    input: Dict[str, Any]
+    target: Dict[str, Any]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OsaDecisionSftRecord(BaseModel):
+    sample_id: str
+    task: str = "osa_decision_sft"
+    agent: str = "optimization_strategy"
+    input: Dict[str, Any]
+    target: Dict[str, Any]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CompilerSftRecord(BaseModel):
+    sample_id: str
+    task: str
+    agent: str
+    input: Dict[str, Any]
+    target: Dict[str, Any]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class BuildReport(BaseModel):
@@ -97,7 +176,10 @@ def write_jsonl(path: Path, records: Iterable[BaseModel | Dict[str, Any]]) -> in
 def load_build_report(path: Path) -> BuildReport:
     if not path.exists():
         return BuildReport()
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_text = path.read_text(encoding="utf-8").strip()
+    if not raw_text:
+        return BuildReport()
+    payload = json.loads(raw_text)
     return BuildReport.model_validate(payload)
 
 

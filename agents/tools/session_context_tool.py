@@ -3,11 +3,13 @@ from typing import Optional
 
 from langchain.tools import ToolRuntime, tool
 
+from agents.tools.wrapper_think import tool_with_reason
+
 from agent_runtime import AgentRuntimeContext
 from agents.tools.db_tool import get_latest_session_context
 
 
-@tool
+@tool_with_reason
 def load_latest_session_context(
     status: Optional[str] = None,
     runtime: ToolRuntime[AgentRuntimeContext] = None,

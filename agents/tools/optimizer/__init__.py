@@ -18,6 +18,11 @@ def optimize_ibns_network(*args, **kwargs):
 	from .interface import optimize_ibns_network as _impl
 	return _impl(*args, **kwargs)
 
+
+def run_joint_control_optimizer(*args, **kwargs):
+	from .joint_control import run_joint_control_optimizer as _impl
+	return _impl(*args, **kwargs)
+
 __all__ = [
 	"App",
 	"Flow",
@@ -28,4 +33,5 @@ __all__ = [
 	"IBNSOptimizationEngine",
 	"optimize_network_slices",
 	"optimize_ibns_network",
+	"run_joint_control_optimizer",
 ]

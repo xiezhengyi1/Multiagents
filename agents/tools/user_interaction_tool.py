@@ -6,7 +6,9 @@ from typing import Any, Callable, List
 
 from langchain.tools import ToolRuntime, tool
 
-from agent_runtime.context import AgentRuntimeContext
+from agents.tools.wrapper_think import tool_with_reason
+
+from agent_runtime.core.context import AgentRuntimeContext
 
 
 def _normalize_options(options: List[str] | None) -> List[str]:
@@ -81,7 +83,7 @@ def collect_user_clarification(
     return response_payload
 
 
-@tool
+@tool_with_reason
 def ask_user_clarification(
     question: str,
     options: List[str] | None = None,

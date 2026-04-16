@@ -4,7 +4,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 
 def _json_friendly(value: Any) -> Any:
@@ -51,14 +51,51 @@ class OperationIntent(BaseModel):
     session_id: str = Field(default="", description="Session identifier")
     snapshot_id: str = Field(default="", description="Planning snapshot identifier")
     supi: str = Field(default="", description="UE identifier")
-    app_id: str = Field(default="", description="Application identifier")
+    app_id: Optional[str] = Field(default="", description="Application identifier")
     app_name: Optional[str] = Field(default=None, description="Application name")
     operation_type: str = Field(default="modify", description="Requested operation type")
     urgency: str = Field(default="Normal", description="Requested urgency")
     raw_input: str = Field(default="", description="Original user input")
     raw_intent_summary: str = Field(default="", description="Structured intent summary")
     resolution_status: str = Field(default="", description="Top-level resolution status")
+    requested_domains: List[str] = Field(default_factory=list, description="Requested control domains inferred from intent")
+    domain_evidence: Dict[str, List[str]] = Field(default_factory=dict, description="Evidence supporting each domain decision")
+    mobility_intent: Dict[str, Any] = Field(default_factory=dict, description="Mobility / AM policy goals extracted from the user request")
+    objective_profile_hint: str = Field(default="", description="Semantic optimization profile hint inferred from the request")
     flows: List[FlowSelector] = Field(default_factory=list, description="Resolved flow selectors")
+
+    @field_validator("domain_evidence", mode="before")
+    @classmethod
+    def _normalize_domain_evidence(cls, value: Any) -> Dict[str, List[str]]:
+        if isinstance(value, dict):
+            normalized: Dict[str, List[str]] = {}
+            for key, items in value.items():
+                if isinstance(items, list):
+                    normalized[str(key)] = [str(item) for item in items if str(item or "").strip()]
+                elif items not in (None, "", [], {}):
+                    normalized[str(key)] = [str(items)]
+            return normalized
+        if isinstance(value, list):
+            items = [str(item) for item in value if str(item or "").strip()]
+            return {"general": items} if items else {}
+        if value in (None, "", {}, []):
+            return {}
+        return {"general": [str(value)]}
+
+    @field_validator("mobility_intent", mode="before")
+    @classmethod
+    def _normalize_mobility_intent(cls, value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        return {}
+
+    @field_validator("objective_profile_hint", mode="before")
+    @classmethod
+    def _normalize_objective_profile_hint(cls, value: Any) -> str:
+        if isinstance(value, dict):
+            candidate = str(value.get("profile_name") or "").strip()
+            return candidate
+        return str(value or "").strip()
 
 
 class PolicyDraft(BaseModel):
@@ -68,7 +105,8 @@ class PolicyDraft(BaseModel):
     flow_id: Optional[str] = Field(default=None, description="Flow ID")
     target_type: str = Field(default="flow", description="Target scope")
     policy_id: str = Field(default="", description="Unique policy ID")
-    policy_type: str = Field(..., description="Policy type")
+    policy_type: str = Field(..., description="Policy type such as SmPolicyDecision, UrspRuleRequest, or PcfAmPolicyControlPolicyAssociation")
+    resource_keys: List[str] = Field(default_factory=list, description="Normalized resource claims such as selected S-NSSAI or DNN bindings")
     policy_details: Dict[str, Any] = Field(default_factory=dict, description="Raw policy details")
 
     @field_serializer("policy_details", when_used="always")
@@ -80,6 +118,7 @@ class PolicyPlanDraft(BaseModel):
     supi: str = Field(default="", description="User SUPI")
     session_id: str = Field(default="", description="Session identifier for deterministic execution")
     snapshot_id: str = Field(default="", description="Snapshot identifier for deterministic execution")
+    planning_metadata: Dict[str, Any] = Field(default_factory=dict, description="Planning metadata such as domains, templates, and objective breakdown")
     all_policies: List[PolicyDraft] = Field(default_factory=list, description="All generated policy drafts")
 
 

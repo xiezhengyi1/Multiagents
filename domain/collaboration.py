@@ -18,6 +18,13 @@ class PlanningContext(BaseModel):
         default_factory=list,
         description="Structured handoff history from previous rounds",
     )
+    active_domains: list[str] = Field(default_factory=list, description="Domains selected by Main Agent")
+    main_agent_guidance: str = Field(default="", description="Round-specific guidance injected by Main Agent")
+    objective_profile: Dict[str, Any] = Field(default_factory=dict, description="Semantic optimization profile")
+    forbidden_assumptions: list[str] = Field(default_factory=list, description="Assumptions subagents must not make")
+    required_evidence: list[str] = Field(default_factory=list, description="Evidence subagents must collect")
+    revision_requests: list[Dict[str, Any]] = Field(default_factory=list, description="Structured revision requests returned by Mediator")
+    unified_constraints: Dict[str, Any] = Field(default_factory=dict, description="Structured hard constraints returned by Mediator")
 
 
 class PlanningRequest(BaseModel):

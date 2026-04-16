@@ -1,186 +1,83 @@
 from __future__ import annotations
 
-import inspect
-import json
 import os
 from typing import Any, Iterable, Optional
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
-from agent_runtime.artifacts import ArtifactEnvelope
-from agent_runtime.context import AgentRuntimeContext
-from utils.agent_tracing import JsonlTraceWriter, TracedStructuredAgent, build_tool_specs
+from agent_runtime.core.context import AgentRuntimeContext
+from agent_runtime.core.cache import RuntimeCache
+from agent_runtime.execution.structured_tool_loop import StructuredToolLoop
+from agent_runtime.messages import build_tool_specs, extract_tool_calls
+from agent_runtime.storage.artifacts import ArtifactEnvelope
+from agent_runtime.trace.writer import JsonlTraceWriter, TracedStructuredAgent
 from utils.logger import setup_logger
 
 # Load environment variables once for all agents.
 load_dotenv()
 
-class _JsonToolAgentRunnable:
-    def __init__(
-        self,
-        *,
-        llm: ChatOpenAI,
-        tools: Iterable[Any],
-        system_prompt: str,
-        response_model: type[BaseModel],
-        max_iterations: int = 8,
-    ) -> None:
-        self.system_prompt = str(system_prompt or "").strip()
-        self.response_model = response_model
-        self.max_iterations = max_iterations
-        self.tools = list(tools)
-        self.tools_by_name = {}
-        for tool in self.tools:
-            name = str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
-            if not name:
-                raise ValueError("tool name is required")
-            if name in self.tools_by_name:
-                raise ValueError(f"duplicate tool name: {name}")
-            self.tools_by_name[name] = tool
-        self.llm = llm.bind_tools(self.tools)
 
-    @staticmethod
-    def _coerce_message(message: Any) -> BaseMessage:
-        if isinstance(message, BaseMessage):
-            return message
-        if not isinstance(message, dict):
-            raise TypeError(f"messages must contain dict or BaseMessage, got {type(message).__name__}")
-        role = str(message.get("role") or message.get("type") or "").strip().lower()
-        content = message.get("content")
-        if isinstance(content, str):
-            text = content
-        else:
-            text = json.dumps(content, ensure_ascii=False)
-        if role == "system":
-            return SystemMessage(content=text)
-        if role in {"assistant", "ai"}:
-            return AIMessage(content=text)
-        if role == "tool":
-            tool_call_id = str(message.get("tool_call_id") or "").strip()
-            if not tool_call_id:
-                raise ValueError("tool messages require tool_call_id")
-            return ToolMessage(
-                content=text,
-                tool_call_id=tool_call_id,
-                name=str(message.get("name") or "").strip() or None,
-                status=str(message.get("status") or "success"),
-            )
-        return HumanMessage(content=text)
+# ── Module-level utilities (extracted from BaseAgent) ──────────────────
 
-    @staticmethod
-    def _assistant_text_content(message: AIMessage) -> str:
-        content = message.content
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, str):
-                    parts.append(block)
-                    continue
-                if not isinstance(block, dict):
-                    parts.append(str(block))
-                    continue
-                if block.get("type") in {"text", "output_text"}:
-                    parts.append(str(block.get("text") or ""))
-            return "".join(parts)
-        return str(content)
 
-    @staticmethod
-    def _tool_result_to_content(result: Any) -> str:
-        if isinstance(result, ToolMessage):
-            if isinstance(result.content, str):
-                return result.content
-            return json.dumps(result.content, ensure_ascii=False)
-        if isinstance(result, str):
-            return result
-        return json.dumps(result, ensure_ascii=False)
+def extract_grounding_tool_names(
+    result: dict[str, Any],
+    grounding_tools: Iterable[str],
+) -> list[str]:
+    """Filter tool calls in *result* to those whose name is in *grounding_tools*."""
+    allowed = {
+        str(name).strip()
+        for name in grounding_tools
+        if str(name).strip()
+    }
+    if not allowed:
+        return []
+    messages = result.get("messages") or []
+    calls = extract_tool_calls(messages)
+    names: list[str] = []
+    for call in calls:
+        name = str(call.get("name") or "").strip()
+        if name in allowed:
+            names.append(name)
+    return names
 
-    @staticmethod
-    def _build_tool_runtime(context: AgentRuntimeContext | None, tool_call_id: str | None):
-        from langchain.tools import ToolRuntime
-        return ToolRuntime(
-            state={},
-            context=context,
-            config={},
-            stream_writer=lambda *_args, **_kwargs: None,
-            tool_call_id=tool_call_id,
-            store=None,
-        )
 
-    def _invoke_tool(self, tool_name: str, args: dict[str, Any], *, context: AgentRuntimeContext | None, tool_call_id: str | None) -> ToolMessage:
-        tool = self.tools_by_name.get(tool_name)
-        if tool is None:
-            raise RuntimeError(f"Model requested unknown tool: {tool_name}")
-        func = getattr(tool, "func", None)
-        if func is None:
-            raise RuntimeError(f"Tool {tool_name} does not expose a callable func")
-        kwargs = dict(args)
-        if "runtime" in inspect.signature(func).parameters:
-            kwargs["runtime"] = self._build_tool_runtime(context, tool_call_id)
-        result = func(**kwargs)
-        return ToolMessage(
-            content=self._tool_result_to_content(result),
-            tool_call_id=str(tool_call_id or ""),
-            name=tool_name,
-            status="success",
-        )
-
-    def invoke(self, payload: dict[str, Any], *, context: AgentRuntimeContext | None = None, **kwargs: Any) -> dict[str, Any]:
-        raw_messages = payload.get("messages")
-        if not isinstance(raw_messages, list) or not raw_messages:
-            raise ValueError("json tool agent requires a non-empty messages list")
-        conversation: list[BaseMessage] = [SystemMessage(content=self.system_prompt)]
-        conversation.extend(self._coerce_message(message) for message in raw_messages)
-        output_messages: list[BaseMessage] = []
-
-        for _ in range(self.max_iterations):
-            ai_message = self.llm.invoke(conversation, **kwargs)
-            if not isinstance(ai_message, AIMessage):
-                raise TypeError(f"Expected AIMessage from model, got {type(ai_message).__name__}")
-            output_messages.append(ai_message)
-            conversation.append(ai_message)
-            if ai_message.invalid_tool_calls:
-                raise RuntimeError(f"Model produced invalid tool calls: {ai_message.invalid_tool_calls}")
-
-            tool_calls = getattr(ai_message, "tool_calls", None) or []
-            if tool_calls:
-                for tool_call in tool_calls:
-                    if not isinstance(tool_call, dict):
-                        raise TypeError("tool_call must be a dict")
-                    tool_name = str(tool_call.get("name") or "").strip()
-                    if not tool_name:
-                        raise RuntimeError("tool_call is missing tool name")
-                    tool_args = tool_call.get("args")
-                    if not isinstance(tool_args, dict):
-                        raise RuntimeError(f"tool_call args for {tool_name} must be an object")
-                    tool_message = self._invoke_tool(
-                        tool_name,
-                        tool_args,
-                        context=context,
-                        tool_call_id=str(tool_call.get("id") or ""),
-                    )
-                    output_messages.append(tool_message)
-                    conversation.append(tool_message)
-                continue
-
-            assistant_text = self._assistant_text_content(ai_message).strip()
-            if not assistant_text:
-                raise RuntimeError("Model returned empty assistant content without tool calls")
-            structured = self.response_model.model_validate_json(assistant_text)
-            return {
-                "messages": output_messages,
-                "structured_response": structured,
-            }
-
-        raise RuntimeError(f"Model exceeded max iterations ({self.max_iterations}) without returning final JSON")
+def coerce_structured_response(
+    result: dict[str, Any],
+    response_model: type[BaseModel],
+    *,
+    error_message: str,
+) -> BaseModel:
+    """Extract and validate the structured_response from an agent result dict."""
+    structured = result.get("structured_response")
+    if structured is None:
+        raise RuntimeError(error_message)
+    if isinstance(structured, response_model):
+        return structured
+    if isinstance(structured, str):
+        return response_model.model_validate_json(structured)
+    return response_model.model_validate(structured)
 
 
 class BaseAgent:
-    def __init__(self, model_name: str = "qwen-plus", temperature: float = 0):
+    def __init__(self, model_name: str = "qwen-plus", temperature: float = 0, use_local_model: bool = False) -> None:
+        self._cache = RuntimeCache()
+        if use_local_model:
+            api_key = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
+            model_name = os.getenv("OLLAMA_MODEL_NAME", "gemma4-26b")
+            self.model_name = model_name
+            self.temperature = temperature
+            self.llm = ChatOpenAI(
+                model=model_name,
+                temperature=temperature,
+                api_key=api_key,
+                base_url=api_key,
+                timeout=120.0,
+                max_retries=2,
+            )
+            return
         api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
         base_url = os.getenv("OPENAI_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         raw_timeout = os.getenv("OPENAI_TIMEOUT_SECONDS", "120")
@@ -211,6 +108,74 @@ class BaseAgent:
 
     def get_llm(self) -> ChatOpenAI:
         return self.llm
+
+    def _sync_cache_agent_name(self) -> None:
+        if not hasattr(self, "_cache"):
+            self._cache = RuntimeCache()
+        agent_name = str(getattr(self, "agent_name", "") or self.__class__.__name__).strip()
+        if self._cache.agent_name != agent_name:
+            self._cache.agent_name = agent_name
+
+    def extract_grounding_tool_names(self, result: dict[str, Any]) -> list[str]:
+        return extract_grounding_tool_names(result, getattr(self, "GROUNDING_TOOLS", []))
+
+    @staticmethod
+    def coerce_structured_response(
+        result: dict[str, Any],
+        response_model: type[BaseModel],
+        *,
+        error_message: str,
+    ) -> BaseModel:
+        return coerce_structured_response(
+            result,
+            response_model,
+            error_message=error_message,
+        )
+
+    def get_cached_runtime_value(
+        self,
+        namespace: str,
+        cache_key: Any,
+        *,
+        snapshot_id: str = "",
+        session_id: str = "",
+        default: Any = None,
+    ) -> Any:
+        self._sync_cache_agent_name()
+        return self._cache.get(namespace, cache_key, snapshot_id=snapshot_id, session_id=session_id, default=default)
+
+    def cache_runtime_value(
+        self,
+        namespace: str,
+        cache_key: Any,
+        value: Any,
+        *,
+        snapshot_id: str = "",
+        session_id: str = "",
+    ) -> None:
+        self._sync_cache_agent_name()
+        self._cache.set(namespace, cache_key, value, snapshot_id=snapshot_id, session_id=session_id)
+
+    def has_cached_runtime_value(
+        self,
+        namespace: str,
+        cache_key: Any,
+        *,
+        snapshot_id: str = "",
+        session_id: str = "",
+    ) -> bool:
+        self._sync_cache_agent_name()
+        return self._cache.has(namespace, cache_key, snapshot_id=snapshot_id, session_id=session_id)
+
+    def clear_runtime_cache(
+        self,
+        *,
+        namespace: str | None = None,
+        snapshot_id: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        self._sync_cache_agent_name()
+        self._cache.clear(namespace=namespace, snapshot_id=snapshot_id, session_id=session_id)
 
     def initialize_agent_runtime(
         self,
@@ -349,7 +314,7 @@ class BaseAgent:
         max_iterations: int = 8,
     ):
         tool_list = list(tools)
-        runnable = _JsonToolAgentRunnable(
+        runnable = StructuredToolLoop(
             llm=self.llm,
             tools=tool_list,
             system_prompt=system_prompt,
@@ -367,26 +332,3 @@ class BaseAgent:
             runnable=runnable,
             writer=JsonlTraceWriter(agent_name),
         )
-
-    def invoke_json_response(
-        self,
-        *,
-        system_prompt: str,
-        user_prompt: str,
-        response_model: type[BaseModel],
-        runtime_context: AgentRuntimeContext | None,
-    ) -> BaseModel:
-        if not hasattr(self, "agent"):
-            raise RuntimeError("invoke_json_response() requires self.agent to be initialized")
-        pending_messages = getattr(self, "_pending_invoke_messages", None)
-        if not isinstance(pending_messages, list) or not pending_messages:
-            pending_messages = [{"role": "user", "content": user_prompt}]
-        result = self.agent.invoke({"messages": pending_messages}, context=runtime_context)
-        structured = result.get("structured_response")
-        if structured is None:
-            raise RuntimeError("Agent returned no structured_response.")
-        if isinstance(structured, response_model):
-            return structured
-        if isinstance(structured, str):
-            return response_model.model_validate_json(structured)
-        return response_model.model_validate(structured)

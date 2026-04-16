@@ -1,13 +1,22 @@
 import json
+import os
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 
 HOST = "localhost"
-PORT = 8000
+PORT = 18080
+GENERIC_POLICY_PATH = "/pcf/policies"
+AM_POLICY_PATH = "/npcf-am-policy-control/v1/policies"
+AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
 
 POLICY_EXECUTION_CACHE: Dict[str, Dict[str, Any]] = {}
+FAIL_ONCE_STATE = {
+    "am": 1 if str(os.getenv("MOCK_FAIL_ONCE_AM", "")).strip() == "1" else 0,
+}
+FAIL_ONCE_STATUS = int(str(os.getenv("MOCK_FAIL_ONCE_AM_STATUS", "422")).strip() or "422")
 
 
 def _coerce_non_empty(value: Any, field_name: str) -> str:
@@ -61,7 +70,7 @@ def _validate_dispatch_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if nested_policy_id and nested_policy_id != policy_id:
         raise ValueError("top-level policy_id does not match policy_details.policy_id")
 
-    return {
+    validated = {
         "request_id": request_id,
         "session_id": session_id,
         "snapshot_id": snapshot_id,
@@ -70,10 +79,18 @@ def _validate_dispatch_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "policy_details": policy_details,
         "flow_id": _extract_flow_id(policy_details),
     }
+    if policy_type == AM_POLICY_TYPE:
+        request = policy_details.get("request")
+        if not isinstance(request, dict):
+            raise ValueError("AM policy payload requires policy_details.request")
+        if not str(request.get("supi") or "").strip():
+            raise ValueError("AM policy payload requires request.supi")
+    return validated
 
 
 def _build_ack(payload: Dict[str, Any]) -> Dict[str, Any]:
     applied_at = time.time()
+    event_type = "am_policy_applied" if payload["policy_type"] == AM_POLICY_TYPE else "policy_applied"
     return {
         "request_id": payload["request_id"],
         "policy_id": payload["policy_id"],
@@ -82,7 +99,7 @@ def _build_ack(payload: Dict[str, Any]) -> Dict[str, Any]:
         "completed": True,
         "results": [
             {
-                "eventType": "policy_applied",
+                "eventType": event_type,
                 "policy_id": payload["policy_id"],
                 "policy_type": payload["policy_type"],
                 "session_id": payload["session_id"],
@@ -135,8 +152,11 @@ class MockPCFHandler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self) -> None:
-        if self.path != "/pcf/policies":
-            self._send_json(404, {"status": "failed", "error": "not found"})
+        raw_path = self.path or "/"
+        parsed = urlsplit(raw_path)
+        normalized_path = (parsed.path or raw_path.split("?", 1)[0] or "/").rstrip("/") or "/"
+        if normalized_path not in {GENERIC_POLICY_PATH, AM_POLICY_PATH}:
+            self._send_json(404, {"status": "failed", "error": "not found", "raw_path": raw_path, "normalized_path": normalized_path})
             return
 
         try:
@@ -144,6 +164,20 @@ class MockPCFHandler(BaseHTTPRequestHandler):
             payload = _validate_dispatch_payload(raw_payload)
         except (ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"status": "failed", "error": str(exc)})
+            return
+
+        if payload["policy_type"] == AM_POLICY_TYPE and FAIL_ONCE_STATE["am"] > 0:
+            FAIL_ONCE_STATE["am"] -= 1
+            self._send_json(
+                FAIL_ONCE_STATUS,
+                {
+                    "status": "failed",
+                    "request_id": payload["request_id"],
+                    "policy_id": payload["policy_id"],
+                    "policy_type": payload["policy_type"],
+                    "error": "simulated AM policy rejection for retry-path evaluation",
+                },
+            )
             return
 
         ack = _build_ack(payload)
@@ -158,6 +192,7 @@ class MockPCFHandler(BaseHTTPRequestHandler):
             201,
             {
                 "status": "success",
+                "path": normalized_path,
                 "request_id": payload["request_id"],
                 "session_id": payload["session_id"],
                 "snapshot_id": payload["snapshot_id"],
@@ -196,8 +231,8 @@ class MockPCFHandler(BaseHTTPRequestHandler):
 def run() -> None:
     server_address = (HOST, PORT)
     httpd = HTTPServer(server_address, MockPCFHandler)
-    print(f"Mock PCF server running on http://{HOST}:{PORT}")
-    print("Press Ctrl+C to stop.")
+    print(f"Mock PCF server running on http://{HOST}:{PORT}", flush=True)
+    print("Press Ctrl+C to stop.", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

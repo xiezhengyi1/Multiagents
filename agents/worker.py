@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from agent_runtime import ArtifactCache, ArtifactEnvelope, ArtifactStore, AgentWorkspace
-from agent_runtime.queue import FileTaskQueue
+from agent_runtime.storage.queue import FileTaskQueue
 
 
 class ArtifactWorkerMixin:

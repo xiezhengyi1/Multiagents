@@ -1,146 +1,47 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+from uuid import uuid4
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain.tools import ToolRuntime, tool
 
+from agents.tools.wrapper_think import tool_with_reason
+
 from agent_runtime import AgentRuntimeContext, ArtifactEnvelope
+from agent_runtime.trace.builder import build_run_tree_record
+from agent_runtime.trace.writer import JsonlTraceWriter
+from agents.BaseAgent import BaseAgent
 from domain.policy_compiler import PolicyCompiler
 from agents.tools.db_tool import (
-    get_latest_snapshot_data,
     get_snapshot_data_by_id,
     get_ue_context_by_supi,
     get_ue_flow_catalog_by_supi,
+    record_mobility_event,
+    upsert_am_policy_association,
+    upsert_serving_nf_binding,
     upsert_ue_context,
 )
-from agents.tools.pcf_tools import dispatch_policy_to_pcf, dispatch_policy_to_pcf_request
+from agents.tools.pcf_tools import dispatch_policy_to_pcf_request
 from workflows.assurance_evaluator import AssuranceEvaluator
 from workflows.execution_controller import ExecutionController
 
-from agents.BaseAgent import BaseAgent
 from agents.worker import ArtifactWorkerMixin
+from utils.logger import setup_logger
 
-from .contracts import FeedbackReport
-
-
-@tool
-def tool_dispatch_policy(
-    policy_type: str,
-    policy_json: str,
-    runtime: ToolRuntime[AgentRuntimeContext] = None,
-) -> str:
-    """Dispatch a policy payload to PCF."""
-    return dispatch_policy_to_pcf(policy_type, policy_json)
+from .contracts import FeedbackReport, FeedbackSummaryDraft
+from .prompts import (
+    PDA_FEEDBACK_SUMMARY_SYSTEM_PROMPT,
+    PDA_FEEDBACK_SUMMARY_USER_PROMPT,
+)
 
 
-@tool
-def tool_evaluate_sla(
-    supi: str,
-    flow_id: str,
-    k: float = 0.2,
-    runtime: ToolRuntime[AgentRuntimeContext] = None,
-) -> str:
-    """Evaluate whether a specific flow satisfies its SLA in the latest snapshot."""
-    target_supi = str(supi or "").strip()
-    target_flow_id = str(flow_id or "").strip()
-    if not target_supi or not target_flow_id:
-        return "evaluation_failed"
-
-    snapshot = get_latest_snapshot_data() or {}
-    app_data = snapshot.get("apps", []) if isinstance(snapshot, dict) else []
-
-    for app in app_data:
-        if not isinstance(app, dict):
-            continue
-        app_supi = str(app.get("supi") or "").strip()
-        flows = app.get("flows", [])
-        for flow in flows:
-            if not isinstance(flow, dict):
-                continue
-            flow_supi = app_supi or str(flow.get("supi") or "").strip()
-            if flow_supi != target_supi or str(flow.get("flow_id") or "").strip() != target_flow_id:
-                continue
-
-            lat_req = float(flow.get("lat") or 0.0)
-            jitter_req = float(flow.get("jitter_req") or 0.0)
-            gbr_ul = float(flow.get("gbr_ul") or 0.0)
-            gbr_dl = float(flow.get("gbr_dl") or 0.0)
-
-            sim_latency = float(flow.get("sim_latency") or 0.0)
-            sim_jitter = float(flow.get("sim_jitter") or 0.0)
-            sim_throughput_ul = float(flow.get("sim_throughput_ul") or 0.0)
-            sim_throughput_dl = float(flow.get("sim_throughput_dl") or 0.0)
-
-            k_lat = (sim_latency - lat_req) / (lat_req if lat_req > 0 else 1.0)
-            k_jitter = (sim_jitter - jitter_req) / (jitter_req if jitter_req > 0 else 1.0)
-            k_ul = (gbr_ul - sim_throughput_ul) / (gbr_ul if gbr_ul > 0 else 1.0)
-            k_dl = (gbr_dl - sim_throughput_dl) / (gbr_dl if gbr_dl > 0 else 1.0)
-
-            if all(k_i < 0 for k_i in (k_lat, k_jitter, k_ul, k_dl)):
-                return "satisfied"
-            if all(k_i <= k for k_i in (k_lat, k_jitter, k_ul, k_dl)):
-                return "satisfied"
-            return f"{target_flow_id} violated"
-
-    return "evaluation_failed"
-
-
-@tool
-def tool_update_db_after_success(
-    supi: str,
-    policy: str = "",
-    policies_json: str = "",
-    runtime: ToolRuntime[AgentRuntimeContext] = None,
-) -> str:
-    """Commit successfully applied policies into UE context storage."""
-    normalized_supi = str(supi or "").strip()
-    if not normalized_supi:
-        return "database update failed: supi is required"
-
-    raw_policies: List[Dict[str, Any]] = []
-    if policies_json:
-        try:
-            parsed = json.loads(policies_json)
-        except json.JSONDecodeError as exc:
-            return f"database update failed: policies_json is not valid JSON: {exc}"
-        if not isinstance(parsed, list):
-            return "database update failed: policies_json must be a list"
-        raw_policies = [PolicyCompiler.json_friendly(item) for item in parsed if isinstance(item, dict)]
-    elif policy:
-        try:
-            parsed_policy = json.loads(policy) if isinstance(policy, str) else policy
-        except json.JSONDecodeError as exc:
-            return f"database update failed: policy is not valid JSON: {exc}"
-        if not isinstance(parsed_policy, dict):
-            return "database update failed: policy must be an object"
-        raw_policies = [{"policy_details": PolicyCompiler.json_friendly(parsed_policy)}]
-    else:
-        return "database update failed: missing policy or policies_json"
-
-    existing = get_ue_context_by_supi(normalized_supi) or {}
-    merged = PolicyCompiler.merge_policies_into_context(existing, raw_policies)
-    catalog = get_ue_flow_catalog_by_supi(normalized_supi)
-
-    ok = upsert_ue_context(
-        supi=normalized_supi,
-        sm_policy_data=merged.get("sm_policy_data"),
-        pcc_rules=merged.get("pcc_rules"),
-        qos_decs=merged.get("qos_decs"),
-        sess_rules=merged.get("sess_rules"),
-        traff_cont_decs=merged.get("traff_cont_decs"),
-        chg_decs=merged.get("chg_decs"),
-        ursp_rules=merged.get("ursp_rules"),
-        app_catalog=catalog.get("app_catalog") or existing.get("app_catalog") or [],
-        flow_catalog=catalog.get("flow_catalog") or existing.get("flow_catalog") or [],
-    )
-    return "database update success" if ok else "database update failed"
-
-
-@tool
+@tool_with_reason
 def tool_feedback_to_iea(
     supi: str,
-    reason: str,
+    feedback_reason: str,
     correction_suggestion: str,
     policy_id: str = "",
     flow_id: str = "",
@@ -154,17 +55,17 @@ def tool_feedback_to_iea(
         "supi": str(supi or "").strip(),
         "policy_id": str(policy_id or "").strip(),
         "flow_id": str(flow_id or "").strip(),
-        "reason": str(reason or "").strip(),
+        "reason": str(feedback_reason or "").strip(),
         "correction_suggestion": str(correction_suggestion or "").strip(),
         "dispatch_attempts": int(dispatch_attempts or 0),
     }
     return json.dumps(payload, ensure_ascii=False)
 
 
-@tool
+@tool_with_reason
 def tool_feedback_to_osa(
     supi: str,
-    reason: str,
+    feedback_reason: str,
     correction_suggestion: str,
     policy_id: str = "",
     flow_id: str = "",
@@ -178,26 +79,33 @@ def tool_feedback_to_osa(
         "supi": str(supi or "").strip(),
         "policy_id": str(policy_id or "").strip(),
         "flow_id": str(flow_id or "").strip(),
-        "reason": str(reason or "").strip(),
+        "reason": str(feedback_reason or "").strip(),
         "correction_suggestion": str(correction_suggestion or "").strip(),
         "dispatch_attempts": int(dispatch_attempts or 0),
     }
     return json.dumps(payload, ensure_ascii=False)
 
-class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
+class PolicyDispatchAgent(ArtifactWorkerMixin):
     agent_name = "policy_dispatch"
-    def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507"):
-        super().__init__(model_name=model_name)
+    TRACE_SYSTEM_PROMPT = (
+        "You are the Policy Dispatch Agent. "
+        "Compile policies, dispatch them to PCF, run assurance checks, and return a FeedbackReport."
+    )
+
+    def __init__(
+        self,
+        model_name: str = "qwen3-30b-a3b-instruct-2507",
+        *,
+        enable_llm_feedback_summary: bool = True,
+        feedback_llm: Any = None,
+    ):
         self.agent_name = "policy_dispatch"
-        self.initialize_agent_runtime(logger_color="\033[92m")
-        self.tools = [
-            tool_dispatch_policy,
-            tool_update_db_after_success,
-            tool_evaluate_sla,
-            tool_feedback_to_iea,
-            tool_feedback_to_osa,
-        ]
-        self.tool_map = {tool_obj.name: tool_obj for tool_obj in self.tools}
+        self.model_name = model_name
+        self.enable_llm_feedback_summary = bool(enable_llm_feedback_summary)
+        self._feedback_llm = feedback_llm
+        self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[92m")
+        self._trace_writer = JsonlTraceWriter(self.agent_name)
+        self.init_worker_runtime()
 
     def expected_request_type(self) -> str:
         return "PolicyPlanDraft"
@@ -218,6 +126,9 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
             load_ue_context=get_ue_context_by_supi,
             load_ue_flow_catalog=get_ue_flow_catalog_by_supi,
             persist_ue_context=upsert_ue_context,
+            persist_am_policy_association=upsert_am_policy_association,
+            record_mobility_event=record_mobility_event,
+            persist_serving_nf_binding=upsert_serving_nf_binding,
             logger=self.logger,
         )
 
@@ -225,18 +136,32 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
     def _build_assurance_evaluator() -> AssuranceEvaluator:
         return AssuranceEvaluator(load_snapshot_by_id=get_snapshot_data_by_id)
 
+    @staticmethod
+    def _serialize_artifact_payload(payload: Any) -> dict[str, Any]:
+        if hasattr(payload, "model_dump"):
+            dumped = payload.model_dump(mode="json")
+            if isinstance(dumped, dict):
+                return dumped
+        if isinstance(payload, dict):
+            return payload
+        raise TypeError(f"Unsupported artifact payload type: {type(payload).__name__}")
+
     def _cache_received_request(self, strategy_output: Any) -> ArtifactEnvelope:
         payload = (
             strategy_output.model_dump(mode="json")
             if hasattr(strategy_output, "model_dump")
             else PolicyCompiler.json_friendly(strategy_output)
         )
-        return self.cache_received_artifact(
+        envelope = ArtifactEnvelope(
             artifact_type="PolicyPlanDraft",
-            payload=payload if isinstance(payload, dict) else {"value": payload},
+            source_agent="coordinator",
+            target_agent=self.agent_name,
             session_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
             snapshot_id=str(getattr(strategy_output, "snapshot_id", "") or "").strip(),
+            payload=payload if isinstance(payload, dict) else {"value": payload},
         )
+        self.cache.cache_received(envelope)
+        return envelope
 
     def _cache_produced_result(
         self,
@@ -244,11 +169,17 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
         request_envelope: ArtifactEnvelope,
         feedback_report: FeedbackReport,
     ) -> None:
-        self.cache_produced_artifact(
+        envelope = ArtifactEnvelope(
             artifact_type="FeedbackReport",
-            request_envelope=request_envelope,
-            payload=feedback_report,
+            source_agent=self.agent_name,
+            target_agent=request_envelope.source_agent,
+            session_id=request_envelope.session_id,
+            snapshot_id=request_envelope.snapshot_id,
+            correlation_id=request_envelope.correlation_id,
+            upstream_artifact_ids=[request_envelope.artifact_id],
+            payload=self._serialize_artifact_payload(feedback_report),
         )
+        self.cache.cache_produced(envelope)
 
     def execute_and_evaluate(self, strategy_output: Any) -> FeedbackReport:
         self.ensure_worker_runtime_initialized()
@@ -269,32 +200,297 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
         outcome_payload = outcome.to_dict()
         if feedback_payload:
             outcome_payload["feedback_payload"] = feedback_payload
+        if self.enable_llm_feedback_summary and str(outcome_payload.get("recommended_action") or "").strip() == "feedback":
+            summary = self._summarize_feedback_with_llm(
+                strategy_output=strategy_output,
+                outcome_payload=outcome_payload,
+            )
+            outcome_payload["violation_details"] = summary.violation_details
+            outcome_payload["correction_suggestion"] = summary.correction_suggestion
+            current_payload = outcome_payload.get("feedback_payload")
+            if isinstance(current_payload, dict):
+                current_payload["llm_summary"] = summary.model_dump(mode="json")
         feedback_report = FeedbackReport(**outcome_payload)
+        self._write_execution_trace(
+            strategy_output=strategy_output,
+            outcome=outcome,
+            feedback_report=feedback_report,
+            request_envelope=request_envelope,
+        )
         self._cache_produced_result(
             request_envelope=request_envelope,
             feedback_report=feedback_report,
         )
         return feedback_report
 
+    def _write_execution_trace(
+        self,
+        *,
+        strategy_output: Any,
+        outcome: Any,
+        feedback_report: FeedbackReport,
+        request_envelope: ArtifactEnvelope,
+    ) -> None:
+        context = AgentRuntimeContext(
+            agent_name=self.agent_name,
+            session_id=request_envelope.session_id,
+            snapshot_id=request_envelope.snapshot_id,
+            supi=str(getattr(strategy_output, "supi", "") or "").strip() or None,
+            thread_id=request_envelope.session_id or request_envelope.snapshot_id or self.agent_name,
+            allow_user_interaction=False,
+        )
+        payload = {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "Policy plan:\n"
+                        f"{json.dumps(self._serialize_artifact_payload(strategy_output), ensure_ascii=False)}\n\n"
+                        "Execute dispatch, assurance, and feedback generation."
+                    )
+                )
+            ],
+            "trace_metadata": self._pending_trace_metadata_payload(),
+        }
+        result = {
+            "messages": self._build_trace_messages(
+                strategy_output=strategy_output,
+                outcome=outcome,
+                feedback_report=feedback_report,
+            ),
+            "structured_response": feedback_report.model_dump(mode="json"),
+        }
+        now = datetime.now(timezone.utc)
+        record = build_run_tree_record(
+            agent_name=self.agent_name,
+            model_name=self.model_name,
+            system_prompt=self.TRACE_SYSTEM_PROMPT,
+            run_id=f"run-{uuid4()}",
+            payload=payload,
+            context=context,
+            result=result,
+            status="success",
+            captured_error=None,
+            start_dt=now,
+            end_dt=now,
+        )
+        self._trace_writer.write(record)
+
+    def _pending_trace_metadata_payload(self) -> Dict[str, Any]:
+        metadata = getattr(self, "_pending_trace_metadata", None)
+        if metadata is None:
+            return {}
+        if not isinstance(metadata, dict):
+            raise TypeError("_pending_trace_metadata must be a dict when present")
+        scenario_tags = metadata.get("scenario_tags") or []
+        if not isinstance(scenario_tags, list):
+            raise TypeError("_pending_trace_metadata.scenario_tags must be a list")
+        return {
+            "scenario_id": str(metadata.get("scenario_id") or "").strip() or None,
+            "scenario_tags": [str(item).strip() for item in scenario_tags if str(item).strip()],
+        }
+
+    @staticmethod
+    def _append_trace_tool_call(
+        messages: list[Any],
+        *,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Any,
+        status: str = "success",
+    ) -> None:
+        tool_call_id = f"call-{uuid4().hex}"
+        messages.append(
+            AIMessage(
+                content="",
+                id=f"msg-{uuid4().hex}",
+                tool_calls=[
+                    {
+                        "id": tool_call_id,
+                        "name": tool_name,
+                        "args": PolicyCompiler.json_friendly(args),
+                    }
+                ],
+            )
+        )
+        messages.append(
+            {
+                "type": "tool",
+                "content": (
+                    result
+                    if isinstance(result, str)
+                    else json.dumps(PolicyCompiler.json_friendly(result), ensure_ascii=False)
+                ),
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "status": status,
+                "id": f"{tool_call_id}-result",
+            }
+        )
+
+    def _build_trace_messages(
+        self,
+        *,
+        strategy_output: Any,
+        outcome: Any,
+        feedback_report: FeedbackReport,
+    ) -> list[Any]:
+        messages: list[Any] = []
+        strategy_payload = self._serialize_artifact_payload(strategy_output)
+        metrics_text = str(getattr(outcome, "performance_metrics", "") or "").strip()
+        metrics_payload = json.loads(metrics_text) if metrics_text else {}
+        if metrics_payload and not isinstance(metrics_payload, dict):
+            raise TypeError("performance_metrics must decode to a JSON object")
+
+        feedback_payload = (
+            feedback_report.model_dump(mode="json")
+            if hasattr(feedback_report, "model_dump")
+            else self._serialize_artifact_payload(feedback_report)
+        )
+        failure_phase = str((getattr(outcome, "feedback_payload", {}) or {}).get("phase") or "").strip()
+
+        compile_result = metrics_payload.get("policy_plan") or {
+            "session_id": strategy_payload.get("session_id"),
+            "snapshot_id": strategy_payload.get("snapshot_id"),
+            "supi": strategy_payload.get("supi"),
+            "policies": strategy_payload.get("all_policies") or [],
+        }
+        compile_status = "error" if failure_phase == "compile" else "success"
+        compile_payload: Any = compile_result
+        if compile_status == "error":
+            compile_payload = {
+                "error": str(getattr(outcome, "violation_details", "") or "compile failed"),
+                "feedback_payload": getattr(outcome, "feedback_payload", {}) or {},
+            }
+        self._append_trace_tool_call(
+            messages,
+            tool_name="compile_policy_plan",
+            args={"policy_plan_draft": strategy_payload},
+            result=compile_payload,
+            status=compile_status,
+        )
+        if compile_status == "error":
+            return messages
+
+        policies = compile_result.get("policies") or strategy_payload.get("all_policies") or []
+        if not isinstance(policies, list):
+            raise TypeError("Compiled policy list must be a list")
+        for policy in policies:
+            if not isinstance(policy, dict):
+                raise TypeError("Each compiled policy must be a dict")
+            self._append_trace_tool_call(
+                messages,
+                tool_name="validate_policy",
+                args={"policy": policy},
+                result={"status": "validated", "policy_id": policy.get("policy_id"), "policy": policy},
+            )
+
+        dispatch_results = metrics_payload.get("dispatch_results") or []
+        if not isinstance(dispatch_results, list):
+            raise TypeError("dispatch_results must be a list")
+        for receipt in dispatch_results:
+            if not isinstance(receipt, dict):
+                raise TypeError("Each dispatch result must be a dict")
+            self._append_trace_tool_call(
+                messages,
+                tool_name="dispatch_policy_to_pcf_request",
+                args={
+                    "policy_id": receipt.get("policy_id"),
+                    "policy_type": receipt.get("policy_type"),
+                    "flow_id": receipt.get("flow_id"),
+                    "session_id": strategy_payload.get("session_id"),
+                    "snapshot_id": strategy_payload.get("snapshot_id"),
+                },
+                result=receipt,
+                status="success" if str(receipt.get("status") or "").strip().lower() == "success" else "error",
+            )
+
+        assurance_results = metrics_payload.get("assurance_results") or []
+        if not isinstance(assurance_results, list):
+            raise TypeError("assurance_results must be a list")
+        for verdict in assurance_results:
+            if not isinstance(verdict, dict):
+                raise TypeError("Each assurance result must be a dict")
+            verdict_status = str(verdict.get("status") or "").strip().lower()
+            self._append_trace_tool_call(
+                messages,
+                tool_name="assurance_evaluate",
+                args={
+                    "policy_id": verdict.get("policy_id"),
+                    "flow_id": verdict.get("flow_id"),
+                    "snapshot_id": strategy_payload.get("snapshot_id"),
+                },
+                result=verdict,
+                status="success" if verdict_status in {"satisfied", "skipped"} else "error",
+            )
+
+        feedback_payload_data = getattr(outcome, "feedback_payload", {}) or {}
+        if not isinstance(feedback_payload_data, dict):
+            raise TypeError("feedback_payload must be a dict")
+        if feedback_payload_data:
+            self._append_trace_tool_call(
+                messages,
+                tool_name="build_feedback_payload",
+                args={"recommended_consumer": feedback_payload.get("recommended_consumer")},
+                result=feedback_payload_data,
+                status="success",
+            )
+
+        if str(feedback_report.execution_status or "").strip().lower() == "success":
+            self._append_trace_tool_call(
+                messages,
+                tool_name="commit_policy_updates",
+                args={
+                    "supi": strategy_payload.get("supi"),
+                    "policy_ids": [policy.get("policy_id") for policy in policies],
+                    "session_id": strategy_payload.get("session_id"),
+                    "snapshot_id": strategy_payload.get("snapshot_id"),
+                },
+                result={"status": "committed", "execution_status": feedback_report.execution_status},
+                status="success",
+            )
+
+        return messages
+
     def _build_feedback_payload(self, *, strategy_output: Any, outcome: Any) -> Dict[str, Any]:
         if str(getattr(outcome, "recommended_action", "") or "").strip() != "feedback":
             return getattr(outcome, "feedback_payload", {}) or {}
 
         seed = getattr(outcome, "feedback_payload", {}) or {}
+        failures = seed.get("failures") if isinstance(seed.get("failures"), list) else []
+        first_failure = failures[0] if failures else {}
         tool_input = {
             "supi": str(getattr(strategy_output, "supi", "") or seed.get("supi") or "").strip(),
-            "reason": str(getattr(outcome, "violation_details", "") or seed.get("error") or "").strip(),
+            "reason": str(
+                getattr(outcome, "violation_details", "")
+                or first_failure.get("error")
+                or seed.get("error")
+                or ""
+            ).strip(),
             "correction_suggestion": str(getattr(outcome, "correction_suggestion", "") or "").strip(),
-            "policy_id": str(seed.get("policy_id") or "").strip(),
-            "flow_id": str(seed.get("flow_id") or "").strip(),
+            "policy_id": str(first_failure.get("policy_id") or seed.get("policy_id") or "").strip(),
+            "flow_id": str(first_failure.get("flow_id") or seed.get("flow_id") or "").strip(),
             "dispatch_attempts": int(getattr(outcome, "dispatch_attempts", 0) or 0),
         }
 
         recommended_consumer = str(getattr(outcome, "recommended_consumer", "") or "").strip()
         if recommended_consumer == "intent_encoding":
-            payload_text = tool_feedback_to_iea.invoke(tool_input)
+            payload_text = tool_feedback_to_iea.func(
+                supi=tool_input["supi"],
+                feedback_reason=tool_input["reason"],
+                correction_suggestion=tool_input["correction_suggestion"],
+                policy_id=tool_input["policy_id"],
+                flow_id=tool_input["flow_id"],
+                dispatch_attempts=tool_input["dispatch_attempts"],
+            )
         elif recommended_consumer == "optimization_strategy":
-            payload_text = tool_feedback_to_osa.invoke(tool_input)
+            payload_text = tool_feedback_to_osa.func(
+                supi=tool_input["supi"],
+                feedback_reason=tool_input["reason"],
+                correction_suggestion=tool_input["correction_suggestion"],
+                policy_id=tool_input["policy_id"],
+                flow_id=tool_input["flow_id"],
+                dispatch_attempts=tool_input["dispatch_attempts"],
+            )
         else:
             return seed
 
@@ -303,7 +499,68 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
             return seed
         if seed:
             payload["controller_feedback"] = seed
+        failure_scope = str(getattr(outcome, "failure_scope", "") or "").strip()
+        if failure_scope:
+            payload["failure_scope"] = failure_scope
         return payload
+
+    @staticmethod
+    def _extract_message_text(message: Any) -> str:
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                    continue
+                if isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
+                    parts.append(str(block.get("text") or ""))
+            return "".join(parts).strip()
+        return str(content or "").strip()
+
+    def _get_feedback_llm(self) -> Any:
+        if self._feedback_llm is None:
+            self._feedback_llm = BaseAgent(model_name=self.model_name).get_llm()
+        return self._feedback_llm
+
+    def _summarize_feedback_with_llm(
+        self,
+        *,
+        strategy_output: Any,
+        outcome_payload: Dict[str, Any],
+    ) -> FeedbackSummaryDraft:
+        metrics_payload = json.loads(str(outcome_payload.get("performance_metrics") or "{}"))
+        context_payload = {
+            "policy_plan": (
+                strategy_output.model_dump(mode="json")
+                if hasattr(strategy_output, "model_dump")
+                else PolicyCompiler.json_friendly(strategy_output)
+            ),
+            "controller_feedback": {
+                "execution_status": outcome_payload.get("execution_status"),
+                "violation_details": outcome_payload.get("violation_details"),
+                "correction_suggestion": outcome_payload.get("correction_suggestion"),
+                "recommended_consumer": outcome_payload.get("recommended_consumer"),
+                "recommended_action": outcome_payload.get("recommended_action"),
+                "failure_scope": outcome_payload.get("failure_scope"),
+                "dispatch_attempts": outcome_payload.get("dispatch_attempts"),
+                "feedback_payload": outcome_payload.get("feedback_payload") or {},
+            },
+            "execution_metrics": metrics_payload,
+        }
+        response = self._get_feedback_llm().invoke(
+            [
+                SystemMessage(content=PDA_FEEDBACK_SUMMARY_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=PDA_FEEDBACK_SUMMARY_USER_PROMPT.format(
+                        context_json=json.dumps(context_payload, ensure_ascii=False)
+                    )
+                ),
+            ]
+        )
+        return FeedbackSummaryDraft.model_validate_json(self._extract_message_text(response))
 
     @staticmethod
     def _extract_json_payload_from_dispatch_output(dispatch_output: str) -> Optional[Dict[str, Any]]:
@@ -322,101 +579,6 @@ class PolicyDispatchAgent(BaseAgent, ArtifactWorkerMixin):
                 return None
         return payload if isinstance(payload, dict) else None
 
-    @classmethod
-    def _extract_feedback_outputs(cls, dispatch_output: str) -> List[Dict[str, Any]]:
-        payload = cls._extract_json_payload_from_dispatch_output(dispatch_output)
-        if not isinstance(payload, dict):
-            return []
-        ack = payload.get("ack")
-        if isinstance(ack, dict):
-            return [ack]
-        return []
-
-    @staticmethod
-    def _summarize_feedback_outputs(feedback_outputs: List[Dict[str, Any]]) -> str:
-        if not feedback_outputs:
-            return "No ack feedback received."
-        ack = feedback_outputs[-1]
-        summary = {
-            "request_id": ack.get("request_id"),
-            "policy_id": ack.get("policy_id"),
-            "expected": ack.get("expected"),
-            "received": ack.get("received"),
-            "completed": ack.get("completed"),
-            "result_count": len(ack.get("results", [])) if isinstance(ack.get("results"), list) else 0,
-        }
-        return json.dumps(summary, ensure_ascii=False)
-
-    @staticmethod
-    def _build_feedback_report_from_ack(feedback_outputs: List[Dict[str, Any]], *, aborted: bool) -> FeedbackReport:
-        if not feedback_outputs:
-            return FeedbackReport(
-                execution_status="Failed",
-                performance_metrics="No ack feedback received.",
-                violation_details="Missing ack in PDA dispatch response.",
-                correction_suggestion="Check PDA downstream ack path and PCF response format.",
-            )
-
-        ack = feedback_outputs[-1]
-        expected = ack.get("expected")
-        received = ack.get("received")
-        completed = ack.get("completed")
-        results = ack.get("results", []) if isinstance(ack.get("results"), list) else []
-
-        if completed is True:
-            execution_status = "Success"
-            violation_details = "None"
-            correction_suggestion = "None"
-        elif isinstance(expected, int) and isinstance(received, int) and received > 0:
-            execution_status = "Partial Success"
-            violation_details = f"Ack incomplete: expected={expected}, received={received}, completed={completed}"
-            correction_suggestion = "Inspect missing ack results before re-planning."
-        else:
-            execution_status = "Failed"
-            violation_details = f"Ack failed: expected={expected}, received={received}, completed={completed}"
-            correction_suggestion = "Check policy dispatch pipeline and downstream executor status."
-
-        if aborted and execution_status == "Success":
-            execution_status = "Partial Success"
-            correction_suggestion = "Execution stopped after an earlier downstream failure."
-
-        return FeedbackReport(
-            execution_status=execution_status,
-            performance_metrics=json.dumps(
-                {
-                    "request_id": ack.get("request_id"),
-                    "policy_id": ack.get("policy_id"),
-                    "expected": expected,
-                    "received": received,
-                    "completed": completed,
-                    "results": results,
-                },
-                ensure_ascii=False,
-            ),
-            violation_details=violation_details,
-            correction_suggestion=correction_suggestion,
-        )
-
     @staticmethod
     def _extract_flow_id(policy_details: Any) -> Optional[str]:
         return PolicyCompiler.extract_flow_id(policy_details)
-
-    @classmethod
-    def merge_policies_into_context(cls, existing_ctx: Dict[str, Any], policies: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return PolicyCompiler.merge_policies_into_context(existing_ctx, policies)
-
-    def _evaluate_policy_sla(self, policy: Dict[str, Any]) -> str:
-        if policy["target_type"] != "flow":
-            return "skipped"
-
-        flow_id = str(policy.get("flow_id") or "").strip()
-        if not flow_id:
-            raise RuntimeError(f"flow-scoped policy {policy['policy_id']} missing flow_id for SLA evaluation")
-
-        sla_result = tool_evaluate_sla.invoke({"supi": policy["supi"], "flow_id": flow_id})
-        normalized = str(sla_result or "").strip().lower()
-        if normalized == "satisfied":
-            return "satisfied"
-        if "violated" in normalized:
-            raise RuntimeError(f"policy {policy['policy_id']} SLA violated for flow {flow_id}")
-        raise RuntimeError(f"policy {policy['policy_id']} SLA evaluation failed: {sla_result}")

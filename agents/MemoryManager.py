@@ -9,7 +9,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.memory import InMemoryStore
 
-from agents.BaseAgent import BaseAgent
 from database.connection import RAW_DATABASE_URL
 from database.langchain_pg import get_embedding_dimensions, get_openai_embeddings
 from utils.logger import setup_logger
@@ -41,20 +40,23 @@ class MemoryManager:
         short_term_limit: int = 10,
         long_term_file: str = "",
         similarity_threshold: float = 0.5,
+        enable_llm_summarization: bool = False,
         *,
         database_url: Optional[str] = None,
         embeddings: Any = None,
         checkpointer: Any = None,
         store: Any = None,
+        summarizer_llm: Any = None,
     ):
         self.short_term_limit = max(1, int(short_term_limit))
         self.long_term_file = str(long_term_file or "").strip()
         self.similarity_threshold = similarity_threshold
+        self.enable_llm_summarization = bool(enable_llm_summarization)
         self.database_url = str(database_url or RAW_DATABASE_URL).strip()
         self.embeddings = embeddings
         if self.embeddings is None and store is None:
             self.embeddings = get_openai_embeddings()
-        self.agent = BaseAgent()
+        self._summarizer_llm = summarizer_llm
 
         self._checkpointer_manager = None
         self._store_manager = None
@@ -192,6 +194,8 @@ class MemoryManager:
         self.consolidate_memory()
 
     def consolidate_memory(self):
+        if not self.enable_llm_summarization:
+            return
         messages = self._load_messages()
         if len(messages) <= self.short_term_limit:
             return
@@ -227,12 +231,19 @@ class MemoryManager:
             "Keep only facts, preferences, task objectives, and corrective feedback.\n\n"
             f"{text}"
         )
-        response = self.agent.get_llm().invoke(prompt)
+        response = self._get_summarizer_llm().invoke(prompt)
         content = getattr(response, "content", "")
         normalized = str(content or "").strip()
         if not normalized:
             raise RuntimeError("LLM returned empty memory summary.")
         return normalized
+
+    def _get_summarizer_llm(self) -> Any:
+        if self._summarizer_llm is None:
+            from agents.BaseAgent import BaseAgent
+
+            self._summarizer_llm = BaseAgent().get_llm()
+        return self._summarizer_llm
 
     def retrieve(self, query: str, top_k: int = 3) -> Dict[str, Any]:
         short_term = [self._message_to_dict(message) for message in self._load_messages()[-self.short_term_limit :]]

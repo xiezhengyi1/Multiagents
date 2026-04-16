@@ -42,18 +42,64 @@ SCHEMA_JSONL = PROCESSED_ROOT / "schema.jsonl"
 GLOSSARY_JSONL = PROCESSED_ROOT / "glossary.jsonl"
 SPEC_OBJECT_MAP_JSON = PROCESSED_ROOT / "spec_object_map.json"
 TERM_ALIAS_MAP_JSON = PROCESSED_ROOT / "term_alias_map.json"
+CLAUSE_EXACT_INDEX_JSON = PROCESSED_ROOT / "clause_exact_index.json"
 SCHEMA_EXACT_INDEX_JSON = PROCESSED_ROOT / "schema_exact_index.json"
 GLOSSARY_EXACT_INDEX_JSON = PROCESSED_ROOT / "glossary_exact_index.json"
 RETRIEVAL_EVAL_JSON = PROCESSED_ROOT / "retrieval_eval_queries.json"
 
-MIN_CHUNK_TOKENS = 350
-MAX_CHUNK_TOKENS = 900
+MIN_CHUNK_TOKENS = 120
+MAX_CHUNK_TOKENS = 280
+TARGET_EMBED_CHUNK_LENGTH = 1800
 MAX_EMBED_INPUT_LENGTH = 8192
 
 HEADING_RE = re.compile(r"^(?P<num>\d+(?:\.\d+){0,5})\s+(?P<title>.+)$")
 TABLE_RE = re.compile(r"^(Table\s+\d+(?:\.\d+)?(?:[-:]\d+)?[^\n]*)$", re.MULTILINE)
 TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]+")
 CHANGE_REQUEST_RE = re.compile(r"\bC\d-\d+\b", re.IGNORECASE)
+
+MINIMAL_KB_SOURCE_IDS = {
+    "ts_23503_pdf",
+    "ts_24526_pdf",
+    "ts_29512_pdf",
+    "ts_29512_yaml",
+    "ts_29525_pdf",
+    "ts_29525_yaml",
+}
+
+SM_POLICY_RELEVANCE_TERMS = (
+    "smpolicy",
+    "sm policy",
+    "npcf_smpolicycontrol",
+    "smpolicydecision",
+    "smpolicycontextdata",
+    "smpolicyupdatecontextdata",
+    "pccrule",
+    "pcc rule",
+    "qosdata",
+    "qos dec",
+    "sessionrule",
+    "policycontrolrequesttrigger",
+    "usage monitoring",
+    "revalidation",
+)
+
+URSP_RELEVANCE_TERMS = (
+    "ursp",
+    "ue route selection policy",
+    "ue policy",
+    "npcf_uepolicycontrol",
+    "uepolicysection",
+    "traffic descriptor",
+    "trafficdescriptor",
+    "route selection descriptor",
+    "routeselectiondescriptor",
+    "route selection",
+    "os id",
+    "os app id",
+    "access traffic steering",
+    "switching",
+    "splitting",
+)
 
 CANONICAL_TERM_ALIASES: Dict[str, Dict[str, Any]] = {
     "Npcf_SMPolicyControl": {
@@ -123,6 +169,12 @@ CANONICAL_TERM_ALIASES: Dict[str, Dict[str, Any]] = {
         "policy_domain": "ursp",
     },
 }
+
+OBJECT_POLICY_DOMAIN_MAP: Dict[str, str] = {}
+for _canonical_term, _config in CANONICAL_TERM_ALIASES.items():
+    OBJECT_POLICY_DOMAIN_MAP[_canonical_term] = _config["policy_domain"]
+    for _related_object in _config.get("related_objects") or []:
+        OBJECT_POLICY_DOMAIN_MAP.setdefault(_related_object, _config["policy_domain"])
 
 
 @dataclass(frozen=True)
@@ -245,6 +297,8 @@ def infer_object_tags(text: str, *, schema_name: str = "", operation_id: str = "
     candidates = [
         "SmPolicyContextData",
         "SmPolicyDecision",
+        "SmPolicyUpdateContextData",
+        "SmPolicyDeleteData",
         "PccRule",
         "QosData",
         "SessionRule",
@@ -254,6 +308,7 @@ def infer_object_tags(text: str, *, schema_name: str = "", operation_id: str = "
         "RevalidationTime",
         "UsageMonitoringData",
         "RefQosIndication",
+        "UePolicySection",
         "URSP rule",
         "Traffic descriptor",
         "Route selection descriptor",
@@ -274,6 +329,55 @@ def infer_object_tags(text: str, *, schema_name: str = "", operation_id: str = "
     return sorted(set(tags))
 
 
+def is_minimal_source(source: Dict[str, Any]) -> bool:
+    return str(source.get("source_id") or "").strip() in MINIMAL_KB_SOURCE_IDS
+
+
+def _infer_strategy_domains(
+    *,
+    source_policy_domain: str,
+    object_tags: List[str],
+    searchable_text: str,
+) -> List[str]:
+    normalized_domain = str(source_policy_domain or "").strip().lower()
+    if normalized_domain in {"sm_policy", "ursp"}:
+        return [normalized_domain]
+
+    domains = {
+        OBJECT_POLICY_DOMAIN_MAP[tag]
+        for tag in object_tags
+        if tag in OBJECT_POLICY_DOMAIN_MAP
+    }
+    lowered = searchable_text.lower()
+    if any(term in lowered for term in SM_POLICY_RELEVANCE_TERMS):
+        domains.add("sm_policy")
+    if any(term in lowered for term in URSP_RELEVANCE_TERMS):
+        domains.add("ursp")
+    return sorted(domains)
+
+
+def _should_keep_record(
+    *,
+    source: Dict[str, Any],
+    object_tags: List[str],
+    searchable_text: str,
+    strategy_domains: List[str],
+) -> bool:
+    if not is_minimal_source(source):
+        return False
+    if not strategy_domains:
+        return False
+    if object_tags:
+        return True
+
+    lowered = searchable_text.lower()
+    if "sm_policy" in strategy_domains and any(term in lowered for term in SM_POLICY_RELEVANCE_TERMS):
+        return True
+    if "ursp" in strategy_domains and any(term in lowered for term in URSP_RELEVANCE_TERMS):
+        return True
+    return False
+
+
 def make_metadata(
     *,
     source: Dict[str, Any],
@@ -290,6 +394,7 @@ def make_metadata(
     citation_anchor: str = "",
     related_specs: Optional[List[str]] = None,
     normalized_terms: Optional[List[str]] = None,
+    strategy_domains: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     return {
         "source_id": source["source_id"],
@@ -311,6 +416,7 @@ def make_metadata(
         "normalized_terms": normalized_terms or normalize_query_terms(" ".join([canonical_title, clause_title, " ".join(object_tags)])),
         "related_specs": sorted(set(related_specs or [source["spec_id"]])),
         "citation_anchor": citation_anchor or f"{source['spec_id']}:{clause_path or clause_title}",
+        "strategy_domains": sorted(set(strategy_domains or ([source["policy_domain"]] if source["policy_domain"] in {"sm_policy", "ursp"} else []))),
     }
 
 
@@ -322,7 +428,7 @@ def make_record(*, record_id: str, page_content: str, metadata: Dict[str, Any]) 
     }
 
 
-def _split_oversized_text(text: str, *, max_length: int = MAX_EMBED_INPUT_LENGTH) -> List[str]:
+def _split_oversized_text(text: str, *, max_length: int = TARGET_EMBED_CHUNK_LENGTH) -> List[str]:
     normalized = str(text or "").strip()
     if not normalized:
         return []
@@ -444,9 +550,10 @@ def extract_pdf_sections(source: Dict[str, Any]) -> List[Dict[str, Any]]:
     section_start_page = 1
     buffer: List[str] = []
     records: List[Dict[str, Any]] = []
+    record_counter = 0
 
     def flush(current_page: int) -> None:
-        nonlocal buffer, section_heading, section_number, section_start_page
+        nonlocal buffer, section_heading, section_number, section_start_page, record_counter
         text = sanitize_text("\n".join(buffer))
         if not text or not section_number:
             buffer = []
@@ -458,9 +565,22 @@ def extract_pdf_sections(source: Dict[str, Any]) -> List[Dict[str, Any]]:
             if segment["kind"] == "table":
                 canonical_title = f"{canonical_title} {segment['title']}".strip()
             object_tags = infer_object_tags(segment["text"])
+            searchable_text = f"{canonical_title}\n{segment['text'][:1200]}"
+            strategy_domains = _infer_strategy_domains(
+                source_policy_domain=source["policy_domain"],
+                object_tags=object_tags,
+                searchable_text=searchable_text,
+            )
+            if not _should_keep_record(
+                source=source,
+                object_tags=object_tags,
+                searchable_text=searchable_text,
+                strategy_domains=strategy_domains,
+            ):
+                continue
             related_specs = [source["spec_id"]]
             if source["policy_domain"] == "shared":
-                related_specs.extend(["29.512", "29.525", "24.526", "23.503"])
+                related_specs.extend(["29.512", "29.525", "23.503", "24.526"])
             metadata = make_metadata(
                 source=source,
                 doc_type=doc_type,
@@ -474,9 +594,15 @@ def extract_pdf_sections(source: Dict[str, Any]) -> List[Dict[str, Any]]:
                 citation_anchor=f"{source['spec_id']}:{section_number}",
                 related_specs=related_specs,
                 normalized_terms=normalize_query_terms(f"{canonical_title} {segment['text'][:240]}"),
+                strategy_domains=strategy_domains,
             )
             for chunk_index, chunk in enumerate(split_large_section(segment["text"]), start=1):
-                record_id = f"{source['spec_id']}-{section_number}-{'tbl' if segment['kind'] == 'table' else 'clause'}-{segment_index}-{chunk_index}"
+                record_counter += 1
+                record_id = (
+                    f"{source['spec_id']}-{section_number}-"
+                    f"{'tbl' if segment['kind'] == 'table' else 'clause'}-"
+                    f"{segment_index}-{chunk_index}-{record_counter}"
+                )
                 records.extend(_record_with_safe_chunks(record_id=record_id, page_content=chunk, metadata=metadata))
         buffer = []
 
@@ -525,6 +651,19 @@ def build_openapi_operation_chunks(source: Dict[str, Any], document: Dict[str, A
             }
             page_content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
             object_tags = infer_object_tags(page_content, operation_id=operation_id)
+            searchable_text = f"{operation_id}\n{title}\n{page_content[:1200]}"
+            strategy_domains = _infer_strategy_domains(
+                source_policy_domain=source["policy_domain"],
+                object_tags=object_tags,
+                searchable_text=searchable_text,
+            )
+            if not _should_keep_record(
+                source=source,
+                object_tags=object_tags,
+                searchable_text=searchable_text,
+                strategy_domains=strategy_domains,
+            ):
+                continue
             metadata = make_metadata(
                 source=source,
                 doc_type="openapi",
@@ -536,6 +675,7 @@ def build_openapi_operation_chunks(source: Dict[str, Any], document: Dict[str, A
                 object_tags=object_tags,
                 operation_id=operation_id,
                 citation_anchor=f"{source['spec_id']}:{operation_id}",
+                strategy_domains=strategy_domains,
             )
             record_id = f"{source['spec_id']}-op-{operation_id}".replace("/", "_")
             records.extend(_record_with_safe_chunks(record_id=record_id, page_content=page_content, metadata=metadata))
@@ -550,6 +690,19 @@ def build_openapi_schema_chunks(source: Dict[str, Any], document: Dict[str, Any]
             continue
         page_content = yaml.safe_dump({"schema": schema_name, "definition": schema}, sort_keys=False, allow_unicode=True)
         object_tags = infer_object_tags(page_content, schema_name=schema_name)
+        searchable_text = f"{schema_name}\n{page_content[:1200]}"
+        strategy_domains = _infer_strategy_domains(
+            source_policy_domain=source["policy_domain"],
+            object_tags=object_tags,
+            searchable_text=searchable_text,
+        )
+        if not _should_keep_record(
+            source=source,
+            object_tags=object_tags,
+            searchable_text=searchable_text,
+            strategy_domains=strategy_domains,
+        ):
+            continue
         metadata = make_metadata(
             source=source,
             doc_type="openapi",
@@ -561,6 +714,7 @@ def build_openapi_schema_chunks(source: Dict[str, Any], document: Dict[str, Any]
             object_tags=object_tags or [schema_name],
             schema_name=schema_name,
             citation_anchor=f"{source['spec_id']}:{schema_name}",
+            strategy_domains=strategy_domains,
         )
         records.extend(
             _record_with_safe_chunks(
@@ -638,6 +792,7 @@ def build_glossary_records(clause_records: List[Dict[str, Any]], schema_records:
             "citation_anchor": canonical,
             "aliases": aliases,
             "related_objects": related_objects,
+            "strategy_domains": [payload["policy_domain"]],
         }
         records.append(make_record(record_id=f"glossary-{canonical}", page_content=page_content, metadata=metadata))
     return records
@@ -776,7 +931,9 @@ def build_eval_queries() -> List[Dict[str, str]]:
 
 
 def build_processed_corpus() -> Dict[str, int]:
-    manifest = load_manifest()
+    manifest = [source for source in load_manifest() if is_minimal_source(source)]
+    if not manifest:
+        raise RuntimeError("No minimal knowledge-base sources found in manifest. Run fetch first.")
     clause_records: List[Dict[str, Any]] = []
     schema_records: List[Dict[str, Any]] = []
     for source in manifest:
@@ -789,8 +946,10 @@ def build_processed_corpus() -> Dict[str, int]:
     write_jsonl(SCHEMA_JSONL, schema_records)
     write_jsonl(GLOSSARY_JSONL, glossary_records)
     build_auxiliary_maps(clause_records, schema_records, glossary_records)
+    clause_exact = build_exact_index(clause_records, index_name="clause_exact")
     schema_exact = build_exact_index(schema_records, index_name="schema_exact")
     glossary_exact = build_exact_index(glossary_records, index_name="glossary_exact")
+    CLAUSE_EXACT_INDEX_JSON.write_text(json.dumps(clause_exact, ensure_ascii=False, indent=2), encoding="utf-8")
     SCHEMA_EXACT_INDEX_JSON.write_text(json.dumps(schema_exact, ensure_ascii=False, indent=2), encoding="utf-8")
     GLOSSARY_EXACT_INDEX_JSON.write_text(json.dumps(glossary_exact, ensure_ascii=False, indent=2), encoding="utf-8")
     RETRIEVAL_EVAL_JSON.write_text(json.dumps(build_eval_queries(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -821,10 +980,10 @@ def ingest_processed_corpus() -> Dict[str, int]:
     if not clause_records or not schema_records or not glossary_records:
         raise RuntimeError("Processed corpus is incomplete. Run build first.")
 
-    sm_clause_records = [record for record in clause_records if record["metadata"]["policy_domain"] in {"sm_policy", "shared"}]
-    ursp_clause_records = [record for record in clause_records if record["metadata"]["policy_domain"] in {"ursp", "shared"}]
-    sm_schema_records = [record for record in schema_records if record["metadata"]["policy_domain"] in {"sm_policy", "shared"}]
-    ursp_schema_records = [record for record in schema_records if record["metadata"]["policy_domain"] in {"ursp", "shared"}]
+    sm_clause_records = [record for record in clause_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
+    ursp_clause_records = [record for record in clause_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
+    sm_schema_records = [record for record in schema_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
+    ursp_schema_records = [record for record in schema_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
 
     targets = [
         (PCF_SM_POLICY_CLAUSES_COLLECTION, sm_clause_records),
@@ -836,7 +995,8 @@ def ingest_processed_corpus() -> Dict[str, int]:
     stats: Dict[str, int] = {}
     for collection_name, records in targets:
         store = rebuild_pgvector_collection(collection_name=collection_name)
-        store.add_documents(records_to_documents(records), ids=[record["id"] for record in records])
+        if records:
+            store.add_documents(records_to_documents(records), ids=[record["id"] for record in records])
         stats[collection_name] = len(records)
         logger.info("Ingested %s documents into %s.", len(records), collection_name)
     return stats

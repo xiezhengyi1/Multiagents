@@ -9,9 +9,25 @@ wheels/
 # Virtual environments
 .venv
 .vscode
+.agent
 # 运行存储
 runtime
 tests
 frontend
 # 知识库
 data
+
+*.go
+*.json
+*.yaml
+*.yml
+*.md
+*.log
+*.env
+*.sqlite3
+*.db
+*.bak
+*.zip
+*.tar.gz
+*.exe
+*.dll

@@ -21,6 +21,7 @@ class ExecutionOutcome:
     correction_suggestion: str
     recommended_consumer: str = "none"
     recommended_action: str = "none"
+    failure_scope: str = "none"
     feedback_payload: Dict[str, Any] = field(default_factory=dict)
     dispatch_attempts: int = 0
 
@@ -32,6 +33,7 @@ class ExecutionOutcome:
             "correction_suggestion": self.correction_suggestion,
             "recommended_consumer": self.recommended_consumer,
             "recommended_action": self.recommended_action,
+            "failure_scope": self.failure_scope,
             "feedback_payload": self.feedback_payload,
             "dispatch_attempts": self.dispatch_attempts,
         }
@@ -55,6 +57,8 @@ class ExecutionDecisionError(RuntimeError):
 
 
 class ExecutionController:
+    AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
+
     def __init__(
         self,
         *,
@@ -65,6 +69,9 @@ class ExecutionController:
         load_ue_context: Callable[[str], Optional[Dict[str, Any]]],
         load_ue_flow_catalog: Callable[[str], Dict[str, Any]],
         persist_ue_context: Callable[..., bool],
+        persist_am_policy_association: Optional[Callable[..., bool]] = None,
+        record_mobility_event: Optional[Callable[..., bool]] = None,
+        persist_serving_nf_binding: Optional[Callable[..., bool]] = None,
         max_dispatch_attempts: int = 2,
         logger: Any = None,
     ) -> None:
@@ -75,6 +82,9 @@ class ExecutionController:
         self.load_ue_context = load_ue_context
         self.load_ue_flow_catalog = load_ue_flow_catalog
         self.persist_ue_context = persist_ue_context
+        self.persist_am_policy_association = persist_am_policy_association
+        self.record_mobility_event = record_mobility_event
+        self.persist_serving_nf_binding = persist_serving_nf_binding
         self.max_dispatch_attempts = max(1, int(max_dispatch_attempts or 1))
         self.logger = logger or setup_logger(self.__class__.__name__, default_msg_color="\033[92m")
 
@@ -93,7 +103,7 @@ class ExecutionController:
             attempts += 1
             result = self.dispatch_policy(
                 policy["policy_type"],
-                policy["policy_details"],
+                policy,
                 request_id=request_id,
                 session_id=session_id or None,
                 snapshot_id=snapshot_id or None,
@@ -222,6 +232,7 @@ class ExecutionController:
         detail: str,
         correction_suggestion: str,
         recommended_consumer: str,
+        failure_scope: str = "none",
         feedback_payload: Optional[Dict[str, Any]] = None,
         dispatch_attempts: int = 0,
     ) -> ExecutionOutcome:
@@ -229,6 +240,7 @@ class ExecutionController:
             {
                 "dispatch_attempts": dispatch_attempts,
                 "recommended_consumer": recommended_consumer,
+                "failure_scope": failure_scope,
                 "feedback_payload": feedback_payload or {},
             },
             ensure_ascii=False,
@@ -240,29 +252,146 @@ class ExecutionController:
             correction_suggestion=correction_suggestion,
             recommended_consumer=recommended_consumer,
             recommended_action="feedback",
+            failure_scope=failure_scope,
             feedback_payload=feedback_payload or {},
             dispatch_attempts=dispatch_attempts,
         )
 
-    def _commit_successful_policies(self, supi: str, policies: list[Dict[str, Any]]) -> str:
-        existing = self.load_ue_context(supi) or {}
-        merged = self.compiler.merge_policies_into_context(existing, policies)
-        catalog = self.load_ue_flow_catalog(supi)
+    @classmethod
+    def _failure_scope_from_policies(cls, policies: list[Dict[str, Any]]) -> str:
+        if not policies:
+            return "none"
+        scopes = {
+            "mobility" if str(item.get("policy_type") or "").strip() == cls.AM_POLICY_TYPE else "qos"
+            for item in policies
+        }
+        if scopes == {"qos"}:
+            return "qos"
+        if scopes == {"mobility"}:
+            return "mobility"
+        return "mixed"
 
-        ok = self.persist_ue_context(
-            supi=supi,
-            sm_policy_data=merged["sm_policy_data"],
-            pcc_rules=merged["pcc_rules"],
-            qos_decs=merged["qos_decs"],
-            sess_rules=merged["sess_rules"],
-            traff_cont_decs=merged["traff_cont_decs"],
-            chg_decs=merged["chg_decs"],
-            ursp_rules=merged["ursp_rules"],
-            app_catalog=catalog.get("app_catalog") or existing.get("app_catalog") or [],
-            flow_catalog=catalog.get("flow_catalog") or existing.get("flow_catalog") or [],
-        )
-        if not ok:
-            raise RuntimeError(f"failed to persist policies for supi {supi}")
+    @classmethod
+    def _failure_scope_from_entries(cls, entries: list[Dict[str, Any]]) -> str:
+        policy_types = [entry.get("policy_type") for entry in entries if isinstance(entry, dict)]
+        return cls._failure_scope_from_policies([{"policy_type": item} for item in policy_types if item])
+
+    @classmethod
+    def _select_recommended_consumer(cls, failures: list[Dict[str, Any]]) -> str:
+        consumers = [str(item.get("recommended_consumer") or "").strip() for item in failures if isinstance(item, dict)]
+        normalized = {item for item in consumers if item}
+        if not normalized:
+            return "optimization_strategy"
+        if normalized == {"intent_encoding"}:
+            return "intent_encoding"
+        return "optimization_strategy"
+
+    @staticmethod
+    def _build_partial_correction_suggestion(*, recommended_consumer: str, failure_scope: str) -> str:
+        if recommended_consumer == "intent_encoding":
+            return "Re-check UE, app, or flow binding before retrying the failed execution scope."
+        if failure_scope == "mobility":
+            return "Revise the AM policy payload or mobility constraints before retrying mobility execution."
+        if failure_scope == "qos":
+            return "Revise the QoS policy payload or optimization output before retrying QoS execution."
+        return "Revise the failed policy subset before the next execution round."
+
+    def _commit_successful_policies(self, supi: str, policies: list[Dict[str, Any]], *, session_id: str, snapshot_id: str) -> str:
+        existing = self.load_ue_context(supi) or {}
+        access_policies = [policy for policy in policies if str(policy.get("policy_type") or "").strip() != self.AM_POLICY_TYPE]
+        mobility_policies = [policy for policy in policies if str(policy.get("policy_type") or "").strip() == self.AM_POLICY_TYPE]
+
+        if access_policies:
+            merged = self.compiler.merge_policies_into_context(existing, access_policies)
+            catalog = self.load_ue_flow_catalog(supi)
+            ok = self.persist_ue_context(
+                supi=supi,
+                sm_policy_data=merged["sm_policy_data"],
+                pcc_rules=merged["pcc_rules"],
+                qos_decs=merged["qos_decs"],
+                sess_rules=merged["sess_rules"],
+                traff_cont_decs=merged["traff_cont_decs"],
+                chg_decs=merged["chg_decs"],
+                ursp_rules=merged["ursp_rules"],
+                app_catalog=catalog.get("app_catalog") or existing.get("app_catalog") or [],
+                flow_catalog=catalog.get("flow_catalog") or existing.get("flow_catalog") or [],
+            )
+            if not ok:
+                raise RuntimeError(f"failed to persist policies for supi {supi}")
+
+        for policy in mobility_policies:
+            policy_details = policy.get("policy_details") or {}
+            request = policy_details.get("request")
+            if not isinstance(request, dict):
+                raise RuntimeError(f"AM policy {policy.get('policy_id')} missing request payload")
+            association_id = str(policy.get("policy_id") or "").strip()
+            if not association_id:
+                raise RuntimeError("AM policy missing top-level policy_id")
+            if self.persist_am_policy_association is None or self.record_mobility_event is None:
+                raise RuntimeError("AM policy persistence callbacks are not configured")
+
+            persisted = self.persist_am_policy_association(
+                supi=supi,
+                pol_asso_id=association_id,
+                association_request=request,
+                association_policy=policy_details,
+                status="applied",
+                trigger_event="JOINT_CONTROL_REEVALUATION",
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                round_index=1,
+            )
+            if not persisted:
+                raise RuntimeError(f"failed to persist AM policy association for {association_id}")
+
+            am_policy_context = dict(existing.get("amPolicyContext") or {})
+            associations = dict(am_policy_context.get("associations") or {})
+            associations[association_id] = policy_details
+            am_policy_context["associations"] = associations
+            am_policy_context["allowedSnssais"] = request.get("allowedSnssais") or []
+            am_policy_context["targetSnssais"] = request.get("targetSnssais") or []
+            am_policy_context["mappingSnssais"] = request.get("mappingSnssais") or []
+            am_policy_context["rfsp"] = request.get("rfsp")
+            am_policy_context["ueAmbr"] = request.get("ueAmbr") or policy_details.get("ueAmbr")
+            am_policy_context["ueSliceMbrs"] = policy_details.get("ueSliceMbrs") or []
+            am_policy_context["pras"] = policy_details.get("pras") or {}
+
+            updated = self.persist_ue_context(
+                supi=supi,
+                access_mobility_context=existing.get("accessMobilityContext") or {},
+                am_policy_context=am_policy_context,
+                serving_nf_context=existing.get("servingNfContext") or {},
+                mobility_summary={
+                    "currentAssociationId": association_id,
+                    "currentTriggers": policy_details.get("triggers") or [],
+                    "currentRfsp": request.get("rfsp"),
+                    "lastUpdatedReason": "policy_dispatch",
+                },
+            )
+            if not updated:
+                raise RuntimeError(f"failed to update UE mobility context for {association_id}")
+
+            if self.persist_serving_nf_binding is not None:
+                serving_nf_context = existing.get("servingNfContext") or {}
+                if serving_nf_context.get("amf_id") or serving_nf_context.get("amf_uri"):
+                    self.persist_serving_nf_binding(
+                        supi=supi,
+                        nf_type="AMF",
+                        nf_instance_id=str(serving_nf_context.get("amf_id") or ""),
+                        nf_uri=str(serving_nf_context.get("amf_uri") or ""),
+                        binding_info=serving_nf_context,
+                    )
+
+            recorded = self.record_mobility_event(
+                supi=supi,
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                event_type="JOINT_CONTROL_REEVALUATION",
+                event_summary="AM policy association updated from PDA",
+                event_payload={"association_id": association_id, "request": request, "policy": policy_details},
+            )
+            if not recorded:
+                raise RuntimeError(f"failed to record mobility event for {association_id}")
         return "success"
 
     @staticmethod
@@ -296,6 +425,7 @@ class ExecutionController:
                     phase="compile",
                 ),
                 recommended_consumer=recommended_consumer,
+                failure_scope="compile",
                 feedback_payload={"phase": "compile", "error": str(exc)},
                 dispatch_attempts=0,
             )
@@ -305,51 +435,80 @@ class ExecutionController:
             execution_receipts = []
             assurance_results = []
             total_dispatch_attempts = 0
+            failures: list[Dict[str, Any]] = []
             for index, policy in enumerate(policies, start=1):
                 policy_start = datetime.now().timestamp()
-                dispatch_result, dispatch_attempts = self._dispatch_single_policy(
-                    policy=policy,
-                    session_id=policy_plan.session_id,
-                    snapshot_id=policy_plan.snapshot_id,
-                )
-                total_dispatch_attempts += dispatch_attempts
-                execution_receipts.append(dispatch_result)
+                try:
+                    dispatch_result, dispatch_attempts = self._dispatch_single_policy(
+                        policy=policy,
+                        session_id=policy_plan.session_id,
+                        snapshot_id=policy_plan.snapshot_id,
+                    )
+                    total_dispatch_attempts += dispatch_attempts
+                    dispatch_receipt = {
+                        **dispatch_result,
+                        "policy_id": policy.get("policy_id"),
+                        "policy_type": policy.get("policy_type"),
+                        "flow_id": policy.get("flow_id"),
+                    }
+                    execution_receipts.append(dispatch_receipt)
+                except ExecutionDecisionError as exc:
+                    total_dispatch_attempts += exc.dispatch_attempts
+                    failure_receipt = {
+                        "status": "failed",
+                        "policy_id": policy.get("policy_id"),
+                        "policy_type": policy.get("policy_type"),
+                        "flow_id": policy.get("flow_id"),
+                        "error": str(exc),
+                        "phase": "dispatch",
+                    }
+                    execution_receipts.append(failure_receipt)
+                    failures.append(
+                        {
+                            "policy_id": policy.get("policy_id"),
+                            "policy_type": policy.get("policy_type"),
+                            "flow_id": policy.get("flow_id"),
+                            "phase": "dispatch",
+                            "error": str(exc),
+                            "recommended_consumer": exc.recommended_consumer,
+                            "correction_suggestion": exc.correction_suggestion,
+                            "dispatch_attempts": exc.dispatch_attempts,
+                            "feedback_payload": exc.feedback_payload,
+                        }
+                    )
+                    log_timing(
+                        self.logger,
+                        "pda_policy_total",
+                        datetime.now().timestamp() - policy_start,
+                        policy_index=index,
+                        policy_id=policy["policy_id"],
+                        status="dispatch_failed",
+                    )
+                    continue
 
                 verdict = self.assurance_evaluator.evaluate(policy=policy, snapshot_id=policy_plan.snapshot_id)
-                assurance_results.append(verdict.model_dump(mode="json"))
-                if verdict.status == "violated":
-                    raise ExecutionDecisionError(
-                        f"policy {policy['policy_id']} assurance violated for flow {policy.get('flow_id')}",
-                        recommended_consumer="optimization_strategy",
-                        correction_suggestion=self._build_correction_suggestion(
-                            recommended_consumer="optimization_strategy",
-                            phase="assurance",
-                        ),
-                        feedback_payload={
-                            "phase": "assurance",
+                verdict_payload = verdict.model_dump(mode="json")
+                verdict_payload.setdefault("policy_type", policy.get("policy_type"))
+                assurance_results.append(verdict_payload)
+                if verdict.status in {"violated", "failed"}:
+                    failures.append(
+                        {
                             "policy_id": policy.get("policy_id"),
                             "policy_type": policy.get("policy_type"),
                             "flow_id": policy.get("flow_id"),
-                            "assurance_result": verdict.model_dump(mode="json"),
-                        },
-                        dispatch_attempts=total_dispatch_attempts,
-                    )
-                if verdict.status == "failed":
-                    raise ExecutionDecisionError(
-                        f"policy {policy['policy_id']} assurance failed: {verdict.reason}",
-                        recommended_consumer="optimization_strategy",
-                        correction_suggestion=self._build_correction_suggestion(
-                            recommended_consumer="optimization_strategy",
-                            phase="assurance",
-                        ),
-                        feedback_payload={
                             "phase": "assurance",
-                            "policy_id": policy.get("policy_id"),
-                            "policy_type": policy.get("policy_type"),
-                            "flow_id": policy.get("flow_id"),
-                            "assurance_result": verdict.model_dump(mode="json"),
-                        },
-                        dispatch_attempts=total_dispatch_attempts,
+                            "error": (
+                                f"policy {policy['policy_id']} assurance violated for flow {policy.get('flow_id')}"
+                                if verdict.status == "violated"
+                                else f"policy {policy['policy_id']} assurance failed: {verdict.reason}"
+                            ),
+                            "recommended_consumer": "optimization_strategy",
+                            "correction_suggestion": self._build_correction_suggestion(
+                                recommended_consumer="optimization_strategy",
+                                phase="assurance",
+                            ),
+                            "assurance_result": verdict_payload,
+                        }
                     )
 
                 log_timing(
@@ -360,8 +519,76 @@ class ExecutionController:
                     policy_id=policy["policy_id"],
                 )
 
+            if failures:
+                successful_policy_ids = [
+                    str(item.get("policy_id") or "").strip()
+                    for item in execution_receipts
+                    if str(item.get("status") or "").strip().lower() == "success"
+                ]
+                failed_policy_ids = [
+                    str(item.get("policy_id") or "").strip()
+                    for item in failures
+                    if str(item.get("policy_id") or "").strip()
+                ]
+                failure_scope = self._failure_scope_from_entries(failures)
+                recommended_consumer = self._select_recommended_consumer(failures)
+                correction_suggestion = self._build_partial_correction_suggestion(
+                    recommended_consumer=recommended_consumer,
+                    failure_scope=failure_scope,
+                )
+                performance_metrics = json.dumps(
+                    {
+                        "policy_plan": policy_plan.model_dump(mode="json"),
+                        "dispatch_results": execution_receipts,
+                        "assurance_results": assurance_results,
+                        "dispatch_attempts": total_dispatch_attempts,
+                        "domain_receipts": {
+                            "qos": [item for item in execution_receipts if item.get("policy_type") != self.AM_POLICY_TYPE],
+                            "mobility": [item for item in execution_receipts if item.get("policy_type") == self.AM_POLICY_TYPE],
+                        },
+                        "failure_summaries": failures,
+                    },
+                    ensure_ascii=False,
+                )
+                has_assurance_failure = any(
+                    str(item.get("phase") or "").strip() == "assurance"
+                    for item in failures
+                )
+                execution_status = "Failed" if has_assurance_failure else ("Partial Success" if successful_policy_ids else "Failed")
+                violation_details = "; ".join(
+                    str(item.get("error") or "").strip() for item in failures if str(item.get("error") or "").strip()
+                )
+                log_timing(
+                    self.logger,
+                    "pda_total",
+                    datetime.now().timestamp() - total_start,
+                    status="partial" if execution_status == "Partial Success" else "error",
+                )
+                return ExecutionOutcome(
+                    execution_status=execution_status,
+                    performance_metrics=performance_metrics,
+                    violation_details=violation_details or "execution failed",
+                    correction_suggestion=correction_suggestion,
+                    recommended_consumer=recommended_consumer,
+                    recommended_action="feedback",
+                    failure_scope=failure_scope,
+                    feedback_payload={
+                        "phase": "execution",
+                        "failure_scope": failure_scope,
+                        "successful_policy_ids": successful_policy_ids,
+                        "failed_policy_ids": failed_policy_ids,
+                        "failures": failures,
+                    },
+                    dispatch_attempts=total_dispatch_attempts,
+                )
+
             commit_supi = plan.supi or policies[0]["supi"]
-            self._commit_successful_policies(commit_supi, policies)
+            self._commit_successful_policies(
+                commit_supi,
+                policies,
+                session_id=policy_plan.session_id,
+                snapshot_id=policy_plan.snapshot_id,
+            )
 
             performance_metrics = json.dumps(
                 {
@@ -369,6 +596,10 @@ class ExecutionController:
                     "dispatch_results": execution_receipts,
                     "assurance_results": assurance_results,
                     "dispatch_attempts": total_dispatch_attempts,
+                    "domain_receipts": {
+                        "qos": [item for item in execution_receipts if item.get("policy_type") != self.AM_POLICY_TYPE],
+                        "mobility": [item for item in execution_receipts if item.get("policy_type") == self.AM_POLICY_TYPE],
+                    },
                 },
                 ensure_ascii=False,
             )
@@ -380,6 +611,7 @@ class ExecutionController:
                 correction_suggestion="None",
                 recommended_consumer="none",
                 recommended_action="commit",
+                failure_scope="none",
                 feedback_payload={},
                 dispatch_attempts=total_dispatch_attempts,
             )
@@ -389,6 +621,7 @@ class ExecutionController:
                 detail=str(exc),
                 correction_suggestion=exc.correction_suggestion,
                 recommended_consumer=exc.recommended_consumer,
+                failure_scope="mixed",
                 feedback_payload=exc.feedback_payload,
                 dispatch_attempts=exc.dispatch_attempts,
             )
@@ -398,6 +631,7 @@ class ExecutionController:
                 detail=str(exc),
                 correction_suggestion="Check policy payload, guard validation, PCF ack, or telemetry path.",
                 recommended_consumer="optimization_strategy",
+                failure_scope="mixed",
                 feedback_payload={"phase": "runtime", "error": str(exc)},
                 dispatch_attempts=0,
             )

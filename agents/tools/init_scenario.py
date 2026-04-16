@@ -89,6 +89,13 @@ def _build_flow_from_dict(f_dict: Dict[str, Any], used_suffixes: Optional[set] =
     flow_kwargs.setdefault("loss_req", 0.0)
     flow_kwargs.setdefault("jitter_req", 0.0)
     flow_kwargs.setdefault("priority", 1)
+    flow_kwargs.setdefault("sim_throughput_ul", float(f_dict.get("old_allocated_bw_ul", flow_kwargs.get("bw_ul", 0.0)) or 0.0))
+    flow_kwargs.setdefault("sim_throughput_dl", float(f_dict.get("old_allocated_bw_dl", flow_kwargs.get("bw_dl", 0.0)) or 0.0))
+    flow_kwargs.setdefault("sim_latency", max(0.1, float(flow_kwargs.get("lat", 0.0) or 0.0) * 0.85))
+    flow_kwargs.setdefault("sim_jitter", max(0.1, float(flow_kwargs.get("jitter_req", 0.0) or 0.0) * 0.8))
+    flow_kwargs.setdefault("sim_loss_rate", max(0.0, float(flow_kwargs.get("loss_req", 0.0) or 0.0) * 0.75))
+    flow_kwargs.setdefault("sim_packet_sent", int(max(1.0, float(f_dict.get("arrival_rate", 100.0) or 100.0))))
+    flow_kwargs.setdefault("sim_packet_received", int(max(1.0, float(f_dict.get("arrival_rate", 100.0) or 100.0) * 0.99)))
 
     flow_kwargs["flow_id"] = _normalize_or_generate_id(
         flow_kwargs.get("flow_id"),
@@ -154,23 +161,45 @@ _SCENARIO_CACHE: Dict[str, Optional[List[Any]]] = {
     "apps": None,
     "slices": None,
     "nodes": None,
+    "mobility": None,
+    "policy_state": None,
 }
 
 
-def cache_scenario(apps: List[App], slices: List[Slice], nodes: List[Node]) -> None:
+def cache_scenario(
+    apps: List[App],
+    slices: List[Slice],
+    nodes: List[Node],
+    mobility: Optional[List[Dict[str, Any]]] = None,
+    policy_state: Optional[Dict[str, Any]] = None,
+) -> None:
     _SCENARIO_CACHE["apps"] = apps
     _SCENARIO_CACHE["slices"] = slices
     _SCENARIO_CACHE["nodes"] = nodes
+    _SCENARIO_CACHE["mobility"] = mobility or []
+    _SCENARIO_CACHE["policy_state"] = policy_state or {}
 
 
 def get_cached_scenario() -> Tuple[Optional[List[App]], Optional[List[Slice]], Optional[List[Node]]]:
     return _SCENARIO_CACHE.get("apps"), _SCENARIO_CACHE.get("slices"), _SCENARIO_CACHE.get("nodes")
 
 
+def get_cached_control_scenario() -> Dict[str, Any]:
+    return {
+        "apps": _SCENARIO_CACHE.get("apps"),
+        "slices": _SCENARIO_CACHE.get("slices"),
+        "nodes": _SCENARIO_CACHE.get("nodes"),
+        "mobility": _SCENARIO_CACHE.get("mobility") or [],
+        "policy_state": _SCENARIO_CACHE.get("policy_state") or {},
+    }
+
+
 def clear_cached_scenario() -> None:
     _SCENARIO_CACHE["apps"] = None
     _SCENARIO_CACHE["slices"] = None
     _SCENARIO_CACHE["nodes"] = None
+    _SCENARIO_CACHE["mobility"] = None
+    _SCENARIO_CACHE["policy_state"] = None
 
 
 def serialize_scenario_for_api(apps: List[App], slices: List[Slice], nodes: List[Node]) -> Dict[str, Any]:
@@ -178,6 +207,8 @@ def serialize_scenario_for_api(apps: List[App], slices: List[Slice], nodes: List
         "apps": _asdict_list(apps),
         "slices": _asdict_list(slices),
         "nodes": _asdict_list(nodes),
+        "mobility": _SCENARIO_CACHE.get("mobility") or [],
+        "policy_state": _SCENARIO_CACHE.get("policy_state") or {},
     }
 
 def _map_5qi_by_service_type(service_type_id: int) -> int:
@@ -250,6 +281,88 @@ def _extract_app_supi(app_dict: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _build_seed_mobility_context(supi: str, index: int, app: App) -> Dict[str, Any]:
+    allowed_snssai = []
+    target_snssai = []
+    for flow in getattr(app, "flows", []):
+        try:
+            sst = int(getattr(flow, "service_type_id", 1))
+        except (TypeError, ValueError):
+            sst = 1
+        sd = "000001" if sst in (1, 2) else "000002"
+        snssai = {"sst": sst, "sd": sd}
+        if snssai not in allowed_snssai:
+            allowed_snssai.append(snssai)
+        if getattr(flow, "priority", 10) <= 3 and snssai not in target_snssai:
+            target_snssai.append(snssai)
+    if not target_snssai:
+        target_snssai = list(allowed_snssai)
+
+    return {
+        "accessType": "3GPP_ACCESS",
+        "accessTypes": ["3GPP_ACCESS"],
+        "ratType": "NR" if index % 2 == 0 else "EUTRA",
+        "ratTypes": ["NR", "EUTRA"],
+        "userLoc": {
+            "nrLocation": {
+                "tai": {"plmnId": {"mcc": "208", "mnc": "93"}, "tac": f"{1000 + index:06d}"},
+                "ncgi": {"plmnId": {"mcc": "208", "mnc": "93"}, "nrCellId": f"{(index + 1) * 1000000:09d}"},
+            }
+        },
+        "guami": {"plmnId": {"mcc": "208", "mnc": "93"}, "amfId": f"{index + 1:06x}"},
+        "servingPlmn": {"mcc": "208", "mnc": "93"},
+        "timeZone": "+08:00",
+        "presenceAreas": {
+            f"pra-{index + 1:03d}": {
+                "praId": f"{index + 1}",
+                "presenceState": "IN_AREA",
+                "trackingAreaList": [{"plmnId": {"mcc": "208", "mnc": "93"}, "tac": f"{1000 + index:06d}"}],
+            }
+        },
+        "allowedSnssais": allowed_snssai,
+        "targetSnssais": target_snssai,
+        "mappingSnssais": [{"servingSnssai": item, "homeSnssai": item} for item in allowed_snssai],
+        "mobilityEventType": "INITIAL_ATTACH",
+    }
+
+
+def _build_seed_am_policy_context(supi: str, index: int, mobility_context: Dict[str, Any]) -> Dict[str, Any]:
+    pol_asso_id = f"{supi}-am-{index + 1}"
+    return {
+        "polAssociationIDGenerator": index + 1,
+        "associations": {
+            pol_asso_id: {
+                "request": {
+                    "notificationUri": f"http://localhost:8000/notify/{supi}",
+                    "supi": supi,
+                    "accessType": mobility_context["accessType"],
+                    "accessTypes": mobility_context["accessTypes"],
+                    "ratType": mobility_context["ratType"],
+                    "ratTypes": mobility_context["ratTypes"],
+                    "userLoc": mobility_context["userLoc"],
+                    "guami": mobility_context["guami"],
+                    "servingPlmn": mobility_context["servingPlmn"],
+                    "timeZone": mobility_context["timeZone"],
+                    "allowedSnssais": mobility_context["allowedSnssais"],
+                    "targetSnssais": mobility_context["targetSnssais"],
+                    "mappingSnssais": mobility_context["mappingSnssais"],
+                    "rfsp": 1 + (index % 4),
+                    "suppFeat": "1",
+                },
+                "triggers": ["LOC_CH", "PRA_CH", "ALLOWED_NSSAI_CH"],
+                "rfsp": 1 + (index % 4),
+                "pras": mobility_context["presenceAreas"],
+                "suppFeat": "1",
+            }
+        },
+        "allowedSnssais": mobility_context["allowedSnssais"],
+        "targetSnssais": mobility_context["targetSnssais"],
+        "mappingSnssais": mobility_context["mappingSnssais"],
+        "rfsp": 1 + (index % 4),
+        "pras": mobility_context["presenceAreas"],
+    }
+
+
 def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
     """
     根据场景中的 flow 为每个 UE 生成并写入 UeContext 关键字段。
@@ -257,8 +370,10 @@ def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
     """
     ue_payload: Dict[str, Dict[str, Any]] = {}
 
-    for app in apps:
+    for app_index, app in enumerate(apps):
         supi = _normalize_supi(getattr(app, "supi", None))
+        mobility_context = _build_seed_mobility_context(supi, app_index, app) if supi else {}
+        am_policy_context = _build_seed_am_policy_context(supi, app_index, mobility_context) if supi else {}
         for flow in app.flows:
             flow_id = getattr(flow, "flow_id", None)
             if not supi or not flow_id:
@@ -284,6 +399,21 @@ def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
                     "chg_decs": {},
                     "app_catalog": [],
                     "flow_catalog": [],
+                    "access_mobility_context": mobility_context,
+                    "am_policy_context": am_policy_context,
+                    "serving_nf_context": {
+                        "pcf_id": "pcf-sim-1",
+                        "pcf_uri": "http://localhost:8000/pcf",
+                        "amf_id": f"amf-sim-{app_index + 1}",
+                        "amf_uri": f"http://localhost:8000/amf/{supi}",
+                    },
+                    "mobility_summary": {
+                        "currentAssociationId": next(iter(am_policy_context.get("associations", {}).keys()), None),
+                        "currentTriggers": ["LOC_CH", "PRA_CH", "ALLOWED_NSSAI_CH"],
+                        "lastMobilityEventType": "INITIAL_ATTACH",
+                        "currentRfsp": am_policy_context.get("rfsp"),
+                        "lastUpdatedReason": "scenario_seed",
+                    },
                 }
 
             if not any(item.get("app_id") == getattr(app, "app_id", None) for item in ue_payload[supi]["app_catalog"]):
@@ -387,6 +517,10 @@ def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
             chg_decs=payload["chg_decs"],
             app_catalog=payload["app_catalog"],
             flow_catalog=payload["flow_catalog"],
+            access_mobility_context=payload["access_mobility_context"],
+            am_policy_context=payload["am_policy_context"],
+            serving_nf_context=payload["serving_nf_context"],
+            mobility_summary=payload["mobility_summary"],
         )
         if ok:
             success += 1
@@ -400,6 +534,32 @@ def sync_latest_flow_five_tuples_to_ue_context() -> Dict[str, int]:
     so flowDescription matches the authoritative five_tuple when available.
     """
     return sync_latest_snapshot_flow_catalog_to_ue_context()
+
+
+def _build_mobility_snapshot_payload(apps: List[App]) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    for app_index, app in enumerate(apps):
+        supi = _normalize_supi(getattr(app, "supi", None))
+        if not supi:
+            continue
+        mobility_context = _build_seed_mobility_context(supi, app_index, app)
+        payload.append({"supi": supi, **mobility_context})
+    return payload
+
+
+def _build_policy_state_payload(apps: List[App]) -> Dict[str, Any]:
+    policy_state: Dict[str, Any] = {}
+    for app_index, app in enumerate(apps):
+        supi = _normalize_supi(getattr(app, "supi", None))
+        if not supi:
+            continue
+        mobility_context = _build_seed_mobility_context(supi, app_index, app)
+        policy_state[supi] = {
+            "amPolicy": _build_seed_am_policy_context(supi, app_index, mobility_context),
+            "appId": getattr(app, "app_id", None),
+            "appName": getattr(app, "name", None),
+        }
+    return policy_state
 
 def _deserialize_scenario(data: Dict[str, Any]) -> Tuple[List[App], List[Slice], List[Node]]:
     used_suffixes: set = set()
@@ -555,24 +715,48 @@ def get_initial_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     snapshot_data = get_latest_snapshot_data()
     if snapshot_data:
         apps, slices, nodes = _deserialize_scenario(snapshot_data)
+        mobility_payload = snapshot_data.get("mobility") if isinstance(snapshot_data, dict) else None
+        policy_payload = snapshot_data.get("policy_state") if isinstance(snapshot_data, dict) else None
         if _snapshot_requires_graph_bootstrap(snapshot_data):
-            ok = update_scenario_in_db(apps, slices, nodes, trigger="System-Init-LegacySnapshot")
+            ok = update_scenario_in_db(
+                apps,
+                slices,
+                nodes,
+                mobility_data=mobility_payload or _build_mobility_snapshot_payload(apps),
+                policy_data=policy_payload or _build_policy_state_payload(apps),
+                trigger="System-Init-LegacySnapshot",
+            )
             if not ok:
                 raise RuntimeError("Failed to generate network graph for legacy snapshot during initialization")
         seeded = _seed_ue_contexts_from_apps(apps)
         sync_summary = sync_latest_flow_five_tuples_to_ue_context()
         print(f"[UEContext] seeded {seeded} UE records (from snapshot)")
         print(f"[UEContext] synced five-tuples for {sync_summary['ues']} UEs / {sync_summary['flows']} flows (from snapshot)")
-        cache_scenario(apps, slices, nodes)
+        cache_scenario(
+            apps,
+            slices,
+            nodes,
+            mobility_payload or _build_mobility_snapshot_payload(apps),
+            policy_payload or _build_policy_state_payload(apps),
+        )
         return apps, slices, nodes
 
     apps, slices, nodes = _create_default_scenario()
-    update_scenario_in_db(apps, slices, nodes, trigger="System-Init")
+    mobility_payload = _build_mobility_snapshot_payload(apps)
+    policy_payload = _build_policy_state_payload(apps)
+    update_scenario_in_db(
+        apps,
+        slices,
+        nodes,
+        mobility_data=mobility_payload,
+        policy_data=policy_payload,
+        trigger="System-Init",
+    )
     seeded = _seed_ue_contexts_from_apps(apps)
     sync_summary = sync_latest_flow_five_tuples_to_ue_context()
     print(f"[UEContext] seeded {seeded} UE records (from default)")
     print(f"[UEContext] synced five-tuples for {sync_summary['ues']} UEs / {sync_summary['flows']} flows (from default)")
-    cache_scenario(apps, slices, nodes)
+    cache_scenario(apps, slices, nodes, mobility_payload, policy_payload)
     return apps, slices, nodes
 
 
@@ -593,8 +777,17 @@ def initialize_scenario(reset: bool = False) -> dict:
     if reset:
         # 关键步骤：强制生成默认场景并保存
         apps, slices, nodes = _create_default_scenario()
-        cache_scenario(apps, slices, nodes)
-        ok = update_scenario_in_db(apps, slices, nodes, trigger="Manual-Reset")
+        mobility_payload = _build_mobility_snapshot_payload(apps)
+        policy_payload = _build_policy_state_payload(apps)
+        cache_scenario(apps, slices, nodes, mobility_payload, policy_payload)
+        ok = update_scenario_in_db(
+            apps,
+            slices,
+            nodes,
+            mobility_data=mobility_payload,
+            policy_data=policy_payload,
+            trigger="Manual-Reset",
+        )
         if not ok:
             raise RuntimeError("Failed to persist reset scenario into DB")
         seeded = _seed_ue_contexts_from_apps(apps)

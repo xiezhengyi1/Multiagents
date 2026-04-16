@@ -1,9 +1,14 @@
 import re
 import secrets
 from typing import List, Union, Dict, Any, Optional, Set
-from .models import App, Flow, OptimizationConfig, ServiceType, SLAProfile, Link, Path, Node
+from .models import App, Flow, OptimizationConfig, AMPolicyState, ServiceType, SLAProfile, Link, Path, Node
 from .engine import SliceOptimizationEngine, IBNSOptimizationEngine
-from agents.tools.init_scenario import get_current_scenario, cache_scenario, serialize_scenario_for_api
+from agents.tools.init_scenario import (
+    cache_scenario,
+    get_cached_control_scenario,
+    get_current_scenario,
+    serialize_scenario_for_api,
+)
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -144,7 +149,7 @@ def _collapse_payload_to_app_dict(raw_payload: Any) -> Dict[str, Any]:
     return payload
 
 
-def optimize_network_slices(new_app_data: Union[dict, List[dict]], w1: float, w2: float, w3: float, w4: float = 0.0, mode: str = 'full', return_json: bool = True) -> Union[str, Dict[str, Any]]:
+def optimize_network_slices(new_app_data: Union[dict, List[dict]], w1: float, w2: float, w3: float, w4: float = 0.0, mode: str = 'full', return_json: bool = True, *, am_policy_state: Optional[AMPolicyState] = None) -> Union[str, Dict[str, Any]]:
     """
     Execute slice optimization for one target app.
 
@@ -254,7 +259,12 @@ def optimize_network_slices(new_app_data: Union[dict, List[dict]], w1: float, w2
             flows=merged_flows,
         )
 
-        config = OptimizationConfig(w1=w1, w2=w2, w3=w3, w4=w4)
+        # 关键步骤：配置优化参数，可选启用 AM 联合优化
+        config = OptimizationConfig(
+            w1=w1, w2=w2, w3=w3, w4=w4,
+            enable_am_optimization=am_policy_state is not None,
+            am_policy_state=am_policy_state,
+        )
         engine = SliceOptimizationEngine(config)
 
         if existing_app is not None:
@@ -289,8 +299,20 @@ def optimize_network_slices(new_app_data: Union[dict, List[dict]], w1: float, w2
             cached_flow.old_slice = r_new_slice
             cached_flow.old_allocated_bw_ul = r_act_bw_ul
             cached_flow.old_allocated_bw_dl = r_act_bw_dl
+            cached_flow.sim_throughput_ul = float(r_act_bw_ul or 0.0)
+            cached_flow.sim_throughput_dl = float(r_act_bw_dl or 0.0)
+            cached_flow.sim_latency = max(0.1, float(cached_flow.lat or 0.0) * 0.85)
+            cached_flow.sim_jitter = max(0.1, float(cached_flow.jitter_req or 0.0) * 0.8)
+            cached_flow.sim_loss_rate = max(0.0, float(cached_flow.loss_req or 0.0) * 0.75)
 
-        cache_scenario(updated_apps_list, slices, nodes)
+        cached_control = get_cached_control_scenario()
+        cache_scenario(
+            updated_apps_list,
+            slices,
+            nodes,
+            cached_control.get("mobility") or [],
+            cached_control.get("policy_state") or {},
+        )
 
         slice_status = []
         target_ssts = {

@@ -151,6 +151,8 @@ class NetworkStatusSnapshot(Base):
     slice_data = Column(JSONB, nullable=False, default=list)
     app_data = Column(JSONB, nullable=False, default=list)
     node_data = Column(JSONB, nullable=False, default=list)
+    mobility_data = Column(JSONB, nullable=False, default=list)
+    policy_data = Column(JSONB, nullable=False, default=dict)
 
     # 触发快照的原因，例如 "PeriodicMonitor", "Pre-Optimization", "Post-Optimization"
     trigger_event = Column(String, nullable=True)
@@ -230,6 +232,61 @@ class UeContextRecord(Base):
     ursp_rules = Column(JSONB, nullable=True)
     app_catalog = Column(JSONB, nullable=True)
     flow_catalog = Column(JSONB, nullable=True)
+    access_mobility_context = Column(JSONB, nullable=True)
+    am_policy_context = Column(JSONB, nullable=True)
+    serving_nf_context = Column(JSONB, nullable=True)
+    mobility_summary = Column(JSONB, nullable=True)
 
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class UeAmPolicyAssociationRecord(Base):
+    __tablename__ = "ue_am_policy_assoc"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    supi = Column(String, ForeignKey("ue_context.supi", ondelete="CASCADE"), nullable=False, index=True)
+    pol_asso_id = Column(String, nullable=False, index=True)
+    session_id = Column(String, nullable=True, index=True)
+    snapshot_id = Column(String, nullable=True, index=True)
+    round_index = Column(Integer, default=0)
+    association_request = Column(JSONB, nullable=False)
+    association_policy = Column(JSONB, nullable=False)
+    status = Column(String, nullable=False, default="draft", index=True)
+    trigger_event = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("supi", "pol_asso_id", name="uq_ue_am_policy_assoc_supi_pol_asso_id"),
+    )
+
+
+class UeMobilityEventRecord(Base):
+    __tablename__ = "ue_mobility_event"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    supi = Column(String, ForeignKey("ue_context.supi", ondelete="CASCADE"), nullable=False, index=True)
+    session_id = Column(String, nullable=True, index=True)
+    snapshot_id = Column(String, nullable=True, index=True)
+    event_type = Column(String, nullable=False, index=True)
+    event_summary = Column(Text, nullable=True)
+    event_payload = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+
+class UeServingNfBindingRecord(Base):
+    __tablename__ = "ue_serving_nf_binding"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    supi = Column(String, ForeignKey("ue_context.supi", ondelete="CASCADE"), nullable=False, index=True)
+    nf_type = Column(String, nullable=False, index=True)
+    nf_instance_id = Column(String, nullable=True, index=True)
+    nf_uri = Column(String, nullable=True)
+    binding_info = Column(JSONB, nullable=False, default=dict)
+    status = Column(String, nullable=False, default="active", index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("supi", "nf_type", name="uq_ue_serving_nf_binding_supi_nf_type"),
+    )

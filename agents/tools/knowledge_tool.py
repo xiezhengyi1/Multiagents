@@ -7,9 +7,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from langchain.tools import ToolRuntime, tool
 
+from agents.tools.wrapper_think import tool_with_reason
+
 from agent_runtime import AgentRuntimeContext
 from database.langchain_pg import (
-    PCF_POLICY_GLOSSARY_COLLECTION,
     PCF_SM_POLICY_CLAUSES_COLLECTION,
     PCF_SM_POLICY_SCHEMA_COLLECTION,
     PCF_URSP_CLAUSES_COLLECTION,
@@ -17,6 +18,7 @@ from database.langchain_pg import (
     get_pgvector_store,
 )
 from knowledge_scripts.build_pcf_policy_kb import (
+    CLAUSE_EXACT_INDEX_JSON,
     CLAUSE_JSONL,
     GLOSSARY_EXACT_INDEX_JSON,
     GLOSSARY_JSONL,
@@ -84,6 +86,7 @@ REQUIRED_KB_PATHS = (
     CLAUSE_JSONL,
     SCHEMA_JSONL,
     GLOSSARY_JSONL,
+    CLAUSE_EXACT_INDEX_JSON,
     SCHEMA_EXACT_INDEX_JSON,
     GLOSSARY_EXACT_INDEX_JSON,
     SPEC_OBJECT_MAP_JSON,
@@ -127,11 +130,17 @@ def _shorten(text: str, *, limit: int = MAX_CONTENT_CHARS) -> str:
     return f"{cleaned[: limit - 3].rstrip()}..."
 
 
-def _domain_matches(metadata_domain: str, requested_domain: str) -> bool:
-    normalized_domain = _normalized(metadata_domain)
+def _domain_matches(metadata_domain: Any, requested_domain: str) -> bool:
     normalized_request = _normalized(requested_domain)
     if normalized_request in {"", "all"}:
         return True
+    if isinstance(metadata_domain, dict):
+        strategy_domains = [_normalized(item) for item in metadata_domain.get("strategy_domains") or [] if _normalized(item)]
+        if strategy_domains:
+            return normalized_request in strategy_domains
+        normalized_domain = _normalized(metadata_domain.get("policy_domain") or "")
+    else:
+        normalized_domain = _normalized(metadata_domain)
     if normalized_domain == "shared":
         return True
     return normalized_domain == normalized_request
@@ -183,14 +192,12 @@ def _select_collections(query: str, domain: str) -> List[str]:
             PCF_URSP_SCHEMA_COLLECTION,
             PCF_SM_POLICY_CLAUSES_COLLECTION,
             PCF_URSP_CLAUSES_COLLECTION,
-            PCF_POLICY_GLOSSARY_COLLECTION,
         ]
     return [
         PCF_SM_POLICY_CLAUSES_COLLECTION,
         PCF_URSP_CLAUSES_COLLECTION,
         PCF_SM_POLICY_SCHEMA_COLLECTION,
         PCF_URSP_SCHEMA_COLLECTION,
-        PCF_POLICY_GLOSSARY_COLLECTION,
     ]
 
 
@@ -221,6 +228,12 @@ def _records_by_citation() -> Dict[str, List[Dict[str, Any]]]:
         if citation:
             grouped.setdefault(citation, []).append(record)
     return grouped
+
+
+@lru_cache(maxsize=1)
+def _clause_exact_index() -> Dict[str, Any]:
+    _ensure_processed_corpus()
+    return _load_json(CLAUSE_EXACT_INDEX_JSON)
 
 
 @lru_cache(maxsize=1)
@@ -338,7 +351,7 @@ def _direct_record_matches(key: str, domain: str) -> List[Dict[str, Any]]:
     direct_hits: List[Dict[str, Any]] = []
     for record in catalog.values():
         metadata = record.get("metadata") or {}
-        if not _domain_matches(str(metadata.get("policy_domain") or ""), domain):
+        if not _domain_matches(metadata, domain):
             continue
         search_fields = [
             metadata.get("canonical_title"),
@@ -372,12 +385,21 @@ def _direct_record_matches(key: str, domain: str) -> List[Dict[str, Any]]:
 def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
     catalog = _record_catalog()
     candidates: List[Dict[str, Any]] = []
+    for hit in search_exact_index(_clause_exact_index(), query, top_k=12):
+        record = catalog.get(hit["id"])
+        if record is None:
+            continue
+        metadata = record.get("metadata") or {}
+        if not _domain_matches(metadata, domain):
+            continue
+        score = 1260.0 + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
+        candidates.append(_record_to_candidate(record, score=score, retrieval="exact_clause"))
     for hit in search_exact_index(_schema_exact_index(), query, top_k=12):
         record = catalog.get(hit["id"])
         if record is None:
             continue
         metadata = record.get("metadata") or {}
-        if not _domain_matches(str(metadata.get("policy_domain") or ""), domain):
+        if not _domain_matches(metadata, domain):
             continue
         score = 1200.0 + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
         candidates.append(_record_to_candidate(record, score=score, retrieval="exact_schema"))
@@ -386,7 +408,7 @@ def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
         if record is None:
             continue
         metadata = record.get("metadata") or {}
-        if not _domain_matches(str(metadata.get("policy_domain") or ""), domain):
+        if not _domain_matches(metadata, domain):
             continue
         score = 1000.0 + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
         candidates.append(_record_to_candidate(record, score=score, retrieval="exact_glossary"))
@@ -417,7 +439,7 @@ def _expand_cross_spec_candidates(seed_candidates: Iterable[Dict[str, Any]], dom
                 continue
             for record in by_citation.get(citation) or []:
                 metadata = record.get("metadata") or {}
-                if not _domain_matches(str(metadata.get("policy_domain") or ""), domain):
+                if not _domain_matches(metadata, domain):
                     continue
                 score = 900.0 + _metadata_query_bonus(metadata, query, domain)
                 expanded.append(_record_to_candidate(record, score=score, retrieval=f"cross_spec:{object_name}"))
@@ -438,7 +460,7 @@ def _vector_search_candidates(query: str, domain: str) -> Tuple[List[Dict[str, A
             continue
         for rank, doc in enumerate(docs):
             metadata = doc.metadata if isinstance(getattr(doc, "metadata", None), dict) else {}
-            if not _domain_matches(str(metadata.get("policy_domain") or ""), domain):
+            if not _domain_matches(metadata, domain):
                 continue
             score = 300.0 - rank * 10.0 + _metadata_query_bonus(metadata, query, domain)
             object_terms = {_normalized(item) for item in metadata.get("object_tags") or []}
@@ -455,7 +477,7 @@ def _resolve_explicit_key_candidates(key: str, domain: str) -> List[Dict[str, An
     matches: List[Dict[str, Any]] = []
     for record in _record_catalog().values():
         metadata = record.get("metadata") or {}
-        if not _domain_matches(str(metadata.get("policy_domain") or ""), domain):
+        if not _domain_matches(metadata, domain):
             continue
         candidate_key = _candidate_key(metadata, record.get("id") or "")
         if _normalized(candidate_key) != normalized_key:
@@ -550,7 +572,7 @@ def _format_results(
     return "\n\n---\n\n".join(blocks)
 
 
-@tool
+@tool_with_reason
 def search_semantic_knowledge(
     query: str,
     category: Optional[str] = None,
@@ -585,7 +607,7 @@ def search_semantic_knowledge(
         raise RuntimeError(f"{_log_prefix(runtime)} Knowledge search failed for '{normalized_query}': {exc}") from exc
 
 
-@tool
+@tool_with_reason
 def get_knowledge_by_key(
     key: str,
     category: Optional[str] = None,

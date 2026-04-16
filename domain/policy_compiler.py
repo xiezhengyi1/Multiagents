@@ -33,6 +33,8 @@ class CompiledStrategyPlan:
 
 
 class PolicyCompiler:
+    AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
+
     @staticmethod
     def json_friendly(value: Any) -> Any:
         return _json_friendly(value)
@@ -109,22 +111,24 @@ class PolicyCompiler:
         policy_id = str(policy.get("policy_id") or "").strip()
         policy_type = str(policy.get("policy_type") or "").strip()
         app_id = str(policy.get("app_id") or "").strip()
-        target_type = str(policy.get("target_type") or "flow").strip() or "flow"
+        default_target_type = "ue" if policy_type == cls.AM_POLICY_TYPE else "flow"
+        target_type = str(policy.get("target_type") or default_target_type).strip() or default_target_type
         policy_details = _json_friendly(policy.get("policy_details"))
         if not isinstance(policy_details, dict):
             raise ValueError(f"policy {policy_id or '<unknown>'} missing policy_details object")
 
         supi = str(policy.get("supi") or top_level_supi or "").strip()
         flow_id = str(policy.get("flow_id") or "").strip()
-        if not flow_id:
+        if policy_type != cls.AM_POLICY_TYPE and not flow_id:
             extracted_flow_id = cls.extract_flow_id(policy_details)
             if extracted_flow_id:
                 flow_id = extracted_flow_id
 
-        policy_details.setdefault("policy_id", policy_id)
-        policy_details.setdefault("target_type", target_type)
-        if flow_id:
-            policy_details.setdefault("flow_id", flow_id)
+        if policy_type != cls.AM_POLICY_TYPE:
+            policy_details.setdefault("policy_id", policy_id)
+            policy_details.setdefault("target_type", target_type)
+            if flow_id:
+                policy_details.setdefault("flow_id", flow_id)
 
         return _json_friendly(
             {
@@ -204,6 +208,8 @@ class PolicyCompiler:
                     chg_decs = cls._merge_bucket(chg_decs, policy_id, policy_details["chgDecs"])
             elif policy_type == "UrspRuleRequest":
                 ursp_rules[policy_id] = policy_details
+            elif policy_type == cls.AM_POLICY_TYPE:
+                continue
 
         return {
             "sm_policy_data": sm_policy_data,

@@ -23,6 +23,11 @@ def get_cached_scenario():
     return _impl()
 
 
+def get_cached_control_scenario():
+    from .init_scenario import get_cached_control_scenario as _impl
+    return _impl()
+
+
 def clear_cached_scenario():
     from .init_scenario import clear_cached_scenario as _impl
     return _impl()
@@ -76,7 +81,12 @@ def get_snapshot_data_by_id(*args, **kwargs):
 from .wrapper_think import think_tool as think
 from .pcf_tools import get_ue_context
 from .pcf_tools import get_ue_flow_catalog
+from .pcf_tools import get_am_policy_context
+from .pcf_tools import get_sm_ue_context
+from .pcf_tools import get_sm_ue_flow_catalog
+from .pcf_tools import search_am_policy_targets
 from .pcf_tools import search_flow_targets_by_name
+from .pcf_tools import search_sm_flow_targets
 from .knowledge_tool import search_semantic_knowledge
 from .knowledge_tool import get_knowledge_by_key
 from .user_interaction_tool import ask_user_clarification
@@ -86,6 +96,7 @@ __all__ = [
     "get_initial_scenario",
     "cache_scenario",
     "get_cached_scenario",
+    "get_cached_control_scenario",
     "clear_cached_scenario",
     "serialize_scenario_for_api",
     "deserialize_scenario_payload",
@@ -99,7 +110,12 @@ __all__ = [
     "think",
     "get_ue_context",
     "get_ue_flow_catalog",
+    "get_sm_ue_context",
+    "get_sm_ue_flow_catalog",
+    "get_am_policy_context",
     "search_flow_targets_by_name",
+    "search_sm_flow_targets",
+    "search_am_policy_targets",
     "search_semantic_knowledge",
     "get_knowledge_by_key",
     "ask_user_clarification",

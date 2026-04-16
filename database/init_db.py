@@ -23,7 +23,10 @@ from database.models import (
     SemanticKnowledge,
     SessionContext,
     SessionStageResult,
+    UeAmPolicyAssociationRecord,
     UeContextRecord,
+    UeMobilityEventRecord,
+    UeServingNfBindingRecord,
 )
 from utils.logger import setup_logger
 
@@ -48,16 +51,28 @@ def init_db():
             connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS app_data JSONB"))
             connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS slice_data JSONB"))
             connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS node_data JSONB"))
+            connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS mobility_data JSONB"))
+            connection.execute(text("ALTER TABLE network_status_snapshot ADD COLUMN IF NOT EXISTS policy_data JSONB"))
             connection.execute(text("UPDATE network_status_snapshot SET app_data = '[]'::jsonb WHERE app_data IS NULL"))
             connection.execute(text("UPDATE network_status_snapshot SET slice_data = '[]'::jsonb WHERE slice_data IS NULL"))
             connection.execute(text("UPDATE network_status_snapshot SET node_data = '[]'::jsonb WHERE node_data IS NULL"))
+            connection.execute(text("UPDATE network_status_snapshot SET mobility_data = '[]'::jsonb WHERE mobility_data IS NULL"))
+            connection.execute(text("UPDATE network_status_snapshot SET policy_data = '{}'::jsonb WHERE policy_data IS NULL"))
             connection.execute(text("ALTER TABLE network_status_snapshot DROP COLUMN IF EXISTS snapshot_data"))
             connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS app_catalog JSONB"))
             connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS flow_catalog JSONB"))
             connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS ursp_rules JSONB"))
+            connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS access_mobility_context JSONB"))
+            connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS am_policy_context JSONB"))
+            connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS serving_nf_context JSONB"))
+            connection.execute(text("ALTER TABLE ue_context ADD COLUMN IF NOT EXISTS mobility_summary JSONB"))
             connection.execute(text("UPDATE ue_context SET app_catalog = '[]'::jsonb WHERE app_catalog IS NULL"))
             connection.execute(text("UPDATE ue_context SET flow_catalog = '[]'::jsonb WHERE flow_catalog IS NULL"))
             connection.execute(text("UPDATE ue_context SET ursp_rules = '{}'::jsonb WHERE ursp_rules IS NULL"))
+            connection.execute(text("UPDATE ue_context SET access_mobility_context = '{}'::jsonb WHERE access_mobility_context IS NULL"))
+            connection.execute(text("UPDATE ue_context SET am_policy_context = '{}'::jsonb WHERE am_policy_context IS NULL"))
+            connection.execute(text("UPDATE ue_context SET serving_nf_context = '{}'::jsonb WHERE serving_nf_context IS NULL"))
+            connection.execute(text("UPDATE ue_context SET mobility_summary = '{}'::jsonb WHERE mobility_summary IS NULL"))
             connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS current_stage VARCHAR"))
             connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS current_snapshot_id VARCHAR"))
             connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS current_artifact_id VARCHAR"))

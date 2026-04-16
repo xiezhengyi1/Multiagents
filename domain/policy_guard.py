@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from model.PcfAmPolicyControl import PcfAmPolicyControlPolicyAssociation
 from model.SmPolicyDecision import SmPolicyDecision
 from model.UrspRuleRequest import UrspRuleRequest
 
 
 class PolicyGuard:
-    SUPPORTED_POLICY_TYPES = {"SmPolicyDecision", "UrspRuleRequest"}
+    AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
+    SUPPORTED_POLICY_TYPES = {"SmPolicyDecision", "UrspRuleRequest", AM_POLICY_TYPE}
 
     def validate_policy(self, policy: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(policy, dict):
@@ -23,7 +25,7 @@ class PolicyGuard:
 
         if not supi:
             raise ValueError(f"policy {policy_id or '<unknown>'} missing supi")
-        if not app_id:
+        if policy_type != self.AM_POLICY_TYPE and not app_id:
             raise ValueError(f"policy {policy_id or '<unknown>'} missing app_id")
         if not policy_id:
             raise ValueError("policy_id is required")
@@ -48,6 +50,18 @@ class PolicyGuard:
 
         if target_type == "flow" and not flow_id:
             raise ValueError(f"flow-scoped policy {policy_id} missing flow_id")
+
+        if policy_type == self.AM_POLICY_TYPE:
+            if target_type != "ue":
+                raise ValueError(f"AM policy {policy_id} must use target_type=ue")
+            request = policy_details.get("request")
+            if not isinstance(request, dict):
+                raise ValueError(f"AM policy {policy_id} missing request object")
+            request_supi = str(request.get("supi") or "").strip()
+            if request_supi and request_supi != supi:
+                raise ValueError(f"AM policy {policy_id} request.supi does not match top-level supi")
+            PcfAmPolicyControlPolicyAssociation.model_validate(policy_details)
+            return policy
 
         expected_prefix = "smp-" if policy_type == "SmPolicyDecision" else "ursp-"
         if not policy_id.startswith(expected_prefix):

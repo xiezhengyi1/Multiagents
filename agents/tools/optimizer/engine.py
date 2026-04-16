@@ -2,7 +2,7 @@ import pulp
 import pandas as pd
 from typing import List, Tuple, Optional, Dict
 
-from .models import App, Slice, Node, Flow, OptimizationConfig, ServiceType, SLAProfile, Link, Path
+from .models import App, Slice, Node, Flow, OptimizationConfig, AMPolicyState, ServiceType, SLAProfile, Link, Path
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -90,6 +90,190 @@ class SliceOptimizationEngine:
         )
         return x, B_act_ul, B_act_dl, dev, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
 
+    def _create_am_variables(self, slices: List[Slice], am_state: AMPolicyState):
+        """关键步骤：创建 AM 策略联合优化的决策变量。"""
+        candidate_triggers = list(am_state.trigger_signal_costs.keys())
+        # a_j: S-NSSAI j 是否纳入 Allowed NSSAI
+        am_allowed = pulp.LpVariable.dicts("am_allowed", (s.snssai for s in slices), cat='Binary')
+        # t_j: S-NSSAI j 是否纳入 Target NSSAI
+        am_target = pulp.LpVariable.dicts("am_target", (s.snssai for s in slices), cat='Binary')
+        # r: RFSP 索引
+        am_rfsp = pulp.LpVariable("am_rfsp", lowBound=1, upBound=am_state.rfsp_max, cat='Integer')
+        # UE-AMBR
+        am_ambr_ul = pulp.LpVariable("am_ambr_ul", lowBound=0)
+        am_ambr_dl = pulp.LpVariable("am_ambr_dl", lowBound=0)
+        # Trigger 订阅
+        am_triggers = pulp.LpVariable.dicts("am_trigger", candidate_triggers, cat='Binary')
+        # 变更绝对值辅助变量
+        am_allowed_chg = pulp.LpVariable.dicts("am_allowed_chg", (s.snssai for s in slices), lowBound=0)
+        am_target_chg = pulp.LpVariable.dicts("am_target_chg", (s.snssai for s in slices), lowBound=0)
+        am_rfsp_chg = pulp.LpVariable("am_rfsp_chg", lowBound=0)
+        am_trigger_chg = pulp.LpVariable.dicts("am_trigger_chg", candidate_triggers, lowBound=0)
+        return {
+            "am_allowed": am_allowed,
+            "am_target": am_target,
+            "am_rfsp": am_rfsp,
+            "am_ambr_ul": am_ambr_ul,
+            "am_ambr_dl": am_ambr_dl,
+            "am_triggers": am_triggers,
+            "am_allowed_chg": am_allowed_chg,
+            "am_target_chg": am_target_chg,
+            "am_rfsp_chg": am_rfsp_chg,
+            "am_trigger_chg": am_trigger_chg,
+        }
+
+    def _add_am_coupling_constraints(self, prob, apps, slices, x, B_act_ul, B_act_dl, am_vars, am_state: AMPolicyState):
+        """关键步骤：添加 QoS-AM 耦合约束条件。"""
+        am_allowed = am_vars["am_allowed"]
+        am_target = am_vars["am_target"]
+        am_rfsp = am_vars["am_rfsp"]
+        am_ambr_ul = am_vars["am_ambr_ul"]
+        am_ambr_dl = am_vars["am_ambr_dl"]
+        am_triggers = am_vars["am_triggers"]
+        am_allowed_chg = am_vars["am_allowed_chg"]
+        am_target_chg = am_vars["am_target_chg"]
+        am_rfsp_chg = am_vars["am_rfsp_chg"]
+        am_trigger_chg = am_vars["am_trigger_chg"]
+        num_flows = max(1, sum(len(a.flows) for a in apps))
+        old_allowed_set = set(am_state.old_allowed_snssais)
+        old_target_set = set(am_state.old_target_snssais)
+
+        for s in slices:
+            # C-AM1: 如果任意流映射到切片 j，则 j 必须在 Allowed NSSAI
+            for app in apps:
+                for f in app.flows:
+                    prob += x[app.app_id, f.flow_id, s.snssai] <= am_allowed[s.snssai], \
+                        f"AM1_{app.app_id}_{f.flow_id}_{s.snssai}"
+
+            # C-AM2: Target ⊆ Allowed
+            prob += am_target[s.snssai] <= am_allowed[s.snssai], f"AM2_{s.snssai}"
+
+            # C-AM3: 有流量的切片应在 Target
+            prob += pulp.lpSum(
+                x[app.app_id, f.flow_id, s.snssai] for app in apps for f in app.flows
+            ) <= num_flows * am_target[s.snssai], f"AM3_{s.snssai}"
+
+            # Allowed NSSAI 变更绝对值线性化
+            old_a = 1 if s.snssai in old_allowed_set else 0
+            prob += am_allowed_chg[s.snssai] >= am_allowed[s.snssai] - old_a, f"AM_achg_pos_{s.snssai}"
+            prob += am_allowed_chg[s.snssai] >= old_a - am_allowed[s.snssai], f"AM_achg_neg_{s.snssai}"
+
+            # Target NSSAI 变更绝对值线性化
+            old_t = 1 if s.snssai in old_target_set else 0
+            prob += am_target_chg[s.snssai] >= am_target[s.snssai] - old_t, f"AM_tchg_pos_{s.snssai}"
+            prob += am_target_chg[s.snssai] >= old_t - am_target[s.snssai], f"AM_tchg_neg_{s.snssai}"
+
+        # C-AM4: UE-AMBR 一致性
+        total_alloc_ul = pulp.lpSum(
+            B_act_ul[app.app_id, f.flow_id, s.snssai]
+            for app in apps for f in app.flows for s in slices
+        )
+        total_alloc_dl = pulp.lpSum(
+            B_act_dl[app.app_id, f.flow_id, s.snssai]
+            for app in apps for f in app.flows for s in slices
+        )
+        total_req_ul = sum(f.bw_ul for app in apps for f in app.flows)
+        total_req_dl = sum(f.bw_dl for app in apps for f in app.flows)
+        headroom = am_state.ambr_headroom
+
+        prob += am_ambr_ul >= total_alloc_ul, "AM4_ambr_ul_lower"
+        prob += am_ambr_dl >= total_alloc_dl, "AM4_ambr_dl_lower"
+        prob += am_ambr_ul <= (1 + headroom) * max(total_req_ul, 1.0), "AM4_ambr_ul_upper"
+        prob += am_ambr_dl <= (1 + headroom) * max(total_req_dl, 1.0), "AM4_ambr_dl_upper"
+
+        # C-AM5: RFSP-QoS 关联 — 流优先级最高值约束 RFSP 上界
+        max_value_weight = max((1.0 / max(1, f.priority)) for app in apps for f in app.flows)
+        rfsp_upper = am_state.rfsp_max - int(am_state.rfsp_max * max_value_weight)
+        rfsp_upper = max(1, rfsp_upper)
+        prob += am_rfsp <= rfsp_upper, "AM5_rfsp_priority"
+
+        # RFSP 变更绝对值线性化
+        prob += am_rfsp_chg >= am_rfsp - am_state.old_rfsp, "AM_rfsp_chg_pos"
+        prob += am_rfsp_chg >= am_state.old_rfsp - am_rfsp, "AM_rfsp_chg_neg"
+
+        # C-AM6: Trigger 约束
+        for trigger_name in am_state.mandatory_triggers:
+            if trigger_name in am_triggers:
+                prob += am_triggers[trigger_name] == 1, f"AM6_mandatory_{trigger_name}"
+
+        # ALLOWED_NSSAI_CH: 若 Allowed 发生变更则必须订阅
+        total_allowed_chg = pulp.lpSum(am_allowed_chg[s.snssai] for s in slices)
+        if "ALLOWED_NSSAI_CH" in am_triggers:
+            prob += am_triggers["ALLOWED_NSSAI_CH"] >= total_allowed_chg / max(len(slices), 1), \
+                "AM6_nssai_ch_trigger"
+
+        # Trigger 变更绝对值线性化
+        for trigger_name in am_state.trigger_signal_costs:
+            if trigger_name not in am_triggers:
+                continue
+            old_v = 1 if trigger_name in am_state.old_triggers else 0
+            prob += am_trigger_chg[trigger_name] >= am_triggers[trigger_name] - old_v, \
+                f"AM_trg_chg_pos_{trigger_name}"
+            prob += am_trigger_chg[trigger_name] >= old_v - am_triggers[trigger_name], \
+                f"AM_trg_chg_neg_{trigger_name}"
+
+    def _build_am_objectives(self, slices, am_vars, am_state: AMPolicyState, total_req_ul: float, total_req_dl: float):
+        """关键步骤：构建 AM 相关的三个目标函数项。"""
+        am_allowed_chg = am_vars["am_allowed_chg"]
+        am_target_chg = am_vars["am_target_chg"]
+        am_rfsp_chg = am_vars["am_rfsp_chg"]
+        am_trigger_chg = am_vars["am_trigger_chg"]
+        am_triggers = am_vars["am_triggers"]
+        am_ambr_ul = am_vars["am_ambr_ul"]
+        am_ambr_dl = am_vars["am_ambr_dl"]
+
+        rfsp_max = am_state.rfsp_max
+
+        # Φ_am_churn: AM 策略变更成本
+        term_am_churn = (
+            pulp.lpSum(am_allowed_chg[s.snssai] for s in slices)
+            + pulp.lpSum(am_target_chg[s.snssai] for s in slices)
+            + am_rfsp_chg / max(rfsp_max, 1)
+            + pulp.lpSum(am_trigger_chg[k] for k in am_state.trigger_signal_costs if k in am_trigger_chg)
+        )
+
+        # Φ_trigger: Trigger 信令开销
+        mandatory_set = set(am_state.mandatory_triggers)
+        term_trigger = pulp.lpSum(
+            am_state.trigger_signal_costs[k] * am_triggers[k]
+            for k in am_state.trigger_signal_costs
+            if k not in mandatory_set and k in am_triggers
+        )
+
+        # Φ_ambr_tight: AMBR 紧致性
+        eps = 1e-6
+        safe_req_ul = max(total_req_ul, eps)
+        safe_req_dl = max(total_req_dl, eps)
+        term_ambr_tight = am_ambr_ul / safe_req_ul + am_ambr_dl / safe_req_dl - 2.0
+
+        return term_am_churn, term_trigger, term_ambr_tight
+
+    def _extract_am_solution(self, slices, am_vars, am_state: AMPolicyState) -> Dict:
+        """关键步骤：从 MILP 最优解中提取 AM 策略参数。"""
+        am_allowed = am_vars["am_allowed"]
+        am_target = am_vars["am_target"]
+        am_rfsp = am_vars["am_rfsp"]
+        am_ambr_ul = am_vars["am_ambr_ul"]
+        am_ambr_dl = am_vars["am_ambr_dl"]
+        am_triggers = am_vars["am_triggers"]
+        TOL = 1e-6
+
+        allowed_snssais = [s.snssai for s in slices if self._safe_pulp_value(am_allowed[s.snssai]) >= 1.0 - TOL]
+        target_snssais = [s.snssai for s in slices if self._safe_pulp_value(am_target[s.snssai]) >= 1.0 - TOL]
+        rfsp_val = max(1, int(round(self._safe_pulp_value(am_rfsp, default=1.0))))
+        ambr_ul_val = round(self._safe_pulp_value(am_ambr_ul), 2)
+        ambr_dl_val = round(self._safe_pulp_value(am_ambr_dl), 2)
+        active_triggers = [k for k in am_state.trigger_signal_costs if k in am_triggers and self._safe_pulp_value(am_triggers[k]) >= 1.0 - TOL]
+
+        return {
+            "allowed_snssais": allowed_snssais,
+            "target_snssais": target_snssais,
+            "rfsp": rfsp_val,
+            "ue_ambr_ul_mbps": ambr_ul_val,
+            "ue_ambr_dl_mbps": ambr_dl_val,
+            "triggers": active_triggers,
+        }
+
     def _solve_problem_and_collect(
         self,
         prob,
@@ -107,6 +291,10 @@ class SliceOptimizationEngine:
         term_qos_core,
         term_qos_aux,
         term_tiebreak,
+        *,
+        am_terms=None,
+        am_vars=None,
+        am_state=None,
     ):
         """关键步骤：统一执行求解并返回结果与目标分解。"""
         objective = (
@@ -116,6 +304,12 @@ class SliceOptimizationEngine:
             + (self.config.w4 * term_qos_aux)
             + term_tiebreak
         )
+        # 关键步骤：当 AM 优化启用时，叠加 AM 目标函数项
+        if am_terms is not None:
+            term_am_churn, term_trigger, term_ambr_tight = am_terms
+            objective += self.config.w5 * term_am_churn
+            objective += self.config.w6 * term_trigger
+            objective += self.config.w7 * term_ambr_tight
         prob.setObjective(objective)
         solver_time_limit = int(getattr(self.config, "solver_time_limit", 30) or 30)
         solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=solver_time_limit)
@@ -135,6 +329,11 @@ class SliceOptimizationEngine:
             term_tiebreak,
             objective_val
         )
+        # 关键步骤：提取 AM 最优解并写入 breakdown
+        if am_terms is not None and am_vars is not None and am_state is not None:
+            breakdown["am_churn"] = self._safe_pulp_value(am_terms[0])
+            breakdown["am_trigger"] = self._safe_pulp_value(am_terms[1])
+            breakdown["am_ambr_tight"] = self._safe_pulp_value(am_terms[2])
         return flow_results, slice_results, status_str, objective_val, breakdown
 
     def solve(self, apps: List[App], slices: List[Slice], nodes: List[Node]) -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float], Dict[str, float]]:
@@ -155,6 +354,16 @@ class SliceOptimizationEngine:
         self._add_flow_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, change, served, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl)
         self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
         self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
+
+        # 关键步骤：可选 AM 联合优化
+        am_vars, am_terms, am_state = None, None, None
+        if self.config.enable_am_optimization and self.config.am_policy_state is not None:
+            am_state = self.config.am_policy_state
+            am_vars = self._create_am_variables(slices, am_state)
+            self._add_am_coupling_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, am_vars, am_state)
+            total_req_ul = sum(f.bw_ul for a in apps for f in a.flows)
+            total_req_dl = sum(f.bw_dl for a in apps for f in a.flows)
+            am_terms = self._build_am_objectives(slices, am_vars, am_state, total_req_ul, total_req_dl)
 
         # 3. 构建目标函数项
         term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak = self._build_objectives(
@@ -177,7 +386,15 @@ class SliceOptimizationEngine:
             term_qos_core,
             term_qos_aux,
             term_tiebreak,
+            am_terms=am_terms,
+            am_vars=am_vars,
+            am_state=am_state,
         )
+        # 关键步骤：提取 AM 最优解
+        am_solution = None
+        if am_vars is not None and am_state is not None:
+            am_solution = self._extract_am_solution(slices, am_vars, am_state)
+            breakdown["am_solution"] = am_solution
         logger.info(f"求解完成. 状态: {status_str}")
         return flow_results, slice_results, status_str, objective_val, breakdown
 
@@ -197,6 +414,16 @@ class SliceOptimizationEngine:
         self._add_incremental_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, fix_bandwidth=True)
         self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
         self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
+
+        # 关键步骤：可选 AM 联合优化
+        am_vars, am_terms, am_state = None, None, None
+        if self.config.enable_am_optimization and self.config.am_policy_state is not None:
+            am_state = self.config.am_policy_state
+            am_vars = self._create_am_variables(slices, am_state)
+            self._add_am_coupling_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, am_vars, am_state)
+            total_req_ul = sum(f.bw_ul for a in apps for f in a.flows)
+            total_req_dl = sum(f.bw_dl for a in apps for f in a.flows)
+            am_terms = self._build_am_objectives(slices, am_vars, am_state, total_req_ul, total_req_dl)
 
         term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak = self._build_objectives(
             apps, slices, x, served, dev, change, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
@@ -218,10 +445,16 @@ class SliceOptimizationEngine:
             term_qos_core,
             term_qos_aux,
             term_tiebreak,
+            am_terms=am_terms,
+            am_vars=am_vars,
+            am_state=am_state,
         )
         if status_str == "Infeasible":
             logger.warning("Strict incremental infeasible, retrying with relaxed bandwidth preservation")
             return self._solve_incremental_relaxed(apps, slices, nodes)
+        # 关键步骤：提取 AM 最优解
+        if am_vars is not None and am_state is not None:
+            breakdown["am_solution"] = self._extract_am_solution(slices, am_vars, am_state)
         logger.info(f"增量求解完成. 状态: {status_str}")
         return flow_results, slice_results, status_str, objective_val, breakdown
 
@@ -245,6 +478,16 @@ class SliceOptimizationEngine:
         self._add_slice_constraints(prob, apps, slices, B_act_ul, B_act_dl, dev)
         self._add_node_constraints(prob, apps, slices, nodes, B_act_ul, B_act_dl)
 
+        # 关键步骤：可选 AM 联合优化
+        am_vars, am_terms, am_state = None, None, None
+        if self.config.enable_am_optimization and self.config.am_policy_state is not None:
+            am_state = self.config.am_policy_state
+            am_vars = self._create_am_variables(slices, am_state)
+            self._add_am_coupling_constraints(prob, apps, slices, x, B_act_ul, B_act_dl, am_vars, am_state)
+            total_req_ul = sum(f.bw_ul for a in apps for f in a.flows)
+            total_req_dl = sum(f.bw_dl for a in apps for f in a.flows)
+            am_terms = self._build_am_objectives(slices, am_vars, am_state, total_req_ul, total_req_dl)
+
         term_load_raw, term_sig_raw, term_load, term_sig, term_exp, term_qos_core, term_qos_aux, term_tiebreak = self._build_objectives(
             apps, slices, x, served, dev, change, deficit_ul, deficit_dl, gbr_gap_ul, gbr_gap_dl
         )
@@ -265,7 +508,13 @@ class SliceOptimizationEngine:
             term_qos_core,
             term_qos_aux,
             term_tiebreak,
+            am_terms=am_terms,
+            am_vars=am_vars,
+            am_state=am_state,
         )
+        # 关键步骤：提取 AM 最优解
+        if am_vars is not None and am_state is not None:
+            breakdown["am_solution"] = self._extract_am_solution(slices, am_vars, am_state)
         logger.info(f"混合求解完成. 状态: {status_str}")
         return flow_results, slice_results, status_str, objective_val, breakdown
 

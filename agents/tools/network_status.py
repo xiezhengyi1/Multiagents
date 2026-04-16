@@ -4,12 +4,14 @@ from typing import Optional
 
 from langchain.tools import ToolRuntime, tool
 
+from agents.tools.wrapper_think import tool_with_reason
+
 from agent_runtime import AgentRuntimeContext
 from agents.tools.init_scenario import get_current_scenario
 from dataclasses import asdict
 from agents.tools.network_graph import build_and_persist_graph_from_scenario, get_latest_graph
 
-@tool
+@tool_with_reason
 def save_network_status_snapshot(
     trigger_event: str = "Manual",
     runtime: ToolRuntime[AgentRuntimeContext] = None,
