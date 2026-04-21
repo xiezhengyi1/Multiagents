@@ -21,6 +21,8 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
 from database.langchain_pg import (
+    PCF_AM_POLICY_CLAUSES_COLLECTION,
+    PCF_AM_POLICY_SCHEMA_COLLECTION,
     PCF_POLICY_GLOSSARY_COLLECTION,
     PCF_SM_POLICY_CLAUSES_COLLECTION,
     PCF_SM_POLICY_SCHEMA_COLLECTION,
@@ -60,11 +62,42 @@ CHANGE_REQUEST_RE = re.compile(r"\bC\d-\d+\b", re.IGNORECASE)
 MINIMAL_KB_SOURCE_IDS = {
     "ts_23503_pdf",
     "ts_24526_pdf",
+    "ts_29507_pdf",
+    "ts_29507_yaml",
     "ts_29512_pdf",
     "ts_29512_yaml",
     "ts_29525_pdf",
     "ts_29525_yaml",
+    "ts_29571_yaml",
 }
+
+AM_POLICY_RELEVANCE_TERMS = (
+    "ampolicy",
+    "am policy",
+    "access and mobility policy",
+    "npcf_ampolicycontrol",
+    "policyassociation",
+    "policy association",
+    "policyassociationrequest",
+    "policyassociationupdaterequest",
+    "amrequestedvaluerep",
+    "requesttrigger",
+    "allowed nssai",
+    "allowedsnssais",
+    "target nssai",
+    "targetsnssais",
+    "partially allowed nssai",
+    "pending nssai",
+    "rejected snssais",
+    "service area restriction",
+    "servareares",
+    "rfsp",
+    "rfspindex",
+    "presence reporting area",
+    "pra",
+    "smf selection",
+    "ue slice mbr",
+)
 
 SM_POLICY_RELEVANCE_TERMS = (
     "smpolicy",
@@ -132,6 +165,90 @@ CANONICAL_TERM_ALIASES: Dict[str, Dict[str, Any]] = {
         "related_objects": ["SessionRule"],
         "policy_domain": "sm_policy",
     },
+    "Npcf_AMPolicyControl": {
+        "aliases": [
+            "AM Policy",
+            "AM Policy Control",
+            "Access and Mobility Policy Control",
+            "AM policy API",
+        ],
+        "related_specs": ["29.507", "23.503", "29.571"],
+        "related_objects": [
+            "PolicyAssociation",
+            "PolicyAssociationRequest",
+            "PolicyAssociationUpdateRequest",
+            "AmRequestedValueRep",
+            "RequestTrigger",
+            "ServiceAreaRestriction",
+            "RfspIndex",
+            "PresenceInfo",
+        ],
+        "policy_domain": "am_policy",
+    },
+    "PcfAmPolicyControlPolicyAssociation": {
+        "aliases": ["PolicyAssociation", "AM Policy Association", "policy association"],
+        "related_specs": ["29.507", "23.503", "29.571"],
+        "related_objects": [
+            "PolicyAssociation",
+            "PolicyAssociationRequest",
+            "PolicyAssociationUpdateRequest",
+            "AmRequestedValueRep",
+        ],
+        "policy_domain": "am_policy",
+    },
+    "PcfAmPolicyControlPolicyAssociationRequest": {
+        "aliases": ["PolicyAssociationRequest", "AM Policy Association Request"],
+        "related_specs": ["29.507", "29.571"],
+        "related_objects": [
+            "PolicyAssociationRequest",
+            "ServiceAreaRestriction",
+            "RfspIndex",
+            "SmfSelectionData",
+        ],
+        "policy_domain": "am_policy",
+    },
+    "PcfAmPolicyControlRequestTrigger": {
+        "aliases": ["RequestTrigger", "AM Policy Request Trigger", "policy trigger"],
+        "related_specs": ["29.507"],
+        "related_objects": ["RequestTrigger", "AmRequestedValueRep"],
+        "policy_domain": "am_policy",
+    },
+    "Allowed NSSAI": {
+        "aliases": ["allowedSnssais", "allowed S-NSSAIs", "allowed S-NSSAI"],
+        "related_specs": ["29.507", "23.503", "29.571"],
+        "related_objects": ["PolicyAssociationRequest", "AmRequestedValueRep", "Snssai"],
+        "policy_domain": "am_policy",
+    },
+    "Target NSSAI": {
+        "aliases": ["targetSnssais", "target S-NSSAIs", "target S-NSSAI"],
+        "related_specs": ["29.507", "23.503", "29.571"],
+        "related_objects": ["PolicyAssociationRequest", "PolicyAssociationUpdateRequest", "Snssai"],
+        "policy_domain": "am_policy",
+    },
+    "ServiceAreaRestriction": {
+        "aliases": ["service area restriction", "servAreaRes", "service-area"],
+        "related_specs": ["29.507", "29.571", "23.503"],
+        "related_objects": ["ServiceAreaRestriction", "PolicyAssociation", "PolicyAssociationRequest"],
+        "policy_domain": "am_policy",
+    },
+    "RfspIndex": {
+        "aliases": ["RFSP", "rfsp", "RFSP index"],
+        "related_specs": ["29.507", "29.571", "23.503"],
+        "related_objects": ["RfspIndex", "PolicyAssociation", "PolicyAssociationRequest"],
+        "policy_domain": "am_policy",
+    },
+    "AmRequestedValueRep": {
+        "aliases": ["current mobility requested values", "AM requested value report"],
+        "related_specs": ["29.507", "29.571"],
+        "related_objects": ["AmRequestedValueRep", "RequestTrigger", "PresenceInfo"],
+        "policy_domain": "am_policy",
+    },
+    "PresenceInfo": {
+        "aliases": ["PRA", "presence reporting area", "praStatuses", "pras"],
+        "related_specs": ["29.507", "29.571"],
+        "related_objects": ["PresenceInfo", "AmRequestedValueRep", "PolicyAssociationUpdateRequest"],
+        "policy_domain": "am_policy",
+    },
     "Npcf_UEPolicyControl": {
         "aliases": ["UE Policy Control", "URSP control API", "UE policy API"],
         "related_specs": ["29.525", "23.503"],
@@ -197,6 +314,7 @@ def _utcnow() -> str:
 def default_sources() -> List[CorpusSource]:
     return [
         CorpusSource("ts_23503_pdf", "23.503", "Policy and charging control framework for the 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/123500_123599/123503/18.08.00_60/ts_123503v180800p.pdf", "stage2", "shared", "ts_123503_v18_8_0.pdf"),
+        CorpusSource("ts_29507_pdf", "29.507", "Access and Mobility Policy Control Service", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129507/18.08.00_60/ts_129507v180800p.pdf", "stage3", "am_policy", "ts_129507_v18_8_0.pdf"),
         CorpusSource("ts_29512_pdf", "29.512", "Session Management Policy Control Service", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129512/18.08.00_60/ts_129512v180800p.pdf", "stage3", "sm_policy", "ts_129512_v18_8_0.pdf"),
         CorpusSource("ts_29514_pdf", "29.514", "Policy Authorization Service", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129514/18.08.00_60/ts_129514v180800p.pdf", "stage3", "sm_policy", "ts_129514_v18_8_0.pdf"),
         CorpusSource("ts_24526_pdf", "24.526", "UE policies for 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/124500_124599/124526/18.08.00_60/ts_124526v180800p.pdf", "stage3", "ursp", "ts_124526_v18_8_0.pdf"),
@@ -204,6 +322,7 @@ def default_sources() -> List[CorpusSource]:
         CorpusSource("ts_29519_pdf", "29.519", "UDR policy data definitions", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129519/18.08.00_60/ts_129519v180800p.pdf", "stage3", "ursp", "ts_129519_v18_8_0.pdf"),
         CorpusSource("ts_24501_pdf", "24.501", "NAS protocol for 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/124500_124599/124501/18.08.00_60/ts_124501v180800p.pdf", "stage3", "shared", "ts_124501_v18_8_0.pdf"),
         CorpusSource("ts_23501_pdf", "23.501", "System architecture for the 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/123500_123599/123501/18.08.00_60/ts_123501v180800p.pdf", "stage2", "shared", "ts_123501_v18_8_0.pdf"),
+        CorpusSource("ts_29507_yaml", "29.507", "Npcf_AMPolicyControl OpenAPI", "18", "1.0.7", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29507_Npcf_AMPolicyControl.yaml", "openapi", "am_policy", "TS29507_Npcf_AMPolicyControl.yaml"),
         CorpusSource("ts_29512_yaml", "29.512", "Npcf_SMPolicyControl OpenAPI", "18", "1.3.4", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29512_Npcf_SMPolicyControl.yaml", "openapi", "sm_policy", "TS29512_Npcf_SMPolicyControl.yaml"),
         CorpusSource("ts_29525_yaml", "29.525", "Npcf_UEPolicyControl OpenAPI", "18", "1.3.3", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29525_Npcf_UEPolicyControl.yaml", "openapi", "ursp", "TS29525_Npcf_UEPolicyControl.yaml"),
         CorpusSource("ts_29571_yaml", "29.571", "Common Data Types OpenAPI", "18", "1.5.4", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29571_CommonData.yaml", "openapi", "shared", "TS29571_CommonData.yaml"),
@@ -302,6 +421,22 @@ def infer_object_tags(text: str, *, schema_name: str = "", operation_id: str = "
         "PccRule",
         "QosData",
         "SessionRule",
+        "PolicyAssociation",
+        "PolicyAssociationRequest",
+        "PolicyAssociationUpdateRequest",
+        "AmRequestedValueRep",
+        "RequestTrigger",
+        "ServiceAreaRestriction",
+        "WirelineServiceAreaRestriction",
+        "RfspIndex",
+        "PresenceInfo",
+        "SmfSelectionData",
+        "UeSliceMbr",
+        "Allowed NSSAI",
+        "Target NSSAI",
+        "Partially Allowed NSSAI",
+        "Pending NSSAI",
+        "Rejected S-NSSAI",
         "TrafficControlData",
         "ChargingData",
         "PolicyControlRequestTrigger",
@@ -324,6 +459,8 @@ def infer_object_tags(text: str, *, schema_name: str = "", operation_id: str = "
             tags.append(candidate)
     if "npcf_smpolicycontrol" in haystack:
         tags.append("Npcf_SMPolicyControl")
+    if "npcf_ampolicycontrol" in haystack:
+        tags.append("Npcf_AMPolicyControl")
     if "npcf_uepolicycontrol" in haystack:
         tags.append("Npcf_UEPolicyControl")
     return sorted(set(tags))
@@ -349,6 +486,8 @@ def _infer_strategy_domains(
         if tag in OBJECT_POLICY_DOMAIN_MAP
     }
     lowered = searchable_text.lower()
+    if any(term in lowered for term in AM_POLICY_RELEVANCE_TERMS):
+        domains.add("am_policy")
     if any(term in lowered for term in SM_POLICY_RELEVANCE_TERMS):
         domains.add("sm_policy")
     if any(term in lowered for term in URSP_RELEVANCE_TERMS):
@@ -371,6 +510,8 @@ def _should_keep_record(
         return True
 
     lowered = searchable_text.lower()
+    if "am_policy" in strategy_domains and any(term in lowered for term in AM_POLICY_RELEVANCE_TERMS):
+        return True
     if "sm_policy" in strategy_domains and any(term in lowered for term in SM_POLICY_RELEVANCE_TERMS):
         return True
     if "ursp" in strategy_domains and any(term in lowered for term in URSP_RELEVANCE_TERMS):
@@ -919,6 +1060,9 @@ def build_auxiliary_maps(clause_records: List[Dict[str, Any]], schema_records: L
 
 def build_eval_queries() -> List[Dict[str, str]]:
     return [
+        {"query": "Which AM policy fields carry allowed NSSAI target NSSAI and RFSP", "target_collection": PCF_AM_POLICY_SCHEMA_COLLECTION},
+        {"query": "What request triggers are defined for AM Policy Control", "target_collection": PCF_AM_POLICY_SCHEMA_COLLECTION},
+        {"query": "How does Npcf_AMPolicyControl relate to service area restriction and presence reporting area", "target_collection": PCF_POLICY_GLOSSARY_COLLECTION},
         {"query": "What core objects are included in SmPolicyDecision", "target_collection": PCF_SM_POLICY_SCHEMA_COLLECTION},
         {"query": "What is the responsibility boundary between Npcf_SMPolicyControl and Npcf_UEPolicyControl", "target_collection": PCF_POLICY_GLOSSARY_COLLECTION},
         {"query": "What descriptors make up a URSP rule", "target_collection": PCF_URSP_CLAUSES_COLLECTION},
@@ -960,6 +1104,19 @@ def records_to_documents(records: Iterable[Dict[str, Any]]) -> List[Any]:
     return [build_pgvector_document(page_content=record["page_content"], metadata=record["metadata"]) for record in records]
 
 
+def collection_scoped_ids(collection_name: str, records: Iterable[Dict[str, Any]]) -> List[str]:
+    normalized_collection = str(collection_name or "").strip()
+    if not normalized_collection:
+        raise ValueError("collection_name is required for collection-scoped ids.")
+    scoped_ids: List[str] = []
+    for record in records:
+        record_id = str(record.get("id") or "").strip()
+        if not record_id:
+            raise ValueError("record id is required for collection-scoped ids.")
+        scoped_ids.append(f"{normalized_collection}:{record_id}")
+    return scoped_ids
+
+
 def normalize_records_for_embedding(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     normalized_records: List[Dict[str, Any]] = []
     for record in records:
@@ -980,12 +1137,16 @@ def ingest_processed_corpus() -> Dict[str, int]:
     if not clause_records or not schema_records or not glossary_records:
         raise RuntimeError("Processed corpus is incomplete. Run build first.")
 
+    am_clause_records = [record for record in clause_records if "am_policy" in (record["metadata"].get("strategy_domains") or [])]
     sm_clause_records = [record for record in clause_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
     ursp_clause_records = [record for record in clause_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
+    am_schema_records = [record for record in schema_records if "am_policy" in (record["metadata"].get("strategy_domains") or [])]
     sm_schema_records = [record for record in schema_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
     ursp_schema_records = [record for record in schema_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
 
     targets = [
+        (PCF_AM_POLICY_CLAUSES_COLLECTION, am_clause_records),
+        (PCF_AM_POLICY_SCHEMA_COLLECTION, am_schema_records),
         (PCF_SM_POLICY_CLAUSES_COLLECTION, sm_clause_records),
         (PCF_SM_POLICY_SCHEMA_COLLECTION, sm_schema_records),
         (PCF_URSP_CLAUSES_COLLECTION, ursp_clause_records),
@@ -996,7 +1157,7 @@ def ingest_processed_corpus() -> Dict[str, int]:
     for collection_name, records in targets:
         store = rebuild_pgvector_collection(collection_name=collection_name)
         if records:
-            store.add_documents(records_to_documents(records), ids=[record["id"] for record in records])
+            store.add_documents(records_to_documents(records), ids=collection_scoped_ids(collection_name, records))
         stats[collection_name] = len(records)
         logger.info("Ingested %s documents into %s.", len(records), collection_name)
     return stats
@@ -1010,7 +1171,7 @@ def run_pipeline(*, force_fetch: bool = False) -> Dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build the PCF SmPolicy + URSP standards knowledge base.")
+    parser = argparse.ArgumentParser(description="Build the PCF SM/AM/UE policy standards knowledge base.")
     parser.add_argument("command", choices=["fetch", "build", "ingest", "all"])
     parser.add_argument("--force-fetch", action="store_true")
     args = parser.parse_args()

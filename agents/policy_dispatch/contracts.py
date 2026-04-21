@@ -18,5 +18,6 @@ class FeedbackReport(BaseModel):
     failure_scope: str = Field(default="none", description="qos, mobility, mixed, compile, or none")
     feedback_payload: Dict[str, Any] = Field(default_factory=dict, description="Machine-readable payload for the next consumer")
     dispatch_attempts: int = Field(default=0, description="How many dispatch attempts PDA used in this execution round")
+    committed_snapshot_id: str = Field(default="", description="Snapshot id produced by the final commit writeback")
 
 __all__ = ["FeedbackReport", "FeedbackSummaryDraft"]

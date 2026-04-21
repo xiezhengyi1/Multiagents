@@ -104,6 +104,7 @@ def build_domain_feedback(
         "dispatch_receipts": qos_receipts,
         "assurance_verdicts": qos_verdicts,
         "failure_scope": str(report.failure_scope or "").strip(),
+        "committed_snapshot_id": str(getattr(report, "committed_snapshot_id", "") or "").strip(),
     }
     mobility_feedback = {
         "status": "success" if mobility_receipts and all(item.get("status") == "success" for item in mobility_receipts) else "failed",

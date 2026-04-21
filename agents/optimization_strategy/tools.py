@@ -56,11 +56,11 @@ def _summarize_optimizer_result(result: Any) -> Dict[str, Any]:
     if isinstance(target_app, dict) and target_app.get("flows"):
         summary["qos_flow_assignments"] = [
             {
-                "flow_id": _pick_first(flow, ("flow_id", "Flow ID")),
-                "new_slice": _pick_first(flow, ("new_slice", "New Slice")),
-                "bw_ul": _pick_first(flow, ("bw_ul", "Act BW UL", "Req BW UL")),
-                "bw_dl": _pick_first(flow, ("bw_dl", "Act BW DL", "Req BW DL")),
-                "lat": _pick_first(flow, ("lat", "Latency", "Req Lat")),
+                "flow_id": flow.get("id"),
+                "new_slice": ((flow.get("allocation") or {}).get("current_slice_snssai")),
+                "bw_ul": ((flow.get("allocation") or {}).get("allocated_bandwidth_ul")),
+                "bw_dl": ((flow.get("allocation") or {}).get("allocated_bandwidth_dl")),
+                "lat": ((flow.get("telemetry") or {}).get("latency") or (flow.get("sla") or {}).get("latency")),
             }
             for flow in target_app["flows"]
             if isinstance(flow, dict)

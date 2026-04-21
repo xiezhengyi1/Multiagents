@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -65,35 +65,23 @@ class BaseAgent:
     def __init__(self, model_name: str = "qwen-plus", temperature: float = 0, use_local_model: bool = False) -> None:
         self._cache = RuntimeCache()
         if use_local_model:
-            api_key = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
-            model_name = os.getenv("OLLAMA_MODEL_NAME", "gemma4-26b")
+            base_url = os.getenv("vLLM_URL")
+            model_name = os.getenv("vLLM_MODEL_NAME")
             self.model_name = model_name
             self.temperature = temperature
             self.llm = ChatOpenAI(
                 model=model_name,
                 temperature=temperature,
-                api_key=api_key,
-                base_url=api_key,
+                api_key=base_url,
+                base_url=base_url,
                 timeout=120.0,
                 max_retries=2,
             )
             return
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
-        base_url = os.getenv("OPENAI_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        api_key = os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("OPENAI_BASE_URL")
         raw_timeout = os.getenv("OPENAI_TIMEOUT_SECONDS", "120")
         raw_max_retries = os.getenv("OPENAI_MAX_RETRIES", "2")
-
-        # 中文标注：API Key 缺失直接抛出，不再静默打印警告
-        if not api_key:
-            raise RuntimeError("Missing API key: set OPENAI_API_KEY or DASHSCOPE_API_KEY")
-
-        timeout_seconds = float(raw_timeout)
-        if timeout_seconds <= 0:
-            raise ValueError("OPENAI_TIMEOUT_SECONDS must be positive")
-
-        max_retries = int(raw_max_retries)
-        if max_retries < 0:
-            raise ValueError("OPENAI_MAX_RETRIES must be >= 0")
 
         self.model_name = model_name
         self.temperature = temperature
@@ -102,8 +90,8 @@ class BaseAgent:
             temperature=temperature,
             api_key=api_key,
             base_url=base_url,
-            timeout=timeout_seconds,
-            max_retries=max_retries,
+            timeout=float(raw_timeout),
+            max_retries=int(raw_max_retries),
         )
 
     def get_llm(self) -> ChatOpenAI:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
@@ -9,6 +10,8 @@ from typing import Any, Callable, Dict, Optional
 from domain.policy_plan import PolicyPlan
 from domain.policy_compiler import PolicyCompiler
 from domain.policy_guard import PolicyGuard
+from agents.tools.db_tool import get_latest_snapshot_metadata, update_scenario_in_db
+from agents.tools.init_scenario import cache_scenario, get_cached_control_scenario, get_current_scenario
 from workflows.assurance_evaluator import AssuranceEvaluator
 from utils.logger import log_event, log_timing, setup_logger
 
@@ -24,6 +27,7 @@ class ExecutionOutcome:
     failure_scope: str = "none"
     feedback_payload: Dict[str, Any] = field(default_factory=dict)
     dispatch_attempts: int = 0
+    committed_snapshot_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -36,6 +40,7 @@ class ExecutionOutcome:
             "failure_scope": self.failure_scope,
             "feedback_payload": self.feedback_payload,
             "dispatch_attempts": self.dispatch_attempts,
+            "committed_snapshot_id": self.committed_snapshot_id,
         }
 
 
@@ -255,6 +260,7 @@ class ExecutionController:
             failure_scope=failure_scope,
             feedback_payload=feedback_payload or {},
             dispatch_attempts=dispatch_attempts,
+            committed_snapshot_id="",
         )
 
     @classmethod
@@ -403,9 +409,164 @@ class ExecutionController:
             policies=plan.policies,
         )
 
+    @staticmethod
+    def _find_app_for_patch(
+        apps: list[Any],
+        *,
+        app_id: str,
+        app_name: str,
+        supi: str,
+    ) -> Optional[Any]:
+        normalized_app_id = str(app_id or "").strip()
+        normalized_app_name = str(app_name or "").strip()
+        normalized_supi = str(supi or "").strip()
+        for app in apps:
+            if normalized_app_id and str(getattr(app, "id", "") or "").strip() == normalized_app_id:
+                return app
+            if normalized_app_name and str(getattr(app, "name", "") or "").strip() == normalized_app_name:
+                return app
+        if normalized_supi:
+            for app in apps:
+                if str(getattr(app, "supi", "") or "").strip() == normalized_supi:
+                    return app
+        return None
+
+    @staticmethod
+    def _apply_flow_patch(flow: Any, patch: Dict[str, Any]) -> None:
+        sla_patch = patch.get("sla") if isinstance(patch.get("sla"), dict) else {}
+        allocation_patch = patch.get("allocation") if isinstance(patch.get("allocation"), dict) else {}
+        telemetry_patch = patch.get("telemetry") if isinstance(patch.get("telemetry"), dict) else {}
+
+        for attr, key in (
+            ("bandwidth_ul", "bandwidth_ul"),
+            ("bandwidth_dl", "bandwidth_dl"),
+            ("guaranteed_bandwidth_ul", "guaranteed_bandwidth_ul"),
+            ("guaranteed_bandwidth_dl", "guaranteed_bandwidth_dl"),
+            ("latency", "latency"),
+            ("jitter", "jitter"),
+            ("loss_rate", "loss_rate"),
+            ("priority", "priority"),
+        ):
+            if key in sla_patch and sla_patch[key] is not None:
+                setattr(flow.sla, attr, sla_patch[key])
+
+        for attr, key in (
+            ("current_slice_snssai", "current_slice_snssai"),
+            ("allocated_bandwidth_ul", "allocated_bandwidth_ul"),
+            ("allocated_bandwidth_dl", "allocated_bandwidth_dl"),
+        ):
+            if key in allocation_patch:
+                setattr(flow.allocation, attr, allocation_patch[key])
+
+        for attr, key in (
+            ("throughput_ul", "throughput_ul"),
+            ("throughput_dl", "throughput_dl"),
+            ("latency", "latency"),
+            ("jitter", "jitter"),
+            ("loss_rate", "loss_rate"),
+            ("packet_sent", "packet_sent"),
+            ("packet_received", "packet_received"),
+        ):
+            if key in telemetry_patch:
+                setattr(flow.telemetry, attr, telemetry_patch[key])
+
+    def _commit_snapshot_writeback(self, strategy_output: Any) -> str:
+        planning_metadata = getattr(strategy_output, "planning_metadata", {}) or {}
+        if not isinstance(planning_metadata, dict):
+            return ""
+        writeback_patch = planning_metadata.get("snapshot_writeback_patch") or {}
+        if not isinstance(writeback_patch, dict):
+            return ""
+
+        qos_plan = writeback_patch.get("qos_plan") or {}
+        if not isinstance(qos_plan, dict):
+            return ""
+
+        target_app_patch = qos_plan.get("target_app") or {}
+        impacted_flows = qos_plan.get("impacted_flows") or []
+        if not isinstance(target_app_patch, dict) and not isinstance(impacted_flows, list):
+            return ""
+
+        apps, slices, nodes = deepcopy(get_current_scenario())
+        cached_control = get_cached_control_scenario()
+        flow_patches: list[tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]] = []
+
+        if isinstance(target_app_patch, dict):
+            target_flow_patches = target_app_patch.get("flows") or []
+            if isinstance(target_flow_patches, list):
+                for item in target_flow_patches:
+                    if isinstance(item, dict):
+                        flow_patches.append(
+                            (
+                                str(target_app_patch.get("id") or "").strip() or None,
+                                str(target_app_patch.get("name") or "").strip() or None,
+                                str(target_app_patch.get("supi") or getattr(strategy_output, "supi", "") or "").strip() or None,
+                                item,
+                            )
+                        )
+
+        if isinstance(impacted_flows, list):
+            for item in impacted_flows:
+                if not isinstance(item, dict):
+                    continue
+                flow_payload = item.get("flow")
+                if not isinstance(flow_payload, dict):
+                    continue
+                flow_patches.append(
+                    (
+                        str(item.get("app_id") or "").strip() or None,
+                        str(item.get("app_name") or "").strip() or None,
+                        str(item.get("supi") or "").strip() or None,
+                        flow_payload,
+                    )
+                )
+
+        if not flow_patches:
+            return ""
+
+        for app_id, app_name, supi, flow_patch in flow_patches:
+            flow_id = str(flow_patch.get("id") or "").strip()
+            if not flow_id:
+                continue
+            app = self._find_app_for_patch(apps, app_id=app_id or "", app_name=app_name or "", supi=supi or "")
+            if app is None:
+                continue
+            target_flow = next((flow for flow in app.flows if str(getattr(flow, "id", "") or "").strip() == flow_id), None)
+            if target_flow is None:
+                continue
+            self._apply_flow_patch(target_flow, flow_patch)
+
+        persisted = update_scenario_in_db(
+            apps,
+            slices,
+            nodes,
+            mobility_data=cached_control.get("mobility") or [],
+            policy_data=cached_control.get("policy_state") or {},
+            trigger="Workflow-Commit",
+        )
+        if not persisted:
+            raise RuntimeError("failed to persist committed scenario snapshot")
+        cache_scenario(
+            apps,
+            slices,
+            nodes,
+            cached_control.get("mobility") or [],
+            cached_control.get("policy_state") or {},
+        )
+        latest_snapshot = get_latest_snapshot_metadata() or {}
+        return str(latest_snapshot.get("snapshot_id") or "").strip()
+
     def execute(self, strategy_output: Any) -> ExecutionOutcome:
         total_start = datetime.now().timestamp()
-        log_event(self.logger, "pda_execute_start")
+        policies = list(getattr(strategy_output, "all_policies", []) or [])
+        log_event(
+            self.logger,
+            "pda_execute_start",
+            session_id=str(getattr(strategy_output, "session_id", "") or "").strip() or "<empty>",
+            snapshot_id=str(getattr(strategy_output, "snapshot_id", "") or "").strip() or "<empty>",
+            supi=str(getattr(strategy_output, "supi", "") or "").strip() or "<empty>",
+            policy_count=len(policies),
+        )
 
         try:
             plan = self.compiler.compile_plan(strategy_output)
@@ -483,6 +644,13 @@ class ExecutionController:
                         policy_index=index,
                         policy_id=policy["policy_id"],
                         status="dispatch_failed",
+                        failure_scope=(
+                            "mobility"
+                            if str(policy.get("policy_type") or "").strip() == self.AM_POLICY_TYPE
+                            else "qos"
+                        ),
+                        error_summary=str(exc),
+                        recommended_consumer=exc.recommended_consumer,
                     )
                     continue
 
@@ -563,6 +731,10 @@ class ExecutionController:
                     "pda_total",
                     datetime.now().timestamp() - total_start,
                     status="partial" if execution_status == "Partial Success" else "error",
+                    failure_scope=failure_scope,
+                    recommended_consumer=recommended_consumer,
+                    failed_policy_count=len(failed_policy_ids),
+                    successful_policy_count=len(successful_policy_ids),
                 )
                 return ExecutionOutcome(
                     execution_status=execution_status,
@@ -589,6 +761,7 @@ class ExecutionController:
                 session_id=policy_plan.session_id,
                 snapshot_id=policy_plan.snapshot_id,
             )
+            committed_snapshot_id = self._commit_snapshot_writeback(strategy_output)
 
             performance_metrics = json.dumps(
                 {
@@ -596,6 +769,7 @@ class ExecutionController:
                     "dispatch_results": execution_receipts,
                     "assurance_results": assurance_results,
                     "dispatch_attempts": total_dispatch_attempts,
+                    "committed_snapshot_id": committed_snapshot_id,
                     "domain_receipts": {
                         "qos": [item for item in execution_receipts if item.get("policy_type") != self.AM_POLICY_TYPE],
                         "mobility": [item for item in execution_receipts if item.get("policy_type") == self.AM_POLICY_TYPE],
@@ -614,6 +788,7 @@ class ExecutionController:
                 failure_scope="none",
                 feedback_payload={},
                 dispatch_attempts=total_dispatch_attempts,
+                committed_snapshot_id=committed_snapshot_id,
             )
         except ExecutionDecisionError as exc:
             log_timing(self.logger, "pda_total", datetime.now().timestamp() - total_start, status="error")

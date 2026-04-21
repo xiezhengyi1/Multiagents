@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from langchain.tools import ToolRuntime, tool
+from langchain_core.documents import Document
+from langchain.tools import ToolRuntime
 
 from agents.tools.wrapper_think import tool_with_reason
 
 from agent_runtime import AgentRuntimeContext
 from database.langchain_pg import (
+    PCF_AM_POLICY_CLAUSES_COLLECTION,
+    PCF_AM_POLICY_SCHEMA_COLLECTION,
     PCF_SM_POLICY_CLAUSES_COLLECTION,
     PCF_SM_POLICY_SCHEMA_COLLECTION,
     PCF_URSP_CLAUSES_COLLECTION,
@@ -35,6 +40,155 @@ DEFAULT_RETURNED_RESULTS = 10
 MAX_RETURNED_RESULTS = 30
 MAX_CONTENT_CHARS = 1200
 MAX_SUMMARY_CHARS = 240
+BGE_RERANK_MODEL = "BAAI/bge-reranker-base"
+BGE_RERANK_INPUT_CHARS = 3200
+BGE_RERANK_TERM_CHARS = 700
+SEARCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "belong",
+    "by",
+    "carry",
+    "core",
+    "defined",
+    "describe",
+    "descriptors",
+    "does",
+    "do",
+    "explain",
+    "fields",
+    "for",
+    "how",
+    "in",
+    "included",
+    "include",
+    "is",
+    "it",
+    "make",
+    "of",
+    "or",
+    "relation",
+    "relationship",
+    "relate",
+    "responsibility",
+    "the",
+    "their",
+    "these",
+    "this",
+    "those",
+    "to",
+    "under",
+    "used",
+    "using",
+    "what",
+    "where",
+    "which",
+}
+GLOSSARY_QUERY_KEYWORDS = {
+    "acronym",
+    "alias",
+    "aliases",
+    "basics",
+    "called",
+    "canonical",
+    "expand",
+    "expansion",
+    "mean",
+    "means",
+    "term",
+    "terminology",
+    "what is",
+}
+GENERIC_CLAUSE_TERMS = {
+    "general",
+    "overview",
+    "security",
+    "scope",
+    "introduction",
+    "references",
+    "history",
+    "foreword",
+}
+URSP_SCHEMA_HINT_TERMS = {
+    "association",
+    "contains",
+    "enum",
+    "field",
+    "fields",
+    "parameter",
+    "parameters",
+    "report",
+    "reported",
+    "requesttrigger",
+    "requestedvalue",
+    "requestedvaluerep",
+    "response",
+    "schema",
+}
+URSP_CLAUSE_HINT_TERMS = {
+    "defined",
+    "definition",
+    "descriptor",
+    "descriptors",
+    "make up",
+    "rule",
+    "rules",
+    "structure",
+    "where",
+}
+AM_SCHEMA_HINT_TERMS = {
+    "allowed nssai",
+    "allowedsnssais",
+    "am policy",
+    "mobility",
+    "policy association",
+    "policyassociation",
+    "requesttrigger",
+    "rfsp",
+    "service area",
+    "service area restriction",
+    "target nssai",
+    "targetsnssais",
+}
+AM_CLAUSE_HINT_TERMS = {
+    "clause",
+    "described",
+    "where",
+}
+SM_QOS_TABLE_HINT_TERMS = {
+    "5qi",
+    "delay",
+    "jitter",
+    "latency",
+    "packet delay budget",
+    "packet error rate",
+    "qos requirements",
+    "requirements",
+}
+AM_POLICY_KEYWORDS = (
+    "ampolicy",
+    "am policy",
+    "npcf_ampolicycontrol",
+    "policyassociation",
+    "policy association",
+    "policyassociationrequest",
+    "policyassociationupdaterequest",
+    "amrequestedvaluerep",
+    "requesttrigger",
+    "allowed nssai",
+    "target nssai",
+    "service area",
+    "service area restriction",
+    "rfsp",
+    "pra",
+    "presence reporting area",
+    "ue ambr",
+)
 SM_POLICY_KEYWORDS = (
     "smpolicy",
     "sm policy",
@@ -82,6 +236,20 @@ SCHEMA_QUERY_KEYWORDS = (
     "value",
     "values",
 )
+OPERATION_QUERY_KEYWORDS = (
+    "api",
+    "endpoint",
+    "operation",
+    "method",
+    "create",
+    "delete",
+    "update",
+    "read",
+    "post",
+    "get",
+    "put",
+    "patch",
+)
 REQUIRED_KB_PATHS = (
     CLAUSE_JSONL,
     SCHEMA_JSONL,
@@ -92,6 +260,7 @@ REQUIRED_KB_PATHS = (
     SPEC_OBJECT_MAP_JSON,
     TERM_ALIAS_MAP_JSON,
 )
+COMPOUND_TERM_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+")
 
 
 def _log_prefix(runtime: ToolRuntime[AgentRuntimeContext] = None) -> str:
@@ -130,6 +299,36 @@ def _shorten(text: str, *, limit: int = MAX_CONTENT_CHARS) -> str:
     return f"{cleaned[: limit - 3].rstrip()}..."
 
 
+def _normalize_search_term(term: str) -> str:
+    normalized = _normalized(term)
+    if len(normalized) > 4 and normalized.endswith("ies"):
+        return f"{normalized[:-3]}y"
+    if len(normalized) > 4 and normalized.endswith("s") and not normalized.endswith("ss"):
+        return normalized[:-1]
+    return normalized
+
+
+def _expand_compound_tokens(text: str) -> List[str]:
+    expanded: List[str] = []
+    for raw_token in re.findall(r"[A-Za-z0-9_.-]+", str(text or "")):
+        parts = COMPOUND_TERM_RE.findall(raw_token.replace("_", " ").replace("-", " ").replace(".", " "))
+        expanded.extend(part.lower() for part in parts if part)
+    return expanded
+
+
+def _search_terms(text: str) -> List[str]:
+    normalized = normalize_query_terms(text) + _expand_compound_tokens(text)
+    filtered = [
+        _normalize_search_term(term)
+        for term in normalized
+        if term not in SEARCH_STOPWORDS and (len(term) > 2 or term in {"am", "sm", "ue", "os"})
+    ]
+    deduped = sorted(set(term for term in filtered if term))
+    if deduped:
+        return deduped
+    return sorted(set(_normalize_search_term(term) for term in normalized if term))
+
+
 def _domain_matches(metadata_domain: Any, requested_domain: str) -> bool:
     normalized_request = _normalized(requested_domain)
     if normalized_request in {"", "all"}:
@@ -137,23 +336,31 @@ def _domain_matches(metadata_domain: Any, requested_domain: str) -> bool:
     if isinstance(metadata_domain, dict):
         strategy_domains = [_normalized(item) for item in metadata_domain.get("strategy_domains") or [] if _normalized(item)]
         if strategy_domains:
+            if normalized_request == "mobility":
+                return any(item in {"am_policy", "ursp"} for item in strategy_domains)
             return normalized_request in strategy_domains
         normalized_domain = _normalized(metadata_domain.get("policy_domain") or "")
     else:
         normalized_domain = _normalized(metadata_domain)
     if normalized_domain == "shared":
         return True
+    if normalized_request == "mobility":
+        return normalized_domain in {"am_policy", "ursp"}
     return normalized_domain == normalized_request
 
 
 def _spec_priority(spec_id: str, domain: str) -> int:
     normalized_domain = _normalized(domain)
-    if normalized_domain == "sm_policy":
+    if normalized_domain == "am_policy":
+        order = ["29.507", "23.503", "29.571", "24.501", "23.501", "29.519", "29.525", "24.526", "29.512"]
+    elif normalized_domain == "sm_policy":
         order = ["29.512", "23.503", "29.571", "29.514", "29.213", "29.214", "24.501", "23.501", "29.519", "29.525", "24.526"]
     elif normalized_domain == "ursp":
         order = ["24.526", "29.525", "23.503", "29.519", "24.501", "23.501", "29.571", "29.512", "29.514"]
+    elif normalized_domain == "mobility":
+        order = ["29.507", "24.526", "29.525", "23.503", "29.571", "24.501", "23.501", "29.519"]
     else:
-        order = ["23.503", "29.512", "24.526", "29.525", "29.571", "29.514", "29.519", "24.501", "23.501"]
+        order = ["23.503", "29.507", "29.512", "24.526", "29.525", "29.571", "29.514", "29.519", "24.501", "23.501"]
     try:
         return max(0, 20 - order.index(spec_id))
     except ValueError:
@@ -165,37 +372,139 @@ def _prefers_schema(query: str) -> bool:
     return any(keyword in lowered for keyword in SCHEMA_QUERY_KEYWORDS)
 
 
+def _prefers_operation(query: str) -> bool:
+    lowered = _normalized(query)
+    if any(phrase in lowered for phrase in ("which endpoint", "what endpoint", "which operation", "what operation", "which method", "what method")):
+        return True
+    if bool(re.search(r"\b(endpoint|operation|method)\b", lowered)):
+        return True
+    has_http_or_action_verb = bool(
+        re.search(r"\b(create|creates|created|delete|deletes|deleted|update|updates|updated|read|reads|post|get|put|patch)\b", lowered)
+    )
+    if has_http_or_action_verb:
+        return True
+    return bool(re.search(r"\bapi\b", lowered) and re.search(r"\b(create|creates|created|delete|deletes|deleted|update|updates|updated|read|reads)\b", lowered))
+
+
+def _prefers_glossary(query: str) -> bool:
+    lowered = _normalized(query)
+    return any(keyword in lowered for keyword in GLOSSARY_QUERY_KEYWORDS)
+
+
+def _is_short_term_query(query: str) -> bool:
+    terms = _search_terms(query)
+    if len(terms) > 6:
+        return False
+    return not _prefers_schema(query) and not _prefers_operation(query)
+
+
+def _ursp_prefers_schema(query: str) -> bool:
+    lowered = _normalized(query)
+    if _prefers_schema(query):
+        return True
+    return any(term in lowered for term in URSP_SCHEMA_HINT_TERMS)
+
+
+def _ursp_prefers_clause(query: str) -> bool:
+    lowered = _normalized(query)
+    return any(term in lowered for term in URSP_CLAUSE_HINT_TERMS)
+
+
+def _am_prefers_schema(query: str) -> bool:
+    lowered = _normalized(query)
+    if _prefers_schema(query):
+        return True
+    return any(term in lowered for term in AM_SCHEMA_HINT_TERMS)
+
+
+def _sm_prefers_qos_table(query: str) -> bool:
+    lowered = _normalized(query)
+    if "5qi" in lowered:
+        return True
+    if "qos" in lowered and ("requirement" in lowered or "requirements" in lowered):
+        return True
+    return any(term in lowered for term in SM_QOS_TABLE_HINT_TERMS)
+
+
+def _am_prefers_clause(query: str) -> bool:
+    lowered = _normalized(query)
+    return "rfsp" in lowered and any(term in lowered for term in AM_CLAUSE_HINT_TERMS)
+
+
+def _prefers_clause_location(query: str, domain: str) -> bool:
+    lowered = _normalized(query)
+    if (
+        lowered.startswith("where")
+        or " described " in f" {lowered} "
+        or " defined " in f" {lowered} "
+        or "make up" in lowered
+        or "structure" in lowered
+    ):
+        return True
+    if domain == "ursp":
+        return _ursp_prefers_clause(query)
+    if domain == "am_policy":
+        return _am_prefers_clause(query)
+    return False
+
+
 def _infer_policy_domain(query: str, category: Optional[str]) -> str:
     normalized_category = _normalized(category)
-    if normalized_category in {"sm_policy", "ursp", "shared", "all"}:
+    if normalized_category in {"sm_policy", "am_policy", "ursp", "mobility", "shared", "all"}:
         return "all" if normalized_category == "shared" else normalized_category
 
     haystack = " ".join(part for part in [query, category] if part).lower()
+    am_hits = sum(1 for keyword in AM_POLICY_KEYWORDS if keyword in haystack)
     sm_hits = sum(1 for keyword in SM_POLICY_KEYWORDS if keyword in haystack)
     ursp_hits = sum(1 for keyword in URSP_KEYWORDS if keyword in haystack)
+    mobility_hits = am_hits + ursp_hits
+    if am_hits and not sm_hits and not ursp_hits:
+        return "am_policy"
     if sm_hits and not ursp_hits:
         return "sm_policy"
-    if ursp_hits and not sm_hits:
+    if ursp_hits and not sm_hits and not am_hits:
         return "ursp"
+    if mobility_hits and not sm_hits:
+        return "mobility"
     return "all"
 
 
 def _select_collections(query: str, domain: str) -> List[str]:
     prefers_schema = _prefers_schema(query)
+    if domain == "am_policy":
+        return [PCF_AM_POLICY_SCHEMA_COLLECTION, PCF_AM_POLICY_CLAUSES_COLLECTION] if prefers_schema else [PCF_AM_POLICY_CLAUSES_COLLECTION, PCF_AM_POLICY_SCHEMA_COLLECTION]
     if domain == "sm_policy":
         return [PCF_SM_POLICY_SCHEMA_COLLECTION, PCF_SM_POLICY_CLAUSES_COLLECTION] if prefers_schema else [PCF_SM_POLICY_CLAUSES_COLLECTION, PCF_SM_POLICY_SCHEMA_COLLECTION]
     if domain == "ursp":
         return [PCF_URSP_SCHEMA_COLLECTION, PCF_URSP_CLAUSES_COLLECTION] if prefers_schema else [PCF_URSP_CLAUSES_COLLECTION, PCF_URSP_SCHEMA_COLLECTION]
+    if domain == "mobility":
+        if prefers_schema:
+            return [
+                PCF_AM_POLICY_SCHEMA_COLLECTION,
+                PCF_URSP_SCHEMA_COLLECTION,
+                PCF_AM_POLICY_CLAUSES_COLLECTION,
+                PCF_URSP_CLAUSES_COLLECTION,
+            ]
+        return [
+            PCF_AM_POLICY_CLAUSES_COLLECTION,
+            PCF_URSP_CLAUSES_COLLECTION,
+            PCF_AM_POLICY_SCHEMA_COLLECTION,
+            PCF_URSP_SCHEMA_COLLECTION,
+        ]
     if prefers_schema:
         return [
+            PCF_AM_POLICY_SCHEMA_COLLECTION,
             PCF_SM_POLICY_SCHEMA_COLLECTION,
             PCF_URSP_SCHEMA_COLLECTION,
+            PCF_AM_POLICY_CLAUSES_COLLECTION,
             PCF_SM_POLICY_CLAUSES_COLLECTION,
             PCF_URSP_CLAUSES_COLLECTION,
         ]
     return [
+        PCF_AM_POLICY_CLAUSES_COLLECTION,
         PCF_SM_POLICY_CLAUSES_COLLECTION,
         PCF_URSP_CLAUSES_COLLECTION,
+        PCF_AM_POLICY_SCHEMA_COLLECTION,
         PCF_SM_POLICY_SCHEMA_COLLECTION,
         PCF_URSP_SCHEMA_COLLECTION,
     ]
@@ -281,6 +590,7 @@ def _sanitize_limit(limit: Optional[int]) -> int:
 def _doc_type_priority(doc_type: str, query: str, domain: str) -> float:
     normalized_doc_type = _normalized(doc_type)
     prefers_schema = _prefers_schema(query)
+    prefers_glossary = _prefers_glossary(query)
     if prefers_schema:
         if normalized_doc_type == "openapi":
             return 260.0
@@ -292,6 +602,15 @@ def _doc_type_priority(doc_type: str, query: str, domain: str) -> float:
             return 100.0
         return 0.0
 
+    if prefers_glossary:
+        if normalized_doc_type == "glossary":
+            return 420.0
+        if normalized_doc_type == "openapi":
+            return 40.0
+        if normalized_doc_type in {"stage2", "stage3", "table"}:
+            return 20.0
+        return 0.0
+
     if normalized_doc_type == "glossary":
         return 220.0
     if normalized_doc_type == "table":
@@ -299,17 +618,296 @@ def _doc_type_priority(doc_type: str, query: str, domain: str) -> float:
     if normalized_doc_type in {"stage2", "stage3"}:
         return 140.0
     if normalized_doc_type == "openapi":
-        return 110.0 if domain == "sm_policy" else 90.0
-    return 0.0
+        score = 110.0 if domain == "sm_policy" else 90.0
+    else:
+        score = 0.0
+
+    if domain == "ursp":
+        if _ursp_prefers_schema(query):
+            if normalized_doc_type == "openapi":
+                score += 120.0
+            elif normalized_doc_type in {"stage2", "stage3"}:
+                score -= 45.0
+        elif _ursp_prefers_clause(query):
+            if normalized_doc_type in {"stage2", "stage3"}:
+                score += 110.0
+            elif normalized_doc_type == "openapi":
+                score -= 70.0
+            elif normalized_doc_type == "glossary":
+                score -= 30.0
+    elif domain == "am_policy":
+        if _am_prefers_clause(query):
+            if normalized_doc_type in {"stage2", "stage3", "table"}:
+                score += 150.0
+            elif normalized_doc_type == "openapi":
+                score -= 80.0
+        elif _am_prefers_schema(query):
+            if normalized_doc_type == "openapi":
+                score += 135.0
+            elif normalized_doc_type == "glossary":
+                score += 40.0
+            elif normalized_doc_type in {"stage2", "stage3"}:
+                score -= 55.0
+    elif domain == "sm_policy":
+        if _sm_prefers_qos_table(query):
+            if normalized_doc_type == "table":
+                score += 170.0
+            elif normalized_doc_type == "openapi":
+                score += 55.0
+            elif normalized_doc_type in {"stage2", "stage3"}:
+                score -= 50.0
+    return score
+
+
+def _expanded_query_terms(query: str, domain: str) -> set[str]:
+    base_terms = set(_search_terms(query))
+    query_text = _normalized(query)
+    alias_map = _term_alias_map()
+    expanded = set(base_terms)
+    short_term_query = _is_short_term_query(query)
+    for canonical_title, payload in alias_map.items():
+        phrases = [str(canonical_title)]
+        phrases.extend(str(item) for item in payload.get("aliases") or [])
+        matched = False
+        for phrase in phrases:
+            normalized_phrase = _normalized(phrase)
+            if len(normalized_phrase) < 3 or normalized_phrase not in query_text:
+                continue
+            expanded.update(_search_terms(phrase))
+            matched = True
+        if not matched:
+            continue
+        expanded.update(_search_terms(canonical_title))
+        if not short_term_query:
+            expanded.update(
+                token
+                for item in payload.get("related_objects") or []
+                for token in _search_terms(str(item))
+            )
+        if domain in {"am_policy", "mobility"}:
+            if not short_term_query:
+                expanded.update(
+                    token
+                    for item in payload.get("related_specs") or []
+                    for token in _search_terms(str(item))
+                )
+    if domain == "sm_policy" and _sm_prefers_qos_table(query):
+        expanded.update(
+            {
+                "5qi",
+                "packet",
+                "delay",
+                "budget",
+                "error",
+                "rate",
+                "qos",
+                "qosdata",
+                "qoscharacteristics",
+                "latency",
+                "jitter",
+                "requirement",
+            }
+        )
+    return expanded
+
+
+def _glossary_phrase_bonus(metadata: Dict[str, Any], query: str) -> float:
+    query_terms = set(_search_terms(query))
+    query_text = _normalized(query)
+    phrases: List[Tuple[str, float]] = []
+    canonical_title = str(metadata.get("canonical_title") or "").strip()
+    if canonical_title:
+        phrases.append((canonical_title, 220.0))
+    for alias in metadata.get("aliases") or []:
+        phrases.append((str(alias), 260.0))
+    for tag in metadata.get("object_tags") or []:
+        phrases.append((str(tag), 180.0))
+
+    best = 0.0
+    for phrase, base in phrases:
+        normalized_phrase = _normalized(phrase)
+        if len(normalized_phrase) < 3 or normalized_phrase not in query_text:
+            continue
+        phrase_terms = set(_search_terms(phrase))
+        overlap = len(query_terms.intersection(phrase_terms))
+        score = base + 42.0 * overlap
+        if normalized_phrase == query_text:
+            score += 160.0
+        best = max(best, score)
+    return best
+
+
+def _glossary_strong_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for record in _record_catalog().values():
+        metadata = record.get("metadata") or {}
+        if _normalized(metadata.get("doc_type") or "") != "glossary":
+            continue
+        if not _domain_matches(metadata, domain):
+            continue
+        phrase_bonus = _glossary_phrase_bonus(metadata, query)
+        if phrase_bonus <= 0:
+            continue
+        score = 1500.0 + phrase_bonus + _metadata_query_bonus(metadata, query, domain)
+        candidates.append(_record_to_candidate(record, score=score, retrieval="glossary_phrase"))
+    return _dedupe_candidates(candidates, limit=6)
+
+
+def _metadata_term_sets(metadata: Dict[str, Any]) -> Tuple[set[str], set[str], set[str]]:
+    title_parts = [
+        str(metadata.get("canonical_title") or "").strip(),
+        str(metadata.get("clause_title") or "").strip(),
+        str(metadata.get("schema_name") or "").strip(),
+        str(metadata.get("operation_id") or "").strip(),
+        str(metadata.get("table_id") or "").strip(),
+    ]
+    title_terms = set(_search_terms(" ".join(part for part in title_parts if part)))
+    object_terms = {
+        token
+        for item in metadata.get("object_tags") or []
+        for token in _search_terms(str(item))
+    }
+    normalized_terms = set(
+        term
+        for term in metadata.get("normalized_terms") or []
+        if term not in SEARCH_STOPWORDS and (len(term) > 2 or term in {"am", "sm", "ue", "os"})
+    )
+    return title_terms, object_terms, normalized_terms
+
+
+def _is_generic_clause_candidate(metadata: Dict[str, Any]) -> bool:
+    normalized_doc_type = _normalized(metadata.get("doc_type") or "")
+    if normalized_doc_type not in {"stage2", "stage3", "table"}:
+        return False
+    title = " ".join(
+        part
+        for part in [
+            str(metadata.get("clause_title") or "").strip(),
+            str(metadata.get("canonical_title") or "").strip(),
+        ]
+        if part
+    ).lower()
+    return any(term in title for term in GENERIC_CLAUSE_TERMS)
+
+
+def _identifier_match_bonus(identifier: Any, query_terms: set[str]) -> float:
+    identifier_terms = set(_search_terms(str(identifier or "")))
+    if not identifier_terms:
+        return 0.0
+    overlap = query_terms.intersection(identifier_terms)
+    if not overlap:
+        return 0.0
+    precision = len(overlap) / len(identifier_terms)
+    return 60.0 * len(overlap) + 140.0 * precision
+
+
+def _should_skip_generic_clause_candidate(metadata: Dict[str, Any], query: str) -> bool:
+    if not _is_generic_clause_candidate(metadata):
+        return False
+    query_terms = set(_search_terms(query))
+    title_terms, object_terms, _normalized_terms = _metadata_term_sets(metadata)
+    return not bool(query_terms.intersection(title_terms | object_terms))
 
 
 def _metadata_query_bonus(metadata: Dict[str, Any], query: str, domain: str) -> float:
     score = _spec_priority(str(metadata.get("spec_id") or ""), domain)
     score += _doc_type_priority(str(metadata.get("doc_type") or ""), query, domain)
-    query_terms = set(normalize_query_terms(query))
-    object_terms = {_normalized(item) for item in metadata.get("object_tags") or []}
-    score += 12.0 * len(query_terms.intersection(object_terms))
+    query_terms = _expanded_query_terms(query, domain)
+    title_terms, object_terms, normalized_terms = _metadata_term_sets(metadata)
+    score += 24.0 * len(query_terms.intersection(title_terms))
+    score += 14.0 * len(query_terms.intersection(object_terms))
+    score += 6.0 * len(query_terms.intersection(normalized_terms))
+    if _is_generic_clause_candidate(metadata):
+        score -= 180.0
+        if query_terms.intersection(title_terms | object_terms):
+            score += 120.0
+    score += _identifier_match_bonus(metadata.get("schema_name"), query_terms)
+    if metadata.get("operation_id"):
+        score += _identifier_match_bonus(metadata.get("operation_id"), query_terms)
+        if _prefers_operation(query):
+            score += 140.0
+            operation_id = _normalized(metadata.get("operation_id") or "")
+            query_text = _normalized(query)
+            for verb in ("create", "update", "delete", "get", "read"):
+                if verb in query_text:
+                    score += 180.0 if verb in operation_id else -120.0
+        else:
+            score -= 680.0
+    elif _prefers_operation(query) and _normalized(metadata.get("doc_type") or "") == "openapi":
+        score -= 140.0
     return score
+
+
+def _sm_qos_requirement_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
+    if domain != "sm_policy" or not _sm_prefers_qos_table(query):
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for record in _record_catalog().values():
+        metadata = record.get("metadata") or {}
+        if not _domain_matches(metadata, domain):
+            continue
+        doc_type = _normalized(metadata.get("doc_type") or "")
+        object_tags = {str(item) for item in metadata.get("object_tags") or []}
+        title = _normalized(metadata.get("canonical_title") or "")
+        if not ({"QosData", "QosCharacteristics", "5Qi"} & object_tags or "qosdata" in title or "5qi" in title):
+            continue
+        if doc_type not in {"table", "openapi", "glossary"}:
+            continue
+        base = 2480.0 if doc_type == "table" else 1700.0 if doc_type == "openapi" else 1260.0
+        page_text = _normalized(record.get("page_content") or "")
+        if "5.6.2.8" in title or "definition of type qosdata" in title or "packetdelaybudget" in page_text:
+            base += 820.0
+        candidates.append(_record_to_candidate(record, score=base + _metadata_query_bonus(metadata, query, domain), retrieval="sm_qos_requirements"))
+    return _dedupe_candidates(candidates, limit=6)
+
+
+def _am_rfsp_clause_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
+    if domain != "am_policy" or not _am_prefers_clause(query):
+        return []
+    candidates: List[Dict[str, Any]] = []
+    for record in _record_catalog().values():
+        metadata = record.get("metadata") or {}
+        if not _domain_matches(metadata, domain):
+            continue
+        doc_type = _normalized(metadata.get("doc_type") or "")
+        if doc_type not in {"stage2", "stage3", "table"}:
+            continue
+        object_tags = {str(item) for item in metadata.get("object_tags") or []}
+        title = _normalized(metadata.get("canonical_title") or "")
+        page_text = _normalized(record.get("page_content") or "")
+        if "RfspIndex" not in object_tags and "rfsp" not in title and "rfsp index" not in page_text:
+            continue
+        base = 2520.0
+        if "4.2.2.3.2" in title or "rfsp index" in title or "rfsp index" in page_text:
+            base += 760.0
+        candidates.append(_record_to_candidate(record, score=base + _metadata_query_bonus(metadata, query, domain), retrieval="am_rfsp_clause"))
+    return _dedupe_candidates(candidates, limit=6)
+
+
+def _operation_intent_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
+    if not _prefers_operation(query):
+        return []
+    query_text = _normalized(query)
+    query_terms = _expanded_query_terms(query, domain)
+    requested_verbs = [verb for verb in ("create", "update", "delete", "get", "read") if verb in query_text]
+    candidates: List[Dict[str, Any]] = []
+    for record in _record_catalog().values():
+        metadata = record.get("metadata") or {}
+        if not _domain_matches(metadata, domain):
+            continue
+        operation_id = str(metadata.get("operation_id") or "").strip()
+        if not operation_id:
+            continue
+        operation_terms = set(_search_terms(operation_id))
+        overlap = len(query_terms.intersection(operation_terms))
+        if not overlap and not any(verb in _normalized(operation_id) for verb in requested_verbs):
+            continue
+        score = 2300.0 + 120.0 * overlap + _metadata_query_bonus(metadata, query, domain)
+        normalized_operation = _normalized(operation_id)
+        for verb in requested_verbs:
+            score += 260.0 if verb in normalized_operation else -140.0
+        candidates.append(_record_to_candidate(record, score=score, retrieval="operation_intent"))
+    return _dedupe_candidates(candidates, limit=6)
 
 
 def _record_to_candidate(record: Dict[str, Any], *, score: float, retrieval: str) -> Dict[str, Any]:
@@ -334,15 +932,144 @@ def _doc_to_candidate(doc: Any, *, score: float, retrieval: str) -> Dict[str, An
     }
 
 
+@lru_cache(maxsize=8)
+def _bge_reranker(top_n: int) -> Any:
+    try:
+        from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+        from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+    except ImportError as exc:
+        raise RuntimeError(
+            "BGE reranking requires LangChain's HuggingFace cross-encoder support. "
+            "Install `sentence-transformers` and ensure `langchain_community.cross_encoders.HuggingFaceCrossEncoder` is available."
+        ) from exc
+
+    model = HuggingFaceCrossEncoder(model_name=BGE_RERANK_MODEL)
+    return CrossEncoderReranker(model=model, top_n=top_n)
+
+
+def _limited_terms(values: Iterable[Any], *, limit: int = BGE_RERANK_TERM_CHARS) -> str:
+    seen: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.append(text)
+        joined = ", ".join(seen)
+        if len(joined) >= limit:
+            return joined[:limit].rstrip(" ,")
+    return ", ".join(seen)
+
+
+def _bge_rerank_query(query: str, domain: str) -> str:
+    expanded_terms = _limited_terms(sorted(_expanded_query_terms(query, domain)))
+    if not expanded_terms:
+        return query
+    return f"Query: {query}\nExpanded technical terms: {expanded_terms}"
+
+
+def _candidate_rerank_text(candidate: Dict[str, Any]) -> str:
+    metadata = candidate["metadata"]
+    result_key = _candidate_key(metadata, candidate.get("id") or "")
+    aliases = _limited_terms(metadata.get("aliases") or [])
+    objects = _limited_terms(metadata.get("object_tags") or [])
+    normalized_terms = _limited_terms(metadata.get("normalized_terms") or [])
+    parts = [
+        f"Candidate ResultKey: {result_key}",
+        f"Candidate title: {metadata.get('canonical_title', '')}",
+        f"Candidate knowledge type: {metadata.get('doc_type', '')}",
+        f"Candidate policy domain: {metadata.get('policy_domain', '')}",
+        f"Candidate schema name: {metadata.get('schema_name', '')}",
+        f"Candidate operation id: {metadata.get('operation_id', '')}",
+        f"Candidate clause path: {metadata.get('clause_path', '')}",
+        f"Candidate table id: {metadata.get('table_id', '')}",
+        f"Candidate aliases: {aliases}",
+        f"Candidate object tags: {objects}",
+        f"Candidate normalized technical terms: {normalized_terms}",
+        f"Content: {candidate.get('page_content', '')}",
+    ]
+    return _shorten(" ".join(part for part in parts if part), limit=BGE_RERANK_INPUT_CHARS)
+
+
+def _bge_rerank_candidates(query: str, domain: str, candidates: Iterable[Dict[str, Any]], *, limit: int) -> List[Dict[str, Any]]:
+    candidate_list = list(candidates)
+    if not candidate_list:
+        return []
+    rerank_query = _bge_rerank_query(query, domain)
+    compressor = _bge_reranker(limit)
+    documents = [
+        Document(
+            page_content=_candidate_rerank_text(candidate),
+            metadata={"candidate_index": index},
+        )
+        for index, candidate in enumerate(candidate_list)
+    ]
+    reranked_documents = list(compressor.compress_documents(documents, query=rerank_query))
+    if not reranked_documents:
+        raise RuntimeError("BGE reranker returned no documents for a non-empty candidate set.")
+
+    ordered: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+    for document in reranked_documents[:limit]:
+        index = document.metadata.get("candidate_index")
+        if not isinstance(index, int):
+            raise RuntimeError("BGE reranker did not preserve candidate_index metadata.")
+        if index in seen:
+            continue
+        seen.add(index)
+        ordered.append(candidate_list[index])
+    return ordered
+
+
 def _dedupe_candidates(candidates: Iterable[Dict[str, Any]], *, limit: int = DEFAULT_RETURNED_RESULTS) -> List[Dict[str, Any]]:
-    chosen: Dict[str, Dict[str, Any]] = {}
-    for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
+    return _aggregate_parent_candidates(candidates, limit=limit)
+
+
+def _retrieval_family(retrieval: str) -> str:
+    normalized = str(retrieval or "").strip()
+    return normalized.split(":", 1)[0] if normalized else "unknown"
+
+
+def _aggregate_parent_candidates(
+    candidates: Iterable[Dict[str, Any]],
+    *,
+    limit: int = DEFAULT_RETURNED_RESULTS,
+) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for candidate in candidates:
         metadata = candidate["metadata"]
-        dedupe_key = _candidate_key(metadata, candidate.get("id") or "")
-        current = chosen.get(dedupe_key)
-        if current is None or candidate["score"] > current["score"]:
-            chosen[dedupe_key] = candidate
-    return list(sorted(chosen.values(), key=lambda item: item["score"], reverse=True))[:limit]
+        parent_key = _candidate_key(metadata, candidate.get("id") or "")
+        if not parent_key:
+            continue
+        grouped[parent_key].append(candidate)
+
+    aggregated: List[Dict[str, Any]] = []
+    for parent_key, group in grouped.items():
+        ranked_group = sorted(group, key=lambda item: item["score"], reverse=True)
+        representative = dict(ranked_group[0])
+        representative_metadata = dict(representative["metadata"])
+        support_count = len(ranked_group)
+        retrieval_families = sorted({_retrieval_family(item.get("retrieval") or "") for item in ranked_group})
+        support_bonus = min(96.0, 18.0 * max(0, support_count - 1))
+        retrieval_bonus = min(36.0, 12.0 * max(0, len(retrieval_families) - 1))
+        representative["score"] = round(float(representative["score"]) + support_bonus + retrieval_bonus, 4)
+        representative_retrieval = str(representative.get("retrieval") or "")
+        if support_count > 1 or len(retrieval_families) > 1:
+            representative["retrieval"] = (
+                representative_retrieval
+                if representative_retrieval.startswith("parent_aggregate:")
+                else f"parent_aggregate:{representative_retrieval}"
+            )
+        else:
+            representative["retrieval"] = representative_retrieval
+        representative["metadata"] = {
+            **representative_metadata,
+            "parent_result_key": parent_key,
+            "support_count": support_count,
+            "supporting_retrievals": retrieval_families,
+        }
+        aggregated.append(representative)
+
+    return sorted(aggregated, key=lambda item: item["score"], reverse=True)[:limit]
 
 
 def _direct_record_matches(key: str, domain: str) -> List[Dict[str, Any]]:
@@ -385,6 +1112,7 @@ def _direct_record_matches(key: str, domain: str) -> List[Dict[str, Any]]:
 def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
     catalog = _record_catalog()
     candidates: List[Dict[str, Any]] = []
+    prefers_schema = _prefers_schema(query)
     for hit in search_exact_index(_clause_exact_index(), query, top_k=12):
         record = catalog.get(hit["id"])
         if record is None:
@@ -392,7 +1120,10 @@ def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
         metadata = record.get("metadata") or {}
         if not _domain_matches(metadata, domain):
             continue
-        score = 1260.0 + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
+        if _should_skip_generic_clause_candidate(metadata, query):
+            continue
+        clause_base = 1120.0 if prefers_schema else 1260.0
+        score = clause_base + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
         candidates.append(_record_to_candidate(record, score=score, retrieval="exact_clause"))
     for hit in search_exact_index(_schema_exact_index(), query, top_k=12):
         record = catalog.get(hit["id"])
@@ -401,7 +1132,8 @@ def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
         metadata = record.get("metadata") or {}
         if not _domain_matches(metadata, domain):
             continue
-        score = 1200.0 + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
+        schema_base = 1380.0 if prefers_schema else 1200.0
+        score = schema_base + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
         candidates.append(_record_to_candidate(record, score=score, retrieval="exact_schema"))
     for hit in search_exact_index(_glossary_exact_index(), query, top_k=12):
         record = catalog.get(hit["id"])
@@ -447,26 +1179,35 @@ def _expand_cross_spec_candidates(seed_candidates: Iterable[Dict[str, Any]], dom
 
 
 def _vector_search_candidates(query: str, domain: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-    query_terms = set(normalize_query_terms(query))
+    query_terms = set(_search_terms(query))
     candidates: List[Dict[str, Any]] = []
     errors: List[str] = []
     collections = _select_collections(query, domain)
     for collection_name in collections:
         try:
             store = get_pgvector_store(collection_name=collection_name)
-            docs = store.similarity_search(query, k=3)
+            docs = store.similarity_search_with_score(query, k=20)
         except Exception as exc:
             errors.append(f"{collection_name}: {exc}")
             continue
-        for rank, doc in enumerate(docs):
+        for rank, (doc, raw_score) in enumerate(docs):
             metadata = doc.metadata if isinstance(getattr(doc, "metadata", None), dict) else {}
             if not _domain_matches(metadata, domain):
                 continue
+            if _is_generic_clause_candidate(metadata):
+                continue
             score = 300.0 - rank * 10.0 + _metadata_query_bonus(metadata, query, domain)
-            object_terms = {_normalized(item) for item in metadata.get("object_tags") or []}
+            if raw_score is not None:
+                try:
+                    score -= float(raw_score) * 15.0
+                except (TypeError, ValueError):
+                    pass
+            title_terms, object_terms, normalized_terms = _metadata_term_sets(metadata)
+            score += 10.0 * len(query_terms.intersection(title_terms))
             score += 8.0 * len(query_terms.intersection(object_terms))
+            score += 4.0 * len(query_terms.intersection(normalized_terms))
             candidates.append(_doc_to_candidate(doc, score=score, retrieval=f"vector:{collection_name}"))
-    return _dedupe_candidates(candidates, limit=6), errors
+    return _aggregate_parent_candidates(candidates, limit=20), errors
 
 
 def _resolve_explicit_key_candidates(key: str, domain: str) -> List[Dict[str, Any]]:
@@ -533,12 +1274,19 @@ def _render_result(candidate: Dict[str, Any]) -> str:
 
 def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED_RESULTS) -> Tuple[List[Dict[str, Any]], List[str]]:
     direct = _direct_record_matches(query, domain)
+    glossary = _glossary_strong_candidates(query, domain)
+    domain_special = [
+        *_sm_qos_requirement_candidates(query, domain),
+        *_am_rfsp_clause_candidates(query, domain),
+        *_operation_intent_candidates(query, domain),
+    ]
     exact = _exact_search_candidates(query, domain)
-    seeds = _dedupe_candidates([*direct, *exact], limit=6)
+    rerank_pool_limit = max(limit * 4, 20)
+    seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
     cross_spec = _expand_cross_spec_candidates(seeds, domain, query)
     vector, errors = _vector_search_candidates(query, domain)
-    combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=limit)
-    return combined, errors
+    combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=rerank_pool_limit)
+    return _bge_rerank_candidates(query, domain, combined, limit=limit), errors
 
 
 def _format_results(

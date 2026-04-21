@@ -72,6 +72,7 @@ class OptimizationStrategyCompiler:
         advisor_output: OsaAdvisorOutput,
         planning_request: PlanningRequest,
         grounding_tools: List[str],
+        planning_evidence: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         errors: List[str] = []
         domains = {
@@ -85,6 +86,7 @@ class OptimizationStrategyCompiler:
             for item in (planning_request.context.required_evidence or [])
             if str(item).strip()
         }
+        normalized_planning_evidence = dict(planning_evidence or {})
 
         has_sm = bool(advisor_output.sm_policies)
         has_am = advisor_output.am_policy is not None
@@ -100,16 +102,32 @@ class OptimizationStrategyCompiler:
             errors.append("mobility-active planning requires am_policy")
         if required_evidence and not grounding:
             errors.append("planning context requires evidence collection but advisor used no grounding tools")
-        if (has_sm or has_am or has_ursp) and not grounding:
+        if (has_sm or has_am or has_ursp) and not grounding and not self._has_existing_policy_evidence(
+            planning_request=planning_request,
+            planning_evidence=normalized_planning_evidence,
+            has_sm=has_sm,
+            has_am=has_am,
+            has_ursp=has_ursp,
+        ):
             errors.append("policy output requires at least one non-think grounding tool")
-        if has_sm and not ({"preview_optimizer", "fetch_network_status"} & grounding):
+        if has_sm and self._missing_qos_evidence(
+            planning_request=planning_request,
+            planning_evidence=normalized_planning_evidence,
+            grounding=grounding,
+        ):
             errors.append("sm_policies require preview_optimizer or fetch_network_status evidence")
-        if has_am and "inspect_ue_policies" not in grounding:
+        if has_am and self._missing_mobility_evidence(
+            planning_request=planning_request,
+            planning_evidence=normalized_planning_evidence,
+            grounding=grounding,
+        ):
             errors.append("am_policy requires inspect_ue_policies evidence")
         if has_ursp:
             if not self._ursp_requested_or_evidenced(planning_request):
                 errors.append("ursp_policies require explicit route-selection or UE-policy-routing intent")
-            if not ({"inspect_ue_policies", "search_semantic_knowledge", "get_knowledge_by_key"} & grounding):
+            if not self._has_existing_ursp_evidence(planning_request) and not (
+                {"inspect_ue_policies", "search_semantic_knowledge", "get_knowledge_by_key"} & grounding
+            ):
                 errors.append("ursp_policies require explicit routing or policy-semantic evidence")
         return errors
 
@@ -124,6 +142,71 @@ class OptimizationStrategyCompiler:
             ]
         ).lower()
         return any(token in raw_text for token in ("ursp", "route", "routing", "route selection", "ue policy"))
+
+    @staticmethod
+    def _has_preview_qos_evidence(planning_evidence: Dict[str, Any]) -> bool:
+        if bool(planning_evidence.get("preview_qos_plan_present")):
+            return True
+        flows = planning_evidence.get("flows") or []
+        return isinstance(flows, list) and any(
+            isinstance(item, dict) and str(item.get("flow_id") or "").strip()
+            for item in flows
+        )
+
+    @staticmethod
+    def _has_preview_mobility_evidence(planning_evidence: Dict[str, Any]) -> bool:
+        return bool(planning_evidence.get("preview_mobility_plan_present"))
+
+    @staticmethod
+    def _has_existing_ursp_evidence(planning_request: PlanningRequest) -> bool:
+        raw_text = " ".join(
+            [
+                json.dumps(_json_friendly(planning_request.operation_intent.domain_evidence or {}), ensure_ascii=False),
+                json.dumps(_json_friendly(planning_request.operation_intent.mobility_intent or {}), ensure_ascii=False),
+                json.dumps(_json_friendly(planning_request.context.revision_requests or []), ensure_ascii=False),
+            ]
+        ).lower()
+        return any(token in raw_text for token in ("ursp", "route", "routing", "route selection", "ue policy"))
+
+    def _has_existing_policy_evidence(
+        self,
+        *,
+        planning_request: PlanningRequest,
+        planning_evidence: Dict[str, Any],
+        has_sm: bool,
+        has_am: bool,
+        has_ursp: bool,
+    ) -> bool:
+        checks: List[bool] = []
+        if has_sm:
+            checks.append(self._has_preview_qos_evidence(planning_evidence))
+        if has_am:
+            checks.append(self._has_preview_mobility_evidence(planning_evidence))
+        if has_ursp:
+            checks.append(self._has_existing_ursp_evidence(planning_request))
+        return bool(checks) and all(checks)
+
+    def _missing_qos_evidence(
+        self,
+        *,
+        planning_request: PlanningRequest,
+        planning_evidence: Dict[str, Any],
+        grounding: set[str],
+    ) -> bool:
+        if self._has_preview_qos_evidence(planning_evidence):
+            return False
+        return not ({"preview_optimizer", "fetch_network_status"} & grounding)
+
+    def _missing_mobility_evidence(
+        self,
+        *,
+        planning_request: PlanningRequest,
+        planning_evidence: Dict[str, Any],
+        grounding: set[str],
+    ) -> bool:
+        if self._has_preview_mobility_evidence(planning_evidence):
+            return False
+        return "inspect_ue_policies" not in grounding
 
     def assemble_policy_plan(
         self,
@@ -146,6 +229,7 @@ class OptimizationStrategyCompiler:
                 item.model_dump(mode="json") if hasattr(item, "model_dump") else _json_friendly(item)
                 for item in (getattr(optimizer_preview, "cross_domain_verdicts", []) or [])
             ],
+            "snapshot_writeback_patch": self._build_snapshot_writeback_patch(optimizer_preview),
         }
 
         plan = PolicyPlanDraft(
@@ -214,6 +298,24 @@ class OptimizationStrategyCompiler:
         normalized = normalize_policy_plan_draft(plan, planning_request.operation_intent)
         self._validate_compiled_plan(normalized, planning_request)
         return normalized
+
+    @staticmethod
+    def _build_snapshot_writeback_patch(optimizer_preview: Any) -> Dict[str, Any]:
+        qos_plan = getattr(optimizer_preview, "qos_plan", {}) or {}
+        mobility_plan = getattr(optimizer_preview, "mobility_plan", {}) or {}
+        patch: Dict[str, Any] = {}
+        if isinstance(qos_plan, dict):
+            patch["qos_plan"] = _json_friendly(
+                {
+                    "target_app": qos_plan.get("target_app") or {},
+                    "impacted_flows": qos_plan.get("impacted_flows") or [],
+                    "slice_stats": qos_plan.get("slice_stats") or [],
+                    "meta": qos_plan.get("meta") or {},
+                }
+            )
+        if isinstance(mobility_plan, dict) and mobility_plan:
+            patch["mobility_plan"] = _json_friendly(mobility_plan)
+        return patch
 
     @staticmethod
     def _validate_optimizer_preview(optimizer_preview: Any) -> None:
@@ -437,9 +539,10 @@ class OptimizationStrategyCompiler:
         for item in flows:
             if not isinstance(item, dict):
                 continue
-            if str(item.get("flow_id") or "").strip() != flow_id:
+            if str(item.get("id") or "").strip() != flow_id:
                 continue
-            selected_slice = str(item.get("New Slice") or "").strip()
+            allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+            selected_slice = str(allocation.get("current_slice_snssai") or "").strip()
             if selected_slice:
                 keys.append(f"slice:{selected_slice}")
                 snssai = build_slice_snssai(selected_slice)

@@ -80,29 +80,31 @@ def get_network_status_summary(flow_type_id: int = None) -> str:
         # 简化的占用统计
         slice_snssai = s.get("snssai") if isinstance(s, dict) else getattr(s, "snssai", None)
         dynamic_used_ul = sum(
-            float(flow.get("bw_ul") or 0.0)
+            float(((flow.get("allocation") or {}).get("allocated_bandwidth_ul")) or 0.0)
             for a in apps
             for flow in (a.get("flows", []) if isinstance(a, dict) else [])
-            if str(flow.get("old_slice") or "").strip() == str(slice_snssai or "").strip()
+            if str(((flow.get("allocation") or {}).get("current_slice_snssai")) or "").strip() == str(slice_snssai or "").strip()
         )
         dynamic_used_dl = sum(
-            float(flow.get("bw_dl") or 0.0)
+            float(((flow.get("allocation") or {}).get("allocated_bandwidth_dl")) or 0.0)
             for a in apps
             for flow in (a.get("flows", []) if isinstance(a, dict) else [])
-            if str(flow.get("old_slice") or "").strip() == str(slice_snssai or "").strip()
+            if str(((flow.get("allocation") or {}).get("current_slice_snssai")) or "").strip() == str(slice_snssai or "").strip()
         )
         active_flows_count = sum(
             1
             for a in apps
             for flow in (a.get("flows", []) if isinstance(a, dict) else [])
-            if str(flow.get("old_slice") or "").strip() == str(slice_snssai or "").strip()
+            if str(((flow.get("allocation") or {}).get("current_slice_snssai")) or "").strip() == str(slice_snssai or "").strip()
         )
         
-        total_used_ul = float((s.get("current_load_bw_ul") if isinstance(s, dict) else getattr(s, "current_load_bw_ul", 0.0)) or 0.0) + float((s.get("reserved_bw") if isinstance(s, dict) else getattr(s, "reserved_bw", 0.0)) or 0.0) + dynamic_used_ul
-        total_used_dl = float((s.get("current_load_bw_dl") if isinstance(s, dict) else getattr(s, "current_load_bw_dl", 0.0)) or 0.0) + float((s.get("reserved_bw") if isinstance(s, dict) else getattr(s, "reserved_bw", 0.0)) or 0.0) + dynamic_used_dl
+        capacity = s.get("capacity", {}) if isinstance(s, dict) else getattr(s, "capacity", None)
+        load = s.get("load", {}) if isinstance(s, dict) else getattr(s, "load", None)
+        total_used_ul = float((load.get("current_bandwidth_ul") if isinstance(load, dict) else getattr(load, "current_bandwidth_ul", 0.0)) or 0.0) + float((capacity.get("reserved_bandwidth_ul") if isinstance(capacity, dict) else getattr(capacity, "reserved_bandwidth_ul", 0.0)) or 0.0) + dynamic_used_ul
+        total_used_dl = float((load.get("current_bandwidth_dl") if isinstance(load, dict) else getattr(load, "current_bandwidth_dl", 0.0)) or 0.0) + float((capacity.get("reserved_bandwidth_dl") if isinstance(capacity, dict) else getattr(capacity, "reserved_bandwidth_dl", 0.0)) or 0.0) + dynamic_used_dl
         
-        total_bw_ul = float((s.get("total_bw_ul") if isinstance(s, dict) else getattr(s, "total_bw_ul", 0.0)) or 0.0)
-        total_bw_dl = float((s.get("total_bw_dl") if isinstance(s, dict) else getattr(s, "total_bw_dl", 0.0)) or 0.0)
+        total_bw_ul = float((capacity.get("total_bandwidth_ul") if isinstance(capacity, dict) else getattr(capacity, "total_bandwidth_ul", 0.0)) or 0.0)
+        total_bw_dl = float((capacity.get("total_bandwidth_dl") if isinstance(capacity, dict) else getattr(capacity, "total_bandwidth_dl", 0.0)) or 0.0)
         utilization_ul = (total_used_ul / total_bw_ul * 100) if total_bw_ul > 0 else 0.0
         utilization_dl = (total_used_dl / total_bw_dl * 100) if total_bw_dl > 0 else 0.0
         
@@ -113,20 +115,20 @@ def get_network_status_summary(flow_type_id: int = None) -> str:
             "usage_ul_pct": round(utilization_ul, 1),
             "usage_dl_pct": round(utilization_dl, 1),
             "active_flows": active_flows_count,
-            "latency_sla": s.get("latency") if isinstance(s, dict) else getattr(s, "latency", None)
+            "latency_sla": (s.get("qos", {}) if isinstance(s, dict) else getattr(s, "qos", None)).get("latency") if isinstance((s.get("qos", {}) if isinstance(s, dict) else getattr(s, "qos", None)), dict) else getattr(getattr(s, "qos", None), "latency", None)
         })
 
     # 简化的应用列表
     app_summary_list = []
     for a in apps:
         flows = a.get("flows", []) if isinstance(a, dict) else []
-        if flow_type_id is not None and any(int(flow.get("service_type_id") or 0) != flow_type_id for flow in flows):
+        if flow_type_id is not None and any(int(((flow.get("service") or {}).get("service_type_id")) or 0) != flow_type_id for flow in flows):
             continue
         app_summary_list.append({
-            "app_id": a.get("app_id") if isinstance(a, dict) else None,
+            "app_id": a.get("id") if isinstance(a, dict) else None,
             "app_name": a.get("name") if isinstance(a, dict) else None,
             "flow_count": len(flows),
-            "total_bw_mbps": round(sum(float(flow.get("bw_ul") or 0.0) + float(flow.get("bw_dl") or 0.0) for flow in flows), 2)
+            "total_bw_mbps": round(sum(float(((flow.get("sla") or {}).get("bandwidth_ul")) or 0.0) + float(((flow.get("sla") or {}).get("bandwidth_dl")) or 0.0) for flow in flows), 2)
         })
         
     return json.dumps({

@@ -63,32 +63,41 @@ def build_flow_info_from_five_tuple(five_tuple: Any, *, flow_direction: str = "B
 
 
 def _normalize_catalog_flow(app: Dict[str, Any], flow: Dict[str, Any]) -> Dict[str, Any]:
-    current_bw_ul = flow.get("old_allocated_bw_ul")
-    current_bw_dl = flow.get("old_allocated_bw_dl")
-    if current_bw_ul is None:
-        current_bw_ul = flow.get("bw_ul")
-    if current_bw_dl is None:
-        current_bw_dl = flow.get("bw_dl")
+    service = flow.get("service") if isinstance(flow.get("service"), dict) else {}
+    sla = flow.get("sla") if isinstance(flow.get("sla"), dict) else {}
+    allocation = flow.get("allocation") if isinstance(flow.get("allocation"), dict) else {}
+    traffic = flow.get("traffic") if isinstance(flow.get("traffic"), dict) else {}
 
     return {
         "supi": app.get("supi"),
         "app_name": app.get("name"),
-        "app_id": app.get("app_id"),
+        "app_id": app.get("id"),
         "flow_name": flow.get("name"),
-        "flow_id": flow.get("flow_id"),
-        "service_type": flow.get("service_type"),
-        "service_type_id": flow.get("service_type_id"),
-        "bw_ul": flow.get("bw_ul"),
-        "bw_dl": flow.get("bw_dl"),
-        "gbr_ul": flow.get("gbr_ul"),
-        "gbr_dl": flow.get("gbr_dl"),
-        "lat": flow.get("lat"),
-        "loss_req": flow.get("loss_req"),
-        "jitter_req": flow.get("jitter_req"),
-        "priority": flow.get("priority"),
-        "current_bw_ul": current_bw_ul,
-        "current_bw_dl": current_bw_dl,
-        "five_tuple": list(flow.get("five_tuple")) if isinstance(flow.get("five_tuple"), (list, tuple)) else None,
+        "flow_id": flow.get("id"),
+        "service": {
+            "service_type": service.get("service_type"),
+            "service_type_id": service.get("service_type_id"),
+        },
+        "sla": {
+            "bandwidth_ul": sla.get("bandwidth_ul"),
+            "bandwidth_dl": sla.get("bandwidth_dl"),
+            "guaranteed_bandwidth_ul": sla.get("guaranteed_bandwidth_ul"),
+            "guaranteed_bandwidth_dl": sla.get("guaranteed_bandwidth_dl"),
+            "latency": sla.get("latency"),
+            "jitter": sla.get("jitter"),
+            "loss_rate": sla.get("loss_rate"),
+            "priority": sla.get("priority"),
+        },
+        "allocation": {
+            "current_slice_snssai": allocation.get("current_slice_snssai"),
+            "allocated_bandwidth_ul": allocation.get("allocated_bandwidth_ul"),
+            "allocated_bandwidth_dl": allocation.get("allocated_bandwidth_dl"),
+        },
+        "traffic": {
+            "packet_size": traffic.get("packet_size"),
+            "arrival_rate": traffic.get("arrival_rate"),
+            "five_tuple": list(traffic.get("five_tuple")) if isinstance(traffic.get("five_tuple"), (list, tuple)) else None,
+        },
     }
 
 
@@ -109,7 +118,7 @@ def _build_catalogs_from_app_data(app_data: Any, supi: str) -> Tuple[List[Dict[s
         app_entry = {
             "supi": target_supi,
             "app_name": app.get("name"),
-            "app_id": app.get("app_id"),
+            "app_id": app.get("id"),
             "flow_count": len(app.get("flows") or []),
         }
         app_catalog.append(app_entry)
@@ -515,44 +524,69 @@ def _snapshot_row_to_payload(row: Any) -> Dict[str, Any]:
         ),
     }
 
+
+def _payload_has_scenario_entities(payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return any(bool(payload.get(key)) for key in ("apps", "slices", "nodes"))
+
 def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
-    """Read latest snapshot payload from the graph snapshot when available."""
+    """Read latest scenario snapshot, preferring the authoritative status table."""
+    try:
+        with session_scope() as session:
+            rows = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).limit(20).all()
+            for latest_snapshot in rows:
+                payload = _snapshot_row_to_payload(latest_snapshot)
+                if not _payload_has_scenario_entities(payload):
+                    continue
+                logger.debug(f"Loaded scenario snapshot (Timestamp: {latest_snapshot.timestamp}).")
+                return {
+                    "snapshot_id": payload.get("snapshot_id"),
+                    "apps": payload["apps"],
+                    "slices": payload["slices"],
+                    "nodes": payload["nodes"],
+                    "mobility": payload["mobility"],
+                    "policy_state": payload["policy_state"],
+                }
+    except Exception as e:
+        logger.warning(f"Failed to load latest snapshot: {e}")
+
     try:
         from agents.tools.network_graph import get_latest_graph
 
         graph = get_latest_graph()
         if graph is not None:
             payload = graph.to_compatibility_snapshot()
-            return {
-                "snapshot_id": payload.get("snapshot_id"),
-                "apps": payload["apps"],
-                "slices": payload["slices"],
-                "nodes": payload["nodes"],
-            }
+            if _payload_has_scenario_entities(payload):
+                return {
+                    "snapshot_id": payload.get("snapshot_id"),
+                    "apps": payload["apps"],
+                    "slices": payload["slices"],
+                    "nodes": payload["nodes"],
+                }
     except Exception as e:
         logger.warning(f"Failed to load latest graph-backed snapshot: {e}")
-
-    try:
-        with session_scope() as session:
-            latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
-            if latest_snapshot:
-                logger.debug(f"Loaded scenario snapshot (Timestamp: {latest_snapshot.timestamp}).")
-            payload = _snapshot_row_to_payload(latest_snapshot)
-            return {
-                "snapshot_id": payload.get("snapshot_id"),
-                "apps": payload["apps"],
-                "slices": payload["slices"],
-                "nodes": payload["nodes"],
-                "mobility": payload["mobility"],
-                "policy_state": payload["policy_state"],
-            }
-    except Exception as e:
-        logger.warning(f"Failed to load latest snapshot: {e}")
     return None
 
 
 def get_latest_snapshot_metadata() -> Optional[Dict[str, Any]]:
-    """Return metadata for the latest bound graph snapshot when available."""
+    """Return metadata for the latest scenario snapshot, preferring the status table."""
+    try:
+        with session_scope() as session:
+            rows = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).limit(20).all()
+            for latest_snapshot in rows:
+                payload = _snapshot_row_to_payload(latest_snapshot)
+                if not _payload_has_scenario_entities(payload):
+                    continue
+                metadata = {
+                    "snapshot_id": str(latest_snapshot.id),
+                    "timestamp": latest_snapshot.timestamp.isoformat() if latest_snapshot.timestamp else None,
+                    "trigger_event": latest_snapshot.trigger_event,
+                }
+                return metadata
+    except Exception as e:
+        logger.warning(f"Failed to load latest snapshot metadata: {e}")
+
     try:
         from agents.tools.network_graph import get_latest_graph_snapshot_metadata
 
@@ -561,20 +595,7 @@ def get_latest_snapshot_metadata() -> Optional[Dict[str, Any]]:
             return metadata
     except Exception as e:
         logger.warning(f"Failed to load latest graph snapshot metadata: {e}")
-
-    try:
-        with session_scope() as session:
-            latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
-            if not latest_snapshot:
-                return None
-            return {
-                "snapshot_id": str(latest_snapshot.id),
-                "timestamp": latest_snapshot.timestamp.isoformat() if latest_snapshot.timestamp else None,
-                "trigger_event": latest_snapshot.trigger_event,
-            }
-    except Exception as e:
-        logger.warning(f"Failed to load latest snapshot metadata: {e}")
-        return None
+    return None
 
 
 def get_snapshot_data_by_id(snapshot_id: Union[str, int]) -> Optional[Dict[str, Any]]:
@@ -683,6 +704,7 @@ def update_session_context(
     session_id: str,
     *,
     current_step: Optional[str] = None,
+    current_snapshot_id: Optional[str] = None,
     intent_data: Optional[Dict[str, Any]] = None,
     policy_data: Optional[Dict[str, Any]] = None,
     status: Optional[str] = None,
@@ -702,6 +724,8 @@ def update_session_context(
             if current_step is not None:
                 row.current_step = current_step
                 row.current_stage = current_step
+            if current_snapshot_id is not None:
+                row.current_snapshot_id = str(current_snapshot_id or "").strip() or None
             if intent_data is not None:
                 row.intent_data = intent_data
             if policy_data is not None:
@@ -1105,7 +1129,8 @@ def _enrich_pcc_rules_with_flow_catalog(
             flow_id = _extract_flow_id_from_pcc_rule_id(enriched_rule.get("pccRuleId") or rule_key)
             flow_entry = flow_map.get(flow_id) if flow_id else None
             if flow_entry:
-                flow_info = build_flow_info_from_five_tuple(flow_entry.get("five_tuple"))
+                traffic = flow_entry.get("traffic") if isinstance(flow_entry.get("traffic"), dict) else {}
+                flow_info = build_flow_info_from_five_tuple(traffic.get("five_tuple"))
                 if flow_info:
                     enriched_rule["flowInfos"] = [flow_info]
             enriched_rule_map[rule_key] = enriched_rule

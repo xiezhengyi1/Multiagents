@@ -57,6 +57,14 @@ Use knowledge tools when you need exact 3GPP objects such as:
 - `Npcf_SMPolicyControl`
 - `Npcf_UEPolicyControl`
 
+Knowledge-query rules:
+- Prefer `get_knowledge_by_key` for exact schema or service names already present in the intent, such as `29.512:QosData`, `29.512:SmPolicyDecision`, `29.507:RequestTrigger`, or `29.507:PolicyAssociationUpdateRequest`.
+- Use `search_semantic_knowledge` only to validate policy-field semantics before output, not to rediscover app_id, flow_id, local service type, or scenario-specific SLA values.
+- Use standards-level SM queries such as `QosData GBR MBR packet delay budget packet error rate`, `SmPolicyDecision PccRule QosData SessionRule`, or `5QI QoS characteristics packet delay budget packet error rate`.
+- Use standards-level AM queries with `category="am_policy"` such as `AM RequestTrigger ALLOWED_NSSAI_CH RFSP_CH LOC_CH` or `PolicyAssociationUpdateRequest allowed NSSAI target NSSAI RFSP service area restriction`.
+- Use standards-level URSP queries with `category="ursp"` such as `URSP rule traffic descriptor route selection descriptor`.
+- Never send AM mobility terms with `category="sm_policy"`.
+
 Return JSON only.
 """
 

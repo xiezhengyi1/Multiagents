@@ -45,6 +45,7 @@ from workflows.main_control_support import (
     build_planning_context,
     parse_pda_metrics,
 )
+from utils.logger import log_event
 
 
 class MainControlOrchestrator:
@@ -59,13 +60,14 @@ class MainControlOrchestrator:
         ad_agent: Optional[AssuranceDiagnosisAgent] = None,
         memory_manager: Optional[MemoryManager] = None,
         max_rounds: int = 3,
+        use_local_model: bool = False,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be at least 1")
-        self.main_agent = main_agent or MainControlAgent()
-        self.ie_agent = ie_agent or IntentEncodingAgent()
-        self.os_agent = os_agent or OptimizationStrategyAgent()
-        self.pd_agent = pd_agent or PolicyDispatchAgent()
+        self.main_agent = main_agent or MainControlAgent(use_local_model=use_local_model)
+        self.ie_agent = ie_agent or IntentEncodingAgent(use_local_model=use_local_model)
+        self.os_agent = os_agent or OptimizationStrategyAgent(use_local_model=use_local_model)
+        self.pd_agent = pd_agent or PolicyDispatchAgent(use_local_model=use_local_model)
         self.cr_agent = cr_agent or ConflictResolutionAgent()
         self.ad_agent = ad_agent or AssuranceDiagnosisAgent()
         self.memory_manager = memory_manager or MemoryManager(
@@ -190,14 +192,20 @@ class MainControlOrchestrator:
 
         feedback_context = ""
         previous_diagnosis: Dict[str, Any] = {}
-        previous_operation_intent: Optional[OperationIntent] = None
-        previous_policy_plan: Optional[PolicyPlanDraft] = None
         previous_mediator_decision: Optional[Dict[str, Any]] = None
         latest_result: Optional[ControlRoundResult] = None
         round_traces: List[Dict[str, Any]] = []
         completed = False
 
         for round_index in range(1, self.max_rounds + 1):
+            log_event(
+                self.main_agent.logger,
+                "control_round_start",
+                session_id=session_id,
+                round_index=round_index,
+                retry_count=max(0, round_index - 1),
+                previous_root_cause=str(previous_diagnosis.get("root_cause_category") or "").strip() or "<none>",
+            )
             memory_context = self._build_memory_context(user_input)
             self._apply_trace_metadata(self.main_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
             try:
@@ -223,40 +231,22 @@ class MainControlOrchestrator:
             self._remember("MAIN", global_intent)
 
             retry_category = str(previous_diagnosis.get("root_cause_category") or "").strip().lower()
-            reuse_operation_intent = (
-                round_index > 1
-                and previous_operation_intent is not None
-                and retry_category in {
-                    "execution_failure",
-                    "sla_violation",
-                    "cross_domain_inconsistency",
-                    "am_policy_dispatch_failure",
-                    "mobility_policy_validation_failure",
-                }
-            )
-            if reuse_operation_intent:
-                operation_intent = previous_operation_intent.model_copy(deep=True)
-                operation_intent.requested_domains = [item.value for item in global_intent.requested_domains]
-                operation_intent.objective_profile_hint = global_intent.objective_profile.profile_name
-                if global_intent.supi:
-                    operation_intent.supi = global_intent.supi
-            else:
-                self._apply_trace_metadata(self.ie_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
-                try:
-                    operation_intent = self.ie_agent.analyze_operation_intent(
-                        user_input=user_input,
-                        context=self._build_ie_context(
-                            global_intent=global_intent.model_dump(mode="json"),
-                            round_index=round_index,
-                            diagnosis=previous_diagnosis,
-                            feedback_context=feedback_context,
-                        ),
-                        session_id=session_id,
-                        snapshot_id=snapshot_id,
-                    )
-                finally:
-                    self._clear_trace_metadata(self.ie_agent)
-                self._remember("IEA", operation_intent)
+            self._apply_trace_metadata(self.ie_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
+            try:
+                operation_intent = self.ie_agent.analyze_operation_intent(
+                    user_input=user_input,
+                    context=self._build_ie_context(
+                        global_intent=global_intent.model_dump(mode="json"),
+                        round_index=round_index,
+                        diagnosis=previous_diagnosis,
+                        feedback_context=feedback_context,
+                    ),
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                )
+            finally:
+                self._clear_trace_metadata(self.ie_agent)
+            self._remember("IEA", operation_intent)
 
             planning_request = PlanningRequest(
                 operation_intent=operation_intent,
@@ -272,22 +262,12 @@ class MainControlOrchestrator:
                     unified_constraints=(previous_mediator_decision or {}).get("unified_constraints") if isinstance(previous_mediator_decision, dict) else None,
                 ),
             )
-            reuse_policy_plan = (
-                round_index > 1
-                and retry_category == "execution_failure"
-                and previous_policy_plan is not None
-            )
-            if reuse_policy_plan:
-                policy_plan = previous_policy_plan.model_copy(deep=True)
-            else:
-                self._apply_trace_metadata(self.os_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
-                try:
-                    policy_plan = self.os_agent.generate_strategy(planning_request)
-                finally:
-                    self._clear_trace_metadata(self.os_agent)
-                self._remember("OSA", policy_plan)
-            previous_operation_intent = operation_intent.model_copy(deep=True)
-            previous_policy_plan = policy_plan.model_copy(deep=True)
+            self._apply_trace_metadata(self.os_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
+            try:
+                policy_plan = self.os_agent.generate_strategy(planning_request)
+            finally:
+                self._clear_trace_metadata(self.os_agent)
+            self._remember("OSA", policy_plan)
 
             qos_proposal, mobility_proposal = split_domain_proposals(policy_plan)
             initial_verdicts: List[DomainVerdict] = []
@@ -416,6 +396,16 @@ class MainControlOrchestrator:
                 retry_count=max(0, round_index - 1),
                 round_traces=round_traces,
             )
+            log_event(
+                self.main_agent.logger,
+                "control_round_complete",
+                session_id=session_id,
+                round_index=round_index,
+                completed=completed,
+                requested_domains=",".join(item.value for item in global_intent.requested_domains) or "<empty>",
+                diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
+                execution_status=report.execution_status if report is not None else "blocked",
+            )
             if completed:
                 break
 
@@ -435,10 +425,25 @@ class MainControlOrchestrator:
                 mediator_decision=mediator_decision.model_dump(mode="json"),
                 round_index=round_index,
             )
+            log_event(
+                self.main_agent.logger,
+                "control_round_retry_scheduled",
+                session_id=session_id,
+                next_round=round_index + 1,
+                diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
+            )
 
         update_session_context(
             session_id,
             current_step="completed" if completed else "failed",
+            current_snapshot_id=str(
+                (
+                    latest_result.qos_feedback.get("committed_snapshot_id")
+                    if latest_result is not None and isinstance(latest_result.qos_feedback, dict)
+                    else ""
+                )
+                or snapshot_id
+            ).strip(),
             status="completed" if completed else "failed",
         )
         if latest_result is None:
@@ -498,7 +503,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     try:
         user_input = _resolve_user_input(args.user_input)
-        orchestrator = MainControlOrchestrator(max_rounds=args.max_rounds)
+        orchestrator = MainControlOrchestrator(max_rounds=args.max_rounds, use_local_model=True)
         result = orchestrator.run(
             user_input,
             scenario_id=args.scenario_id,

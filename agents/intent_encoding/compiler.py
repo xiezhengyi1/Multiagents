@@ -543,40 +543,45 @@ class IntentCompiler:
 
     @staticmethod
     def _flow_candidate_from_catalog(flow: Dict[str, Any], *, score: float) -> FlowCandidateEvidence:
+        service = flow.get("service") if isinstance(flow.get("service"), dict) else {}
         return FlowCandidateEvidence(
             supi=str(flow.get("supi") or "").strip(),
             app_id=str(flow.get("app_id") or "").strip(),
             app_name=str(flow.get("app_name") or "").strip() or None,
             flow_id=str(flow.get("flow_id") or "").strip(),
             flow_name=str(flow.get("flow_name") or "").strip(),
-            service_type=str(flow.get("service_type") or "").strip() or None,
-            service_type_id=flow.get("service_type_id"),
+            service_type=str(service.get("service_type") or "").strip() or None,
+            service_type_id=service.get("service_type_id"),
             score=score,
         )
 
     @staticmethod
     def _build_flow_selector_from_catalog(flow: Dict[str, Any]) -> FlowSelector:
-        five_tuple = flow.get("five_tuple")
+        service = flow.get("service") if isinstance(flow.get("service"), dict) else {}
+        sla = flow.get("sla") if isinstance(flow.get("sla"), dict) else {}
+        allocation = flow.get("allocation") if isinstance(flow.get("allocation"), dict) else {}
+        traffic = flow.get("traffic") if isinstance(flow.get("traffic"), dict) else {}
+        five_tuple = traffic.get("five_tuple")
         return FlowSelector(
             supi=str(flow.get("supi") or "").strip(),
             app_id=str(flow.get("app_id") or "").strip(),
             flow_id=str(flow.get("flow_id") or "").strip() or None,
             target_type="flow",
             name=str(flow.get("flow_name") or flow.get("flow_id") or "").strip(),
-            service_type=str(flow.get("service_type") or "").strip() or None,
-            service_type_id=flow.get("service_type_id"),
-            bw_ul=flow.get("bw_ul"),
-            bw_dl=flow.get("bw_dl"),
-            gbr_ul=flow.get("gbr_ul"),
-            gbr_dl=flow.get("gbr_dl"),
-            lat=flow.get("lat"),
-            loss_req=flow.get("loss_req"),
-            jitter_req=flow.get("jitter_req"),
-            priority=flow.get("priority"),
+            service_type=str(service.get("service_type") or "").strip() or None,
+            service_type_id=service.get("service_type_id"),
+            bw_ul=sla.get("bandwidth_ul"),
+            bw_dl=sla.get("bandwidth_dl"),
+            gbr_ul=sla.get("guaranteed_bandwidth_ul"),
+            gbr_dl=sla.get("guaranteed_bandwidth_dl"),
+            lat=sla.get("latency"),
+            loss_req=sla.get("loss_rate"),
+            jitter_req=sla.get("jitter"),
+            priority=sla.get("priority"),
             description=str(flow.get("flow_name") or "").strip() or None,
             five_tuple=list(five_tuple) if isinstance(five_tuple, (list, tuple)) else None,
-            current_bw_ul=flow.get("current_bw_ul"),
-            current_bw_dl=flow.get("current_bw_dl"),
+            current_bw_ul=allocation.get("allocated_bandwidth_ul"),
+            current_bw_dl=allocation.get("allocated_bandwidth_dl"),
             resolution_status="resolved",
         )
 

@@ -25,7 +25,7 @@ def _resolve_target_app_payload(request: JointOptimizationRequest) -> Optional[D
     if isinstance(operation_intent, dict) and operation_intent.get("flows"):
         return {
             "app_id": operation_intent.get("app_id"),
-            "name": operation_intent.get("app_name") or operation_intent.get("app_name"),
+            "name": operation_intent.get("app_name"),
             "supi": operation_intent.get("supi"),
             "flows": operation_intent.get("flows"),
         }
@@ -39,7 +39,7 @@ def _resolve_target_app_payload(request: JointOptimizationRequest) -> Optional[D
     for app in apps:
         if not isinstance(app, dict):
             continue
-        if target_app_id and str(app.get("app_id") or "").strip() == target_app_id:
+        if target_app_id and str(app.get("id") or "").strip() == target_app_id:
             return app
         if target_supi and str(app.get("supi") or "").strip() == target_supi:
             return app
@@ -228,4 +228,3 @@ def run_joint_control_optimizer_payload(payload: Dict[str, Any]) -> Dict[str, An
 def run_joint_control_optimizer_json(payload_json: str) -> str:
     payload = json.loads(payload_json)
     return json.dumps(run_joint_control_optimizer_payload(payload), ensure_ascii=False)
-

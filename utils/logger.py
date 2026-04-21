@@ -4,6 +4,20 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict
 
+
+def _reconfigure_stream_utf8(stream: Any) -> None:
+    reconfigure = getattr(stream, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
+_reconfigure_stream_utf8(sys.stdout)
+_reconfigure_stream_utf8(sys.stderr)
+
+
 # ASCII 颜色代码
 class LogColors:
     RESET = "\033[0m"

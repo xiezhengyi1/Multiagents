@@ -22,7 +22,7 @@ from generate_user_inputs import (
     build_output,
     load_network_state,
 )
-from agents.tools.init_scenario import initialize_scenario
+from agents.tools.db_tool import get_latest_snapshot_metadata
 from sft_data.common import ensure_agent_layout, processed_dir
 from sft_data.schemas import write_jsonl
 from sft_data.trajectory_projection import (
@@ -270,8 +270,9 @@ def collect_workflow_trajectories(
 ) -> Dict[str, Any]:
     ensure_agent_layout("workflow")
     init_db()
-    if not reset_scenario_each_run:
-        initialize_scenario(reset=True)
+    latest_snapshot = get_latest_snapshot_metadata() or {}
+    if not str(latest_snapshot.get("snapshot_id") or "").strip():
+        raise RuntimeError("No latest snapshot found. Seed the scenario snapshot once before collecting trajectories.")
 
     results: List[Dict[str, Any]] = []
     if spec_output is not None:
@@ -292,9 +293,6 @@ def collect_workflow_trajectories(
     with runtime_context:
         total = len(records)
         for record in records:
-            if reset_scenario_each_run:
-                initialize_scenario(reset=True)
-
             scenario_id = _scenario_id(record, prefix=scenario_prefix)
             merged_tags = _merge_tags(record.get("scenario_tags", []), scenario_tags)
             orchestrator = MainControlOrchestrator(max_rounds=max_rounds)

@@ -35,9 +35,11 @@ def _safe_float(value: Any) -> Optional[float]:
 
 
 def _summarize_flow_status(flow_props: Dict[str, Any]) -> str:
-    latency = _safe_float(flow_props.get("sim_latency") or flow_props.get("lat"))
-    jitter = _safe_float(flow_props.get("sim_jitter") or flow_props.get("jitter_req"))
-    loss = _safe_float(flow_props.get("loss_req"))
+    telemetry = flow_props.get("telemetry") if isinstance(flow_props.get("telemetry"), dict) else {}
+    sla = flow_props.get("sla") if isinstance(flow_props.get("sla"), dict) else {}
+    latency = _safe_float(telemetry.get("latency") or sla.get("latency"))
+    jitter = _safe_float(telemetry.get("jitter") or sla.get("jitter"))
+    loss = _safe_float(telemetry.get("loss_rate") or sla.get("loss_rate"))
 
     if latency is not None and latency <= 20 and (loss is None or loss <= 0.002):
         return "healthy"
@@ -117,8 +119,8 @@ def _derive_topology(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "edge_key": f"{flow_key}:ue-ran",
                     "source_key": ue_key,
                     "target_key": primary_ran,
-                    "flow_id": flow_props.get("flow_id"),
-                    "service_type": flow_props.get("service_type"),
+                    "flow_id": flow_props.get("id"),
+                    "service_type": (flow_props.get("service") or {}).get("service_type"),
                     "status": _summarize_flow_status(flow_props),
                 }
             )
@@ -128,28 +130,32 @@ def _derive_topology(payload: Dict[str, Any]) -> Dict[str, Any]:
                     "edge_key": f"{flow_key}:ran-core",
                     "source_key": primary_ran,
                     "target_key": primary_core,
-                    "flow_id": flow_props.get("flow_id"),
-                    "service_type": flow_props.get("service_type"),
+                    "flow_id": flow_props.get("id"),
+                    "service_type": (flow_props.get("service") or {}).get("service_type"),
                     "status": _summarize_flow_status(flow_props),
                 }
             )
 
+        service = flow_props.get("service") if isinstance(flow_props.get("service"), dict) else {}
+        sla = flow_props.get("sla") if isinstance(flow_props.get("sla"), dict) else {}
+        allocation = flow_props.get("allocation") if isinstance(flow_props.get("allocation"), dict) else {}
+        telemetry = flow_props.get("telemetry") if isinstance(flow_props.get("telemetry"), dict) else {}
         flow_statuses.append(
             {
                 "flow_key": flow_key,
-                "flow_id": flow_props.get("flow_id"),
+                "flow_id": flow_props.get("id"),
                 "name": flow_props.get("name"),
                 "supi": flow_props.get("supi"),
                 "app_id": flow_props.get("app_id"),
                 "app_name": flow_props.get("app_name"),
-                "service_type": flow_props.get("service_type"),
-                "slice": flow_props.get("old_slice"),
-                "bw_ul": flow_props.get("bw_ul"),
-                "bw_dl": flow_props.get("bw_dl"),
-                "latency": flow_props.get("sim_latency") or flow_props.get("lat"),
-                "jitter": flow_props.get("sim_jitter") or flow_props.get("jitter_req"),
-                "throughput_ul": flow_props.get("sim_throughput_ul"),
-                "throughput_dl": flow_props.get("sim_throughput_dl"),
+                "service_type": service.get("service_type"),
+                "slice": allocation.get("current_slice_snssai"),
+                "bw_ul": sla.get("bandwidth_ul"),
+                "bw_dl": sla.get("bandwidth_dl"),
+                "latency": telemetry.get("latency") or sla.get("latency"),
+                "jitter": telemetry.get("jitter") or sla.get("jitter"),
+                "throughput_ul": telemetry.get("throughput_ul"),
+                "throughput_dl": telemetry.get("throughput_dl"),
                 "status": _summarize_flow_status(flow_props),
                 "route": {
                     "ue_key": ue_key,

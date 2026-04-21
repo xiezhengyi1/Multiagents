@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from io import BytesIO
@@ -28,7 +29,9 @@ from knowledge_scripts.build_pcf_policy_kb import (
     build_eval_queries,
     build_exact_index,
     build_glossary_records,
+    collection_scoped_ids,
     default_sources,
+    extract_openapi_chunks,
     infer_object_tags,
     is_minimal_source,
     is_probable_heading,
@@ -38,6 +41,7 @@ from knowledge_scripts.build_pcf_policy_kb import (
     normalize_records_for_embedding,
     sanitize_text,
     split_large_section,
+    TOKEN_RE,
     write_jsonl,
 )
 from utils.logger import setup_logger
@@ -56,6 +60,8 @@ DOCLING_SCHEMA_EXACT_INDEX_JSON = DOCLING_PROCESSED_ROOT / "schema_exact_index.j
 DOCLING_GLOSSARY_EXACT_INDEX_JSON = DOCLING_PROCESSED_ROOT / "glossary_exact_index.json"
 DOCLING_RETRIEVAL_EVAL_JSON = DOCLING_PROCESSED_ROOT / "retrieval_eval_queries.json"
 
+PCF_AM_POLICY_CLAUSES_DOCLING_COLLECTION = "pcf_am_policy_clauses_r18_docling"
+PCF_AM_POLICY_SCHEMA_DOCLING_COLLECTION = "pcf_am_policy_schema_r18_docling"
 PCF_SM_POLICY_CLAUSES_DOCLING_COLLECTION = "pcf_sm_policy_clauses_r18_docling"
 PCF_SM_POLICY_SCHEMA_DOCLING_COLLECTION = "pcf_sm_policy_schema_r18_docling"
 PCF_URSP_CLAUSES_DOCLING_COLLECTION = "pcf_ursp_clauses_r18_docling"
@@ -85,7 +91,10 @@ def _write_auxiliary_maps_to_docling_outputs(
         globals_map["SPEC_OBJECT_MAP_JSON"], globals_map["TERM_ALIAS_MAP_JSON"] = original_targets
 
 
-def _load_pdf_sources(manifest: Optional[Iterable[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+def _load_minimal_sources_by_doc_type(
+    doc_types: set[str],
+    manifest: Optional[Iterable[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     if manifest is None:
         if MANIFEST_PATH.exists():
             manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
@@ -106,20 +115,28 @@ def _load_pdf_sources(manifest: Optional[Iterable[Dict[str, Any]]] = None) -> Li
                 }
                 manifest.append(source_dict)
 
-    pdf_sources: List[Dict[str, Any]] = []
+    sources: List[Dict[str, Any]] = []
     for source in manifest:
-        if source.get("doc_type") not in {"stage2", "stage3"}:
+        if source.get("doc_type") not in doc_types:
             continue
         local_path = Path(str(source.get("local_path") or "")).expanduser()
         if not local_path.exists():
             raise FileNotFoundError(f"PCF PDF source not found: {local_path}")
         normalized = dict(source)
         normalized["local_path"] = str(local_path)
-        pdf_sources.append(normalized)
-    pdf_sources = [source for source in pdf_sources if is_minimal_source(source)]
+        sources.append(normalized)
+    return [source for source in sources if is_minimal_source(source)]
+
+
+def _load_pdf_sources(manifest: Optional[Iterable[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    pdf_sources = _load_minimal_sources_by_doc_type({"stage2", "stage3"}, manifest)
     if not pdf_sources:
         raise RuntimeError("No PCF PDF sources were found for docling processing.")
     return pdf_sources
+
+
+def _load_openapi_sources(manifest: Optional[Iterable[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    return _load_minimal_sources_by_doc_type({"openapi"}, manifest)
 
 
 def _get_docling_converter() -> DocumentConverter:
@@ -351,6 +368,13 @@ _BOILERPLATE_CLAUSE_PREFIXES = (
 
 # 最小有效内容长度（低于此阈值认为信息量不足）
 _MIN_CONTENT_LENGTH = 40
+_SINGLE_DIGIT_TOKEN_RE = re.compile(r"^\d$")
+_GENERIC_NOISE_TITLE_RE = re.compile(r"^(?:\d+\s+){5,}\d+$")
+_EMBEDDED_TABLE_MARKER_RE = re.compile(
+    r"(?P<section>\d+(?:\.\d+)+)\s+Type\s+(?P<type>[A-Za-z][A-Za-z0-9_]*)\s+"
+    r"Table\s+(?P<section_repeat>\d+(?:\.\d+)+)-\d+:\s+Definition of type\s+(?P=type)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _is_boilerplate(record: Dict[str, Any]) -> bool:
@@ -381,6 +405,30 @@ def _is_low_information(record: Dict[str, Any]) -> bool:
     return False
 
 
+def _is_ocr_noise(record: Dict[str, Any]) -> bool:
+    """判定记录是否更像 OCR/版面噪声而不是标准条文。"""
+    content = str(record.get("page_content") or "").strip()
+    metadata = record.get("metadata") or {}
+    clause_title = str(metadata.get("clause_title") or "").strip()
+    if _GENERIC_NOISE_TITLE_RE.match(clause_title):
+        return True
+
+    tokens = TOKEN_RE.findall(content)
+    if len(tokens) < 8:
+        return False
+
+    single_digit_tokens = sum(1 for token in tokens if _SINGLE_DIGIT_TOKEN_RE.match(token))
+    alpha_tokens = sum(1 for token in tokens if any(char.isalpha() for char in token))
+    long_alpha_tokens = sum(1 for token in tokens if len(token) >= 4 and any(char.isalpha() for char in token))
+    unique_tokens = len(set(token.lower() for token in tokens))
+
+    if single_digit_tokens >= 6 and single_digit_tokens / len(tokens) >= 0.35 and long_alpha_tokens <= 2:
+        return True
+    if alpha_tokens <= max(2, len(tokens) // 6) and unique_tokens <= max(4, len(tokens) // 5):
+        return True
+    return False
+
+
 def _deduplicate_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """基于内容前缀去重，保留第一次出现的记录。"""
     seen: Dict[str, bool] = {}
@@ -396,6 +444,49 @@ def _deduplicate_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
+def _promote_embedded_table_markers(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    promoted: List[Dict[str, Any]] = list(records)
+    seen_ids = {str(record.get("id") or "").strip() for record in records}
+    for record in records:
+        metadata = record.get("metadata") or {}
+        spec_id = str(metadata.get("spec_id") or "").strip()
+        page_content = str(record.get("page_content") or "")
+        page_start = int(metadata.get("page_start") or 1)
+        page_end = int(metadata.get("page_end") or page_start)
+        for match in _EMBEDDED_TABLE_MARKER_RE.finditer(page_content):
+            section = str(match.group("section") or "").strip()
+            repeated = str(match.group("section_repeat") or "").strip()
+            type_name = str(match.group("type") or "").strip()
+            if not section or section != repeated or not type_name:
+                continue
+            synthetic_id = f"{record['id']}-embedded-table-{section}-{type_name}"
+            if synthetic_id in seen_ids:
+                continue
+            canonical_title = f"{spec_id} {section} Type {type_name} Table {section}-1: Definition of type {type_name}".strip()
+            synthetic_metadata = {
+                **metadata,
+                "doc_type": "table",
+                "clause_path": section,
+                "clause_title": f"Type {type_name}",
+                "table_id": f"Table {section}-1: Definition of type {type_name}",
+                "canonical_title": canonical_title,
+                "citation_anchor": f"{spec_id}:{section}",
+                "page_start": page_start,
+                "page_end": page_end,
+                "object_tags": infer_object_tags(f"{type_name} {page_content}"),
+                "normalized_terms": normalize_query_terms(canonical_title),
+            }
+            promoted.append(
+                {
+                    "id": synthetic_id,
+                    "page_content": f"Table {section}-1: Definition of type {type_name}",
+                    "metadata": synthetic_metadata,
+                }
+            )
+            seen_ids.add(synthetic_id)
+    return promoted
+
+
 def clean_docling_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     中文标注：完整的数据清洗流水线。
@@ -404,14 +495,31 @@ def clean_docling_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     3. 去除重复内容
     """
     # 第一轮：过滤噪声
-    filtered = [r for r in records if not _is_boilerplate(r) and not _is_low_information(r)]
+    filtered = [
+        r
+        for r in records
+        if not _is_boilerplate(r)
+        and not _is_low_information(r)
+        and not _is_ocr_noise(r)
+    ]
+    filtered = _promote_embedded_table_markers(filtered)
     # 第二轮：去重
     return _deduplicate_records(filtered)
+
+
+def _namespace_docling_records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    namespaced: List[Dict[str, Any]] = []
+    for record in records:
+        normalized = dict(record)
+        normalized["id"] = f"docling-{str(record.get('id') or '').strip()}"
+        namespaced.append(normalized)
+    return namespaced
 
 
 def build_corpus_from_docling(manifest: Optional[Iterable[Dict[str, Any]]] = None) -> Dict[str, int]:
     ensure_docling_directories()
     pdf_sources = _load_pdf_sources(manifest)
+    openapi_sources = _load_openapi_sources(manifest)
     clause_records: List[Dict[str, Any]] = []
     for source in pdf_sources:
         clause_records.extend(extract_pdf_sections_with_docling(source))
@@ -422,7 +530,12 @@ def build_corpus_from_docling(manifest: Optional[Iterable[Dict[str, Any]]] = Non
     logger.info("Data cleaning: %d -> %d records (removed %d noise entries).", raw_count, len(clause_records), raw_count - len(clause_records))
 
     schema_records: List[Dict[str, Any]] = []
+    for source in openapi_sources:
+        schema_records.extend(extract_openapi_chunks(source))
+    clause_records = _namespace_docling_records(clause_records)
+    schema_records = _namespace_docling_records(schema_records)
     glossary_records = build_glossary_records(clause_records, schema_records)
+    glossary_records = _namespace_docling_records(glossary_records)
 
     write_jsonl(DOCLING_CLAUSE_JSONL, clause_records)
     write_jsonl(DOCLING_SCHEMA_JSONL, schema_records)
@@ -437,13 +550,19 @@ def build_corpus_from_docling(manifest: Optional[Iterable[Dict[str, Any]]] = Non
     DOCLING_GLOSSARY_EXACT_INDEX_JSON.write_text(json.dumps(glossary_exact, ensure_ascii=False, indent=2), encoding="utf-8")
 
     eval_queries = []
+    collection_rewrites = {
+        "pcf_am_policy_clauses_r18": PCF_AM_POLICY_CLAUSES_DOCLING_COLLECTION,
+        "pcf_am_policy_schema_r18": PCF_AM_POLICY_SCHEMA_DOCLING_COLLECTION,
+        "pcf_sm_policy_clauses_r18": PCF_SM_POLICY_CLAUSES_DOCLING_COLLECTION,
+        "pcf_sm_policy_schema_r18": PCF_SM_POLICY_SCHEMA_DOCLING_COLLECTION,
+        "pcf_ursp_clauses_r18": PCF_URSP_CLAUSES_DOCLING_COLLECTION,
+        "pcf_ursp_schema_r18": PCF_URSP_SCHEMA_DOCLING_COLLECTION,
+        "pcf_policy_glossary_r18": PCF_POLICY_GLOSSARY_DOCLING_COLLECTION,
+    }
     for item in build_eval_queries():
         target = str(item["target_collection"])
-        target = target.replace("pcf_sm_policy_clauses_r18", PCF_SM_POLICY_CLAUSES_DOCLING_COLLECTION)
-        target = target.replace("pcf_sm_policy_schema_r18", PCF_SM_POLICY_SCHEMA_DOCLING_COLLECTION)
-        target = target.replace("pcf_ursp_clauses_r18", PCF_URSP_CLAUSES_DOCLING_COLLECTION)
-        target = target.replace("pcf_ursp_schema_r18", PCF_URSP_SCHEMA_DOCLING_COLLECTION)
-        target = target.replace("pcf_policy_glossary_r18", PCF_POLICY_GLOSSARY_DOCLING_COLLECTION)
+        for base_collection, docling_collection in collection_rewrites.items():
+            target = target.replace(base_collection, docling_collection)
         eval_queries.append({**item, "target_collection": target})
     DOCLING_RETRIEVAL_EVAL_JSON.write_text(json.dumps(eval_queries, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -480,7 +599,7 @@ def _with_strategy_domains(records: Iterable[Dict[str, Any]]) -> List[Dict[str, 
 
 
 def _filter_minimal_records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    allowed_spec_ids = {"23.503", "24.526", "29.512", "29.525", "glossary"}
+    allowed_spec_ids = {"23.503", "24.526", "29.507", "29.512", "29.525", "29.571", "glossary"}
     filtered: List[Dict[str, Any]] = []
     for record in records:
         metadata = record.get("metadata") or {}
@@ -521,15 +640,19 @@ def ingest_docling_corpus() -> Dict[str, int]:
     schema_records = _prepare_records_for_ingest(DOCLING_SCHEMA_JSONL)
     glossary_records = _prepare_records_for_ingest(DOCLING_GLOSSARY_JSONL)
 
-    if not clause_records or not glossary_records:
+    if not clause_records or not schema_records or not glossary_records:
         raise RuntimeError("Docling processed corpus is incomplete. Run build first.")
 
+    am_clause_records = [record for record in clause_records if "am_policy" in (record["metadata"].get("strategy_domains") or [])]
     sm_clause_records = [record for record in clause_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
     ursp_clause_records = [record for record in clause_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
+    am_schema_records = [record for record in schema_records if "am_policy" in (record["metadata"].get("strategy_domains") or [])]
     sm_schema_records = [record for record in schema_records if "sm_policy" in (record["metadata"].get("strategy_domains") or [])]
     ursp_schema_records = [record for record in schema_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
 
     targets = [
+        (PCF_AM_POLICY_CLAUSES_DOCLING_COLLECTION, am_clause_records),
+        (PCF_AM_POLICY_SCHEMA_DOCLING_COLLECTION, am_schema_records),
         (PCF_SM_POLICY_CLAUSES_DOCLING_COLLECTION, sm_clause_records),
         (PCF_SM_POLICY_SCHEMA_DOCLING_COLLECTION, sm_schema_records),
         (PCF_URSP_CLAUSES_DOCLING_COLLECTION, ursp_clause_records),
@@ -540,7 +663,7 @@ def ingest_docling_corpus() -> Dict[str, int]:
     for collection_name, records in targets:
         store = rebuild_pgvector_collection(collection_name=collection_name)
         if records:
-            store.add_documents(_records_to_documents(records), ids=[record["id"] for record in records])
+            store.add_documents(_records_to_documents(records), ids=collection_scoped_ids(collection_name, records))
         stats[collection_name] = len(records)
         logger.info("Ingested %s documents into %s.", len(records), collection_name)
     return stats
@@ -552,10 +675,31 @@ def run_docling_pipeline() -> Dict[str, Any]:
     return {"processed": processed, "ingested": ingested}
 
 
+def repair_processed_docling_corpus() -> Dict[str, int]:
+    clause_records = load_jsonl(DOCLING_CLAUSE_JSONL)
+    schema_records = load_jsonl(DOCLING_SCHEMA_JSONL)
+    glossary_records = load_jsonl(DOCLING_GLOSSARY_JSONL)
+    repaired_clause_records = _namespace_docling_records(
+        clean_docling_records(
+            [
+                {**record, "id": str(record.get("id") or "").removeprefix("docling-")}
+                if str(record.get("id") or "").startswith("docling-")
+                else record
+                for record in clause_records
+            ]
+        )
+    )
+    write_jsonl(DOCLING_CLAUSE_JSONL, repaired_clause_records)
+    clause_exact = build_exact_index(repaired_clause_records, index_name="clause_exact")
+    DOCLING_CLAUSE_EXACT_INDEX_JSON.write_text(json.dumps(clause_exact, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_auxiliary_maps_to_docling_outputs(repaired_clause_records, schema_records, glossary_records)
+    return {"clauses": len(repaired_clause_records)}
+
+
 def main() -> None:
     _ensure_ascii_runtime_or_reexec(sys.argv)
-    parser = argparse.ArgumentParser(description="Build the docling-based PCF PDF knowledge base.")
-    parser.add_argument("command", choices=["build", "ingest", "all"])
+    parser = argparse.ArgumentParser(description="Build the docling-based PCF SM/AM/UE policy knowledge base.")
+    parser.add_argument("command", choices=["build", "ingest", "all", "repair"])
     args = parser.parse_args()
 
     ensure_docling_directories()
@@ -563,6 +707,8 @@ def main() -> None:
         result = build_corpus_from_docling()
     elif args.command == "ingest":
         result = ingest_docling_corpus()
+    elif args.command == "repair":
+        result = repair_processed_docling_corpus()
     else:
         result = run_docling_pipeline()
     print(json.dumps(result, ensure_ascii=False, indent=2))

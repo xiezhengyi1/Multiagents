@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain.tools import ToolRuntime, tool
+from pydantic import ValidationError
 
 from agents.tools.wrapper_think import tool_with_reason
 
@@ -98,11 +99,13 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         *,
         enable_llm_feedback_summary: bool = True,
         feedback_llm: Any = None,
+        use_local_model: bool = False,
     ):
         self.agent_name = "policy_dispatch"
         self.model_name = model_name
         self.enable_llm_feedback_summary = bool(enable_llm_feedback_summary)
         self._feedback_llm = feedback_llm
+        self.use_local_model = use_local_model
         self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[92m")
         self._trace_writer = JsonlTraceWriter(self.agent_name)
         self.init_worker_runtime()
@@ -522,7 +525,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
 
     def _get_feedback_llm(self) -> Any:
         if self._feedback_llm is None:
-            self._feedback_llm = BaseAgent(model_name=self.model_name).get_llm()
+            self._feedback_llm = BaseAgent(model_name=self.model_name, use_local_model=self.use_local_model).get_llm()
         return self._feedback_llm
 
     def _summarize_feedback_with_llm(
@@ -560,7 +563,62 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
                 ),
             ]
         )
-        return FeedbackSummaryDraft.model_validate_json(self._extract_message_text(response))
+        return self._coerce_feedback_summary(
+            self._extract_message_text(response),
+            default_violation=str(outcome_payload.get("violation_details") or "").strip(),
+            default_correction=str(outcome_payload.get("correction_suggestion") or "").strip(),
+        )
+
+    def _coerce_feedback_summary(
+        self,
+        raw_text: str,
+        *,
+        default_violation: str,
+        default_correction: str,
+    ) -> FeedbackSummaryDraft:
+        text = str(raw_text or "").strip()
+        if not text:
+            return FeedbackSummaryDraft(
+                violation_details=default_violation or "execution failed",
+                correction_suggestion=default_correction or "Revise the failed policy subset before the next execution round.",
+            )
+
+        try:
+            return FeedbackSummaryDraft.model_validate_json(text)
+        except ValidationError:
+            payload = self._extract_json_payload_from_dispatch_output(text)
+            if isinstance(payload, dict):
+                try:
+                    return FeedbackSummaryDraft.model_validate(payload)
+                except ValidationError:
+                    pass
+
+        repair_response = self._get_feedback_llm().invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Convert the user's content into a strict JSON object with exactly two string keys: "
+                        "`violation_details` and `correction_suggestion`. Return JSON only."
+                    )
+                ),
+                HumanMessage(content=text),
+            ]
+        )
+        repaired_text = self._extract_message_text(repair_response)
+        try:
+            return FeedbackSummaryDraft.model_validate_json(repaired_text)
+        except ValidationError:
+            repaired_payload = self._extract_json_payload_from_dispatch_output(repaired_text)
+            if isinstance(repaired_payload, dict):
+                try:
+                    return FeedbackSummaryDraft.model_validate(repaired_payload)
+                except ValidationError:
+                    pass
+
+        return FeedbackSummaryDraft(
+            violation_details=default_violation or text,
+            correction_suggestion=default_correction or "Revise the failed policy subset before the next execution round.",
+        )
 
     @staticmethod
     def _extract_json_payload_from_dispatch_output(dispatch_output: str) -> Optional[Dict[str, Any]]:

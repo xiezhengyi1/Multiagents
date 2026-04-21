@@ -126,7 +126,7 @@ def select_target_snssais(snapshot: MobilityContextSnapshot, qos_plan: Dict[str,
     for flow in qos_plan.get("target_app", {}).get("flows", []):
         if not isinstance(flow, dict):
             continue
-        candidate = build_slice_snssai(flow.get("New Slice"))
+        candidate = build_slice_snssai((flow.get("allocation") or {}).get("current_slice_snssai"))
         if candidate is not None and all(item.model_dump() != candidate.model_dump() for item in target):
             target.append(candidate)
     if not target:
@@ -276,12 +276,12 @@ def run_cross_domain_checks(
         for flow in qos_plan.get("target_app", {}).get("flows", []):
             if not isinstance(flow, dict):
                 continue
-            snssai = build_slice_snssai(flow.get("New Slice"))
+            snssai = build_slice_snssai((flow.get("allocation") or {}).get("current_slice_snssai"))
             if snssai is None:
                 continue
             if snssai_key(snssai) not in allowed_keys:
                 hard_conflicts.append(
-                    f"QoS-selected slice {flow.get('New Slice')} is not covered by mobility allowedSnssais"
+                    f"QoS-selected slice {(flow.get('allocation') or {}).get('current_slice_snssai')} is not covered by mobility allowedSnssais"
                 )
 
     total_ul = 0.0
@@ -289,8 +289,9 @@ def run_cross_domain_checks(
     for flow in qos_plan.get("target_app", {}).get("flows", []):
         if not isinstance(flow, dict):
             continue
-        total_ul += float(flow.get("Act BW UL") or 0.0)
-        total_dl += float(flow.get("Act BW DL") or 0.0)
+        allocation = flow.get("allocation") if isinstance(flow.get("allocation"), dict) else {}
+        total_ul += float(allocation.get("allocated_bandwidth_ul") or 0.0)
+        total_dl += float(allocation.get("allocated_bandwidth_dl") or 0.0)
     try:
         ue_ambr_ul = float(str(mobility_draft.policy.ueAmbr.uplink).split()[0]) if mobility_draft.policy.ueAmbr else 0.0
         ue_ambr_dl = float(str(mobility_draft.policy.ueAmbr.downlink).split()[0]) if mobility_draft.policy.ueAmbr else 0.0

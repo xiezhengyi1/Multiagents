@@ -40,71 +40,131 @@ class Path:
 
 
 @dataclass
-class Flow:
-    name: str
-    flow_id: str
+class FlowService:
     service_type: str
-    bw_ul: float
-    bw_dl: float
-    gbr_ul: float
-    gbr_dl: float
-    lat: float
-    loss_req: float
-    jitter_req: float
-    priority: int
-    old_slice: Optional[str] = None
-    old_allocated_bw_ul: Optional[float] = None
-    old_allocated_bw_dl: Optional[float] = None
-    optimize_requested: bool = False
-
-    # IBNS-specific defaults
-    packet_size: float = 0.0
-    arrival_rate: float = 0.0
     service_type_id: int = 1
 
-    # Runtime metrics from simulator
-    sim_throughput_ul: Optional[float] = None
-    sim_throughput_dl: Optional[float] = None
-    sim_latency: Optional[float] = None
-    sim_jitter: Optional[float] = None
-    sim_loss_rate: Optional[float] = None
-    sim_packet_sent: Optional[int] = None
-    sim_packet_received: Optional[int] = None
+
+@dataclass
+class FlowTraffic:
+    packet_size: float = 0.0
+    arrival_rate: float = 0.0
     five_tuple: Optional[Tuple[str, str, int, int, str]] = None
+
+
+@dataclass
+class FlowSLA:
+    bandwidth_ul: float
+    bandwidth_dl: float
+    guaranteed_bandwidth_ul: float
+    guaranteed_bandwidth_dl: float
+    latency: float
+    jitter: float
+    loss_rate: float
+    priority: int
+
+
+@dataclass
+class FlowAllocation:
+    current_slice_snssai: Optional[str] = None
+    allocated_bandwidth_ul: Optional[float] = None
+    allocated_bandwidth_dl: Optional[float] = None
+    optimize_requested: bool = False
+
+
+@dataclass
+class FlowTelemetry:
+    throughput_ul: Optional[float] = None
+    throughput_dl: Optional[float] = None
+    latency: Optional[float] = None
+    jitter: Optional[float] = None
+    loss_rate: Optional[float] = None
+    packet_sent: Optional[int] = None
+    packet_received: Optional[int] = None
+
+
+@dataclass
+class Flow:
+    id: str
+    name: str
+    service: FlowService
+    sla: FlowSLA
+    traffic: FlowTraffic = field(default_factory=FlowTraffic)
+    allocation: FlowAllocation = field(default_factory=FlowAllocation)
+    telemetry: FlowTelemetry = field(default_factory=FlowTelemetry)
 
     @property
     def data_rate(self) -> float:
-        if self.packet_size > 0 and self.arrival_rate > 0:
-            return self.packet_size * self.arrival_rate
-        r_ul = max(0.0, self.bw_ul * 1e6)
-        r_dl = max(0.0, self.bw_dl * 1e6)
+        if self.traffic.packet_size > 0 and self.traffic.arrival_rate > 0:
+            return self.traffic.packet_size * self.traffic.arrival_rate
+        r_ul = max(0.0, self.sla.bandwidth_ul * 1e6)
+        r_dl = max(0.0, self.sla.bandwidth_dl * 1e6)
         if r_ul > 0 and r_dl > 0:
             return (2.0 * r_ul * r_dl) / (r_ul + r_dl)
         return max(r_ul, r_dl)
 
 
 @dataclass
+class AppSummary:
+    total_bandwidth_ul: float
+    total_bandwidth_dl: float
+    min_latency: float
+    max_priority: int
+
+
+@dataclass
 class App:
+    id: str
     name: str
-    app_id: str
     flows: List[Flow]
     supi: Optional[str] = None
-    total_bw_ul: float = field(init=False)
-    total_bw_dl: float = field(init=False)
-    min_lat: float = field(init=False)
-    max_prio: int = field(init=False)
 
-    def __post_init__(self):
+    @property
+    def summary(self) -> AppSummary:
         if not self.flows:
-            self.total_bw_ul = 0.0
-            self.total_bw_dl = 0.0
-            self.min_lat = float("inf")
-            self.max_prio = 0
-        else:
-            self.total_bw_ul = sum(flow.bw_ul for flow in self.flows)
-            self.total_bw_dl = sum(flow.bw_dl for flow in self.flows)
-            self.min_lat = min(flow.lat for flow in self.flows)
-            self.max_prio = max(flow.priority for flow in self.flows)
+            return AppSummary(
+                total_bandwidth_ul=0.0,
+                total_bandwidth_dl=0.0,
+                min_latency=float("inf"),
+                max_priority=0,
+            )
+        return AppSummary(
+            total_bandwidth_ul=sum(flow.sla.bandwidth_ul for flow in self.flows),
+            total_bandwidth_dl=sum(flow.sla.bandwidth_dl for flow in self.flows),
+            min_latency=min(flow.sla.latency for flow in self.flows),
+            max_priority=max(flow.sla.priority for flow in self.flows),
+        )
+
+
+@dataclass
+class SliceCapacity:
+    total_bandwidth_ul: float = 0.0
+    total_bandwidth_dl: float = 0.0
+    reserved_bandwidth_ul: float = 0.0
+    reserved_bandwidth_dl: float = 0.0
+
+
+@dataclass
+class SliceLoad:
+    current_bandwidth_ul: float = 0.0
+    current_bandwidth_dl: float = 0.0
+
+
+@dataclass
+class SliceQos:
+    latency: float = 0.0
+    processing_delay: float = 0.0
+    jitter: float = 0.0
+    loss_rate: float = 0.0
+
+
+@dataclass
+class SliceTelemetry:
+    utilization_ul: Optional[float] = None
+    utilization_dl: Optional[float] = None
+    latency: Optional[float] = None
+    jitter: Optional[float] = None
+    loss_rate: Optional[float] = None
 
 
 @dataclass
@@ -112,59 +172,66 @@ class Slice:
     name: str
     sst: int
     sd: str
+    capacity: SliceCapacity = field(default_factory=SliceCapacity)
+    load: SliceLoad = field(default_factory=SliceLoad)
+    qos: SliceQos = field(default_factory=SliceQos)
+    telemetry: SliceTelemetry = field(default_factory=SliceTelemetry)
     snssai: str = field(init=False)
-    total_bw_ul: float = 0.0
-    total_bw_dl: float = 0.0
-    current_load_bw_ul: float = 0.0
-    current_load_bw_dl: float = 0.0
-    latency: float = 0.0
-    proc_delay: float = 0.0
-    loss: float = 0.0
-    jitter: float = 0.0
-    reserved_bw: float = 0.0
-
-    sim_utilization_ul: Optional[float] = None
-    sim_utilization_dl: Optional[float] = None
-    sim_latency: Optional[float] = None
-    sim_jitter: Optional[float] = None
-    sim_loss_rate: Optional[float] = None
 
     def __post_init__(self):
         self.snssai = f"{self.sst:02X}{self.sd}"
 
     def can_accommodate(self, flow: Flow) -> bool:
-        if flow.service_type_id != self.sst:
+        if flow.service.service_type_id != self.sst:
             return False
 
-        avail_ul = self.total_bw_ul - self.current_load_bw_ul - self.reserved_bw
-        avail_dl = self.total_bw_dl - self.current_load_bw_dl - self.reserved_bw
-        if avail_ul < flow.bw_ul or avail_dl < flow.bw_dl:
+        avail_ul = (
+            self.capacity.total_bandwidth_ul
+            - self.load.current_bandwidth_ul
+            - self.capacity.reserved_bandwidth_ul
+        )
+        avail_dl = (
+            self.capacity.total_bandwidth_dl
+            - self.load.current_bandwidth_dl
+            - self.capacity.reserved_bandwidth_dl
+        )
+        if avail_ul < flow.sla.bandwidth_ul or avail_dl < flow.sla.bandwidth_dl:
             return False
         return True
 
 
 @dataclass
+class NodeCapacity:
+    cpu: float
+    memory: float
+    mec: float = 0.0
+    prb: float = 0.0
+
+
+@dataclass
+class NodeTelemetry:
+    cpu_utilization: Optional[float] = 0
+    mec_utilization: Optional[float] = 0
+    memory_utilization: Optional[float] = 0
+    prb_utilization: Optional[float] = 0
+
+
+@dataclass
 class Node:
+    id: int
     name: str
-    cpu_capacity: float
-    memory_capacity: float
-    slices_hosted: List[str]
-    id: int = -1
-    type: str = "Generic"
-    mec_capacity: float = 0.0
-    prb_capacity: float = 0.0
-    sim_cpu_utilization: Optional[float] = 0
-    sim_mec_utilization: Optional[float] = 0
-    sim_mem_utilization: Optional[float] = 0
-    sim_prb_utilization: Optional[float] = 0
+    node_type: str
+    capacity: NodeCapacity
+    hosted_slice_snssais: List[str]
+    telemetry: NodeTelemetry = field(default_factory=NodeTelemetry)
 
     @property
     def is_an(self):
-        return self.type == "AN"
+        return self.node_type == "AN"
 
     @property
     def is_cn(self):
-        return self.type == "CN"
+        return self.node_type == "CN"
 
 
 @dataclass
@@ -176,10 +243,8 @@ class AMPolicyState:
     old_triggers: List[str] = field(default_factory=list)
     old_ue_ambr_ul: float = 0.0
     old_ue_ambr_dl: float = 0.0
-    # 可选参数
     rfsp_max: int = 8
     ambr_headroom: float = 0.2
-    # 各 trigger 的预期信令频率权重
     trigger_signal_costs: Dict[str, float] = field(default_factory=lambda: {
         "LOC_CH": 1.0,
         "PRA_CH": 0.6,
@@ -198,10 +263,9 @@ class OptimizationConfig:
     w2: float = 50.0
     w3: float = 1000.0
     w4: float = 0.0
-    # 关键步骤：AM 优化目标权重
-    w5: float = 30.0   # AM 策略变更成本
-    w6: float = 10.0   # Trigger 信令开销
-    w7: float = 5.0    # AMBR 紧致性
+    w5: float = 30.0
+    w6: float = 10.0
+    w7: float = 5.0
     alpha_cn: float = 0.04
     alpha_an: float = 0.01
     beta: float = 0.05

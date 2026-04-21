@@ -54,6 +54,7 @@ class OptimizationStrategyAdvisor:
         normalized_user_intent: Dict[str, Any],
         coordination_context: Dict[str, Any],
         optimizer_preview: Any,
+        planning_evidence: Dict[str, Any],
     ) -> AdvisorInvocation:
         runtime_context = self.owner.build_runtime_context(
             agent_name=self.owner.agent_name,
@@ -63,8 +64,6 @@ class OptimizationStrategyAdvisor:
             thread_id=planning_request.context.session_id,
         )
         preview_payload = _summarize_optimizer_result(optimizer_preview)
-        planning_evidence = self.compiler.build_planning_evidence(planning_request, optimizer_preview)
-
         request_tools = build_request_tools(planning_request)
         all_tools = [*self.owner._BASE_TOOLS, *request_tools]
         advisor_agent = self.owner.create_json_agent(
@@ -144,12 +143,26 @@ def _normalize_domains(raw_domains: Iterable[Any]) -> list[str]:
     return normalized
 
 
-def _required_tool_instructions(active_domains: list[str]) -> str:
+def _required_tool_instructions(active_domains: list[str], planning_evidence: Dict[str, Any]) -> str:
     instructions: list[str] = []
     if "qos" in active_domains:
-        instructions.append("- QoS is active: call `preview_optimizer` or `fetch_network_status` before final JSON.")
+        if bool(planning_evidence.get("preview_qos_plan_present")):
+            instructions.append(
+                "- QoS is active: the initial optimizer preview already provides grounded QoS runtime evidence. Reuse it directly unless you need fresher comparison evidence or the preview leaves required fields unsupported."
+            )
+        else:
+            instructions.append(
+                "- QoS is active but the initial optimizer preview does not provide grounded QoS runtime evidence. Call `preview_optimizer` or `fetch_network_status` before final JSON."
+            )
     if "mobility" in active_domains:
-        instructions.append("- Mobility is active: call `inspect_ue_policies` before final JSON.")
+        if bool(planning_evidence.get("preview_mobility_plan_present")):
+            instructions.append(
+                "- Mobility is active: the initial optimizer preview already provides grounded mobility context. Reuse it directly unless required fields remain unsupported or you need fresher UE-policy evidence."
+            )
+        else:
+            instructions.append(
+                "- Mobility is active but the initial optimizer preview does not provide grounded mobility context. Call `inspect_ue_policies` before final JSON."
+            )
     if not instructions:
         instructions.append("- Call a grounding tool before final JSON if any policy field depends on runtime evidence.")
     return "\n".join(instructions)
@@ -193,7 +206,7 @@ def build_advisor_user_prompt(
         "Initial optimizer preview summary:\n"
         f"{json.dumps(optimizer_preview_summary, ensure_ascii=False)}\n\n"
         "Mandatory tool-use rules for this round:\n"
-        f"{_required_tool_instructions(active_domains)}\n\n"
+        f"{_required_tool_instructions(active_domains, planning_evidence)}\n\n"
         "Output contract:\n"
         f"{_output_schema_contract(active_domains)}\n\n"
         "Reasoning requirement:\n"

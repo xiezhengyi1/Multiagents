@@ -24,7 +24,7 @@ def _join_key_parts(*parts: Any) -> str:
 
 def _app_identity(properties: Dict[str, Any], fallback: str = "") -> str:
     supi = str(properties.get("supi") or "").strip()
-    app_id = str(properties.get("app_id") or "").strip()
+    app_id = str(properties.get("id") or "").strip()
     if supi and app_id:
         return f"{supi}:{app_id}"
     if app_id:
@@ -184,7 +184,7 @@ class NetworkGraph:
             if attrs.get("node_type") != "flow":
                 continue
             properties = attrs.get("properties") or {}
-            if str(properties.get("supi") or "").strip() == target_supi and str(properties.get("flow_id") or "").strip() == target_flow:
+            if str(properties.get("supi") or "").strip() == target_supi and str(properties.get("id") or "").strip() == target_flow:
                 return dict(properties)
         return None
 
@@ -197,7 +197,7 @@ class NetworkGraph:
             node_type = attrs.get("node_type")
             properties = attrs.get("properties") or {}
             if node_type == "app" and str(properties.get("supi") or "").strip() == target_supi:
-                app_id = str(properties.get("app_id") or "")
+                app_id = str(properties.get("id") or "")
                 app_bucket_key = _app_identity(properties, fallback=str(_node_key))
                 app_catalog[app_bucket_key] = {
                     "supi": target_supi,
@@ -242,7 +242,7 @@ class NetworkGraph:
         for app in apps:
             app_payload = asdict(app) if not isinstance(app, dict) else dict(app)
             supi = str(app_payload.get("supi") or "").strip()
-            app_id = str(app_payload.get("app_id") or app_payload.get("name") or "")
+            app_id = str(app_payload.get("id") or app_payload.get("name") or "")
             app_key = _join_key_parts("app", supi, app_id)
             if supi:
                 ue_key = _join_key_parts("ue", supi)
@@ -257,29 +257,32 @@ class NetworkGraph:
                 flow_payload["app_id"] = app_id
                 flow_payload["app_name"] = app_payload.get("name")
                 flow_payload["supi"] = supi
-                flow_id = str(flow_payload.get("flow_id") or "").strip()
+                flow_id = str(flow_payload.get("id") or "").strip()
                 flow_key = _join_key_parts("flow", supi, app_id, flow_id)
-                graph.add_node(flow_key, "flow", label=str(flow_payload.get("name") or flow_payload.get("flow_id") or ""), properties=flow_payload)
+                graph.add_node(flow_key, "flow", label=str(flow_payload.get("name") or flow_payload.get("id") or ""), properties=flow_payload)
                 graph.add_edge(app_key, flow_key, "contains_flow", edge_key=f"{app_key}->{flow_key}", properties={"app_id": app_id})
-                old_slice = str(flow_payload.get("old_slice") or "").strip()
-                if old_slice:
-                    slice_key = _join_key_parts("slice", old_slice)
-                    graph.add_edge(flow_key, slice_key, "served_by_slice", edge_key=f"{flow_key}->{slice_key}", properties={"slice": old_slice})
-                for metric_name in (
-                    "bw_ul",
-                    "bw_dl",
-                    "gbr_ul",
-                    "gbr_dl",
-                    "lat",
-                    "jitter_req",
-                    "loss_req",
-                    "sim_latency",
-                    "sim_jitter",
-                    "sim_throughput_ul",
-                    "sim_throughput_dl",
+                allocation = flow_payload.get("allocation") if isinstance(flow_payload.get("allocation"), dict) else {}
+                sla = flow_payload.get("sla") if isinstance(flow_payload.get("sla"), dict) else {}
+                telemetry = flow_payload.get("telemetry") if isinstance(flow_payload.get("telemetry"), dict) else {}
+                current_slice = str(allocation.get("current_slice_snssai") or "").strip()
+                if current_slice:
+                    slice_key = _join_key_parts("slice", current_slice)
+                    graph.add_edge(flow_key, slice_key, "served_by_slice", edge_key=f"{flow_key}->{slice_key}", properties={"slice": current_slice})
+                for metric_name, metric_value in (
+                    ("sla.bandwidth_ul", sla.get("bandwidth_ul")),
+                    ("sla.bandwidth_dl", sla.get("bandwidth_dl")),
+                    ("sla.guaranteed_bandwidth_ul", sla.get("guaranteed_bandwidth_ul")),
+                    ("sla.guaranteed_bandwidth_dl", sla.get("guaranteed_bandwidth_dl")),
+                    ("sla.latency", sla.get("latency")),
+                    ("sla.jitter", sla.get("jitter")),
+                    ("sla.loss_rate", sla.get("loss_rate")),
+                    ("telemetry.latency", telemetry.get("latency")),
+                    ("telemetry.jitter", telemetry.get("jitter")),
+                    ("telemetry.throughput_ul", telemetry.get("throughput_ul")),
+                    ("telemetry.throughput_dl", telemetry.get("throughput_dl")),
                 ):
-                    if metric_name in flow_payload and flow_payload.get(metric_name) is not None:
-                        graph.upsert_metric("node", flow_key, metric_name, flow_payload.get(metric_name))
+                    if metric_value is not None:
+                        graph.upsert_metric("node", flow_key, metric_name, metric_value)
 
         for slice_obj in slices:
             slice_payload = asdict(slice_obj) if not isinstance(slice_obj, dict) else dict(slice_obj)
@@ -287,22 +290,42 @@ class NetworkGraph:
             slice_payload["snssai"] = snssai
             slice_key = _join_key_parts("slice", snssai)
             graph.add_node(slice_key, "slice", label=str(slice_payload.get("name") or snssai), properties=slice_payload)
-            for metric_name in ("total_bw_ul", "total_bw_dl", "current_load_bw_ul", "current_load_bw_dl", "latency", "loss", "jitter"):
-                if metric_name in slice_payload and slice_payload.get(metric_name) is not None:
-                    graph.upsert_metric("node", slice_key, metric_name, slice_payload.get(metric_name))
+            capacity = slice_payload.get("capacity") if isinstance(slice_payload.get("capacity"), dict) else {}
+            load = slice_payload.get("load") if isinstance(slice_payload.get("load"), dict) else {}
+            qos = slice_payload.get("qos") if isinstance(slice_payload.get("qos"), dict) else {}
+            for metric_name, metric_value in (
+                ("capacity.total_bandwidth_ul", capacity.get("total_bandwidth_ul")),
+                ("capacity.total_bandwidth_dl", capacity.get("total_bandwidth_dl")),
+                ("capacity.reserved_bandwidth_ul", capacity.get("reserved_bandwidth_ul")),
+                ("capacity.reserved_bandwidth_dl", capacity.get("reserved_bandwidth_dl")),
+                ("load.current_bandwidth_ul", load.get("current_bandwidth_ul")),
+                ("load.current_bandwidth_dl", load.get("current_bandwidth_dl")),
+                ("qos.latency", qos.get("latency")),
+                ("qos.processing_delay", qos.get("processing_delay")),
+                ("qos.loss_rate", qos.get("loss_rate")),
+                ("qos.jitter", qos.get("jitter")),
+            ):
+                if metric_value is not None:
+                    graph.upsert_metric("node", slice_key, metric_name, metric_value)
 
         for node_obj in nodes:
             node_payload = asdict(node_obj) if not isinstance(node_obj, dict) else dict(node_obj)
             node_name = str(node_payload.get("name") or node_payload.get("id") or "")
-            node_type = "ran_node" if str(node_payload.get("type") or "").upper() == "AN" else "core_node"
+            node_type = "ran_node" if str(node_payload.get("node_type") or "").upper() == "AN" else "core_node"
             node_key = _join_key_parts(node_type, node_name)
             graph.add_node(node_key, node_type, label=node_name, properties=node_payload)
-            for hosted_slice in node_payload.get("slices_hosted", []) or []:
+            for hosted_slice in node_payload.get("hosted_slice_snssais", []) or []:
                 slice_key = _join_key_parts("slice", hosted_slice)
                 graph.add_edge(slice_key, node_key, "hosted_on", edge_key=f"{slice_key}->{node_key}", properties={"hosted": True})
-            for metric_name in ("cpu_capacity", "memory_capacity", "mec_capacity", "prb_capacity"):
-                if metric_name in node_payload and node_payload.get(metric_name) is not None:
-                    graph.upsert_metric("node", node_key, metric_name, node_payload.get(metric_name))
+            capacity = node_payload.get("capacity") if isinstance(node_payload.get("capacity"), dict) else {}
+            for metric_name, metric_value in (
+                ("capacity.cpu", capacity.get("cpu")),
+                ("capacity.memory", capacity.get("memory")),
+                ("capacity.mec", capacity.get("mec")),
+                ("capacity.prb", capacity.get("prb")),
+            ):
+                if metric_value is not None:
+                    graph.upsert_metric("node", node_key, metric_name, metric_value)
 
         return graph
 

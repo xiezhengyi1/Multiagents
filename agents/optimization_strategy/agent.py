@@ -31,8 +31,8 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     }
     _BASE_TOOLS = [think, search_semantic_knowledge, get_knowledge_by_key]
 
-    def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507"):
-        super().__init__(model_name=model_name)
+    def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507", use_local_model: bool = False) -> None:
+        super().__init__(model_name=model_name, use_local_model=use_local_model)
         self.agent_name = "optimization_strategy"
         self.compiler = OptimizationStrategyCompiler()
         self.advisor = OptimizationStrategyAdvisor(self, self.compiler)
@@ -97,11 +97,13 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         advisor_invocation = None
         try:
             optimizer_preview = self._run_joint_optimizer_direct(planning_request)
+            planning_evidence = self.compiler.build_planning_evidence(planning_request, optimizer_preview)
             advisor_invocation = self.advisor.advise(
                 planning_request=planning_request,
                 normalized_user_intent=normalized_user_intent,
                 coordination_context=coordination_context,
                 optimizer_preview=optimizer_preview,
+                planning_evidence=planning_evidence,
             )
             grounding_tools = extract_grounding_tool_names(
                 advisor_invocation.raw_result,
@@ -111,6 +113,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 advisor_output=advisor_invocation.advisor_output,
                 planning_request=planning_request,
                 grounding_tools=grounding_tools,
+                planning_evidence=planning_evidence,
             )
             if validation_errors:
                 raise RuntimeError("OSA advisor grounding validation failed: " + "; ".join(validation_errors))

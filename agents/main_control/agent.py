@@ -12,13 +12,8 @@ from agents.BaseAgent import BaseAgent, coerce_structured_response, extract_grou
 from agents.tools.user_interaction_tool import ask_user_clarification
 from agents.worker import ArtifactWorkerMixin
 from agents.tools import (
-    get_am_policy_context,
     get_knowledge_by_key,
-    get_sm_ue_context,
-    get_sm_ue_flow_catalog,
-    search_am_policy_targets,
     search_semantic_knowledge,
-    search_sm_flow_targets,
     think,
 )
 from domain.control_plane import ControlDomain
@@ -54,13 +49,8 @@ class MainControlInvocation:
 
 class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "main_control"
-    SM_GROUNDING_TOOLS = {"search_sm_flow_targets", "get_sm_ue_context", "get_sm_ue_flow_catalog"}
-    AM_GROUNDING_TOOLS = {"get_am_policy_context", "search_am_policy_targets"}
-    LEGACY_GROUNDING_TOOLS = {"search_flow_targets_by_name", "get_ue_context", "get_ue_flow_catalog"}
+    LEGACY_GROUNDING_TOOLS = set()
     GROUNDING_TOOLS = {
-        *SM_GROUNDING_TOOLS,
-        *AM_GROUNDING_TOOLS,
-        *LEGACY_GROUNDING_TOOLS,
         "get_knowledge_by_key",
         "search_semantic_knowledge",
     }
@@ -71,11 +61,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         self.initialize_agent_runtime(logger_color="\033[93m")
         self.tools = [
             ask_user_clarification,
-            search_sm_flow_targets,
-            get_sm_ue_context,
-            get_sm_ue_flow_catalog,
-            get_am_policy_context,
-            search_am_policy_targets,
             get_knowledge_by_key,
             search_semantic_knowledge,
         ]
@@ -121,6 +106,13 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             intent: Optional[GlobalControlIntent] = None
             validation_errors: List[str] = []
             for attempt_index in range(3):
+                log_event(
+                    self.logger,
+                    "main_control_attempt_start",
+                    attempt=attempt_index + 1,
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                )
                 invocation = self._invoke_global_intent_result(
                     current_prompt,
                     runtime_context=runtime_context,
@@ -132,6 +124,12 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     context=context,
                     grounding_tools=grounding_tools,
                 ):
+                    log_event(
+                        self.logger,
+                        "main_control_grounding_gate_failed",
+                        attempt=attempt_index + 1,
+                        grounding_tools=",".join(grounding_tools) or "<none>",
+                    )
                     if attempt_index == 2:
                         raise RuntimeError("Main Agent failed mandatory grounding-tool gate after repeated retries.")
                     current_prompt = self._build_grounding_retry_prompt(
@@ -148,7 +146,26 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     grounding_tools=grounding_tools,
                 )
                 if not validation_errors:
+                    log_event(
+                        self.logger,
+                        "main_control_attempt_success",
+                        attempt=attempt_index + 1,
+                        requested_domains=",".join(item.value for item in intent.requested_domains),
+                        supi=intent.supi,
+                        target_flow_ids=",".join(intent.target_flow_ids or []) or "<empty>",
+                    )
                     break
+                log_event(
+                    self.logger,
+                    "main_control_validation_failed",
+                    attempt=attempt_index + 1,
+                    grounding_tools=",".join(grounding_tools) or "<none>",
+                    validation_errors=" || ".join(validation_errors),
+                    supi=str(intent.supi or "").strip() or "<empty>",
+                    app_id=str(intent.app_id or "").strip() or "<empty>",
+                    target_flow_ids=",".join(intent.target_flow_ids or []) or "<empty>",
+                    target_flow_names=",".join(intent.target_flow_names or []) or "<empty>",
+                )
                 if attempt_index == 2:
                     raise RuntimeError(
                         "Main Agent could not produce a valid GlobalControlIntent: "
@@ -222,9 +239,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         recommended: List[str] = []
         normalized = str(user_input or "")
         lowered = normalized.lower()
-        has_explicit_supi = bool(re.search(r"(?i)imsi-\d{5,}", normalized))
-        has_explicit_object_id = bool(re.search(r"(?i)\b(app-\d+|flow-\d+)\b", normalized))
-        has_named_flow_signal = bool(re.search(r"\b[A-Za-z]+(?:[_-][A-Za-z0-9]+)+\b", normalized))
         has_policy_object_signal = any(
             token in lowered
             for token in (
@@ -239,15 +253,8 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             )
         )
 
-        # 关键步骤：这里只给出“证据抓取”建议，不在代码里根据关键词替 LLM 做域划分。
-        if has_explicit_supi:
-            recommended.extend(["get_sm_ue_flow_catalog", "get_sm_ue_context"])
-        if has_named_flow_signal or has_explicit_object_id:
-            recommended.extend(["get_sm_ue_flow_catalog", "search_sm_flow_targets"])
-        if has_explicit_supi and has_policy_object_signal:
-            recommended.append("get_am_policy_context")
         if has_policy_object_signal:
-            recommended.extend(["search_am_policy_targets", "get_knowledge_by_key", "search_semantic_knowledge"])
+            recommended.extend(["get_knowledge_by_key", "search_semantic_knowledge"])
         deduped: List[str] = []
         for item in recommended:
             if item not in deduped:
@@ -263,7 +270,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         user_input: str,
     ) -> str:
         recommended_tools = cls._recommended_grounding_tools(user_input)
-        tool_line = ", ".join(recommended_tools) if recommended_tools else "get_sm_ue_context or get_sm_ue_flow_catalog"
+        tool_line = ", ".join(recommended_tools) if recommended_tools else "get_knowledge_by_key or search_semantic_knowledge"
         return (
             f"{base_prompt}\n\n"
             "Your previous draft failed validation because it did not use the required grounding tools.\n"
@@ -274,10 +281,28 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _build_validation_retry_prompt(*, base_prompt: str, validation_errors: List[str]) -> str:
+        extra_rules: List[str] = []
+        joined_errors = " ".join(validation_errors)
+        if "Main Agent must not resolve target_flow_ids without explicit flow identifiers in user input" in joined_errors:
+            extra_rules.append(
+                "The user named a flow by name, not by explicit flow-id. Keep target_flow_ids=[] and do not copy catalog-resolved flow-... values into the JSON."
+            )
+        if "Main Agent must not populate target_flow_names; IEA owns flow-name resolution" in joined_errors:
+            extra_rules.append(
+                "Keep target_flow_names=[] even when the user names a flow in plain text. Only use that evidence to choose domains."
+            )
+        if "Main Agent must not populate app_name; IEA owns app-name resolution" in joined_errors:
+            extra_rules.append(
+                "Keep app_name=null even when the user names an application in plain text."
+            )
+        suffix = ""
+        if extra_rules:
+            suffix = "\nAdditional correction rules:\n- " + "\n- ".join(extra_rules) + "\n"
         return (
             f"{base_prompt}\n\n"
             "Your previous draft failed validation.\n"
             "Validation errors:\n- " + "\n- ".join(validation_errors) + "\n\n"
+            f"{suffix}"
             "Return a corrected GlobalControlIntent JSON only."
         )
 
@@ -304,12 +329,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
     def _requires_grounding_tools(*, user_input: str, context: str) -> bool:
         normalized_input = str(user_input or "")
         lowered = normalized_input.lower()
-        if re.search(r"(?i)imsi-\d{5,}", normalized_input):
-            return True
-        if re.search(r"(?i)\b(app-\d+|flow-\d+)\b", normalized_input):
-            return True
-        if re.search(r"\b[A-Za-z]+(?:[_-][A-Za-z0-9]+)+\b", normalized_input):
-            return True
         if any(token in lowered for token in ("allowed nssai", "target nssai", "service area", "rfsp", "amf", "am policy", "ue policy", "npcf_")):
             return True
         try:
@@ -317,6 +336,58 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         except Exception:
             payload = {}
         if isinstance(payload, dict) and int(payload.get("round_index") or 1) > 1:
+            return True
+        return False
+
+    @staticmethod
+    def _has_explicit_mobility_signal(*, user_input: str, context: str) -> bool:
+        normalized_input = str(user_input or "")
+        lowered = normalized_input.lower()
+        mobility_patterns = (
+            r"\bmobility\b",
+            r"\bhandover\b",
+            r"\bservice area\b",
+            r"\brfsp\b",
+            r"\bamf\b",
+            r"\bpra\b",
+            r"\btracking area\b",
+            r"\ballowed nssai\b",
+            r"\btarget nssai\b",
+            r"\bloc_ch\b",
+            r"\bpra_ch\b",
+            r"\baccess change\b",
+            r"\baccess type\b",
+            r"\bnpcf_uepolicycontrol\b",
+            r"\bnpcf_ampolicycontrol\b",
+            r"切换",
+            r"漫游",
+            r"移动性",
+            r"驻留",
+            r"服务区",
+            r"跟踪区",
+        )
+        if any(re.search(pattern, lowered, re.IGNORECASE) for pattern in mobility_patterns):
+            return True
+        try:
+            payload = json.loads(str(context or ""))
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            return False
+        previous_diagnosis = payload.get("previous_diagnosis")
+        if isinstance(previous_diagnosis, dict):
+            retry_category = str(previous_diagnosis.get("root_cause_category") or "").strip().lower()
+            if retry_category in {
+                "cross_domain_inconsistency",
+                "am_policy_dispatch_failure",
+                "mobility_policy_validation_failure",
+            }:
+                return True
+            reason_summary = str(previous_diagnosis.get("reason_summary") or "").strip().lower()
+            if any(token in reason_summary for token in ("mobility", "rfsp", "service area", "allowed nssai", "target nssai", "handover", "切换", "移动性")):
+                return True
+        feedback_context = str(payload.get("feedback_context") or "").strip().lower()
+        if any(token in feedback_context for token in ("mobility", "rfsp", "service area", "allowednssais", "targetsnssais", "am policy")):
             return True
         return False
 
@@ -335,6 +406,10 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             values = [item.value for item in intent.requested_domains]
             if any(item not in {"qos", "mobility"} for item in values):
                 errors.append(f"requested_domains contains unsupported values: {values}")
+            if "mobility" in values and not MainControlAgent._has_explicit_mobility_signal(user_input=user_input, context=context):
+                errors.append(
+                    "mobility must not be requested unless the user request or retry context contains explicit mobility-control signals"
+                )
         explicit_supi = ""
         match = re.search(r"(?i)(imsi-\d{5,})", str(user_input or ""))
         if match:
@@ -343,18 +418,12 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             errors.append(f"supi must equal explicit user-provided identifier {explicit_supi}")
         explicit_app_ids = re.findall(r"(?i)\b(app-\d+)\b", str(user_input or ""))
         normalized_app_id = str(intent.app_id or "").strip()
-        if explicit_app_ids:
-            if normalized_app_id != explicit_app_ids[0]:
-                errors.append(f"app_id must equal explicit user-provided identifier {explicit_app_ids[0]}")
-        elif normalized_app_id:
-            errors.append("Main Agent must not resolve app_id without an explicit app identifier in user input")
+        if normalized_app_id:
+            errors.append("Main Agent must not populate app_id; IEA owns app/flow resolution")
         explicit_flow_ids = re.findall(r"(?i)\b(flow-\d+)\b", str(user_input or ""))
         normalized_flow_ids = [str(item or "").strip() for item in (intent.target_flow_ids or []) if str(item or "").strip()]
-        if explicit_flow_ids:
-            if sorted(set(normalized_flow_ids)) != sorted(set(explicit_flow_ids)):
-                errors.append(f"target_flow_ids must match explicit user-provided identifiers {sorted(set(explicit_flow_ids))}")
-        elif normalized_flow_ids:
-            errors.append("Main Agent must not resolve target_flow_ids without explicit flow identifiers in user input")
+        if normalized_flow_ids:
+            errors.append("Main Agent must not populate target_flow_ids; IEA owns flow resolution")
         if str(intent.app_name or "").strip():
             errors.append("Main Agent must not populate app_name; IEA owns app-name resolution")
         if any(str(item or "").strip() for item in (intent.target_flow_names or [])):

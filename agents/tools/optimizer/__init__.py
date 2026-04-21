@@ -4,20 +4,13 @@
 """
 
 from .models import App, Flow, Slice, Node, OptimizationConfig
-from .engine import SliceOptimizationEngine, IBNSOptimizationEngine
+from .engine import SliceOptimizationEngine
 
 
 def optimize_network_slices(*args, **kwargs):
 	# 关键步骤：延迟导入，避免 init_scenario <-> optimizer.interface 循环依赖
 	from .interface import optimize_network_slices as _impl
 	return _impl(*args, **kwargs)
-
-
-def optimize_ibns_network(*args, **kwargs):
-	# 关键步骤：延迟导入，避免包初始化时触发循环导入
-	from .interface import optimize_ibns_network as _impl
-	return _impl(*args, **kwargs)
-
 
 def run_joint_control_optimizer(*args, **kwargs):
 	from .joint_control import run_joint_control_optimizer as _impl
@@ -30,8 +23,6 @@ __all__ = [
 	"Node",
 	"OptimizationConfig",
 	"SliceOptimizationEngine",
-	"IBNSOptimizationEngine",
 	"optimize_network_slices",
-	"optimize_ibns_network",
 	"run_joint_control_optimizer",
 ]
