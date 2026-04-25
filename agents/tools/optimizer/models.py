@@ -243,6 +243,7 @@ class AMPolicyState:
     old_triggers: List[str] = field(default_factory=list)
     old_ue_ambr_ul: float = 0.0
     old_ue_ambr_dl: float = 0.0
+    mobility_risk_score: float = 0.0
     rfsp_max: int = 8
     ambr_headroom: float = 0.2
     trigger_signal_costs: Dict[str, float] = field(default_factory=lambda: {
@@ -266,6 +267,7 @@ class OptimizationConfig:
     w5: float = 30.0
     w6: float = 10.0
     w7: float = 5.0
+    w8: float = 20.0
     alpha_cn: float = 0.04
     alpha_an: float = 0.01
     beta: float = 0.05

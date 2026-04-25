@@ -177,6 +177,12 @@ def build_mobility_draft(
                 continue
             if enum_trigger not in required_triggers:
                 required_triggers.append(enum_trigger)
+    if not snapshot.presenceAreas:
+        required_triggers = [
+            trigger
+            for trigger in required_triggers
+            if trigger != PcfAmPolicyControlRequestTrigger.PRA_CH
+        ]
 
     # 关键步骤：若 MILP 解包含 AMBR，则使用 MILP 值
     if am_plan and am_plan.get("ue_ambr_ul_mbps") is not None and am_plan.get("ue_ambr_dl_mbps") is not None:

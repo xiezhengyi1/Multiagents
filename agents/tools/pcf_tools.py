@@ -1,4 +1,5 @@
 import json
+import os
 import uuid
 from typing import Any, Dict, Optional
 
@@ -19,10 +20,11 @@ from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-# Mock PCF base address used by the local integration environment.
-PCF_BASE_URL = "http://localhost:18080"
+# Unified policy execution gateway address used by the local integration environment.
+PCF_BASE_URL = str(os.getenv("PCF_BASE_URL", "http://localhost:18080")).rstrip("/")
 PCF_REQUEST_TIMEOUT_SEC = 5
 AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
+POLICY_EXECUTION_PATH = "/policy-executions"
 
 
 def _trim_ue_context_for_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -182,7 +184,7 @@ def dispatch_policy_to_pcf_request(
 
     try:
         response = requests.post(
-            f"{PCF_BASE_URL}{_resolve_dispatch_path(payload['policy_type'])}",
+            f"{PCF_BASE_URL}{POLICY_EXECUTION_PATH}",
             json=payload,
             timeout=PCF_REQUEST_TIMEOUT_SEC,
         )
@@ -198,11 +200,7 @@ def dispatch_policy_to_pcf_request(
     except ValueError:
         response_payload = {"raw_response": response.text}
 
-    result: Dict[str, Any] = {
-        "status": "success" if response.ok else "failed",
-        "response_code": response.status_code,
-        **payload,
-    }
+    result: Dict[str, Any] = {"status": "success" if response.ok else "failed", "response_code": response.status_code, **payload}
     if response.ok:
         result.update(response_payload if isinstance(response_payload, dict) else {"response": response_payload})
     else:
@@ -214,18 +212,11 @@ def dispatch_policy_to_pcf_request(
     return result
 
 
-def _resolve_dispatch_path(policy_type: str) -> str:
-    normalized = str(policy_type or "").strip()
-    if normalized == AM_POLICY_TYPE:
-        return "/npcf-am-policy-control/v1/policies"
-    return "/pcf/policies"
-
-
 def dispatch_policy_to_pcf(policy_type: str, policy_json: str) -> str:
     """
-    Dispatch a policy payload to PCF through HTTP POST.
+    Dispatch a policy payload to the policy execution gateway.
 
-    Returns a JSON string so callers can parse the ack deterministically.
+    Returns a JSON string so callers can parse the final execution result deterministically.
     """
     result = dispatch_policy_to_pcf_request(policy_type, policy_json)
     return json.dumps(result, ensure_ascii=False)
@@ -240,7 +231,10 @@ def get_network_feedback(policy_id: str) -> str:
         return json.dumps({"status": "failed", "error": "policy_id is required"}, ensure_ascii=False)
 
     try:
-        response = requests.get(f"{PCF_BASE_URL}/monitor/status/{normalized_policy_id}", timeout=PCF_REQUEST_TIMEOUT_SEC)
+        response = requests.get(
+            f"{PCF_BASE_URL}{POLICY_EXECUTION_PATH}/{normalized_policy_id}",
+            timeout=PCF_REQUEST_TIMEOUT_SEC,
+        )
     except requests.exceptions.RequestException as exc:
         return json.dumps(
             {"status": "failed", "policy_id": normalized_policy_id, "error": f"monitor request failed: {exc}"},

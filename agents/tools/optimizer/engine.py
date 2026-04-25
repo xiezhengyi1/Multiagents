@@ -246,7 +246,11 @@ class SliceOptimizationEngine:
         safe_req_dl = max(total_req_dl, eps)
         term_ambr_tight = am_ambr_ul / safe_req_ul + am_ambr_dl / safe_req_dl - 2.0
 
-        return term_am_churn, term_trigger, term_ambr_tight
+        # Φ_mobility_risk: 高风险移动状态下抑制大规模 AM 策略变更。
+        risk = max(0.0, min(1.0, float(getattr(am_state, "mobility_risk_score", 0.0) or 0.0)))
+        term_mobility_risk = risk * term_am_churn
+
+        return term_am_churn, term_trigger, term_ambr_tight, term_mobility_risk
 
     def _extract_am_solution(self, slices, am_vars, am_state: AMPolicyState) -> Dict:
         """关键步骤：从 MILP 最优解中提取 AM 策略参数。"""
@@ -306,10 +310,11 @@ class SliceOptimizationEngine:
         )
         # 关键步骤：当 AM 优化启用时，叠加 AM 目标函数项
         if am_terms is not None:
-            term_am_churn, term_trigger, term_ambr_tight = am_terms
+            term_am_churn, term_trigger, term_ambr_tight, term_mobility_risk = am_terms
             objective += self.config.w5 * term_am_churn
             objective += self.config.w6 * term_trigger
             objective += self.config.w7 * term_ambr_tight
+            objective += self.config.w8 * term_mobility_risk
         prob.setObjective(objective)
         solver_time_limit = int(getattr(self.config, "solver_time_limit", 30) or 30)
         solver = pulp.PULP_CBC_CMD(msg=0, timeLimit=solver_time_limit)
@@ -334,6 +339,23 @@ class SliceOptimizationEngine:
             breakdown["am_churn"] = self._safe_pulp_value(am_terms[0])
             breakdown["am_trigger"] = self._safe_pulp_value(am_terms[1])
             breakdown["am_ambr_tight"] = self._safe_pulp_value(am_terms[2])
+            breakdown["mobility_risk"] = self._safe_pulp_value(am_terms[3])
+            breakdown["mobility_risk_score"] = float(getattr(am_state, "mobility_risk_score", 0.0) or 0.0)
+            breakdown["mobility_cost"] = (
+                self.config.w5 * breakdown["am_churn"]
+                + self.config.w6 * breakdown["am_trigger"]
+                + self.config.w7 * breakdown["am_ambr_tight"]
+                + self.config.w8 * breakdown["mobility_risk"]
+            )
+        else:
+            breakdown["mobility_cost"] = 0.0
+        breakdown["session_cost"] = (
+            self.config.w1 * breakdown["load_norm"]
+            + self.config.w2 * breakdown["signal_norm"]
+            + self.config.w3 * (breakdown["exp"] + breakdown["qos_core"])
+            + self.config.w4 * breakdown["qos_aux"]
+        )
+        breakdown["coupling_cost"] = breakdown.get("mobility_risk", 0.0) * self.config.w8
         return flow_results, slice_results, status_str, objective_val, breakdown
 
     def solve(self, apps: List[App], slices: List[Slice], nodes: List[Node]) -> Tuple[pd.DataFrame, pd.DataFrame, str, Optional[float], Dict[str, float]]:
@@ -711,6 +733,12 @@ class SliceOptimizationEngine:
                 for s in slices:
                     compatible = 1 if (required_sst is None or required_sst == s.sst) else 0
                     prob += x[app.id, f.id, s.snssai] <= compatible
+                    if self.config.enable_sla_constraints:
+                        violates_latency = s.qos.latency + s.qos.processing_delay > f.sla.latency
+                        violates_jitter = f.sla.jitter > 0 and s.qos.jitter > f.sla.jitter
+                        violates_loss = f.sla.loss_rate > 0 and s.qos.loss_rate > f.sla.loss_rate
+                        if violates_latency or violates_jitter or violates_loss:
+                            prob += x[app.id, f.id, s.snssai] == 0
 
                     prob += B_act_ul[app.id, f.id, s.snssai] <= x[app.id, f.id, s.snssai] * f.sla.bandwidth_ul
                     prob += B_act_dl[app.id, f.id, s.snssai] <= x[app.id, f.id, s.snssai] * f.sla.bandwidth_dl

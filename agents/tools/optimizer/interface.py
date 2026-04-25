@@ -271,6 +271,7 @@ def optimize_network_slices(
     return_json: bool = True,
     *,
     am_policy_state: Optional[AMPolicyState] = None,
+    mobility_risk_weight: float = 0.0,
 ) -> Union[str, Dict[str, Any]]:
     """
     Execute slice optimization for one target app.
@@ -353,6 +354,7 @@ def optimize_network_slices(
 
         config = OptimizationConfig(
             w1=w1, w2=w2, w3=w3, w4=w4,
+            w8=max(0.0, float(mobility_risk_weight or 0.0) * 20.0),
             enable_am_optimization=am_policy_state is not None,
             am_policy_state=am_policy_state,
         )
