@@ -25,6 +25,19 @@ def build_slice_snssai(slice_code: str) -> Optional[Dict[str, Any]]:
 
 
 class OptimizationStrategyCompiler:
+    QOS_GROUNDING_TOOLS = {
+        "preview_qos_optimizer",
+        "fetch_qos_network_status",
+        "preview_optimizer",
+        "fetch_network_status",
+    }
+    MOBILITY_GROUNDING_TOOLS = {
+        "inspect_mobility_ue_policies",
+        "inspect_ue_policies",
+    }
+    QOS_GROUNDING_CAPABILITIES = {"optimizer_counterfactual", "qos_runtime_evidence"}
+    MOBILITY_GROUNDING_CAPABILITIES = {"ue_policy_context", "mobility_policy_context"}
+
     def build_planning_evidence(self, planning_request: PlanningRequest, optimizer_preview: Any) -> Dict[str, Any]:
         operation_intent = planning_request.operation_intent
         preview_payload = (
@@ -72,6 +85,7 @@ class OptimizationStrategyCompiler:
         advisor_output: OsaAdvisorOutput,
         planning_request: PlanningRequest,
         grounding_tools: List[str],
+        grounding_capabilities: Optional[List[str]] = None,
         planning_evidence: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
         errors: List[str] = []
@@ -81,6 +95,11 @@ class OptimizationStrategyCompiler:
             if str(item).strip()
         }
         grounding = set(grounding_tools or [])
+        capabilities = {
+            str(item).strip().lower()
+            for item in (grounding_capabilities or [])
+            if str(item).strip()
+        }
         required_evidence = {
             str(item).strip().lower()
             for item in (planning_request.context.required_evidence or [])
@@ -100,9 +119,9 @@ class OptimizationStrategyCompiler:
             errors.append("qos-active planning requires sm_policies")
         if "mobility" in domains and not has_am:
             errors.append("mobility-active planning requires am_policy")
-        if required_evidence and not grounding:
+        if required_evidence and not grounding and not capabilities:
             errors.append("planning context requires evidence collection but advisor used no grounding tools")
-        if (has_sm or has_am or has_ursp) and not grounding and not self._has_existing_policy_evidence(
+        if (has_sm or has_am or has_ursp) and not grounding and not capabilities and not self._has_existing_policy_evidence(
             planning_request=planning_request,
             planning_evidence=normalized_planning_evidence,
             has_sm=has_sm,
@@ -114,19 +133,23 @@ class OptimizationStrategyCompiler:
             planning_request=planning_request,
             planning_evidence=normalized_planning_evidence,
             grounding=grounding,
+            capabilities=capabilities,
         ):
-            errors.append("sm_policies require preview_optimizer or fetch_network_status evidence")
+            errors.append("sm_policies require preview_qos_optimizer or fetch_qos_network_status evidence")
         if has_am and self._missing_mobility_evidence(
             planning_request=planning_request,
             planning_evidence=normalized_planning_evidence,
             grounding=grounding,
+            capabilities=capabilities,
         ):
-            errors.append("am_policy requires inspect_ue_policies evidence")
+            errors.append("am_policy requires inspect_mobility_ue_policies evidence")
         if has_ursp:
             if not self._ursp_requested_or_evidenced(planning_request):
                 errors.append("ursp_policies require explicit route-selection or UE-policy-routing intent")
             if not self._has_existing_ursp_evidence(planning_request) and not (
-                {"inspect_ue_policies", "search_semantic_knowledge", "get_knowledge_by_key"} & grounding
+                (self.MOBILITY_GROUNDING_TOOLS & grounding)
+                or (self.MOBILITY_GROUNDING_CAPABILITIES & capabilities)
+                or ({"search_semantic_knowledge", "get_knowledge_by_key"} & grounding)
             ):
                 errors.append("ursp_policies require explicit routing or policy-semantic evidence")
         return errors
@@ -192,10 +215,11 @@ class OptimizationStrategyCompiler:
         planning_request: PlanningRequest,
         planning_evidence: Dict[str, Any],
         grounding: set[str],
+        capabilities: set[str],
     ) -> bool:
         if self._has_preview_qos_evidence(planning_evidence):
             return False
-        return not ({"preview_optimizer", "fetch_network_status"} & grounding)
+        return not ((self.QOS_GROUNDING_TOOLS & grounding) or (self.QOS_GROUNDING_CAPABILITIES & capabilities))
 
     def _missing_mobility_evidence(
         self,
@@ -203,10 +227,11 @@ class OptimizationStrategyCompiler:
         planning_request: PlanningRequest,
         planning_evidence: Dict[str, Any],
         grounding: set[str],
+        capabilities: set[str],
     ) -> bool:
         if self._has_preview_mobility_evidence(planning_evidence):
             return False
-        return "inspect_ue_policies" not in grounding
+        return not ((self.MOBILITY_GROUNDING_TOOLS & grounding) or (self.MOBILITY_GROUNDING_CAPABILITIES & capabilities))
 
     def assemble_policy_plan(
         self,

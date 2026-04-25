@@ -11,7 +11,7 @@ from domain.control_plane import ControlDomain, RevisionRequest, UnifiedConstrai
 from .contracts import ConflictResolutionRequest, ConflictResolutionResult
 
 
-class ConflictResolutionAgent(ArtifactWorkerMixin):
+class ConflictResolutionTool(ArtifactWorkerMixin):
     AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
 
     def __init__(self) -> None:

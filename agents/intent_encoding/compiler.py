@@ -11,8 +11,10 @@ from .contracts import FlowCandidateEvidence, IntentAdvisorDecision, IntentEvide
 
 class IntentCompiler:
     VALID_DOMAINS = {"qos", "mobility"}
-    SM_GROUNDING_TOOLS = {"get_sm_ue_context", "get_sm_ue_flow_catalog", "search_sm_flow_targets"}
+    SM_GROUNDING_TOOLS = {"get_sm_ue_context", "get_sm_ue_flow_catalog", "search_sm_flow_targets", "get_ue_flow_catalog", "search_flow_targets_by_name"}
     AM_GROUNDING_TOOLS = {"get_am_policy_context", "search_am_policy_targets"}
+    SM_GROUNDING_CAPABILITIES = {"sm_ue_context", "sm_flow_catalog", "sm_flow_target_resolution"}
+    AM_GROUNDING_CAPABILITIES = {"am_policy_context", "am_policy_target_resolution"}
 
     @classmethod
     def uses_sm_grounding(cls, requested_domains: List[str] | None) -> bool:
@@ -163,17 +165,23 @@ class IntentCompiler:
         *,
         evidence: IntentEvidence,
         grounding_tools: List[str],
+        grounding_capabilities: Optional[List[str]] = None,
     ) -> List[str]:
         errors: List[str] = []
         requested_domains = {str(item or "").strip().lower() for item in (evidence.requested_domains or []) if str(item or "").strip()}
         used_grounding_tools = {str(item or "").strip() for item in (grounding_tools or []) if str(item or "").strip()}
-        if requested_domains == {"mobility"} and used_grounding_tools & self.SM_GROUNDING_TOOLS:
+        used_grounding_capabilities = {
+            str(item or "").strip().lower()
+            for item in (grounding_capabilities or [])
+            if str(item or "").strip()
+        }
+        if requested_domains == {"mobility"} and ((used_grounding_tools & self.SM_GROUNDING_TOOLS) or (used_grounding_capabilities & self.SM_GROUNDING_CAPABILITIES)):
             errors.append("mobility-only intent must not call SM grounding tools")
-        if requested_domains == {"qos"} and used_grounding_tools & self.AM_GROUNDING_TOOLS:
+        if requested_domains == {"qos"} and ((used_grounding_tools & self.AM_GROUNDING_TOOLS) or (used_grounding_capabilities & self.AM_GROUNDING_CAPABILITIES)):
             errors.append("QoS-only intent must not call AM grounding tools")
         if list(evidence.requested_domains or []) == ["mobility"]:
             return errors
-        has_grounding_source = bool(grounding_tools or evidence.cache_hits)
+        has_grounding_source = bool(grounding_tools or used_grounding_capabilities or evidence.cache_hits)
         if evidence.ambiguities and not has_grounding_source:
             errors.append("unresolved QoS intent requires cached evidence or at least one grounding tool call")
         return errors

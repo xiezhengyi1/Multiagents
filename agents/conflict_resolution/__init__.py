@@ -1,4 +1,4 @@
-from .agent import ConflictResolutionAgent
+from .agent import ConflictResolutionTool
 from .contracts import ConflictResolutionRequest, ConflictResolutionResult
 
-__all__ = ["ConflictResolutionAgent", "ConflictResolutionRequest", "ConflictResolutionResult"]
+__all__ = ["ConflictResolutionTool", "ConflictResolutionRequest", "ConflictResolutionResult"]

@@ -1,4 +1,4 @@
-"""OSA request-scoped tool factory."""
+"""OSA request-scoped tool factory with explicit QoS / mobility tool partitions."""
 
 from __future__ import annotations
 
@@ -81,11 +81,11 @@ def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
     from agents.tools.optimizer import run_joint_control_optimizer as run_optimizer
 
     @tool_with_reason
-    def preview_optimizer(
+    def preview_qos_optimizer(
         objective_profile: str = "balanced",
         optimization_template: str = "joint_balanced",
     ) -> str:
-        """Run the joint optimizer with a specific profile or template and return a summary."""
+        """Run the optimizer for QoS-domain evidence collection and return a summarized preview."""
         request = build_joint_optimizer_request(
             planning_request,
             profile_name=str(objective_profile or "balanced").strip().lower(),
@@ -95,16 +95,16 @@ def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
         return json.dumps(_summarize_optimizer_result(result), ensure_ascii=False)
 
     @tool_with_reason
-    def fetch_network_status(service_type_id: Optional[int] = None) -> str:
-        """Fetch current network slice utilization and capacity summary."""
+    def fetch_qos_network_status(service_type_id: Optional[int] = None) -> str:
+        """Fetch QoS-domain network slice utilization and capacity summary."""
         return get_network_status_summary(flow_type_id=service_type_id)
 
     @tool_with_reason
-    def inspect_ue_policies(supi: Optional[str] = None) -> str:
-        """Inspect current UE AM/SM policies and mobility context."""
+    def inspect_mobility_ue_policies(supi: Optional[str] = None) -> str:
+        """Inspect current UE mobility-relevant policy state and access-mobility context."""
         target = str(supi or "").strip() or str(planning_request.operation_intent.supi or "").strip()
         if not target:
-            raise ValueError("inspect_ue_policies requires a SUPI")
+            raise ValueError("inspect_mobility_ue_policies requires a SUPI")
         ue_ctx = get_ue_context_by_supi(target)
         if not ue_ctx:
             raise ValueError(f"No UE context found for {target}")
@@ -112,10 +112,6 @@ def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
         trimmed: Dict[str, Any] = {}
         for key in (
             "supi",
-            "smPolicyData",
-            "pccRules",
-            "qosDecs",
-            "urspRules",
             "accessMobilityContext",
             "amPolicyContext",
             "mobilitySummary",
@@ -127,7 +123,7 @@ def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
             raise ValueError(f"UE context for {target} contains no policy-relevant fields")
         return json.dumps(_json_friendly(trimmed), ensure_ascii=False)
 
-    return [preview_optimizer, fetch_network_status, inspect_ue_policies]
+    return [preview_qos_optimizer, fetch_qos_network_status, inspect_mobility_ue_policies]
 
 
 __all__ = ["build_request_tools", "_summarize_optimizer_result"]

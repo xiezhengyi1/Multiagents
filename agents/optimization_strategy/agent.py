@@ -22,10 +22,16 @@ from .request_builder import build_joint_optimizer_request
 
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "optimization_strategy"
+    QOS_GROUNDING_TOOLS = {
+        "preview_qos_optimizer",
+        "fetch_qos_network_status",
+    }
+    MOBILITY_GROUNDING_TOOLS = {
+        "inspect_mobility_ue_policies",
+    }
     GROUNDING_TOOLS = {
-        "preview_optimizer",
-        "fetch_network_status",
-        "inspect_ue_policies",
+        *QOS_GROUNDING_TOOLS,
+        *MOBILITY_GROUNDING_TOOLS,
         "search_semantic_knowledge",
         "get_knowledge_by_key",
     }

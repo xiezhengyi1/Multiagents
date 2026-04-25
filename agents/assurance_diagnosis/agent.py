@@ -9,7 +9,7 @@ from agents.worker import ArtifactWorkerMixin
 from .contracts import AssuranceDiagnosisRequest, AssuranceDiagnosisResult
 
 
-class AssuranceDiagnosisAgent(ArtifactWorkerMixin):
+class AssuranceDiagnosisTool(ArtifactWorkerMixin):
     def __init__(self) -> None:
         self.agent_name = "assurance_diagnosis"
         self.init_worker_runtime()

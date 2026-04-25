@@ -11,9 +11,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.MemoryManager import MemoryManager
-from agents.assurance_diagnosis import AssuranceDiagnosisAgent
+from agents.assurance_diagnosis import AssuranceDiagnosisTool
 from agents.assurance_diagnosis.contracts import AssuranceDiagnosisRequest
-from agents.conflict_resolution import ConflictResolutionAgent
+from agents.conflict_resolution import ConflictResolutionTool
 from agents.conflict_resolution.contracts import ConflictResolutionRequest
 from agents.intent_encoding import IntentEncodingAgent
 from agents.main_control import MainControlAgent
@@ -56,8 +56,8 @@ class MainControlOrchestrator:
         ie_agent: Optional[IntentEncodingAgent] = None,
         os_agent: Optional[OptimizationStrategyAgent] = None,
         pd_agent: Optional[PolicyDispatchAgent] = None,
-        cr_agent: Optional[ConflictResolutionAgent] = None,
-        ad_agent: Optional[AssuranceDiagnosisAgent] = None,
+        cr_tool: Optional[ConflictResolutionTool] = None,
+        ad_tool: Optional[AssuranceDiagnosisTool] = None,
         memory_manager: Optional[MemoryManager] = None,
         max_rounds: int = 3,
         use_local_model: bool = False,
@@ -68,8 +68,8 @@ class MainControlOrchestrator:
         self.ie_agent = ie_agent or IntentEncodingAgent(use_local_model=use_local_model)
         self.os_agent = os_agent or OptimizationStrategyAgent(use_local_model=use_local_model)
         self.pd_agent = pd_agent or PolicyDispatchAgent(use_local_model=use_local_model)
-        self.cr_agent = cr_agent or ConflictResolutionAgent()
-        self.ad_agent = ad_agent or AssuranceDiagnosisAgent()
+        self.cr_tool = cr_tool or ConflictResolutionTool()
+        self.ad_tool = ad_tool or AssuranceDiagnosisTool()
         self.memory_manager = memory_manager or MemoryManager(
             short_term_limit=max(20, max_rounds * 8),
             enable_llm_summarization=False,
@@ -276,7 +276,7 @@ class MainControlOrchestrator:
             if mobility_proposal:
                 initial_verdicts.append(DomainVerdict(domain=ControlDomain.MOBILITY, status=DomainStatus.APPROVED, summary="AM policy proposal ready."))
 
-            conflict_result = self.cr_agent.run(
+            conflict_result = self.cr_tool.run(
                 ConflictResolutionRequest(
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -346,7 +346,7 @@ class MainControlOrchestrator:
                     "conflict_result": conflict_result.model_dump(mode="json"),
                 },
             )
-            diagnosis = self.ad_agent.run(diagnosis_request).model_dump(mode="json")
+            diagnosis = self.ad_tool.run(diagnosis_request).model_dump(mode="json")
             self._remember("AD", diagnosis)
 
             unified_plan = UnifiedControlPlan(

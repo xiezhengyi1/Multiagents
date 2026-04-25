@@ -152,7 +152,7 @@ def _required_tool_instructions(active_domains: list[str], planning_evidence: Di
             )
         else:
             instructions.append(
-                "- QoS is active but the initial optimizer preview does not provide grounded QoS runtime evidence. Call `preview_optimizer` or `fetch_network_status` before final JSON."
+                "- QoS is active but the initial optimizer preview does not provide grounded QoS runtime evidence. Call `preview_qos_optimizer` or `fetch_qos_network_status` before final JSON."
             )
     if "mobility" in active_domains:
         if bool(planning_evidence.get("preview_mobility_plan_present")):
@@ -161,7 +161,7 @@ def _required_tool_instructions(active_domains: list[str], planning_evidence: Di
             )
         else:
             instructions.append(
-                "- Mobility is active but the initial optimizer preview does not provide grounded mobility context. Call `inspect_ue_policies` before final JSON."
+                "- Mobility is active but the initial optimizer preview does not provide grounded mobility context. Call `inspect_mobility_ue_policies` before final JSON."
             )
     if not instructions:
         instructions.append("- Call a grounding tool before final JSON if any policy field depends on runtime evidence.")

@@ -33,8 +33,18 @@ def _app_identity(properties: Dict[str, Any], fallback: str = "") -> str:
 
 
 class NetworkGraph:
-    NODE_TYPES = {"ue", "app", "flow", "slice", "ran_node", "core_node", "policy_binding"}
-    EDGE_TYPES = {"owns", "contains_flow", "served_by_slice", "hosted_on", "connected_to", "governed_by_policy"}
+    NODE_TYPES = {"ue", "app", "flow", "session", "slice", "ran_node", "core_node", "policy_binding"}
+    EDGE_TYPES = {
+        "owns",
+        "contains_flow",
+        "served_by_slice",
+        "hosted_on",
+        "connected_to",
+        "governed_by_policy",
+        "runs_on_session",
+        "uses_slice",
+        "uses_session",
+    }
 
     def __init__(self, *, snapshot_id: str = "", trigger_event: str = "") -> None:
         self.snapshot_id = str(snapshot_id or "").strip()

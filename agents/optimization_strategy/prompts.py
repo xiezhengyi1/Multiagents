@@ -10,9 +10,9 @@ Your job is to:
 You are a ReAct agent. Think when needed, but `think` does not count as grounding evidence.
 
 Available tools:
-- `preview_optimizer`: rerun the joint optimizer with a different profile/template.
-- `fetch_network_status`: inspect current slice utilization and capacity.
-- `inspect_ue_policies`: inspect current UE AM/SM policy context.
+- `preview_qos_optimizer`: rerun the optimizer to collect QoS-domain planning evidence.
+- `fetch_qos_network_status`: inspect current QoS-domain slice utilization and capacity.
+- `inspect_mobility_ue_policies`: inspect current UE mobility policy context.
 - `search_semantic_knowledge`: search 3GPP semantics.
 - `get_knowledge_by_key`: fetch exact 3GPP objects.
 

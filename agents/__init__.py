@@ -3,8 +3,8 @@ from __future__ import annotations
 from importlib import import_module
 
 __all__ = [
-    "AssuranceDiagnosisAgent",
-    "ConflictResolutionAgent",
+    "AssuranceDiagnosisTool",
+    "ConflictResolutionTool",
     "FeedbackReport",
     "FeatureFusionLayer",
     "IntentEncodingAgent",
@@ -24,8 +24,8 @@ _LAZY_EXPORTS = {
     "NaturalLanguageEncoder": ("agents.Embedding", "NaturalLanguageEncoder"),
     "UserDataEncoder": ("agents.Embedding", "UserDataEncoder"),
     "MemoryManager": ("agents.MemoryManager", "MemoryManager"),
-    "AssuranceDiagnosisAgent": ("agents.assurance_diagnosis", "AssuranceDiagnosisAgent"),
-    "ConflictResolutionAgent": ("agents.conflict_resolution", "ConflictResolutionAgent"),
+    "AssuranceDiagnosisTool": ("agents.assurance_diagnosis", "AssuranceDiagnosisTool"),
+    "ConflictResolutionTool": ("agents.conflict_resolution", "ConflictResolutionTool"),
     "IntentEncodingAgent": ("agents.intent_encoding", "IntentEncodingAgent"),
     "OptimizationStrategyAgent": ("agents.optimization_strategy", "OptimizationStrategyAgent"),
     "FeedbackReport": ("agents.policy_dispatch", "FeedbackReport"),

@@ -393,7 +393,7 @@ class ExecutionController:
                 session_id=session_id,
                 snapshot_id=snapshot_id,
                 event_type="JOINT_CONTROL_REEVALUATION",
-                event_summary="AM policy association updated from PDA",
+                event_summary="AM policy association updated from policy dispatch execution",
                 event_payload={"association_id": association_id, "request": request, "policy": policy_details},
             )
             if not recorded:

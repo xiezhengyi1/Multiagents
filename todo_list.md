@@ -114,4 +114,4 @@ vmrun -T ws start "D:\VMware_Ubuntu\Ubuntu.vmx" nogui
 1. 尝试使用 free5gc + UERANSIM + ns-3
 2. 思考优化问题的优化
 3. 数据集收集需要优化
-4. RAG 库的不精确问题需要解决
+4. RAG 库的不精确问题需要解决 --解决

@@ -156,6 +156,30 @@ def stringify_message_content(value: Any) -> str:
 # ── Tool Spec & Extraction ─────────────────────────────────────
 
 
+_TOOL_CAPABILITY_ALIASES: Dict[str, List[str]] = {
+    "get_sm_ue_context": ["sm_ue_context"],
+    "get_sm_ue_flow_catalog": ["sm_flow_catalog"],
+    "get_ue_flow_catalog": ["sm_flow_catalog"],
+    "search_sm_flow_targets": ["sm_flow_target_resolution"],
+    "search_flow_targets_by_name": ["sm_flow_target_resolution"],
+    "get_am_policy_context": ["am_policy_context"],
+    "search_am_policy_targets": ["am_policy_target_resolution"],
+    "preview_qos_optimizer": ["optimizer_counterfactual", "qos_runtime_evidence"],
+    "preview_optimizer": ["optimizer_counterfactual", "qos_runtime_evidence"],
+    "fetch_qos_network_status": ["qos_runtime_evidence"],
+    "fetch_network_status": ["qos_runtime_evidence"],
+    "inspect_mobility_ue_policies": ["ue_policy_context", "mobility_policy_context"],
+    "inspect_ue_policies": ["ue_policy_context", "mobility_policy_context"],
+}
+
+
+def resolve_tool_capabilities(tool_name: str) -> List[str]:
+    normalized = str(tool_name or "").strip()
+    if not normalized:
+        return []
+    return list(_TOOL_CAPABILITY_ALIASES.get(normalized, []))
+
+
 def build_tool_specs(tools: Iterable[Any]) -> List[Dict[str, Any]]:
     """Build a list of tool spec dicts for trace recording."""
     specs: List[Dict[str, Any]] = []
@@ -165,11 +189,15 @@ def build_tool_specs(tools: Iterable[Any]) -> List[Dict[str, Any]]:
             name = tool.__name__
         description = getattr(tool, "description", None) or getattr(tool, "__doc__", None) or ""
         args_schema = getattr(tool, "args_schema", None)
+        capabilities = getattr(tool, "capabilities", None)
+        if capabilities is None:
+            capabilities = resolve_tool_capabilities(str(name or ""))
         specs.append(
             {
                 "name": str(name or ""),
                 "description": str(description).strip(),
                 "args_schema": json_friendly(args_schema),
+                "capabilities": json_friendly(capabilities),
             }
         )
     return specs

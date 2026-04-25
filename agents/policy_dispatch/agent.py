@@ -5,16 +5,14 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain.tools import ToolRuntime, tool
-from pydantic import ValidationError
 
 from agents.tools.wrapper_think import tool_with_reason
 
 from agent_runtime import AgentRuntimeContext, ArtifactEnvelope
 from agent_runtime.trace.builder import build_run_tree_record
 from agent_runtime.trace.writer import JsonlTraceWriter
-from agents.BaseAgent import BaseAgent
 from domain.policy_compiler import PolicyCompiler
 from agents.tools.db_tool import (
     get_snapshot_data_by_id,
@@ -32,11 +30,7 @@ from workflows.execution_controller import ExecutionController
 from agents.worker import ArtifactWorkerMixin
 from utils.logger import setup_logger
 
-from .contracts import FeedbackReport, FeedbackSummaryDraft
-from .prompts import (
-    PDA_FEEDBACK_SUMMARY_SYSTEM_PROMPT,
-    PDA_FEEDBACK_SUMMARY_USER_PROMPT,
-)
+from .contracts import FeedbackReport
 
 
 @tool_with_reason
@@ -89,22 +83,18 @@ def tool_feedback_to_osa(
 class PolicyDispatchAgent(ArtifactWorkerMixin):
     agent_name = "policy_dispatch"
     TRACE_SYSTEM_PROMPT = (
-        "You are the Policy Dispatch Agent. "
-        "Compile policies, dispatch them to PCF, run assurance checks, and return a FeedbackReport."
+        "You are the Policy Dispatch execution component. "
+        "Compile policies, dispatch them to PCF, run assurance checks, and return a deterministic FeedbackReport."
     )
 
     def __init__(
         self,
         model_name: str = "qwen3-30b-a3b-instruct-2507",
         *,
-        enable_llm_feedback_summary: bool = True,
-        feedback_llm: Any = None,
         use_local_model: bool = False,
     ):
         self.agent_name = "policy_dispatch"
         self.model_name = model_name
-        self.enable_llm_feedback_summary = bool(enable_llm_feedback_summary)
-        self._feedback_llm = feedback_llm
         self.use_local_model = use_local_model
         self.logger = setup_logger(self.__class__.__name__, default_msg_color="\033[92m")
         self._trace_writer = JsonlTraceWriter(self.agent_name)
@@ -203,16 +193,6 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         outcome_payload = outcome.to_dict()
         if feedback_payload:
             outcome_payload["feedback_payload"] = feedback_payload
-        if self.enable_llm_feedback_summary and str(outcome_payload.get("recommended_action") or "").strip() == "feedback":
-            summary = self._summarize_feedback_with_llm(
-                strategy_output=strategy_output,
-                outcome_payload=outcome_payload,
-            )
-            outcome_payload["violation_details"] = summary.violation_details
-            outcome_payload["correction_suggestion"] = summary.correction_suggestion
-            current_payload = outcome_payload.get("feedback_payload")
-            if isinstance(current_payload, dict):
-                current_payload["llm_summary"] = summary.model_dump(mode="json")
         feedback_report = FeedbackReport(**outcome_payload)
         self._write_execution_trace(
             strategy_output=strategy_output,
@@ -506,119 +486,6 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         if failure_scope:
             payload["failure_scope"] = failure_scope
         return payload
-
-    @staticmethod
-    def _extract_message_text(message: Any) -> str:
-        content = getattr(message, "content", "")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, str):
-                    parts.append(block)
-                    continue
-                if isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
-                    parts.append(str(block.get("text") or ""))
-            return "".join(parts).strip()
-        return str(content or "").strip()
-
-    def _get_feedback_llm(self) -> Any:
-        if self._feedback_llm is None:
-            self._feedback_llm = BaseAgent(model_name=self.model_name, use_local_model=self.use_local_model).get_llm()
-        return self._feedback_llm
-
-    def _summarize_feedback_with_llm(
-        self,
-        *,
-        strategy_output: Any,
-        outcome_payload: Dict[str, Any],
-    ) -> FeedbackSummaryDraft:
-        metrics_payload = json.loads(str(outcome_payload.get("performance_metrics") or "{}"))
-        context_payload = {
-            "policy_plan": (
-                strategy_output.model_dump(mode="json")
-                if hasattr(strategy_output, "model_dump")
-                else PolicyCompiler.json_friendly(strategy_output)
-            ),
-            "controller_feedback": {
-                "execution_status": outcome_payload.get("execution_status"),
-                "violation_details": outcome_payload.get("violation_details"),
-                "correction_suggestion": outcome_payload.get("correction_suggestion"),
-                "recommended_consumer": outcome_payload.get("recommended_consumer"),
-                "recommended_action": outcome_payload.get("recommended_action"),
-                "failure_scope": outcome_payload.get("failure_scope"),
-                "dispatch_attempts": outcome_payload.get("dispatch_attempts"),
-                "feedback_payload": outcome_payload.get("feedback_payload") or {},
-            },
-            "execution_metrics": metrics_payload,
-        }
-        response = self._get_feedback_llm().invoke(
-            [
-                SystemMessage(content=PDA_FEEDBACK_SUMMARY_SYSTEM_PROMPT),
-                HumanMessage(
-                    content=PDA_FEEDBACK_SUMMARY_USER_PROMPT.format(
-                        context_json=json.dumps(context_payload, ensure_ascii=False)
-                    )
-                ),
-            ]
-        )
-        return self._coerce_feedback_summary(
-            self._extract_message_text(response),
-            default_violation=str(outcome_payload.get("violation_details") or "").strip(),
-            default_correction=str(outcome_payload.get("correction_suggestion") or "").strip(),
-        )
-
-    def _coerce_feedback_summary(
-        self,
-        raw_text: str,
-        *,
-        default_violation: str,
-        default_correction: str,
-    ) -> FeedbackSummaryDraft:
-        text = str(raw_text or "").strip()
-        if not text:
-            return FeedbackSummaryDraft(
-                violation_details=default_violation or "execution failed",
-                correction_suggestion=default_correction or "Revise the failed policy subset before the next execution round.",
-            )
-
-        try:
-            return FeedbackSummaryDraft.model_validate_json(text)
-        except ValidationError:
-            payload = self._extract_json_payload_from_dispatch_output(text)
-            if isinstance(payload, dict):
-                try:
-                    return FeedbackSummaryDraft.model_validate(payload)
-                except ValidationError:
-                    pass
-
-        repair_response = self._get_feedback_llm().invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "Convert the user's content into a strict JSON object with exactly two string keys: "
-                        "`violation_details` and `correction_suggestion`. Return JSON only."
-                    )
-                ),
-                HumanMessage(content=text),
-            ]
-        )
-        repaired_text = self._extract_message_text(repair_response)
-        try:
-            return FeedbackSummaryDraft.model_validate_json(repaired_text)
-        except ValidationError:
-            repaired_payload = self._extract_json_payload_from_dispatch_output(repaired_text)
-            if isinstance(repaired_payload, dict):
-                try:
-                    return FeedbackSummaryDraft.model_validate(repaired_payload)
-                except ValidationError:
-                    pass
-
-        return FeedbackSummaryDraft(
-            violation_details=default_violation or text,
-            correction_suggestion=default_correction or "Revise the failed policy subset before the next execution round.",
-        )
 
     @staticmethod
     def _extract_json_payload_from_dispatch_output(dispatch_output: str) -> Optional[Dict[str, Any]]:
