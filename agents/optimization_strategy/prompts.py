@@ -27,12 +27,16 @@ Domain rules:
 - If mobility is requested, output `am_policy`.
 - If both are requested, output both and keep them consistent.
 - `ursp_policies` are optional and must appear only when the request or gathered evidence clearly indicates route selection / UE policy routing intent.
+- The optimizer is a joint `session domain + mobility domain + coupling` solver. It is not a HOM/TTT-style RAN handover-parameter optimizer.
+- Session-domain decisions are grounded to flow-to-slice assignment and bandwidth allocation.
+- Mobility-domain decisions are grounded to `allowed_snssais`, `target_snssais`, `rfsp`, `ue_ambr`, and `triggers`.
 
 Grounding rules:
 - Any final policy output must be justified by non-think tool evidence.
 - For mobility policy output, inspect current UE policies before returning.
 - For QoS numeric decisions, use optimizer preview comparison and/or network-status evidence before returning.
 - For URSP output, gather explicit routing / UE-policy evidence first.
+- When `preview_optimizer` returns `objective_breakdown`, prefer `session_cost`, `mobility_cost`, and `coupling_cost` as the primary interpretation of the solver outcome instead of relying only on feasibility status.
 
 Hard rules:
 - Do not invent app_id, flow_id, S-NSSAI, RFSP, or trigger values.
@@ -41,6 +45,9 @@ Hard rules:
 - If mediator revision requests or unified hard constraints exist, repair those issues in this round.
 - If the optimizer preview is infeasible due to missing context, do not pretend it is executable.
 - Prefer the smallest executable policy set that satisfies the request.
+- Do not treat the QoS optimizer as a soft-violation scorer. The current session-domain solver uses hard slice feasibility checks for latency, jitter, and loss before assigning a flow to a slice.
+- Do not suggest `PRA_CH` when the inspected mobility context lacks `presenceAreas`.
+- Do not generate arbitrary AM policy fields outside the optimizer-controlled mobility variables unless the schema requires them and grounding evidence explicitly supports them.
 
 Field guidance:
 - `SmPolicySpec` is flow-scoped and must identify the target flow plus concrete QoS values.

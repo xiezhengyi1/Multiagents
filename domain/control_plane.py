@@ -46,7 +46,60 @@ class DomainStatus(str, Enum):
     FAILED = "failed"
 
 
+SESSION_DECISION_VARIABLES = [
+    "slice_assignment",
+    "bandwidth_allocation",
+    "sm_policy_update",
+    "ursp_update",
+]
+MOBILITY_DECISION_VARIABLES = [
+    "rfsp",
+    "allowed_snssais",
+    "target_snssais",
+    "mapping_snssais",
+    "serv_area_res",
+    "pras",
+    "ue_ambr",
+    "ue_slice_mbrs",
+    "triggers",
+]
+CROSS_DOMAIN_DECISION_VARIABLES: List[str] = []
+SESSION_CONSTRAINTS = [
+    "slice_capacity",
+    "latency_bound",
+    "jitter_bound",
+    "loss_bound",
+    "gbr_floor",
+    "service_type_sst_match",
+]
+MOBILITY_CONSTRAINTS = [
+    "target_subset_allowed",
+    "mandatory_triggers",
+    "service_area_context",
+]
+COUPLING_CONSTRAINTS = [
+    "snssai_alignment",
+    "service_area_consistency",
+    "ambr_consistency",
+    "cross_domain_consistency",
+]
+
+
 class ObjectiveProfile(BaseModel):
+    """Semantic objective weights for the two-domain optimizer.
+
+    Session domain:
+    - sla_violation_cost: SLA deficit, latency, jitter and loss penalties.
+    - resource_pressure_cost: slice capacity pressure and load imbalance.
+    - fairness_cost: priority-weighted tail penalties across flows.
+
+    Mobility domain:
+    - mobility_risk_cost: cost of changing AM policy under risky mobility state.
+
+    Cross-domain:
+    - control_churn_cost: SM/URSP/AM policy change and signaling churn.
+    """
+
     profile_name: str = Field(default="balanced")
     sla_violation_cost: float = Field(default=1.0, ge=0.0)
     mobility_risk_cost: float = Field(default=0.8, ge=0.0)
@@ -73,6 +126,18 @@ class ObjectiveProfile(BaseModel):
 
 
 class OptimizationProblemConfig(BaseModel):
+    """Optimization contract for the current PCF-centered two-domain model.
+
+    The session domain optimizes flow-to-slice assignment and bandwidth.
+    The mobility domain optimizes AM policy continuity fields for a UE.
+    Coupling constraints bind selected slices and allocated bandwidth to the
+    resulting AM allowed/target NSSAI and UE-AMBR.
+
+    This is not a RAN HOM/TTT handover-parameter optimizer. That model would
+    require cell-level trajectory, neighbor-cell and handover-failure inputs
+    that are not part of the current request schema.
+    """
+
     template: OptimizationTemplate = Field(default=OptimizationTemplate.JOINT_BALANCED)
     solver_mode: str = Field(default="incremental")
     active_objectives: List[str] = Field(
@@ -86,32 +151,30 @@ class OptimizationProblemConfig(BaseModel):
     )
     active_constraints: List[str] = Field(
         default_factory=lambda: [
-            "slice_capacity",
-            "latency_bound",
-            "jitter_bound",
-            "gbr_floor",
-            "snssai_alignment",
-            "service_area_consistency",
-            "ambr_consistency",
-            "cross_domain_consistency",
+            *SESSION_CONSTRAINTS,
+            *MOBILITY_CONSTRAINTS,
+            *COUPLING_CONSTRAINTS,
         ]
     )
     decision_variables: List[str] = Field(
-        default_factory=lambda: [
-            "slice_assignment",
-            "bandwidth_allocation",
-            "sm_policy_update",
-            "ursp_update",
-            "rfsp",
-            "allowed_snssais",
-            "target_snssais",
-            "mapping_snssais",
-            "serv_area_res",
-            "pras",
-            "ue_ambr",
-            "ue_slice_mbrs",
-        ]
+        default_factory=lambda: [*SESSION_DECISION_VARIABLES, *MOBILITY_DECISION_VARIABLES]
     )
+
+    def grouped_decision_variables(self) -> Dict[str, List[str]]:
+        variables = set(self.decision_variables)
+        return {
+            "session_domain": [item for item in SESSION_DECISION_VARIABLES if item in variables],
+            "mobility_domain": [item for item in MOBILITY_DECISION_VARIABLES if item in variables],
+            "cross_domain": [item for item in CROSS_DOMAIN_DECISION_VARIABLES if item in variables],
+        }
+
+    def grouped_constraints(self) -> Dict[str, List[str]]:
+        constraints = set(self.active_constraints)
+        return {
+            "session_feasibility": [item for item in SESSION_CONSTRAINTS if item in constraints],
+            "mobility_feasibility": [item for item in MOBILITY_CONSTRAINTS if item in constraints],
+            "coupling": [item for item in COUPLING_CONSTRAINTS if item in constraints],
+        }
 
     def normalized_for_domains(self, requested_domains: List["ControlDomain"]) -> "OptimizationProblemConfig":
         domains = set(requested_domains or [])
@@ -124,29 +187,19 @@ class OptimizationProblemConfig(BaseModel):
             active_constraints = [
                 item
                 for item in active_constraints
-                if item not in {"snssai_alignment", "service_area_consistency", "ambr_consistency", "cross_domain_consistency"}
+                if item not in set(MOBILITY_CONSTRAINTS + COUPLING_CONSTRAINTS)
             ]
             decision_variables = [
                 item
                 for item in decision_variables
-                if item
-                not in {
-                    "rfsp",
-                    "allowed_snssais",
-                    "target_snssais",
-                    "mapping_snssais",
-                    "serv_area_res",
-                    "pras",
-                    "ue_ambr",
-                    "ue_slice_mbrs",
-                }
+                if item not in set(MOBILITY_DECISION_VARIABLES)
             ]
         if ControlDomain.QOS not in domains:
             active_constraints = [
-                item for item in active_constraints if item not in {"slice_capacity", "latency_bound", "jitter_bound", "gbr_floor"}
+                item for item in active_constraints if item not in set(SESSION_CONSTRAINTS)
             ]
             decision_variables = [
-                item for item in decision_variables if item not in {"slice_assignment", "bandwidth_allocation", "sm_policy_update", "ursp_update"}
+                item for item in decision_variables if item not in set(SESSION_DECISION_VARIABLES)
             ]
         return OptimizationProblemConfig(
             template=self.template,

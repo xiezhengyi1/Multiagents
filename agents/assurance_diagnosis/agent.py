@@ -127,7 +127,7 @@ class AssuranceDiagnosisAgent(ArtifactWorkerMixin):
                 affected_policy_ids=sorted(set(affected_policy_ids)),
                 affected_flow_ids=sorted(set(affected_flow_ids)),
                 recommended_actions=[
-                    "Inspect dispatch receipts and downstream ack details for the failed policy path.",
+                    "Inspect dispatch receipts and gateway execution details for the failed policy path.",
                     "Verify the target policy payload before re-running assurance.",
                 ],
                 reason_summary="Execution-layer evidence indicates the failure happened before or during policy application.",

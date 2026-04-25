@@ -70,6 +70,7 @@ def _run_qos_subproblem(
         mode=problem_config.solver_mode,
         return_json=True,
         am_policy_state=am_policy_state,
+        mobility_risk_weight=objective_profile.mobility_risk_cost,
     )
     if not isinstance(result, dict):
         return {}, ["QoS optimizer returned non-dict result"]
@@ -94,6 +95,19 @@ def _build_am_policy_state_from_request(request: JointOptimizationRequest) -> Op
     if not am_ctx:
         return None
 
+    mobility_summary = (
+        ue_ctx.get("mobilitySummary")
+        or ue_ctx.get("mobility_summary")
+        or {}
+    )
+    raw_risk = mobility_summary.get("mobilityRiskScore")
+    if raw_risk is None:
+        raw_risk = mobility_summary.get("mobility_risk_score")
+    try:
+        mobility_risk_score = max(0.0, min(1.0, float(raw_risk or 0.0)))
+    except (TypeError, ValueError):
+        mobility_risk_score = 0.0
+
     return AMPolicyState(
         old_allowed_snssais=am_ctx.get("allowed_snssais") or am_ctx.get("allowedSnssais") or [],
         old_target_snssais=am_ctx.get("target_snssais") or am_ctx.get("targetSnssais") or [],
@@ -101,6 +115,7 @@ def _build_am_policy_state_from_request(request: JointOptimizationRequest) -> Op
         old_triggers=am_ctx.get("triggers") or am_ctx.get("policyAssociationRequest", {}).get("triggers") or [],
         old_ue_ambr_ul=am_ctx.get("ue_ambr_ul") or 0.0,
         old_ue_ambr_dl=am_ctx.get("ue_ambr_dl") or 0.0,
+        mobility_risk_score=mobility_risk_score,
     )
 
 
@@ -212,8 +227,13 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
             "active_objectives": list(problem_config.active_objectives),
             "active_constraints": list(problem_config.active_constraints),
             "decision_variables": list(problem_config.decision_variables),
+            "grouped_decision_variables": problem_config.grouped_decision_variables(),
+            "grouped_constraints": problem_config.grouped_constraints(),
             "legacy_qos_weights": objective_profile.to_legacy_qos_weights(),
             "mobility_risk_cost": objective_profile.mobility_risk_cost,
+            "session_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("session_cost", 0.0),
+            "mobility_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("mobility_cost", 0.0),
+            "coupling_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("coupling_cost", 0.0),
         },
         infeasible_reasons=infeasible_reasons,
     )

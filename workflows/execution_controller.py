@@ -167,31 +167,17 @@ class ExecutionController:
         if result.get("status") != "success":
             error = str(result.get("error") or "unknown dispatch error").strip()
             return f"policy {policy['policy_id']} dispatch failed: {error}"
-
-        ack = result.get("ack")
-        if not isinstance(ack, dict):
-            return f"policy {policy['policy_id']} missing ack in PCF response"
-        if ack.get("completed") is not True:
-            return (
-                f"policy {policy['policy_id']} ack incomplete: expected={ack.get('expected')}, "
-                f"received={ack.get('received')}, completed={ack.get('completed')}"
-            )
         return None
 
     @staticmethod
     def _should_retry_dispatch(*, result: Dict[str, Any]) -> bool:
         error_text = str(result.get("error") or "").strip().lower()
         response_code = result.get("response_code")
-        ack = result.get("ack") if isinstance(result.get("ack"), dict) else None
 
         if isinstance(response_code, int) and response_code >= 500:
             return True
         if any(token in error_text for token in ["timeout", "temporar", "connection", "request failed", "503", "502", "504"]):
             return True
-        if ack and ack.get("completed") is not True:
-            expected = ack.get("expected")
-            received = ack.get("received")
-            return isinstance(expected, int) and isinstance(received, int) and received < expected
         return False
 
     @staticmethod
@@ -804,7 +790,7 @@ class ExecutionController:
             log_timing(self.logger, "pda_total", datetime.now().timestamp() - total_start, status="error")
             return self._build_failure_outcome(
                 detail=str(exc),
-                correction_suggestion="Check policy payload, guard validation, PCF ack, or telemetry path.",
+                correction_suggestion="Check policy payload, guard validation, gateway execution result, or telemetry path.",
                 recommended_consumer="optimization_strategy",
                 failure_scope="mixed",
                 feedback_payload={"phase": "runtime", "error": str(exc)},
