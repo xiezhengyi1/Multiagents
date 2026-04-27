@@ -5,11 +5,10 @@ import json
 import os
 import sys
 from collections import defaultdict
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
-from unittest.mock import patch
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -56,9 +55,11 @@ from knowledge_scripts.build_pcf_policy_kb_docling import (
 )
 
 
-DEFAULT_CASES_PATH = Path(current_dir) / "data" / "pcf_policy_rag_eval_cases.json"
+DEFAULT_CASES_PATH = Path(current_dir) / "data" / "pcf_policy_rag_agent_expanded_cases.json"
 DEFAULT_IEA_GOLD_CASES_PATH = Path(current_dir) / "data" / "pcf_policy_rag_iea_gold_cases.json"
 DEFAULT_EXTENDED_CASES_PATH = Path(current_dir) / "data" / "pcf_policy_rag_extended_cases.json"
+DEFAULT_STRICT_CASES_PATH = Path(current_dir) / "data" / "pcf_policy_rag_strict_cases.json"
+DEFAULT_AGENT_EXPANDED_CASES_PATH = Path(current_dir) / "data" / "pcf_policy_rag_agent_expanded_cases.json"
 DEFAULT_IEA_TRACE_PATHS = (
     Path(parent_dir) / "sft_data" / "main_control" / "raw_traces" / "main_control.jsonl",
     Path(parent_dir) / "sft_data" / "intent_encoding" / "raw_traces" / "intent_encoding.jsonl",
@@ -330,22 +331,42 @@ def knowledge_profile(profile_name: str) -> Iterator[None]:
         config["term_alias_map"],
     )
 
-    with ExitStack() as stack:
-        stack.enter_context(patch.object(knowledge_tool, "CLAUSE_JSONL", config["clause_jsonl"]))
-        stack.enter_context(patch.object(knowledge_tool, "SCHEMA_JSONL", config["schema_jsonl"]))
-        stack.enter_context(patch.object(knowledge_tool, "GLOSSARY_JSONL", config["glossary_jsonl"]))
-        stack.enter_context(patch.object(knowledge_tool, "CLAUSE_EXACT_INDEX_JSON", config["clause_exact_index"]))
-        stack.enter_context(patch.object(knowledge_tool, "SCHEMA_EXACT_INDEX_JSON", config["schema_exact_index"]))
-        stack.enter_context(patch.object(knowledge_tool, "GLOSSARY_EXACT_INDEX_JSON", config["glossary_exact_index"]))
-        stack.enter_context(patch.object(knowledge_tool, "SPEC_OBJECT_MAP_JSON", config["spec_object_map"]))
-        stack.enter_context(patch.object(knowledge_tool, "TERM_ALIAS_MAP_JSON", config["term_alias_map"]))
-        stack.enter_context(patch.object(knowledge_tool, "REQUIRED_KB_PATHS", required_paths))
-        stack.enter_context(patch.object(knowledge_tool, "PCF_AM_POLICY_CLAUSES_COLLECTION", collections["am_clause"]))
-        stack.enter_context(patch.object(knowledge_tool, "PCF_AM_POLICY_SCHEMA_COLLECTION", collections["am_schema"]))
-        stack.enter_context(patch.object(knowledge_tool, "PCF_SM_POLICY_CLAUSES_COLLECTION", collections["sm_clause"]))
-        stack.enter_context(patch.object(knowledge_tool, "PCF_SM_POLICY_SCHEMA_COLLECTION", collections["sm_schema"]))
-        stack.enter_context(patch.object(knowledge_tool, "PCF_URSP_CLAUSES_COLLECTION", collections["ursp_clause"]))
-        stack.enter_context(patch.object(knowledge_tool, "PCF_URSP_SCHEMA_COLLECTION", collections["ursp_schema"]))
+    overrides = {
+        "CLAUSE_JSONL": config["clause_jsonl"],
+        "SCHEMA_JSONL": config["schema_jsonl"],
+        "GLOSSARY_JSONL": config["glossary_jsonl"],
+        "CLAUSE_EXACT_INDEX_JSON": config["clause_exact_index"],
+        "SCHEMA_EXACT_INDEX_JSON": config["schema_exact_index"],
+        "GLOSSARY_EXACT_INDEX_JSON": config["glossary_exact_index"],
+        "SPEC_OBJECT_MAP_JSON": config["spec_object_map"],
+        "TERM_ALIAS_MAP_JSON": config["term_alias_map"],
+        "REQUIRED_KB_PATHS": required_paths,
+        "PCF_AM_POLICY_CLAUSES_COLLECTION": collections["am_clause"],
+        "PCF_AM_POLICY_SCHEMA_COLLECTION": collections["am_schema"],
+        "PCF_SM_POLICY_CLAUSES_COLLECTION": collections["sm_clause"],
+        "PCF_SM_POLICY_SCHEMA_COLLECTION": collections["sm_schema"],
+        "PCF_URSP_CLAUSES_COLLECTION": collections["ursp_clause"],
+        "PCF_URSP_SCHEMA_COLLECTION": collections["ursp_schema"],
+    }
+    original_values = {name: getattr(knowledge_tool, name) for name in overrides}
+    for name, value in overrides.items():
+        setattr(knowledge_tool, name, value)
+    for cache_func in (
+        knowledge_tool._ensure_processed_corpus,
+        knowledge_tool._record_catalog,
+        knowledge_tool._records_by_citation,
+        knowledge_tool._clause_exact_index,
+        knowledge_tool._schema_exact_index,
+        knowledge_tool._glossary_exact_index,
+        knowledge_tool._spec_object_map,
+        knowledge_tool._term_alias_map,
+    ):
+        cache_func.cache_clear()
+    try:
+        yield
+    finally:
+        for name, value in original_values.items():
+            setattr(knowledge_tool, name, value)
         for cache_func in (
             knowledge_tool._ensure_processed_corpus,
             knowledge_tool._record_catalog,
@@ -357,20 +378,6 @@ def knowledge_profile(profile_name: str) -> Iterator[None]:
             knowledge_tool._term_alias_map,
         ):
             cache_func.cache_clear()
-        try:
-            yield
-        finally:
-            for cache_func in (
-                knowledge_tool._ensure_processed_corpus,
-                knowledge_tool._record_catalog,
-                knowledge_tool._records_by_citation,
-                knowledge_tool._clause_exact_index,
-                knowledge_tool._schema_exact_index,
-                knowledge_tool._glossary_exact_index,
-                knowledge_tool._spec_object_map,
-                knowledge_tool._term_alias_map,
-            ):
-                cache_func.cache_clear()
 
 
 def _safe_mean(values: Iterable[float]) -> float:
@@ -532,7 +539,28 @@ def run_evaluation(
             case_source = Path("iea_trace_weak://semantic_queries")
         else:
             raise ValueError(f"Unsupported case source type: {case_source_type}")
-        results = [evaluate_case(case, limit=limit) for case in cases]
+        total_cases = len(cases)
+        print(
+            f"[rag-eval] profile={profile} case_source={case_source_type} "
+            f"cases={total_cases} top_k={limit}",
+            flush=True,
+        )
+        results: List[Dict[str, Any]] = []
+        for index, case in enumerate(cases, start=1):
+            print(
+                f"[rag-eval] ({index}/{total_cases}) start case={case['id']} "
+                f"domain={case['policy_domain']} target={case['target_kind']} "
+                f"query={case['query']}",
+                flush=True,
+            )
+            result = evaluate_case(case, limit=limit)
+            print(
+                f"[rag-eval] ({index}/{total_cases}) done case={case['id']} "
+                f"success={result['success']} top1={result['accuracy_at_1']:.0f} "
+                f"mrr={result['reciprocal_rank']:.4f}",
+                flush=True,
+            )
+            results.append(result)
     report = summarize_results(results, profile=profile, limit=limit, case_source=case_source)
     report["case_source_type"] = case_source_type
     return report

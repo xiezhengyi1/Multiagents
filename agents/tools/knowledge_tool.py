@@ -40,9 +40,11 @@ DEFAULT_RETURNED_RESULTS = 10
 MAX_RETURNED_RESULTS = 30
 MAX_CONTENT_CHARS = 1200
 MAX_SUMMARY_CHARS = 240
-BGE_RERANK_MODEL = "BAAI/bge-reranker-base"
+BGE_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
 BGE_RERANK_INPUT_CHARS = 3200
 BGE_RERANK_TERM_CHARS = 700
+RRF_K = 60.0
+RRF_SCORE_SCALE = 1000.0
 SEARCH_STOPWORDS = {
     "a",
     "an",
@@ -223,18 +225,14 @@ SCHEMA_QUERY_KEYWORDS = (
     "parameter",
     "parameters",
     "enum",
-    "request",
-    "response",
-    "api",
     "object",
     "objects",
     "contains",
     "include",
     "definition",
     "define",
-    "allowed",
-    "value",
-    "values",
+    "properties",
+    "property",
 )
 OPERATION_QUERY_KEYWORDS = (
     "api",
@@ -303,6 +301,10 @@ def _normalize_search_term(term: str) -> str:
     normalized = _normalized(term)
     if len(normalized) > 4 and normalized.endswith("ies"):
         return f"{normalized[:-3]}y"
+    if len(normalized) > 6 and normalized.endswith("ing"):
+        return normalized[:-3]
+    if len(normalized) > 5 and normalized.endswith("ed"):
+        return normalized[:-2]
     if len(normalized) > 4 and normalized.endswith("s") and not normalized.endswith("ss"):
         return normalized[:-1]
     return normalized
@@ -367,9 +369,82 @@ def _spec_priority(spec_id: str, domain: str) -> int:
         return 0
 
 
-def _prefers_schema(query: str) -> bool:
+def _has_explicit_schema_intent(query: str) -> bool:
     lowered = _normalized(query)
     return any(keyword in lowered for keyword in SCHEMA_QUERY_KEYWORDS)
+
+
+@lru_cache(maxsize=8)
+def _domain_schema_phrase_index(domain: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    schema_names: set[str] = set()
+    object_phrases: set[str] = set()
+    for record in _record_catalog().values():
+        metadata = record.get("metadata") or {}
+        if not _domain_matches(metadata, domain):
+            continue
+        if _normalized(metadata.get("doc_type") or "") != "openapi":
+            continue
+        schema_name = str(metadata.get("schema_name") or "").strip()
+        if schema_name:
+            schema_names.add(schema_name)
+        for object_tag in metadata.get("object_tags") or []:
+            normalized_tag = str(object_tag or "").strip()
+            if normalized_tag:
+                object_phrases.add(normalized_tag)
+    return tuple(sorted(schema_names)), tuple(sorted(object_phrases))
+
+
+def _schema_phrase_matches(query: str, domain: str) -> Tuple[set[str], set[str]]:
+    query_terms = set(_search_terms(query))
+    schema_names, object_phrases = _domain_schema_phrase_index(domain)
+    matched_schema_names = {
+        phrase for phrase in schema_names
+        if len(_normalized(phrase)) >= 3 and set(_search_terms(phrase)).issubset(query_terms)
+    }
+    matched_object_phrases = {
+        phrase for phrase in object_phrases
+        if len(_normalized(phrase)) >= 3 and set(_search_terms(phrase)).issubset(query_terms)
+    }
+    return matched_schema_names, matched_object_phrases
+
+
+def _looks_like_schema_object_query(query: str, domain: str) -> bool:
+    if _has_explicit_schema_intent(query):
+        return True
+    if _prefers_clause_location(query, domain) or _prefers_operation(query) or _prefers_glossary(query):
+        return False
+    if _looks_like_exact_identifier_query(query):
+        return False
+
+    query_terms = _search_terms(query)
+    if len(query_terms) <= 3 and _is_short_term_query(query):
+        return False
+
+    matched_schema_names, matched_object_phrases = _schema_phrase_matches(query, domain)
+    technical_phrase_hits = len(matched_schema_names | matched_object_phrases)
+    if technical_phrase_hits >= 2:
+        return True
+
+    lowered = _normalized(query)
+    if matched_schema_names and any(
+        phrase in lowered
+        for phrase in (
+            "carrier",
+            "carries",
+            "contains",
+            "core objects",
+            "information",
+            "mapping",
+            "reports",
+        )
+    ):
+        return True
+
+    return bool(matched_schema_names) and len(query_terms) >= 5
+
+
+def _prefers_schema(query: str, domain: str = "all") -> bool:
+    return _looks_like_schema_object_query(query, domain)
 
 
 def _prefers_operation(query: str) -> bool:
@@ -395,12 +470,26 @@ def _is_short_term_query(query: str) -> bool:
     terms = _search_terms(query)
     if len(terms) > 6:
         return False
-    return not _prefers_schema(query) and not _prefers_operation(query)
+    return not _has_explicit_schema_intent(query) and not _prefers_operation(query)
+
+
+def _looks_like_exact_identifier_query(query: str) -> bool:
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        return False
+    search_terms = _search_terms(normalized_query)
+    has_identifier_shape = (
+        ":" in normalized_query
+        or "_" in normalized_query
+        or bool(re.search(r"[A-Z][a-z]+[A-Z]", normalized_query))
+        or bool(re.fullmatch(r"[A-Z0-9][A-Z0-9\s_-]{1,}", normalized_query))
+    )
+    return has_identifier_shape and len(search_terms) <= 6
 
 
 def _ursp_prefers_schema(query: str) -> bool:
     lowered = _normalized(query)
-    if _prefers_schema(query):
+    if _prefers_schema(query, "ursp"):
         return True
     return any(term in lowered for term in URSP_SCHEMA_HINT_TERMS)
 
@@ -412,7 +501,7 @@ def _ursp_prefers_clause(query: str) -> bool:
 
 def _am_prefers_schema(query: str) -> bool:
     lowered = _normalized(query)
-    if _prefers_schema(query):
+    if _prefers_schema(query, "am_policy"):
         return True
     return any(term in lowered for term in AM_SCHEMA_HINT_TERMS)
 
@@ -469,19 +558,35 @@ def _infer_policy_domain(query: str, category: Optional[str]) -> str:
     return "all"
 
 
-def _select_collections(query: str, domain: str) -> List[str]:
-    prefers_schema = _prefers_schema(query)
+def _domain_collection_pair(domain: str) -> Tuple[Optional[str], Optional[str]]:
     if domain == "am_policy":
-        return [PCF_AM_POLICY_SCHEMA_COLLECTION, PCF_AM_POLICY_CLAUSES_COLLECTION] if prefers_schema else [PCF_AM_POLICY_CLAUSES_COLLECTION, PCF_AM_POLICY_SCHEMA_COLLECTION]
+        return PCF_AM_POLICY_SCHEMA_COLLECTION, PCF_AM_POLICY_CLAUSES_COLLECTION
     if domain == "sm_policy":
-        return [PCF_SM_POLICY_SCHEMA_COLLECTION, PCF_SM_POLICY_CLAUSES_COLLECTION] if prefers_schema else [PCF_SM_POLICY_CLAUSES_COLLECTION, PCF_SM_POLICY_SCHEMA_COLLECTION]
+        return PCF_SM_POLICY_SCHEMA_COLLECTION, PCF_SM_POLICY_CLAUSES_COLLECTION
     if domain == "ursp":
-        return [PCF_URSP_SCHEMA_COLLECTION, PCF_URSP_CLAUSES_COLLECTION] if prefers_schema else [PCF_URSP_CLAUSES_COLLECTION, PCF_URSP_SCHEMA_COLLECTION]
+        return PCF_URSP_SCHEMA_COLLECTION, PCF_URSP_CLAUSES_COLLECTION
+    return None, None
+
+
+def _select_collections(query: str, domain: str) -> List[str]:
+    prefers_schema = _prefers_schema(query, domain)
+    prefers_clause = _prefers_clause_location(query, domain)
+    prefers_operation = _prefers_operation(query)
+    schema_collection, clause_collection = _domain_collection_pair(domain)
+    if schema_collection and clause_collection:
+        if prefers_operation or prefers_schema:
+            return [schema_collection]
+        if prefers_clause:
+            return [clause_collection]
+        return [clause_collection, schema_collection]
     if domain == "mobility":
-        if prefers_schema:
+        if prefers_operation or prefers_schema:
             return [
                 PCF_AM_POLICY_SCHEMA_COLLECTION,
                 PCF_URSP_SCHEMA_COLLECTION,
+            ]
+        if prefers_clause:
+            return [
                 PCF_AM_POLICY_CLAUSES_COLLECTION,
                 PCF_URSP_CLAUSES_COLLECTION,
             ]
@@ -491,11 +596,14 @@ def _select_collections(query: str, domain: str) -> List[str]:
             PCF_AM_POLICY_SCHEMA_COLLECTION,
             PCF_URSP_SCHEMA_COLLECTION,
         ]
-    if prefers_schema:
+    if prefers_operation or prefers_schema:
         return [
             PCF_AM_POLICY_SCHEMA_COLLECTION,
             PCF_SM_POLICY_SCHEMA_COLLECTION,
             PCF_URSP_SCHEMA_COLLECTION,
+        ]
+    if prefers_clause:
+        return [
             PCF_AM_POLICY_CLAUSES_COLLECTION,
             PCF_SM_POLICY_CLAUSES_COLLECTION,
             PCF_URSP_CLAUSES_COLLECTION,
@@ -589,17 +697,37 @@ def _sanitize_limit(limit: Optional[int]) -> int:
 
 def _doc_type_priority(doc_type: str, query: str, domain: str) -> float:
     normalized_doc_type = _normalized(doc_type)
-    prefers_schema = _prefers_schema(query)
+    prefers_schema = _prefers_schema(query, domain)
+    prefers_clause = _prefers_clause_location(query, domain)
+    prefers_operation = _prefers_operation(query)
     prefers_glossary = _prefers_glossary(query)
+    if prefers_operation:
+        if normalized_doc_type == "openapi":
+            return 320.0
+        if normalized_doc_type == "glossary":
+            return 10.0
+        if normalized_doc_type in {"table", "stage2", "stage3"}:
+            return -40.0
+        return 0.0
+
     if prefers_schema:
         if normalized_doc_type == "openapi":
             return 260.0
         if normalized_doc_type == "glossary":
-            return 180.0
+            return 35.0
         if normalized_doc_type == "table":
-            return 120.0
+            return 70.0
         if normalized_doc_type in {"stage2", "stage3"}:
-            return 100.0
+            return 35.0
+        return 0.0
+
+    if prefers_clause:
+        if normalized_doc_type in {"table", "stage2", "stage3"}:
+            return 260.0
+        if normalized_doc_type == "glossary":
+            return 20.0
+        if normalized_doc_type == "openapi":
+            return -60.0
         return 0.0
 
     if prefers_glossary:
@@ -738,6 +866,8 @@ def _glossary_phrase_bonus(metadata: Dict[str, Any], query: str) -> float:
 
 
 def _glossary_strong_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
+    if _prefers_schema(query, domain) or _prefers_clause_location(query, domain) or _prefers_operation(query):
+        return []
     candidates: List[Dict[str, Any]] = []
     for record in _record_catalog().values():
         metadata = record.get("metadata") or {}
@@ -812,16 +942,37 @@ def _should_skip_generic_clause_candidate(metadata: Dict[str, Any], query: str) 
 def _metadata_query_bonus(metadata: Dict[str, Any], query: str, domain: str) -> float:
     score = _spec_priority(str(metadata.get("spec_id") or ""), domain)
     score += _doc_type_priority(str(metadata.get("doc_type") or ""), query, domain)
+    normalized_doc_type = _normalized(metadata.get("doc_type") or "")
     query_terms = _expanded_query_terms(query, domain)
+    matched_schema_names, _matched_object_phrases = _schema_phrase_matches(query, domain)
+    matched_schema_names_normalized = {_normalized(name) for name in matched_schema_names}
     title_terms, object_terms, normalized_terms = _metadata_term_sets(metadata)
     score += 24.0 * len(query_terms.intersection(title_terms))
     score += 14.0 * len(query_terms.intersection(object_terms))
     score += 6.0 * len(query_terms.intersection(normalized_terms))
+    if _prefers_schema(query, domain):
+        score += 120.0 * len(query_terms.intersection(title_terms))
+        score += 80.0 * len(query_terms.intersection(object_terms))
+        if normalized_doc_type == "glossary":
+            score -= 280.0
+    if _prefers_clause_location(query, domain):
+        if normalized_doc_type == "openapi":
+            score -= 240.0
+        elif normalized_doc_type == "glossary":
+            score -= 90.0
     if _is_generic_clause_candidate(metadata):
         score -= 180.0
         if query_terms.intersection(title_terms | object_terms):
             score += 120.0
     score += _identifier_match_bonus(metadata.get("schema_name"), query_terms)
+    if _prefers_schema(query, domain) and metadata.get("schema_name"):
+        normalized_schema_name = _normalized(metadata.get("schema_name") or "")
+        if matched_schema_names_normalized:
+            score += 240.0 if normalized_schema_name in matched_schema_names_normalized else -180.0
+        schema_terms = set(_search_terms(str(metadata.get("schema_name") or "")))
+        overlap = len(query_terms.intersection(schema_terms))
+        if overlap:
+            score += 220.0 + 80.0 * overlap
     if metadata.get("operation_id"):
         score += _identifier_match_bonus(metadata.get("operation_id"), query_terms)
         if _prefers_operation(query):
@@ -859,6 +1010,88 @@ def _sm_qos_requirement_candidates(query: str, domain: str) -> List[Dict[str, An
             base += 820.0
         candidates.append(_record_to_candidate(record, score=base + _metadata_query_bonus(metadata, query, domain), retrieval="sm_qos_requirements"))
     return _dedupe_candidates(candidates, limit=6)
+
+
+def _schema_object_graph_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
+    if not _prefers_schema(query, domain):
+        return []
+
+    query_terms = _expanded_query_terms(query, domain)
+    matched_schema_names, matched_object_phrases = _schema_phrase_matches(query, domain)
+    matched_schema_names_normalized = {_normalized(name) for name in matched_schema_names}
+    matched_object_phrases_normalized = {_normalized(name) for name in matched_object_phrases}
+    candidates: List[Dict[str, Any]] = []
+    for record in _record_catalog().values():
+        metadata = record.get("metadata") or {}
+        if not _domain_matches(metadata, domain):
+            continue
+        if _normalized(metadata.get("doc_type") or "") != "openapi":
+            continue
+        title_terms, object_terms, _ = _metadata_term_sets(metadata)
+        title_overlap = len(query_terms.intersection(title_terms))
+        object_overlap = len(query_terms.intersection(object_terms))
+        schema_name_terms = set(_search_terms(str(metadata.get("schema_name") or "")))
+        schema_overlap = len(query_terms.intersection(schema_name_terms))
+        if title_overlap == 0 and object_overlap == 0 and schema_overlap == 0:
+            continue
+        score = 2440.0 + 180.0 * schema_overlap + 120.0 * title_overlap + 90.0 * object_overlap
+        normalized_schema_name = _normalized(metadata.get("schema_name") or "")
+        if matched_schema_names_normalized:
+            score += 420.0 if normalized_schema_name in matched_schema_names_normalized else -180.0
+        object_phrase_overlap = sum(
+            1
+            for object_tag in metadata.get("object_tags") or []
+            if _normalized(object_tag) in matched_object_phrases_normalized
+        )
+        score += 170.0 * object_phrase_overlap
+        score += _metadata_query_bonus(metadata, query, domain)
+        candidates.append(_record_to_candidate(record, score=score, retrieval="schema_object_graph"))
+    return _dedupe_candidates(candidates, limit=8)
+
+
+def _schema_definition_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
+    if not _prefers_schema(query, domain):
+        return []
+
+    query_terms = _expanded_query_terms(query, domain)
+    query_text = _normalized(query)
+    matched_schema_names, matched_object_phrases = _schema_phrase_matches(query, domain)
+    matched_schema_names_normalized = {_normalized(name) for name in matched_schema_names}
+    matched_object_phrases_normalized = {_normalized(name) for name in matched_object_phrases}
+    candidates: List[Dict[str, Any]] = []
+    for record in _record_catalog().values():
+        metadata = record.get("metadata") or {}
+        if not _domain_matches(metadata, domain):
+            continue
+        if _normalized(metadata.get("doc_type") or "") != "openapi":
+            continue
+        schema_name = str(metadata.get("schema_name") or "").strip()
+        if not schema_name:
+            continue
+        title_terms, object_terms, normalized_terms = _metadata_term_sets(metadata)
+        content_terms = set(_search_terms(str(record.get("page_content") or "")))
+        schema_terms = set(_search_terms(schema_name))
+        title_overlap = len(query_terms.intersection(title_terms))
+        object_overlap = len(query_terms.intersection(object_terms))
+        content_overlap = len(query_terms.intersection(content_terms | normalized_terms))
+        schema_overlap = len(query_terms.intersection(schema_terms))
+        if title_overlap == 0 and object_overlap == 0 and content_overlap == 0 and schema_overlap == 0:
+            continue
+        score = 2320.0 + 220.0 * schema_overlap + 105.0 * title_overlap + 90.0 * object_overlap + 32.0 * content_overlap
+        normalized_schema_name = _normalized(schema_name)
+        if normalized_schema_name in query_text:
+            score += 380.0
+        if matched_schema_names_normalized:
+            score += 460.0 if normalized_schema_name in matched_schema_names_normalized else -180.0
+        object_phrase_overlap = sum(
+            1
+            for object_tag in metadata.get("object_tags") or []
+            if _normalized(object_tag) in matched_object_phrases_normalized
+        )
+        score += 140.0 * object_phrase_overlap
+        score += _metadata_query_bonus(metadata, query, domain)
+        candidates.append(_record_to_candidate(record, score=score, retrieval="schema_definition"))
+    return _dedupe_candidates(candidates, limit=8)
 
 
 def _am_rfsp_clause_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
@@ -1034,8 +1267,33 @@ def _aggregate_parent_candidates(
     *,
     limit: int = DEFAULT_RETURNED_RESULTS,
 ) -> List[Dict[str, Any]]:
+    candidate_list = list(candidates)
+    if not candidate_list:
+        return []
+
+    family_rankings: Dict[str, Dict[str, int]] = defaultdict(dict)
+    family_buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for candidate in candidate_list:
+        parent_key = _candidate_key(candidate["metadata"], candidate.get("id") or "")
+        if not parent_key:
+            continue
+        family = _retrieval_family(candidate.get("retrieval") or "")
+        family_buckets[family].append(candidate)
+
+    for family, bucket in family_buckets.items():
+        ranked_bucket = sorted(bucket, key=lambda item: item["score"], reverse=True)
+        rank_counter = 1
+        seen_parent_keys: set[str] = set()
+        for candidate in ranked_bucket:
+            parent_key = _candidate_key(candidate["metadata"], candidate.get("id") or "")
+            if not parent_key or parent_key in seen_parent_keys:
+                continue
+            seen_parent_keys.add(parent_key)
+            family_rankings[family][parent_key] = rank_counter
+            rank_counter += 1
+
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for candidate in candidates:
+    for candidate in candidate_list:
         metadata = candidate["metadata"]
         parent_key = _candidate_key(metadata, candidate.get("id") or "")
         if not parent_key:
@@ -1049,9 +1307,12 @@ def _aggregate_parent_candidates(
         representative_metadata = dict(representative["metadata"])
         support_count = len(ranked_group)
         retrieval_families = sorted({_retrieval_family(item.get("retrieval") or "") for item in ranked_group})
-        support_bonus = min(96.0, 18.0 * max(0, support_count - 1))
-        retrieval_bonus = min(36.0, 12.0 * max(0, len(retrieval_families) - 1))
-        representative["score"] = round(float(representative["score"]) + support_bonus + retrieval_bonus, 4)
+        rrf_score = 0.0
+        for family in retrieval_families:
+            rank = family_rankings.get(family, {}).get(parent_key)
+            if rank is not None:
+                rrf_score += 1.0 / (RRF_K + float(rank))
+        representative["score"] = round(float(representative["score"]) + rrf_score * RRF_SCORE_SCALE, 4)
         representative_retrieval = str(representative.get("retrieval") or "")
         if support_count > 1 or len(retrieval_families) > 1:
             representative["retrieval"] = (
@@ -1066,6 +1327,7 @@ def _aggregate_parent_candidates(
             "parent_result_key": parent_key,
             "support_count": support_count,
             "supporting_retrievals": retrieval_families,
+            "rrf_score": round(rrf_score, 6),
         }
         aggregated.append(representative)
 
@@ -1112,7 +1374,7 @@ def _direct_record_matches(key: str, domain: str) -> List[Dict[str, Any]]:
 def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
     catalog = _record_catalog()
     candidates: List[Dict[str, Any]] = []
-    prefers_schema = _prefers_schema(query)
+    prefers_schema = _prefers_schema(query, domain)
     for hit in search_exact_index(_clause_exact_index(), query, top_k=12):
         record = catalog.get(hit["id"])
         if record is None:
@@ -1276,6 +1538,8 @@ def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED
     direct = _direct_record_matches(query, domain)
     glossary = _glossary_strong_candidates(query, domain)
     domain_special = [
+        *_schema_object_graph_candidates(query, domain),
+        *_schema_definition_candidates(query, domain),
         *_sm_qos_requirement_candidates(query, domain),
         *_am_rfsp_clause_candidates(query, domain),
         *_operation_intent_candidates(query, domain),
@@ -1283,6 +1547,8 @@ def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED
     exact = _exact_search_candidates(query, domain)
     rerank_pool_limit = max(limit * 4, 20)
     seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
+    if direct and _looks_like_exact_identifier_query(query):
+        return _bge_rerank_candidates(query, domain, seeds, limit=limit), []
     cross_spec = _expand_cross_spec_candidates(seeds, domain, query)
     vector, errors = _vector_search_candidates(query, domain)
     combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=rerank_pool_limit)
