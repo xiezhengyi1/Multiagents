@@ -1,0 +1,1 @@
+task_id,experiment_id,method_id,scenario_id,run_index,user_input,expected_objects,expected_direction,isr,ga,sv,esr,crr,ssi,avg_rounds,avg_latency_ms,avg_retry_count,avg_execution_ms,failure_type,reviewer_notes

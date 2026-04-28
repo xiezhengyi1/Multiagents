@@ -1,0 +1,1 @@
+run_id,experiment_id,method_id,scenario_id,task_id,run_index,status,completed,isr,ga,sv,esr,crr,ssi,round_count,retry_count,avg_latency_ms,execution_status,status_code,failure_type,snapshot_before,snapshot_after,result_path,summary_path,notes
