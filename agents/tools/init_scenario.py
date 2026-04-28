@@ -13,7 +13,10 @@ import random
 import re
 import secrets
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+import yaml
 
 from utils.logger import setup_logger
 from database.models import (
@@ -396,6 +399,387 @@ def _extract_app_supi(app_dict: Dict[str, Any]) -> Optional[str]:
     if app_supi:
         return app_supi
     return None
+
+
+def _snssai_from_parts(sst: Any, sd: Any) -> str:
+    return f"{int(sst):02X}{str(sd).strip().zfill(6)}"
+
+
+def _build_deterministic_five_tuple(*, supi: str, flow_ordinal: int, service_type_id: int) -> Tuple[str, str, int, int, str]:
+    digits = re.sub(r"\D+", "", str(supi or ""))
+    subscriber_index = int(digits[-3:]) if digits else flow_ordinal + 1
+    host_octet = max(1, (flow_ordinal % 200) + 1)
+    src_ip = f"10.{service_type_id}.{subscriber_index % 250}.{host_octet}"
+    dst_ip = f"172.16.{service_type_id}.{10 + host_octet}"
+    src_port = 20000 + ((subscriber_index * 11 + flow_ordinal) % 20000)
+    dst_port = 4000 + (service_type_id * 100) + flow_ordinal
+    protocol = "udp" if service_type_id in (2, 3) else "tcp"
+    return src_ip, dst_ip, src_port, dst_port, protocol
+
+
+def _require_mapping(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
+    value = parent.get(key)
+    if not isinstance(value, dict):
+        raise TypeError(f"Scenario field '{key}' must be a mapping")
+    return value
+
+
+def _require_list(parent: Dict[str, Any], key: str) -> List[Any]:
+    value = parent.get(key)
+    if not isinstance(value, list):
+        raise TypeError(f"Scenario field '{key}' must be a list")
+    return value
+
+
+def _load_experiment_scenario_payload(path: Union[str, Path]) -> Dict[str, Any]:
+    scenario_path = Path(path).expanduser().resolve()
+    if not scenario_path.exists():
+        raise FileNotFoundError(f"Scenario file not found: {scenario_path}")
+    payload = yaml.safe_load(scenario_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"Scenario file must decode to a mapping: {scenario_path}")
+    payload["_scenario_file"] = str(scenario_path)
+    return payload
+
+
+def _deserialize_experiment_scenario(payload: Dict[str, Any]) -> Tuple[List[App], List[Slice], List[Node]]:
+    required_top_keys = [
+        "name",
+        "scenario_id",
+        "slices",
+        "upfs",
+        "gnbs",
+        "ues",
+        "apps",
+        "flows",
+        "free5gc",
+        "ns3",
+        "writer",
+        "topology",
+        "bridge",
+    ]
+    missing_keys = [key for key in required_top_keys if key not in payload]
+    if missing_keys:
+        raise ValueError(f"Scenario payload missing required keys: {missing_keys}")
+
+    slice_rows = _require_list(payload, "slices")
+    upf_rows = _require_list(payload, "upfs")
+    gnb_rows = _require_list(payload, "gnbs")
+    ue_rows = _require_list(payload, "ues")
+    app_rows = _require_list(payload, "apps")
+    flow_rows = _require_list(payload, "flows")
+
+    slice_specs: Dict[str, Dict[str, Any]] = {}
+    slice_flows: Dict[str, List[Dict[str, Any]]] = {}
+    for slice_row in slice_rows:
+        if not isinstance(slice_row, dict):
+            raise TypeError("Each slice entry must be a mapping")
+        label = str(slice_row.get("label") or "").strip()
+        if not label:
+            raise ValueError("Each slice entry must define a non-empty label")
+        if label in slice_specs:
+            raise ValueError(f"Duplicate slice label: {label}")
+        resource = _require_mapping(slice_row, "resource")
+        sst = int(slice_row.get("sst"))
+        sd = str(slice_row.get("sd") or "").strip().zfill(6)
+        slice_specs[label] = {
+            "label": label,
+            "sst": sst,
+            "sd": sd,
+            "resource": resource,
+            "snssai": _snssai_from_parts(sst, sd),
+        }
+        slice_flows[label] = []
+
+    upf_by_name: Dict[str, Dict[str, Any]] = {}
+    for upf_row in upf_rows:
+        if not isinstance(upf_row, dict):
+            raise TypeError("Each upf entry must be a mapping")
+        name = str(upf_row.get("name") or "").strip()
+        if not name:
+            raise ValueError("Each upf entry must define name")
+        if name in upf_by_name:
+            raise ValueError(f"Duplicate upf name: {name}")
+        role = str(upf_row.get("role") or "").strip()
+        if role not in {"branching-upf", "anchor-upf"}:
+            raise ValueError(f"UPF {name} has unsupported role: {role}")
+        upf_by_name[name] = upf_row
+
+    gnb_by_name: Dict[str, Dict[str, Any]] = {}
+    gnb_slice_refs_by_upf: Dict[str, set[str]] = {name: set() for name in upf_by_name}
+    for gnb_row in gnb_rows:
+        if not isinstance(gnb_row, dict):
+            raise TypeError("Each gnb entry must be a mapping")
+        name = str(gnb_row.get("name") or "").strip()
+        if not name:
+            raise ValueError("Each gnb entry must define name")
+        if name in gnb_by_name:
+            raise ValueError(f"Duplicate gnb name: {name}")
+        slice_refs = [str(item).strip() for item in (gnb_row.get("slices") or []) if str(item).strip()]
+        if not slice_refs:
+            raise ValueError(f"gNB {name} must host at least one slice")
+        for slice_ref in slice_refs:
+            if slice_ref not in slice_specs:
+                raise ValueError(f"gNB {name} references unknown slice: {slice_ref}")
+        backhaul_upf = str(gnb_row.get("backhaul_upf") or "").strip()
+        if backhaul_upf not in upf_by_name:
+            raise ValueError(f"gNB {name} references unknown backhaul UPF: {backhaul_upf}")
+        gnb_by_name[name] = gnb_row
+        gnb_slice_refs_by_upf[backhaul_upf].update(slice_refs)
+
+    ue_by_name: Dict[str, Dict[str, Any]] = {}
+    ue_by_supi: Dict[str, Dict[str, Any]] = {}
+    session_refs: Dict[str, Dict[str, Any]] = {}
+    for ue_row in ue_rows:
+        if not isinstance(ue_row, dict):
+            raise TypeError("Each ue entry must be a mapping")
+        ue_name = str(ue_row.get("name") or "").strip()
+        if not ue_name:
+            raise ValueError("Each ue entry must define name")
+        if ue_name in ue_by_name:
+            raise ValueError(f"Duplicate ue name: {ue_name}")
+        supi = _normalize_supi(ue_row.get("supi"))
+        if not supi:
+            raise ValueError(f"UE {ue_name} must define a valid supi")
+        if supi in ue_by_supi:
+            raise ValueError(f"Duplicate UE supi: {supi}")
+        gnb_name = str(ue_row.get("gnb") or "").strip()
+        if gnb_name not in gnb_by_name:
+            raise ValueError(f"UE {ue_name} references unknown gNB: {gnb_name}")
+        sessions = ue_row.get("sessions") or []
+        if not isinstance(sessions, list) or not sessions:
+            raise ValueError(f"UE {ue_name} must define at least one session")
+        for session_row in sessions:
+            if not isinstance(session_row, dict):
+                raise TypeError(f"UE {ue_name} session entries must be mappings")
+            session_ref = str(session_row.get("session_ref") or "").strip()
+            if not session_ref:
+                raise ValueError(f"UE {ue_name} session is missing session_ref")
+            if session_ref in session_refs:
+                raise ValueError(f"Duplicate session_ref: {session_ref}")
+            slice_ref = str(session_row.get("slice_ref") or "").strip()
+            if slice_ref not in slice_specs:
+                raise ValueError(f"UE {ue_name} session references unknown slice: {slice_ref}")
+            session_refs[session_ref] = {
+                "ue_name": ue_name,
+                "supi": supi,
+                "slice_ref": slice_ref,
+            }
+        ue_by_name[ue_name] = ue_row
+        ue_by_supi[supi] = ue_row
+
+    app_by_id: Dict[str, Dict[str, Any]] = {}
+    for app_row in app_rows:
+        if not isinstance(app_row, dict):
+            raise TypeError("Each app entry must be a mapping")
+        app_id = str(app_row.get("app_id") or "").strip()
+        if not app_id:
+            raise ValueError("Each app entry must define app_id")
+        if app_id in app_by_id:
+            raise ValueError(f"Duplicate app_id: {app_id}")
+        ue_name = str(app_row.get("ue_name") or "").strip()
+        if ue_name not in ue_by_name:
+            raise ValueError(f"App {app_id} references unknown UE: {ue_name}")
+        supi = _normalize_supi(app_row.get("supi"))
+        if supi != _normalize_supi(ue_by_name[ue_name].get("supi")):
+            raise ValueError(f"App {app_id} supi does not match UE {ue_name}")
+        flow_ids = [str(item).strip() for item in (app_row.get("flow_ids") or []) if str(item).strip()]
+        if not flow_ids:
+            raise ValueError(f"App {app_id} must declare non-empty flow_ids")
+        app_by_id[app_id] = app_row
+
+    flow_by_id: Dict[str, Dict[str, Any]] = {}
+    for flow_index, flow_row in enumerate(flow_rows):
+        if not isinstance(flow_row, dict):
+            raise TypeError("Each flow entry must be a mapping")
+        flow_id = str(flow_row.get("flow_id") or "").strip()
+        if not flow_id:
+            raise ValueError("Each flow entry must define flow_id")
+        if flow_id in flow_by_id:
+            raise ValueError(f"Duplicate flow_id: {flow_id}")
+        app_id = str(flow_row.get("app_id") or "").strip()
+        if app_id not in app_by_id:
+            raise ValueError(f"Flow {flow_id} references unknown app_id: {app_id}")
+        ue_name = str(flow_row.get("ue_name") or "").strip()
+        if ue_name not in ue_by_name:
+            raise ValueError(f"Flow {flow_id} references unknown UE: {ue_name}")
+        supi = _normalize_supi(flow_row.get("supi"))
+        if supi != _normalize_supi(app_by_id[app_id].get("supi")):
+            raise ValueError(f"Flow {flow_id} supi does not match app {app_id}")
+        slice_ref = str(flow_row.get("slice_ref") or "").strip()
+        if slice_ref not in slice_specs:
+            raise ValueError(f"Flow {flow_id} references unknown slice: {slice_ref}")
+        session_ref = str(flow_row.get("session_ref") or "").strip()
+        session_spec = session_refs.get(session_ref)
+        if session_spec is None:
+            raise ValueError(f"Flow {flow_id} references unknown session_ref: {session_ref}")
+        if session_spec["ue_name"] != ue_name or session_spec["slice_ref"] != slice_ref:
+            raise ValueError(f"Flow {flow_id} session_ref is inconsistent with its UE or slice")
+        expected_snssai = slice_specs[slice_ref]["snssai"]
+        current_snssai = str(flow_row.get("current_slice_snssai") or expected_snssai).strip()
+        if current_snssai != expected_snssai:
+            raise ValueError(
+                f"Flow {flow_id} current_slice_snssai {current_snssai} does not match slice_ref {slice_ref} ({expected_snssai})"
+            )
+        flow_by_id[flow_id] = flow_row
+        slice_flows[slice_ref].append(flow_row)
+
+    for app_id, app_row in app_by_id.items():
+        flow_ids = [str(item).strip() for item in (app_row.get("flow_ids") or []) if str(item).strip()]
+        missing_flow_ids = [flow_id for flow_id in flow_ids if flow_id not in flow_by_id]
+        if missing_flow_ids:
+            raise ValueError(f"App {app_id} references unknown flow_ids: {missing_flow_ids}")
+        orphan_flow_ids = [
+            flow_id
+            for flow_id, flow_row in flow_by_id.items()
+            if str(flow_row.get("app_id") or "").strip() == app_id and flow_id not in flow_ids
+        ]
+        if orphan_flow_ids:
+            raise ValueError(f"App {app_id} is missing flow_ids declared by flows table: {orphan_flow_ids}")
+
+    used_suffixes: set = set()
+    flow_object_by_id: Dict[str, Flow] = {}
+    for flow_index, flow_row in enumerate(flow_rows):
+        app_id = str(flow_row["app_id"]).strip()
+        slice_ref = str(flow_row["slice_ref"]).strip()
+        slice_spec = slice_specs[slice_ref]
+        service_type = str(flow_row.get("service_type") or "").strip()
+        service_type_id = int(flow_row.get("service_type_id") or _service_type_name_to_id(service_type))
+        sla_target = _require_mapping(flow_row, "sla_target")
+        supi = _normalize_supi(flow_row.get("supi"))
+        flow_object_by_id[str(flow_row["flow_id"]).strip()] = Flow(
+            id=_normalize_or_generate_id(flow_row.get("flow_id"), "flow", used_suffixes),
+            name=str(flow_row.get("name") or flow_row.get("flow_id") or "").strip(),
+            service=FlowService(
+                service_type=service_type,
+                service_type_id=service_type_id,
+            ),
+            sla=FlowSLA(
+                bandwidth_ul=float(sla_target.get("bandwidth_ul_mbps") or 0.0),
+                bandwidth_dl=float(sla_target.get("bandwidth_dl_mbps") or 0.0),
+                guaranteed_bandwidth_ul=float(sla_target.get("guaranteed_bandwidth_ul_mbps") or 0.0),
+                guaranteed_bandwidth_dl=float(sla_target.get("guaranteed_bandwidth_dl_mbps") or 0.0),
+                latency=float(sla_target.get("latency_ms") or 0.0),
+                jitter=float(sla_target.get("jitter_ms") or 0.0),
+                loss_rate=float(sla_target.get("loss_rate") or 0.0),
+                priority=int(sla_target.get("priority") or 1),
+            ),
+            traffic=FlowTraffic(
+                packet_size=float(flow_row.get("packet_size_bytes") or 0.0),
+                arrival_rate=float(flow_row.get("arrival_rate_pps") or 0.0),
+                five_tuple=_build_deterministic_five_tuple(
+                    supi=supi or app_id,
+                    flow_ordinal=flow_index + 1,
+                    service_type_id=service_type_id,
+                ),
+            ),
+            allocation=FlowAllocation(
+                current_slice_snssai=slice_spec["snssai"],
+                allocated_bandwidth_ul=float(flow_row.get("allocated_bandwidth_ul_mbps") or 0.0),
+                allocated_bandwidth_dl=float(flow_row.get("allocated_bandwidth_dl_mbps") or 0.0),
+                optimize_requested=bool(flow_row.get("optimize_requested", False)),
+            ),
+        )
+
+    apps: List[App] = []
+    for app_row in app_rows:
+        app_id = str(app_row["app_id"]).strip()
+        app_flow_ids = [str(item).strip() for item in app_row.get("flow_ids") or []]
+        apps.append(
+            App(
+                id=_normalize_or_generate_id(app_id, "app", used_suffixes),
+                name=str(app_row.get("name") or app_id).strip(),
+                supi=_normalize_supi(app_row.get("supi")),
+                flows=[flow_object_by_id[flow_id] for flow_id in app_flow_ids],
+            )
+        )
+
+    slices: List[Slice] = []
+    for slice_row in slice_rows:
+        label = str(slice_row["label"]).strip()
+        slice_spec = slice_specs[label]
+        resource = slice_spec["resource"]
+        flow_items = slice_flows[label]
+        slice_latencies = [float(_require_mapping(flow_item, "sla_target").get("latency_ms") or 0.0) for flow_item in flow_items]
+        slice_jitters = [float(_require_mapping(flow_item, "sla_target").get("jitter_ms") or 0.0) for flow_item in flow_items]
+        slice_losses = [float(_require_mapping(flow_item, "sla_target").get("loss_rate") or 0.0) for flow_item in flow_items]
+        slices.append(
+            Slice(
+                name=label,
+                sst=slice_spec["sst"],
+                sd=slice_spec["sd"],
+                capacity=SliceCapacity(
+                    total_bandwidth_ul=float(resource.get("capacity_ul_mbps") or 0.0),
+                    total_bandwidth_dl=float(resource.get("capacity_dl_mbps") or 0.0),
+                    reserved_bandwidth_ul=float(resource.get("guaranteed_ul_mbps") or 0.0),
+                    reserved_bandwidth_dl=float(resource.get("guaranteed_dl_mbps") or 0.0),
+                ),
+                load=SliceLoad(
+                    current_bandwidth_ul=sum(float(flow_item.get("allocated_bandwidth_ul_mbps") or 0.0) for flow_item in flow_items),
+                    current_bandwidth_dl=sum(float(flow_item.get("allocated_bandwidth_dl_mbps") or 0.0) for flow_item in flow_items),
+                ),
+                qos=SliceQos(
+                    latency=min(slice_latencies) if slice_latencies else 0.0,
+                    processing_delay=max(0.5, round((min(slice_latencies) if slice_latencies else 0.0) * 0.1, 2)),
+                    jitter=min(slice_jitters) if slice_jitters else 0.0,
+                    loss_rate=min(slice_losses) if slice_losses else 0.0,
+                ),
+            )
+        )
+
+    nodes: List[Node] = []
+    all_slice_snssais = sorted(spec["snssai"] for spec in slice_specs.values())
+    for gnb_index, gnb_row in enumerate(gnb_rows):
+        gnb_name = str(gnb_row["name"]).strip()
+        hosted_slice_refs = [str(item).strip() for item in gnb_row.get("slices") or []]
+        hosted_slice_snssais = sorted(slice_specs[slice_ref]["snssai"] for slice_ref in hosted_slice_refs)
+        attached_ues = [
+            ue_row
+            for ue_row in ue_rows
+            if str(ue_row.get("gnb") or "").strip() == gnb_name
+        ]
+        low_latency_slice_count = sum(1 for slice_ref in hosted_slice_refs if slice_specs[slice_ref]["sst"] == 2)
+        nodes.append(
+            Node(
+                id=gnb_index,
+                name=gnb_name,
+                node_type="AN",
+                capacity=NodeCapacity(
+                    cpu=900.0 + (len(attached_ues) * 120.0) + (len(hosted_slice_snssais) * 70.0),
+                    memory=256.0 + (len(attached_ues) * 48.0),
+                    mec=700.0 + (len(hosted_slice_snssais) * 140.0) + (low_latency_slice_count * 80.0),
+                    prb=1800.0 + (len(hosted_slice_snssais) * 260.0) + (len(attached_ues) * 90.0),
+                ),
+                hosted_slice_snssais=hosted_slice_snssais,
+            )
+        )
+
+    for upf_index, upf_row in enumerate(upf_rows):
+        upf_name = str(upf_row["name"]).strip()
+        role = str(upf_row.get("role") or "").strip()
+        if role == "branching-upf":
+            hosted_slice_snssais = sorted(
+                slice_specs[slice_ref]["snssai"]
+                for slice_ref in gnb_slice_refs_by_upf[upf_name]
+            )
+        else:
+            hosted_slice_snssais = list(all_slice_snssais)
+        nodes.append(
+            Node(
+                id=100 + upf_index,
+                name=upf_name,
+                node_type="CN",
+                capacity=NodeCapacity(
+                    cpu=(2600.0 if role == "branching-upf" else 3400.0) + (len(hosted_slice_snssais) * 180.0),
+                    memory=(1024.0 if role == "branching-upf" else 1536.0) + (len(hosted_slice_snssais) * 96.0),
+                    mec=(900.0 if role == "branching-upf" else 1400.0) + (len(hosted_slice_snssais) * 110.0),
+                    prb=0.0,
+                ),
+                hosted_slice_snssais=hosted_slice_snssais,
+            )
+        )
+
+    return apps, slices, nodes
 
 
 def _build_seed_mobility_context(supi: str, index: int, app: App) -> Dict[str, Any]:
@@ -855,6 +1239,12 @@ def deserialize_scenario_payload(payload: Union[str, Dict[str, Any]]) -> Optiona
     if not isinstance(scenario, dict):
         return None
 
+    if all(key in scenario for key in ["slices", "upfs", "gnbs", "ues", "apps", "flows"]):
+        try:
+            return _deserialize_experiment_scenario(scenario)
+        except Exception:
+            return None
+
     if not all(k in scenario for k in ["apps", "slices", "nodes"]):
         return None
 
@@ -1069,16 +1459,26 @@ def get_current_optimizer_scenario() -> Tuple[List[App], List[Slice], List[Node]
     return get_current_scenario()
 
 
-def initialize_scenario(reset: bool = False) -> dict:
+def initialize_scenario(reset: bool = False, scenario_file: Optional[Union[str, Path]] = None) -> dict:
     """Initialize scenario in cache/DB and return summary.
 
     Args:
-        reset: If True, force-generate default scenario and persist as a new snapshot.
+        reset: If True, force-generate default scenario or explicit scenario file and persist as a new snapshot.
                If False, load latest snapshot or create defaults when missing.
+        scenario_file: Optional experiment scenario YAML path. Only valid with reset=True.
     """
+    resolved_scenario_file = Path(scenario_file).expanduser().resolve() if scenario_file else None
+    if resolved_scenario_file is not None and not reset:
+        raise ValueError("scenario_file can only be used together with reset=True")
+
     if reset:
-        # 关键步骤：强制生成默认场景并保存
-        apps, slices, nodes = _create_default_scenario()
+        if resolved_scenario_file is not None:
+            scenario_payload = _load_experiment_scenario_payload(resolved_scenario_file)
+            apps, slices, nodes = _deserialize_experiment_scenario(scenario_payload)
+            trigger = f"Manual-Reset-Scenario:{scenario_payload.get('scenario_id')}"
+        else:
+            apps, slices, nodes = _create_default_scenario()
+            trigger = "Manual-Reset"
         mobility_payload = _build_mobility_snapshot_payload(apps)
         policy_payload = _build_policy_state_payload(apps)
         cache_scenario(apps, slices, nodes, mobility_payload, policy_payload)
@@ -1088,7 +1488,7 @@ def initialize_scenario(reset: bool = False) -> dict:
             nodes,
             mobility_data=mobility_payload,
             policy_data=policy_payload,
-            trigger="Manual-Reset",
+            trigger=trigger,
         )
         if not ok:
             raise RuntimeError("Failed to persist reset scenario into DB")
@@ -1112,6 +1512,7 @@ def initialize_scenario(reset: bool = False) -> dict:
         "cn_nodes": cn_count,
         "flow_range_per_app": [min_flows, max_flows],
         "mode": "reset" if reset else "load-or-init",
+        "scenario_file": str(resolved_scenario_file) if resolved_scenario_file else "",
     }
 
 
@@ -1122,9 +1523,17 @@ def init_main() -> None:
         action="store_true",
         help="Force reset to generated default scenario and persist a new snapshot",
     )
+    parser.add_argument(
+        "--scenario-file",
+        default="",
+        help="Load an experiment scenario YAML and persist it as the initial state. Requires --reset.",
+    )
     args = parser.parse_args()
 
-    summary = initialize_scenario(reset=args.reset)
+    summary = initialize_scenario(
+        reset=args.reset,
+        scenario_file=str(args.scenario_file or "").strip() or None,
+    )
     print("Scenario initialized:")
     print(summary)
 

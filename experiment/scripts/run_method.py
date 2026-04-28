@@ -14,11 +14,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXPERIMENT_ROOT = PROJECT_ROOT / "experiment"
 CONFIG_PATH = EXPERIMENT_ROOT / "configs" / "methods.json"
 MATRIX_PATH = EXPERIMENT_ROOT / "configs" / "experiment_matrix.json"
+SCENARIO_CONFIG_PATH = EXPERIMENT_ROOT / "configs" / "scenarios.json"
 DEFAULT_USER_INPUTS_PATH = EXPERIMENT_ROOT / "generated_user_inputs.json"
 GENERATED_INPUT_DIR = EXPERIMENT_ROOT / "generated_inputs"
 RAW_RUN_DIR = EXPERIMENT_ROOT / "results" / "raw_runs"
 SUMMARY_DIR = EXPERIMENT_ROOT / "results" / "summaries"
 LEDGER_PATH = EXPERIMENT_ROOT / "results" / "ledgers" / "run_ledger.csv"
+PYTHON_EXE = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+INIT_SCENARIO_SCRIPT = PROJECT_ROOT / "agents" / "tools" / "init_scenario.py"
 
 
 def _load_methods() -> Dict[str, Dict[str, Any]]:
@@ -30,6 +33,12 @@ def _load_methods() -> Dict[str, Dict[str, Any]]:
 def _load_matrix() -> Dict[str, Dict[str, Any]]:
     payload = json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
     items = payload.get("experiments", [])
+    return {str(item["id"]).strip(): item for item in items}
+
+
+def _load_scenarios() -> Dict[str, Dict[str, Any]]:
+    payload = json.loads(SCENARIO_CONFIG_PATH.read_text(encoding="utf-8"))
+    items = payload.get("scenarios", [])
     return {str(item["id"]).strip(): item for item in items}
 
 
@@ -88,6 +97,36 @@ def _resolve_case_count(user_inputs_path: Path) -> int:
     if not isinstance(records, list) or not records:
         raise RuntimeError(f"No records found in {user_inputs_path}")
     return len(records)
+
+
+def _resolve_scenario_path(scenario_id: str) -> Path:
+    scenarios = _load_scenarios()
+    scenario = scenarios.get(str(scenario_id).strip())
+    if scenario is None:
+        raise ValueError(f"Unknown scenario id: {scenario_id}")
+    source = str(scenario.get("source") or "").strip()
+    if not source:
+        raise ValueError(f"Scenario {scenario_id} does not define a source path")
+    scenario_path = (PROJECT_ROOT / source).resolve()
+    if not scenario_path.exists():
+        raise FileNotFoundError(f"Scenario source not found for {scenario_id}: {scenario_path}")
+    return scenario_path
+
+
+def _reset_scenario_for_run(scenario_id: str) -> Path:
+    normalized_scenario_id = str(scenario_id or "").strip()
+    if not normalized_scenario_id:
+        raise ValueError("run_method.py requires --scenario so each method run can start from the same initial state")
+    scenario_path = _resolve_scenario_path(normalized_scenario_id)
+    command = [
+        str(PYTHON_EXE),
+        str(INIT_SCENARIO_SCRIPT),
+        "--reset",
+        "--scenario-file",
+        str(scenario_path),
+    ]
+    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    return scenario_path
 
 
 def _run_ours(*, experiment_id: str, scenario_id: str) -> tuple[Path, Path]:
@@ -209,6 +248,8 @@ def main() -> None:
             f"Reason: {method.get('notes', '')}"
         )
 
+    scenario_path = _reset_scenario_for_run(scenario_id)
+
     if method_id == "Ours":
         result_path, summary_path = _run_ours(experiment_id=experiment_id, scenario_id=scenario_id)
     else:
@@ -241,14 +282,26 @@ def main() -> None:
             "execution_status": "batch_completed",
             "status_code": "",
             "failure_type": "",
-            "snapshot_before": "",
+            "snapshot_before": str(scenario_path),
             "snapshot_after": "",
             "result_path": str(result_path),
             "summary_path": str(summary_path),
-            "notes": "Run aggregate_results.py for per-task ledger rows.",
+            "notes": "Scenario reset completed before method run. Run aggregate_results.py for per-task ledger rows.",
         }
     )
-    print(json.dumps({"method": method_id, "result_path": str(result_path), "summary_path": str(summary_path)}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "method": method_id,
+                "scenario": scenario_id,
+                "scenario_source": str(scenario_path),
+                "result_path": str(result_path),
+                "summary_path": str(summary_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

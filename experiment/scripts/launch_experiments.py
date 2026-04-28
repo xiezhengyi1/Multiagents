@@ -109,6 +109,73 @@ def _filter_values(values: List[str], allowed_filter: str) -> List[str]:
     return selected
 
 
+def _generated_inputs_path(*, experiment_id: str, scenario_id: str) -> Path:
+    return EXPERIMENT_ROOT / "generated_inputs" / f"user_inputs_{experiment_id}_{scenario_id}.json"
+
+
+def _load_generated_task_count(*, experiment_id: str, scenario_id: str) -> int:
+    path = _generated_inputs_path(experiment_id=experiment_id, scenario_id=scenario_id)
+    if not path.exists():
+        raise FileNotFoundError(f"Generated input file not found: {path}")
+    payload = _load_json(path)
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        raise TypeError(f"Generated input records must be a list: {path}")
+    return len(records)
+
+
+def _init_experiment_summary(experiment_id: str, planned_scenarios: List[str], planned_methods: List[str]) -> Dict[str, Any]:
+    return {
+        "experiment_id": experiment_id,
+        "planned_scenario_count": len(planned_scenarios),
+        "planned_method_count": len(planned_methods),
+        "planned_run_count": len(planned_scenarios) * len(planned_methods),
+        "built_scenarios": {},
+        "successful_runs": [],
+        "failed_runs": [],
+    }
+
+
+def _build_coverage_summary(experiment_summaries: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    coverage: List[Dict[str, Any]] = []
+    for experiment_id, summary in experiment_summaries.items():
+        built_scenarios = summary["built_scenarios"]
+        successful_runs = summary["successful_runs"]
+        failed_runs = summary["failed_runs"]
+        successful_scenarios = sorted({item["scenario_id"] for item in successful_runs})
+        successful_methods = sorted({item["method_id"] for item in successful_runs})
+        successful_task_invocations = sum(
+            int(built_scenarios[item["scenario_id"]]["task_count"])
+            for item in successful_runs
+            if item["scenario_id"] in built_scenarios
+        )
+        coverage.append(
+            {
+                "experiment_id": experiment_id,
+                "planned_scenario_count": summary["planned_scenario_count"],
+                "planned_method_count": summary["planned_method_count"],
+                "planned_run_count": summary["planned_run_count"],
+                "built_scenario_count": len(built_scenarios),
+                "built_scenarios": [
+                    {
+                        "scenario_id": scenario_id,
+                        "task_count": scenario_meta["task_count"],
+                        "generated_input_path": scenario_meta["generated_input_path"],
+                    }
+                    for scenario_id, scenario_meta in sorted(built_scenarios.items())
+                ],
+                "successful_run_count": len(successful_runs),
+                "failed_run_count": len(failed_runs),
+                "successful_scenario_count": len(successful_scenarios),
+                "successful_method_count": len(successful_methods),
+                "successful_scenarios": successful_scenarios,
+                "successful_methods": successful_methods,
+                "successful_task_invocations": successful_task_invocations,
+            }
+        )
+    return coverage
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Launch experiment runs strictly according to experiment_matrix.json.",
@@ -137,6 +204,7 @@ def main() -> None:
 
     launched_runs: List[Dict[str, Any]] = []
     failed_runs: List[Dict[str, Any]] = []
+    experiment_summaries: Dict[str, Dict[str, Any]] = {}
     for experiment in experiments:
         experiment_id = str(experiment.get("id") or "").strip()
         scenarios = _filter_values(
@@ -151,6 +219,7 @@ def main() -> None:
             raise RuntimeError(f"Experiment {experiment_id} has no scenarios")
         if not methods:
             raise RuntimeError(f"Experiment {experiment_id} has no methods")
+        experiment_summaries[experiment_id] = _init_experiment_summary(experiment_id, scenarios, methods)
 
         for scenario_id in scenarios:
             try:
@@ -165,6 +234,16 @@ def main() -> None:
                     ],
                     label=f"build inputs for {experiment_id}/{scenario_id}",
                 )
+                task_count = _load_generated_task_count(
+                    experiment_id=experiment_id,
+                    scenario_id=scenario_id,
+                )
+                experiment_summaries[experiment_id]["built_scenarios"][scenario_id] = {
+                    "task_count": task_count,
+                    "generated_input_path": str(
+                        _generated_inputs_path(experiment_id=experiment_id, scenario_id=scenario_id)
+                    ),
+                }
             except Exception as exc:
                 failure = {
                     "stage": "build_inputs",
@@ -176,6 +255,7 @@ def main() -> None:
                     "traceback": traceback.format_exc(),
                 }
                 failed_runs.append(failure)
+                experiment_summaries[experiment_id]["failed_runs"].append(failure)
                 _append_failed_run(failure)
                 print(
                     f"[launch][skip] build inputs failed for {experiment_id}/{scenario_id}: {exc}",
@@ -211,10 +291,12 @@ def main() -> None:
                         "experiment_id": experiment_id,
                         "scenario_id": scenario_id,
                         "method_id": method_id,
+                        "task_count": experiment_summaries[experiment_id]["built_scenarios"][scenario_id]["task_count"],
                         "result_path": str(payload["result_path"]),
                         "summary_path": str(payload["summary_path"]),
                     }
                     launched_runs.append(run_record)
+                    experiment_summaries[experiment_id]["successful_runs"].append(run_record)
 
                     if args.skip_aggregate:
                         continue
@@ -245,6 +327,7 @@ def main() -> None:
                         "traceback": traceback.format_exc(),
                     }
                     failed_runs.append(failure)
+                    experiment_summaries[experiment_id]["failed_runs"].append(failure)
                     _append_failed_run(failure)
                     print(
                         f"[launch][skip] failed {experiment_id}/{scenario_id}/{method_id}: {exc}",
@@ -261,6 +344,7 @@ def main() -> None:
                 "failed_run_count": len(failed_runs),
                 "failed_runs_path": str(FAILED_RUNS_PATH),
                 "aggregation_skipped": bool(args.skip_aggregate),
+                "coverage_summary": _build_coverage_summary(experiment_summaries),
             },
             ensure_ascii=False,
             indent=2,
