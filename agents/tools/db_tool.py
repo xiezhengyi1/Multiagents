@@ -1,5 +1,4 @@
 from typing import List, Tuple, Dict, Any, Optional, Union, TYPE_CHECKING
-from dataclasses import asdict
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 import json
@@ -7,7 +6,6 @@ import re
 
 from database.connection import SessionLocal
 from database.models import (
-    NetworkStatusSnapshot,
     SessionContext,
     UeAmPolicyAssociationRecord,
     UeContextRecord,
@@ -74,9 +72,11 @@ def _normalize_catalog_flow(app: Dict[str, Any], flow: Dict[str, Any]) -> Dict[s
         "app_id": app.get("id"),
         "flow_name": flow.get("name"),
         "flow_id": flow.get("id"),
+        "dnn": flow.get("dnn") or service.get("dnn"),
         "service": {
             "service_type": service.get("service_type"),
             "service_type_id": service.get("service_type_id"),
+            "dnn": service.get("dnn") or flow.get("dnn"),
         },
         "sla": {
             "bandwidth_ul": sla.get("bandwidth_ul"),
@@ -184,8 +184,7 @@ def search_flow_targets_by_semantic(
             "candidates": [],
         }
 
-    snapshot = get_latest_snapshot_data() or {}
-    app_data = snapshot.get("apps", []) if isinstance(snapshot, dict) else []
+    app_data = _get_latest_graph_app_data()
     candidates: List[Dict[str, Any]] = []
 
     for app in app_data:
@@ -474,119 +473,68 @@ def session_scope():
         session.close()
 
 
-def _serialize_scenario_for_db(apps: List["App"], slices: List["Slice"], nodes: List["Node"]) -> Dict[str, Any]:
-    """Serialize scenario data for DB storage (slice name removed)."""
-    apps_data = [asdict(app) for app in apps]
-    nodes_data = [asdict(n) for n in nodes]
-
-    slices_data = []
-    for s in slices:
-        s_dict = asdict(s)
-        if "name" in s_dict:
-            del s_dict["name"]
-        slices_data.append(s_dict)
-
-    return {
-        "apps": apps_data,
-        "slices": slices_data,
-        "nodes": nodes_data
-    }
-
-
-def _normalize_snapshot_payload(
-    app_data: Optional[Any],
-    slice_data: Optional[Any],
-    node_data: Optional[Any],
-    mobility_data: Optional[Any] = None,
-    policy_data: Optional[Any] = None,
-) -> Dict[str, Any]:
-    """将拆分列还原为统一快照字典格式。"""
-    return {
-        "apps": app_data if isinstance(app_data, list) else [],
-        "slices": slice_data if isinstance(slice_data, list) else [],
-        "nodes": node_data if isinstance(node_data, list) else [],
-        "mobility": mobility_data if isinstance(mobility_data, list) else [],
-        "policy_state": policy_data if isinstance(policy_data, dict) else {},
-    }
-
-
-def _snapshot_row_to_payload(row: Any) -> Dict[str, Any]:
-    return {
-        "snapshot_id": str(row.id),
-        "timestamp": row.timestamp.isoformat() if getattr(row, "timestamp", None) else None,
-        "trigger_event": getattr(row, "trigger_event", None),
-        **_normalize_snapshot_payload(
-            app_data=getattr(row, "app_data", None),
-            slice_data=getattr(row, "slice_data", None),
-            node_data=getattr(row, "node_data", None),
-            mobility_data=getattr(row, "mobility_data", None),
-            policy_data=getattr(row, "policy_data", None),
-        ),
-    }
-
-
 def _payload_has_scenario_entities(payload: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(payload, dict):
         return False
     return any(bool(payload.get(key)) for key in ("apps", "slices", "nodes"))
 
-def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
-    """Read latest scenario snapshot, preferring the authoritative status table."""
+
+def _get_latest_graph_snapshot_payload() -> Optional[Dict[str, Any]]:
     try:
-        with session_scope() as session:
-            rows = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).limit(20).all()
-            for latest_snapshot in rows:
-                payload = _snapshot_row_to_payload(latest_snapshot)
-                if not _payload_has_scenario_entities(payload):
-                    continue
-                logger.debug(f"Loaded scenario snapshot (Timestamp: {latest_snapshot.timestamp}).")
-                return {
-                    "snapshot_id": payload.get("snapshot_id"),
-                    "apps": payload["apps"],
-                    "slices": payload["slices"],
-                    "nodes": payload["nodes"],
-                    "mobility": payload["mobility"],
-                    "policy_state": payload["policy_state"],
-                }
-    except Exception as e:
-        logger.warning(f"Failed to load latest snapshot: {e}")
+        from agents.tools.network_graph import get_latest_graph
+
+        graph = get_latest_graph()
+        if graph is None:
+            return None
+        payload = graph.to_compatibility_snapshot()
+        if not _payload_has_scenario_entities(payload):
+            return None
+        return {
+            "snapshot_id": payload.get("snapshot_id"),
+            "apps": list(payload.get("apps") or []),
+            "slices": list(payload.get("slices") or []),
+            "nodes": list(payload.get("nodes") or []),
+            "mobility": [],
+            "policy_state": {},
+        }
+    except Exception as exc:
+        logger.warning(f"Failed to load latest graph snapshot: {exc}")
+        return None
+
+
+def _get_latest_graph_app_data() -> List[Dict[str, Any]]:
+    snapshot = _get_latest_graph_snapshot_payload() or {}
+    apps = snapshot.get("apps") if isinstance(snapshot, dict) else []
+    return list(apps or []) if isinstance(apps, list) else []
+
+
+def _build_graph_catalogs_for_supi(supi: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    normalized_supi = str(supi or "").strip()
+    if not normalized_supi:
+        return [], []
 
     try:
         from agents.tools.network_graph import get_latest_graph
 
         graph = get_latest_graph()
-        if graph is not None:
-            payload = graph.to_compatibility_snapshot()
-            if _payload_has_scenario_entities(payload):
-                return {
-                    "snapshot_id": payload.get("snapshot_id"),
-                    "apps": payload["apps"],
-                    "slices": payload["slices"],
-                    "nodes": payload["nodes"],
-                }
-    except Exception as e:
-        logger.warning(f"Failed to load latest graph-backed snapshot: {e}")
-    return None
+        if graph is None:
+            return [], []
+        snapshot = graph.to_compatibility_snapshot()
+        app_data = snapshot.get("apps") if isinstance(snapshot, dict) else []
+        if not isinstance(app_data, list):
+            return [], []
+        return _build_catalogs_from_app_data(app_data, normalized_supi)
+    except Exception as exc:
+        logger.warning(f"Failed to load graph flow catalog for {normalized_supi}: {exc}")
+        return [], []
+
+def get_latest_snapshot_data() -> Optional[Dict[str, Any]]:
+    """Read the latest scenario snapshot from graph storage only."""
+    return _get_latest_graph_snapshot_payload()
 
 
 def get_latest_snapshot_metadata() -> Optional[Dict[str, Any]]:
-    """Return metadata for the latest scenario snapshot, preferring the status table."""
-    try:
-        with session_scope() as session:
-            rows = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).limit(20).all()
-            for latest_snapshot in rows:
-                payload = _snapshot_row_to_payload(latest_snapshot)
-                if not _payload_has_scenario_entities(payload):
-                    continue
-                metadata = {
-                    "snapshot_id": str(latest_snapshot.id),
-                    "timestamp": latest_snapshot.timestamp.isoformat() if latest_snapshot.timestamp else None,
-                    "trigger_event": latest_snapshot.trigger_event,
-                }
-                return metadata
-    except Exception as e:
-        logger.warning(f"Failed to load latest snapshot metadata: {e}")
-
+    """Return metadata for the latest scenario snapshot from graph storage only."""
     try:
         from agents.tools.network_graph import get_latest_graph_snapshot_metadata
 
@@ -613,22 +561,7 @@ def get_snapshot_data_by_id(snapshot_id: Union[str, int]) -> Optional[Dict[str, 
             return graph.to_compatibility_snapshot()
     except Exception as e:
         logger.warning(f"Failed to load graph snapshot {snapshot_id}: {e}")
-
-    try:
-        snapshot_id_int = int(normalized_snapshot_id)
-    except (TypeError, ValueError):
-        logger.warning(f"Invalid snapshot_id: {snapshot_id}")
-        return None
-
-    try:
-        with session_scope() as session:
-            snapshot = session.query(NetworkStatusSnapshot).filter(NetworkStatusSnapshot.id == snapshot_id_int).first()
-            if not snapshot:
-                return None
-            return _snapshot_row_to_payload(snapshot)
-    except Exception as e:
-        logger.warning(f"Failed to load snapshot {snapshot_id}: {e}")
-        return None
+    return None
 
 
 def get_latest_session_context(status: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -748,8 +681,8 @@ def update_scenario_in_db(
     trigger: str = "Optimization-Result",
 ) -> bool:
     """
-    Persist scenario state as a new NetworkStatusSnapshot.
-    Now we treat network state as time-series snapshots instead of just updating a single config row.
+    Persist scenario state as a new graph snapshot.
+    mobility_data / policy_data are accepted for compatibility but no longer written to status snapshots.
     """
     try:
         from uuid import uuid4
@@ -763,14 +696,6 @@ def update_scenario_in_db(
             snapshot_id=snapshot_id,
             trigger_event=trigger,
         )
-        try:
-            with session_scope() as session:
-                latest_snapshot = session.query(NetworkStatusSnapshot).order_by(NetworkStatusSnapshot.timestamp.desc()).first()
-                if latest_snapshot is not None:
-                    latest_snapshot.mobility_data = mobility_data or []
-                    latest_snapshot.policy_data = policy_data or {}
-        except Exception as inner_exc:
-            logger.warning(f"Failed to persist extended snapshot payload: {inner_exc}")
         return True
     except Exception as e:
         logger.error(f"Failed to save scenario snapshot: {e}")
@@ -857,9 +782,7 @@ def get_ue_context_by_supi(supi: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        snapshot = get_latest_snapshot_data() or {}
-        snapshot_apps = snapshot.get("apps", []) if isinstance(snapshot, dict) else []
-        derived_app_catalog, derived_flow_catalog = _build_catalogs_from_app_data(snapshot_apps, supi)
+        derived_app_catalog, derived_flow_catalog = _build_graph_catalogs_for_supi(supi)
 
         with session_scope() as session:
             row = session.query(UeContextRecord).filter(UeContextRecord.supi == supi).first()
@@ -893,8 +816,8 @@ def get_ue_context_by_supi(supi: str) -> Optional[Dict[str, Any]]:
                 "traffContDecs": row.traff_cont_decs,
                 "chgDecs": row.chg_decs,
                 "urspRules": row.ursp_rules,
-                "app_catalog": derived_app_catalog or row.app_catalog or [],
-                "flow_catalog": derived_flow_catalog or row.flow_catalog or [],
+                "app_catalog": derived_app_catalog,
+                "flow_catalog": derived_flow_catalog,
                 "accessMobilityContext": row.access_mobility_context or {},
                 "amPolicyContext": row.am_policy_context or {},
                 "servingNfContext": row.serving_nf_context or {},
@@ -923,8 +846,8 @@ def list_ue_contexts(limit: int = 100) -> List[Dict[str, Any]]:
                     "pccRules": row.pcc_rules,
                     "qosDecs": row.qos_decs,
                     "urspRules": row.ursp_rules,
-                    "app_catalog": row.app_catalog,
-                    "flow_catalog": row.flow_catalog,
+                    "app_catalog": _build_graph_catalogs_for_supi(row.supi)[0],
+                    "flow_catalog": _build_graph_catalogs_for_supi(row.supi)[1],
                     "updated_at": row.updated_at.isoformat() if row.updated_at else None,
                 }
                 for row in rows
@@ -1142,12 +1065,11 @@ def _enrich_pcc_rules_with_flow_catalog(
 
 def sync_latest_snapshot_flow_catalog_to_ue_context() -> Dict[str, int]:
     """
-    Rebuild per-UE app/flow catalogs from the latest snapshot and refresh PCC flowInfos
+    Rebuild per-UE app/flow catalogs from the latest graph snapshot and refresh PCC flowInfos
     using five_tuple-derived flowDescription strings.
     """
-    snapshot = get_latest_snapshot_data() or {}
-    app_data = snapshot.get("apps", []) if isinstance(snapshot, dict) else []
-    if not isinstance(app_data, list) or not app_data:
+    app_data = _get_latest_graph_app_data()
+    if not app_data:
         return {"ues": 0, "flows": 0}
 
     supis = sorted(
@@ -1161,7 +1083,7 @@ def sync_latest_snapshot_flow_catalog_to_ue_context() -> Dict[str, int]:
     synced_ues = 0
     synced_flows = 0
     for supi in supis:
-        app_catalog, flow_catalog = _build_catalogs_from_app_data(app_data, supi)
+        app_catalog, flow_catalog = _build_graph_catalogs_for_supi(supi)
         if not app_catalog and not flow_catalog:
             continue
 

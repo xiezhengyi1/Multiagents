@@ -20,6 +20,7 @@ from agents.main_control import MainControlAgent
 from agents.optimization_strategy import OptimizationStrategyAgent
 from agents.policy_dispatch import PolicyDispatchAgent
 from agents.policy_dispatch.contracts import FeedbackReport
+from agents.tools.knowledge_tool import warmup_knowledge_tool_models
 from agents.tools.db_tool import (
     create_session_context,
     get_latest_snapshot_data,
@@ -61,6 +62,7 @@ class MainControlOrchestrator:
         memory_manager: Optional[MemoryManager] = None,
         max_rounds: int = 3,
         use_local_model: bool = False,
+        preload_models: bool = True,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be at least 1")
@@ -75,6 +77,39 @@ class MainControlOrchestrator:
             enable_llm_summarization=False,
         )
         self.max_rounds = max_rounds
+        self.preloaded_models: Dict[str, Any] = {}
+        if preload_models:
+            self.preloaded_models = self._preload_runtime_models()
+
+    def _preload_runtime_models(self) -> Dict[str, Any]:
+        try:
+            llm_models: List[str] = []
+            preloaded_llm_agents: List[str] = []
+            for agent in (self.main_agent, self.ie_agent, self.os_agent, self.pd_agent):
+                model_name = str(getattr(agent, "model_name", "") or "").strip()
+                if model_name:
+                    llm_models.append(model_name)
+
+                get_llm = getattr(agent, "get_llm", None)
+                if callable(get_llm):
+                    get_llm()
+                    preloaded_llm_agents.append(str(getattr(agent, "agent_name", agent.__class__.__name__) or agent.__class__.__name__))
+
+            knowledge_models = warmup_knowledge_tool_models()
+            log_event(
+                self.main_agent.logger,
+                "runtime_model_preload_complete",
+                llm_models=",".join(model for model in llm_models if model) or "<none>",
+                llm_agents=",".join(preloaded_llm_agents) or "<none>",
+                rerankers=",".join(knowledge_models.get("rerankers") or []) or "<none>",
+                vectorstores=",".join(knowledge_models.get("vectorstores") or []) or "<none>",
+            )
+            return {
+                "llm_models": llm_models,
+                "knowledge_tool": knowledge_models,
+            }
+        except Exception as exc:
+            raise RuntimeError(f"failed to preload runtime models: {exc}") from exc
 
     @staticmethod
     def _apply_trace_metadata(agent: Any, *, scenario_id: str = "", scenario_tags: Optional[List[str]] = None) -> None:
@@ -175,6 +210,12 @@ class MainControlOrchestrator:
             ensure_ascii=False,
         )
 
+    @staticmethod
+    def _retry_consumer(feedback_payload: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(feedback_payload, dict):
+            return ""
+        return str(feedback_payload.get("recommended_consumer") or "").strip().lower()
+
     def run(
         self,
         user_input: str,
@@ -192,7 +233,10 @@ class MainControlOrchestrator:
 
         feedback_context = ""
         previous_diagnosis: Dict[str, Any] = {}
+        previous_report_payload: Dict[str, Any] = {}
         previous_mediator_decision: Optional[Dict[str, Any]] = None
+        previous_global_intent: Optional[GlobalControlIntent] = None
+        previous_operation_intent: Optional[OperationIntent] = None
         latest_result: Optional[ControlRoundResult] = None
         round_traces: List[Dict[str, Any]] = []
         completed = False
@@ -219,6 +263,7 @@ class MainControlOrchestrator:
                         memory_context=memory_context,
                         feedback_context=feedback_context,
                         previous_diagnosis=previous_diagnosis,
+                        previous_execution_feedback=previous_report_payload,
                     ),
                 )
             finally:
@@ -230,23 +275,45 @@ class MainControlOrchestrator:
                 raise RuntimeError("Main Agent returned no SUPI; refusing to patch identifiers outside the agent.")
             self._remember("MAIN", global_intent)
 
-            retry_category = str(previous_diagnosis.get("root_cause_category") or "").strip().lower()
-            self._apply_trace_metadata(self.ie_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
-            try:
-                operation_intent = self.ie_agent.analyze_operation_intent(
-                    user_input=user_input,
-                    context=self._build_ie_context(
-                        global_intent=global_intent.model_dump(mode="json"),
-                        round_index=round_index,
-                        diagnosis=previous_diagnosis,
-                        feedback_context=feedback_context,
-                    ),
+            selected_next_agent = str(global_intent.next_agent or "").strip().lower()
+            reuse_operation_intent = (
+                round_index > 1
+                and selected_next_agent == "optimization_strategy"
+                and previous_operation_intent is not None
+                and str(previous_operation_intent.supi or "").strip() == str(global_intent.supi or "").strip()
+                and set(previous_operation_intent.requested_domains or []) == {item.value for item in global_intent.requested_domains}
+            )
+
+            if reuse_operation_intent:
+                operation_intent = previous_operation_intent.model_copy(deep=True)
+                log_event(
+                    self.main_agent.logger,
+                    "control_round_resume",
                     session_id=session_id,
-                    snapshot_id=snapshot_id,
+                    round_index=round_index,
+                    entrypoint="optimization_strategy",
+                    selected_next_agent=selected_next_agent,
                 )
-            finally:
-                self._clear_trace_metadata(self.ie_agent)
-            self._remember("IEA", operation_intent)
+            else:
+                self._apply_trace_metadata(self.ie_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
+                try:
+                    operation_intent = self.ie_agent.analyze_operation_intent(
+                        user_input=user_input,
+                        context=self._build_ie_context(
+                            global_intent=global_intent.model_dump(mode="json"),
+                            round_index=round_index,
+                            diagnosis=previous_diagnosis,
+                            feedback_context=feedback_context,
+                        ),
+                        session_id=session_id,
+                        snapshot_id=snapshot_id,
+                    )
+                finally:
+                    self._clear_trace_metadata(self.ie_agent)
+                self._remember("IEA", operation_intent)
+
+            previous_global_intent = global_intent.model_copy(deep=True)
+            previous_operation_intent = operation_intent.model_copy(deep=True)
 
             planning_request = PlanningRequest(
                 operation_intent=operation_intent,
@@ -417,6 +484,7 @@ class MainControlOrchestrator:
                 "correction_suggestion": "; ".join(diagnosis.get("recommended_actions") or []),
                 "recommended_consumer": "optimization_strategy",
             }
+            previous_report_payload = dict(report_payload)
             feedback_context = build_feedback_context(
                 feedback_context,
                 pda_feedback=report_payload,
@@ -431,6 +499,7 @@ class MainControlOrchestrator:
                 session_id=session_id,
                 next_round=round_index + 1,
                 diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
+                recommended_consumer=self._retry_consumer(previous_report_payload) or "<none>",
             )
 
         update_session_context(

@@ -115,3 +115,9 @@ vmrun -T ws start "D:\VMware_Ubuntu\Ubuntu.vmx" nogui
 2. 思考优化问题的优化
 3. 数据集收集需要优化
 4. RAG 库的不精确问题需要解决 --解决
+
+
+4.28 TODO
+1. 根据最新网络图重建ue相关表
+2. 确认仿真器回写数据库不会改变flow_id、app_id
+3. 跑实验，单agent、多agent

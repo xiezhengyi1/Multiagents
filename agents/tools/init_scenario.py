@@ -15,12 +15,24 @@ import secrets
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from utils.logger import setup_logger
+from database.models import (
+    UeAmPolicyAssociationRecord,
+    UeContextRecord,
+    UeMobilityEventRecord,
+    UeServingNfBindingRecord,
+)
+
 from agents.tools.db_tool import (
     build_flow_info_from_five_tuple,
     get_latest_snapshot_data,
+    record_mobility_event,
+    session_scope,
     sync_latest_snapshot_flow_catalog_to_ue_context,
     update_scenario_in_db,
+    upsert_am_policy_association,
     upsert_ue_context,
+    upsert_serving_nf_binding,
 )
 from agents.tools.optimizer.models import App, Flow, Node, Slice
 from agents.tools.optimizer.models import (
@@ -36,6 +48,9 @@ from agents.tools.optimizer.models import (
     SliceQos,
     SliceTelemetry,
 )
+
+
+logger = setup_logger(__name__)
 
 
 def _filter_dataclass_kwargs(src: Dict[str, Any], cls, exclude: Optional[set] = None) -> Dict[str, Any]:
@@ -191,18 +206,36 @@ def _build_slice_from_dict(s_dict: Dict[str, Any]) -> Slice:
 
 def _build_node_from_dict(n_dict: Dict[str, Any]) -> Node:
     """按最新 Node 模型构建对象。"""
+    node_type = str(n_dict.get("node_type", n_dict.get("type", "Generic")))
     capacity_payload = n_dict.get("capacity") if isinstance(n_dict.get("capacity"), dict) else {}
     telemetry_payload = n_dict.get("telemetry") if isinstance(n_dict.get("telemetry"), dict) else {}
+    default_capacity = {
+        "AN": {"cpu": 1200.0, "memory": 250.0, "mec": 1200.0, "prb": 2500.0},
+        "CN": {"cpu": 4200.0, "memory": 2024.0, "mec": 1800.0, "prb": 0.0},
+    }.get(node_type.upper(), {"cpu": 0.0, "memory": 0.0, "mec": 0.0, "prb": 0.0})
+
+    raw_node_id = n_dict.get("id", -1)
+    try:
+        normalized_node_id = int(raw_node_id)
+    except (TypeError, ValueError):
+        node_id_match = re.search(r"(\d+)$", str(raw_node_id or n_dict.get("name") or "").strip())
+        if node_id_match:
+            ordinal = max(int(node_id_match.group(1)) - 1, 0)
+            normalized_node_id = 100 + ordinal if node_type.upper() == "CN" else ordinal
+        else:
+            fallback_key = str(raw_node_id or n_dict.get("name") or "node").strip()
+            checksum = sum((index + 1) * ord(char) for index, char in enumerate(fallback_key))
+            normalized_node_id = 1000 + (checksum % 9000) if node_type.upper() == "CN" else checksum % 1000
 
     return Node(
-        id=int(n_dict.get("id", -1) or -1),
+        id=normalized_node_id,
         name=str(n_dict.get("name", n_dict.get("id", "node_unknown"))),
-        node_type=str(n_dict.get("node_type", n_dict.get("type", "Generic"))),
+        node_type=node_type,
         capacity=NodeCapacity(
-            cpu=float(capacity_payload.get("cpu", n_dict.get("cpu_capacity", 0.0)) or 0.0),
-            memory=float(capacity_payload.get("memory", n_dict.get("memory_capacity", 0.0)) or 0.0),
-            mec=float(capacity_payload.get("mec", n_dict.get("mec_capacity", 0.0)) or 0.0),
-            prb=float(capacity_payload.get("prb", n_dict.get("prb_capacity", 0.0)) or 0.0),
+            cpu=float(capacity_payload.get("cpu", n_dict.get("cpu_capacity", default_capacity["cpu"])) or 0.0),
+            memory=float(capacity_payload.get("memory", n_dict.get("memory_capacity", default_capacity["memory"])) or 0.0),
+            mec=float(capacity_payload.get("mec", n_dict.get("mec_capacity", default_capacity["mec"])) or 0.0),
+            prb=float(capacity_payload.get("prb", n_dict.get("prb_capacity", default_capacity["prb"])) or 0.0),
         ),
         hosted_slice_snssais=list(n_dict.get("hosted_slice_snssais", n_dict.get("slices_hosted", [])) or []),
         telemetry=NodeTelemetry(
@@ -660,6 +693,123 @@ def _build_policy_state_payload(apps: List[App]) -> Dict[str, Any]:
         }
     return policy_state
 
+
+def _load_latest_graph_scenario_strict() -> Tuple[List[App], List[Slice], List[Node], str]:
+    from agents.tools.network_graph import get_latest_graph
+
+    graph = get_latest_graph()
+    if graph is None:
+        raise RuntimeError("latest graph snapshot not found")
+
+    snapshot_data = graph.to_compatibility_snapshot()
+    if not _snapshot_uses_new_schema(snapshot_data):
+        raise RuntimeError("latest graph snapshot does not contain a valid scenario payload")
+
+    apps, slices, nodes = _deserialize_scenario(snapshot_data)
+    snapshot_id = str(snapshot_data.get("snapshot_id") or "").strip()
+    return apps, slices, nodes, snapshot_id
+
+
+def rebuild_ue_related_tables_from_latest_graph() -> Dict[str, Any]:
+    apps, slices, nodes, snapshot_id = _load_latest_graph_scenario_strict()
+
+    with session_scope() as session:
+        session.query(UeMobilityEventRecord).delete()
+        session.query(UeServingNfBindingRecord).delete()
+        session.query(UeAmPolicyAssociationRecord).delete()
+        session.query(UeContextRecord).delete()
+
+    seeded = _seed_ue_contexts_from_apps(apps)
+    sync_summary = sync_latest_flow_five_tuples_to_ue_context()
+
+    association_count = 0
+    binding_count = 0
+    mobility_event_count = 0
+    for app_index, app in enumerate(apps):
+        supi = _normalize_supi(getattr(app, "supi", None))
+        if not supi:
+            continue
+
+        mobility_context = _build_seed_mobility_context(supi, app_index, app)
+        am_policy_context = _build_seed_am_policy_context(supi, app_index, mobility_context)
+        associations = am_policy_context.get("associations") if isinstance(am_policy_context, dict) else {}
+        if not isinstance(associations, dict):
+            associations = {}
+
+        for pol_asso_id, association in associations.items():
+            association = association if isinstance(association, dict) else {}
+            association_policy = {
+                "triggers": list(association.get("triggers") or []),
+                "rfsp": association.get("rfsp"),
+                "pras": association.get("pras") or {},
+                "suppFeat": association.get("suppFeat"),
+                "allowedSnssais": am_policy_context.get("allowedSnssais") or [],
+                "targetSnssais": am_policy_context.get("targetSnssais") or [],
+                "mappingSnssais": am_policy_context.get("mappingSnssais") or [],
+            }
+            if upsert_am_policy_association(
+                supi=supi,
+                pol_asso_id=str(pol_asso_id),
+                association_request=association.get("request") or {},
+                association_policy=association_policy,
+                status="active",
+                trigger_event="GRAPH_REBUILD",
+                snapshot_id=snapshot_id,
+            ):
+                association_count += 1
+
+        serving_nf_context = {
+            "pcf_id": "pcf-sim-1",
+            "pcf_uri": "http://localhost:8000/pcf",
+            "amf_id": f"amf-sim-{app_index + 1}",
+            "amf_uri": f"http://localhost:8000/amf/{supi}",
+        }
+        if upsert_serving_nf_binding(
+            supi=supi,
+            nf_type="PCF",
+            nf_instance_id=serving_nf_context["pcf_id"],
+            nf_uri=serving_nf_context["pcf_uri"],
+            binding_info={"supi": supi, "snapshot_id": snapshot_id},
+            status="active",
+        ):
+            binding_count += 1
+        if upsert_serving_nf_binding(
+            supi=supi,
+            nf_type="AMF",
+            nf_instance_id=serving_nf_context["amf_id"],
+            nf_uri=serving_nf_context["amf_uri"],
+            binding_info={"supi": supi, "snapshot_id": snapshot_id},
+            status="active",
+        ):
+            binding_count += 1
+
+        if record_mobility_event(
+            supi=supi,
+            event_type=str(mobility_context.get("mobilityEventType") or "INITIAL_ATTACH"),
+            event_payload=mobility_context,
+            event_summary="rebuild_from_latest_graph",
+            snapshot_id=snapshot_id,
+        ):
+            mobility_event_count += 1
+
+    cache_scenario(
+        apps,
+        slices,
+        nodes,
+        _build_mobility_snapshot_payload(apps),
+        _build_policy_state_payload(apps),
+    )
+
+    return {
+        "snapshot_id": snapshot_id,
+        "ues": seeded,
+        "flow_catalog_ues": sync_summary.get("ues", 0),
+        "flow_catalog_flows": sync_summary.get("flows", 0),
+        "am_policy_associations": association_count,
+        "serving_nf_bindings": binding_count,
+        "mobility_events": mobility_event_count,
+    }
+
 def _deserialize_scenario(data: Dict[str, Any]) -> Tuple[List[App], List[Slice], List[Node]]:
     used_suffixes: set = set()
     apps: List[App] = []
@@ -899,6 +1049,24 @@ def get_current_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
     if apps is not None and slices is not None and nodes is not None:
         return apps, slices, nodes
     return get_initial_scenario()
+
+
+def get_current_optimizer_scenario() -> Tuple[List[App], List[Slice], List[Node]]:
+    """Always prefer the latest graph snapshot for optimizer inputs."""
+    try:
+        apps, slices, nodes, _snapshot_id = _load_latest_graph_scenario_strict()
+        cache_scenario(
+            apps,
+            slices,
+            nodes,
+            _build_mobility_snapshot_payload(apps),
+            _build_policy_state_payload(apps),
+        )
+        return apps, slices, nodes
+    except Exception as exc:
+        logger.warning(f"Failed to load optimizer scenario from latest graph snapshot: {exc}")
+
+    return get_current_scenario()
 
 
 def initialize_scenario(reset: bool = False) -> dict:

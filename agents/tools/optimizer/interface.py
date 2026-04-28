@@ -17,7 +17,7 @@ from .models import (
 )
 from .engine import SliceOptimizationEngine
 from agents.tools.init_scenario import (
-    get_current_scenario,
+    get_current_optimizer_scenario,
 )
 from utils.logger import setup_logger
 
@@ -283,7 +283,7 @@ def optimize_network_slices(
     try:
         # Operate on a detached copy so optimizer previews never mutate the shared
         # in-memory baseline before the workflow is actually committed.
-        apps, slices, nodes = deepcopy(get_current_scenario())
+        apps, slices, nodes = deepcopy(get_current_optimizer_scenario())
         used_suffixes = _collect_used_id_suffixes(apps)
         normalized_payload = _collapse_payload_to_app_dict(new_app_data)
         requested_flows_payload = normalized_payload["flows"]

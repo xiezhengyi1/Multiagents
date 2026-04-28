@@ -10,8 +10,9 @@ from typing import Any, Callable, Dict, Optional
 from domain.policy_plan import PolicyPlan
 from domain.policy_compiler import PolicyCompiler
 from domain.policy_guard import PolicyGuard
-from agents.tools.db_tool import get_latest_snapshot_metadata, update_scenario_in_db
-from agents.tools.init_scenario import cache_scenario, get_cached_control_scenario, get_current_scenario
+from agents.tools.db_tool import update_scenario_in_db
+from agents.tools.init_scenario import cache_scenario, get_cached_control_scenario, get_current_optimizer_scenario
+from agents.tools.network_graph import get_latest_graph_snapshot_metadata
 from workflows.assurance_evaluator import AssuranceEvaluator
 from utils.logger import log_event, log_timing, setup_logger
 
@@ -100,56 +101,30 @@ class ExecutionController:
         session_id: str,
         snapshot_id: str,
     ) -> tuple[Dict[str, Any], int]:
-        attempts = 0
-        last_result: Dict[str, Any] = {}
         request_id = f"req-{uuid.uuid4()}"
+        result = self.dispatch_policy(
+            policy["policy_type"],
+            policy,
+            request_id=request_id,
+            session_id=session_id or None,
+            snapshot_id=snapshot_id or None,
+        )
+        last_result = result if isinstance(result, dict) else {"status": "failed", "error": str(result)}
 
-        while attempts < self.max_dispatch_attempts:
-            attempts += 1
-            result = self.dispatch_policy(
-                policy["policy_type"],
-                policy,
-                request_id=request_id,
-                session_id=session_id or None,
-                snapshot_id=snapshot_id or None,
-            )
-            last_result = result if isinstance(result, dict) else {"status": "failed", "error": str(result)}
+        failure_message = self._extract_dispatch_failure_message(policy=policy, result=last_result)
+        if failure_message is None:
+            return last_result, 1
 
-            failure_message = self._extract_dispatch_failure_message(policy=policy, result=last_result)
-            if failure_message is None:
-                return last_result, attempts
-
-            if attempts < self.max_dispatch_attempts and self._should_retry_dispatch(result=last_result):
-                continue
-
-            recommended_consumer = self._classify_feedback_consumer(
-                detail=failure_message,
-                policy=policy,
-                phase="dispatch",
-            )
-            raise ExecutionDecisionError(
-                failure_message,
-                recommended_consumer=recommended_consumer,
-                correction_suggestion=self._build_correction_suggestion(
-                    recommended_consumer=recommended_consumer,
-                    phase="dispatch",
-                ),
-                feedback_payload={
-                    "phase": "dispatch",
-                    "policy_id": policy.get("policy_id"),
-                    "policy_type": policy.get("policy_type"),
-                    "flow_id": policy.get("flow_id") or policy.get("policy_details", {}).get("flow_id"),
-                    "error": failure_message,
-                    "last_dispatch_result": last_result,
-                },
-                dispatch_attempts=attempts,
-            )
-
+        recommended_consumer = self._classify_feedback_consumer(
+            detail=failure_message,
+            policy=policy,
+            phase="dispatch",
+        )
         raise ExecutionDecisionError(
-            f"policy {policy['policy_id']} dispatch failed after retries",
-            recommended_consumer="optimization_strategy",
+            failure_message,
+            recommended_consumer=recommended_consumer,
             correction_suggestion=self._build_correction_suggestion(
-                recommended_consumer="optimization_strategy",
+                recommended_consumer=recommended_consumer,
                 phase="dispatch",
             ),
             feedback_payload={
@@ -157,9 +132,10 @@ class ExecutionController:
                 "policy_id": policy.get("policy_id"),
                 "policy_type": policy.get("policy_type"),
                 "flow_id": policy.get("flow_id") or policy.get("policy_details", {}).get("flow_id"),
+                "error": failure_message,
                 "last_dispatch_result": last_result,
             },
-            dispatch_attempts=attempts,
+            dispatch_attempts=1,
         )
 
     @staticmethod
@@ -168,17 +144,6 @@ class ExecutionController:
             error = str(result.get("error") or "unknown dispatch error").strip()
             return f"policy {policy['policy_id']} dispatch failed: {error}"
         return None
-
-    @staticmethod
-    def _should_retry_dispatch(*, result: Dict[str, Any]) -> bool:
-        error_text = str(result.get("error") or "").strip().lower()
-        response_code = result.get("response_code")
-
-        if isinstance(response_code, int) and response_code >= 500:
-            return True
-        if any(token in error_text for token in ["timeout", "temporar", "connection", "request failed", "503", "502", "504"]):
-            return True
-        return False
 
     @staticmethod
     def _classify_feedback_consumer(
@@ -473,7 +438,7 @@ class ExecutionController:
         if not isinstance(target_app_patch, dict) and not isinstance(impacted_flows, list):
             return ""
 
-        apps, slices, nodes = deepcopy(get_current_scenario())
+        apps, slices, nodes = deepcopy(get_current_optimizer_scenario())
         cached_control = get_cached_control_scenario()
         flow_patches: list[tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]] = []
 
@@ -539,7 +504,7 @@ class ExecutionController:
             cached_control.get("mobility") or [],
             cached_control.get("policy_state") or {},
         )
-        latest_snapshot = get_latest_snapshot_metadata() or {}
+        latest_snapshot = get_latest_graph_snapshot_metadata() or {}
         return str(latest_snapshot.get("snapshot_id") or "").strip()
 
     def execute(self, strategy_output: Any) -> ExecutionOutcome:

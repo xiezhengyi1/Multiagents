@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import networkx as nx
 
-from database.models import GraphEdge, GraphMetric, GraphNode, NetworkGraphSnapshot, NetworkStatusSnapshot
+from database.models import GraphEdge, GraphMetric, GraphNode, NetworkGraphSnapshot
 from agents.tools.db_tool import session_scope
 from utils.logger import setup_logger
 
@@ -218,7 +218,7 @@ class NetworkGraph:
             if node_type == "flow" and str(properties.get("supi") or "").strip() == target_supi:
                 flow_catalog.append(dict(properties))
                 app_id = str(properties.get("app_id") or "")
-                app_bucket_key = _app_identity(properties, fallback=app_id)
+                app_bucket_key = f"{target_supi}:{app_id}" if target_supi and app_id else str(app_id or _node_key)
                 if app_id:
                     app_catalog.setdefault(
                         app_bucket_key,
@@ -370,7 +370,6 @@ class NetworkGraph:
 
 def persist_network_graph(graph: NetworkGraph, *, base_network_snapshot_id: str = "") -> str:
     payload = graph.to_payload()
-    compatibility = graph.to_compatibility_snapshot()
     snapshot_id = str(payload.get("snapshot_id") or "").strip()
     if not snapshot_id:
         raise ValueError("NetworkGraph snapshot_id is required")
@@ -421,15 +420,6 @@ def persist_network_graph(graph: NetworkGraph, *, base_network_snapshot_id: str 
                     metric_value=metric.get("metric_value"),
                 )
             )
-
-        session.add(
-            NetworkStatusSnapshot(
-                app_data=compatibility.get("apps", []),
-                slice_data=compatibility.get("slices", []),
-                node_data=compatibility.get("nodes", []),
-                trigger_event=graph.trigger_event or None,
-            )
-        )
     return snapshot_id
 
 

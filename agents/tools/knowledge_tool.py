@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from langchain_core.documents import Document
 from langchain.tools import ToolRuntime
@@ -34,6 +38,9 @@ from knowledge_scripts.build_pcf_policy_kb import (
     normalize_query_terms,
     search_exact_index,
 )
+from utils.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 DEFAULT_RETURNED_RESULTS = 10
@@ -45,6 +52,19 @@ BGE_RERANK_INPUT_CHARS = 3200
 BGE_RERANK_TERM_CHARS = 700
 RRF_K = 60.0
 RRF_SCORE_SCALE = 1000.0
+DEBUG_STAGE_TIMEOUT_SECONDS = max(
+    1,
+    int(str(os.getenv("KNOWLEDGE_DEBUG_STAGE_TIMEOUT_SECONDS", "30")).strip() or "30"),
+)
+LEXICAL_CANDIDATE_LIMIT = 24
+MAX_RERANK_POOL = 24
+CROSS_SPEC_SEED_LIMIT = 4
+CROSS_SPEC_OBJECT_LIMIT = 6
+CROSS_SPEC_CITATION_LIMIT = 24
+VECTOR_SEARCH_K = 8
+VECTOR_SEARCH_TRIGGER_THRESHOLD = 8
+HF_CACHE_ROOT = Path(str(os.getenv("HF_HOME", Path.home() / ".cache" / "huggingface")).strip()).expanduser()
+HF_HUB_MODELS_ROOT = HF_CACHE_ROOT / "hub"
 SEARCH_STOPWORDS = {
     "a",
     "an",
@@ -91,6 +111,26 @@ SEARCH_STOPWORDS = {
     "where",
     "which",
 }
+
+
+def _resolve_bge_reranker_model() -> str:
+    explicit_path = str(os.getenv("BGE_RERANK_MODEL_PATH", "")).strip()
+    if explicit_path:
+        candidate = Path(explicit_path).expanduser()
+        if candidate.exists():
+            return str(candidate)
+
+    repo_cache_dir = HF_HUB_MODELS_ROOT / "models--BAAI--bge-reranker-v2-m3" / "snapshots"
+    if repo_cache_dir.exists():
+        snapshots = sorted(
+            (path for path in repo_cache_dir.iterdir() if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if snapshots:
+            return str(snapshots[0])
+
+    return BGE_RERANK_MODEL
 GLOSSARY_QUERY_KEYWORDS = {
     "acronym",
     "alias",
@@ -406,6 +446,17 @@ def _schema_phrase_matches(query: str, domain: str) -> Tuple[set[str], set[str]]
         if len(_normalized(phrase)) >= 3 and set(_search_terms(phrase)).issubset(query_terms)
     }
     return matched_schema_names, matched_object_phrases
+
+
+@lru_cache(maxsize=128)
+def _expanded_query_terms_cached(query: str, domain: str) -> frozenset[str]:
+    return frozenset(_expanded_query_terms(query, domain))
+
+
+@lru_cache(maxsize=128)
+def _schema_phrase_matches_cached(query: str, domain: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    matched_schema_names, matched_object_phrases = _schema_phrase_matches(query, domain)
+    return tuple(sorted(matched_schema_names)), tuple(sorted(matched_object_phrases))
 
 
 def _looks_like_schema_object_query(query: str, domain: str) -> bool:
@@ -943,8 +994,8 @@ def _metadata_query_bonus(metadata: Dict[str, Any], query: str, domain: str) -> 
     score = _spec_priority(str(metadata.get("spec_id") or ""), domain)
     score += _doc_type_priority(str(metadata.get("doc_type") or ""), query, domain)
     normalized_doc_type = _normalized(metadata.get("doc_type") or "")
-    query_terms = _expanded_query_terms(query, domain)
-    matched_schema_names, _matched_object_phrases = _schema_phrase_matches(query, domain)
+    query_terms = set(_expanded_query_terms_cached(query, domain))
+    matched_schema_names, _matched_object_phrases = _schema_phrase_matches_cached(query, domain)
     matched_schema_names_normalized = {_normalized(name) for name in matched_schema_names}
     title_terms, object_terms, normalized_terms = _metadata_term_sets(metadata)
     score += 24.0 * len(query_terms.intersection(title_terms))
@@ -1176,8 +1227,34 @@ def _bge_reranker(top_n: int) -> Any:
             "Install `sentence-transformers` and ensure `langchain_community.cross_encoders.HuggingFaceCrossEncoder` is available."
         ) from exc
 
-    model = HuggingFaceCrossEncoder(model_name=BGE_RERANK_MODEL)
+    model = HuggingFaceCrossEncoder(model_name=_resolve_bge_reranker_model())
     return CrossEncoderReranker(model=model, top_n=top_n)
+
+
+def warmup_knowledge_tool_models() -> Dict[str, Any]:
+    warmed: Dict[str, Any] = {
+        "corpus": [],
+        "vectorstores": [],
+        "rerankers": [],
+    }
+
+    warmed["corpus"] = [str(path) for path in _ensure_processed_corpus()]
+
+    collection_names = [
+        PCF_AM_POLICY_CLAUSES_COLLECTION,
+        PCF_AM_POLICY_SCHEMA_COLLECTION,
+        PCF_SM_POLICY_CLAUSES_COLLECTION,
+        PCF_SM_POLICY_SCHEMA_COLLECTION,
+        PCF_URSP_CLAUSES_COLLECTION,
+        PCF_URSP_SCHEMA_COLLECTION,
+    ]
+    for collection_name in collection_names:
+        get_pgvector_store(collection_name=collection_name)
+        warmed["vectorstores"].append(collection_name)
+
+    _bge_reranker(1)
+    warmed["rerankers"].append(BGE_RERANK_MODEL)
+    return warmed
 
 
 def _limited_terms(values: Iterable[Any], *, limit: int = BGE_RERANK_TERM_CHARS) -> str:
@@ -1409,35 +1486,114 @@ def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
     return _dedupe_candidates(candidates, limit=6)
 
 
-def _expand_cross_spec_candidates(seed_candidates: Iterable[Dict[str, Any]], domain: str, query: str) -> List[Dict[str, Any]]:
-    object_names: List[str] = []
-    alias_map = _term_alias_map()
-    for candidate in seed_candidates:
-        metadata = candidate["metadata"]
-        canonical_title = str(metadata.get("canonical_title") or "").strip()
-        object_names.extend(metadata.get("object_tags") or [])
-        if canonical_title and canonical_title in alias_map:
-            object_names.extend(alias_map[canonical_title].get("related_objects") or [])
+def _top_cross_spec_seeds(seed_candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ranked = sorted(
+        list(seed_candidates),
+        key=lambda item: float(item.get("score") or 0.0),
+        reverse=True,
+    )
+    return ranked[:CROSS_SPEC_SEED_LIMIT]
 
-    seen_objects = sorted(set(name for name in object_names if name))
-    if not seen_objects:
+
+def _rank_cross_spec_objects(
+    seed_candidates: Iterable[Dict[str, Any]],
+    query: str,
+    alias_map: Dict[str, Dict[str, Any]],
+) -> List[Tuple[str, float]]:
+    query_terms = set(_search_terms(query))
+    object_scores: Dict[str, float] = defaultdict(float)
+
+    for candidate in _top_cross_spec_seeds(seed_candidates):
+        metadata = candidate["metadata"]
+        seed_score = float(candidate.get("score") or 0.0)
+        canonical_title = str(metadata.get("canonical_title") or "").strip()
+        candidate_objects = set(str(item).strip() for item in (metadata.get("object_tags") or []) if str(item).strip())
+        if canonical_title and canonical_title in alias_map:
+            candidate_objects.update(
+                str(item).strip()
+                for item in (alias_map[canonical_title].get("related_objects") or [])
+                if str(item).strip()
+            )
+
+        for object_name in candidate_objects:
+            overlap = len(query_terms.intersection(_search_terms(object_name)))
+            object_scores[object_name] += seed_score + overlap * 80.0
+
+    return sorted(
+        object_scores.items(),
+        key=lambda item: (-item[1], item[0]),
+    )[:CROSS_SPEC_OBJECT_LIMIT]
+
+
+def _rank_cross_spec_citations(
+    ranked_objects: Iterable[Tuple[str, float]],
+    spec_map: Dict[str, List[Dict[str, Any]]],
+) -> List[Tuple[str, str, float]]:
+    citation_scores: Dict[str, Tuple[str, float]] = {}
+
+    for object_name, object_score in ranked_objects:
+        seen_citations: set[str] = set()
+        for mapping in spec_map.get(object_name) or []:
+            citation = str(mapping.get("citation_anchor") or "").strip()
+            if not citation or citation in seen_citations:
+                continue
+            seen_citations.add(citation)
+            current = citation_scores.get(citation)
+            if current is None or object_score > current[1]:
+                citation_scores[citation] = (object_name, object_score)
+
+    ranked_citations = sorted(
+        citation_scores.items(),
+        key=lambda item: (-item[1][1], item[0]),
+    )[:CROSS_SPEC_CITATION_LIMIT]
+    return [(citation, object_name, object_score) for citation, (object_name, object_score) in ranked_citations]
+
+
+def _expand_cross_spec_candidates(
+    seed_candidates: Iterable[Dict[str, Any]],
+    domain: str,
+    query: str,
+    emit: Optional[Callable[[str], None]] = None,
+) -> List[Dict[str, Any]]:
+    started_at = time.perf_counter()
+    alias_map = _term_alias_map()
+    selected_seeds = _top_cross_spec_seeds(seed_candidates)
+    if emit is not None:
+        emit(f"stage=expand_cross_spec_candidates detail=selected_seeds count={len(selected_seeds)}")
+
+    ranked_objects = _rank_cross_spec_objects(selected_seeds, query, alias_map)
+    if emit is not None:
+        emit(f"stage=expand_cross_spec_candidates detail=selected_objects count={len(ranked_objects)}")
+    if not ranked_objects:
+        # logger.info("knowledge_tool cross-spec expand skipped: no ranked_objects")
         return []
 
     spec_map = _spec_object_map()
     by_citation = _records_by_citation()
+    ranked_citations = _rank_cross_spec_citations(ranked_objects, spec_map)
+    if emit is not None:
+        emit(f"stage=expand_cross_spec_candidates detail=selected_citations count={len(ranked_citations)}")
+
     expanded: List[Dict[str, Any]] = []
-    for object_name in seen_objects:
-        for mapping in spec_map.get(object_name) or []:
-            citation = str(mapping.get("citation_anchor") or "").strip()
-            if not citation:
+    for citation, object_name, object_score in ranked_citations:
+        for record in by_citation.get(citation) or []:
+            metadata = record.get("metadata") or {}
+            if not _domain_matches(metadata, domain):
                 continue
-            for record in by_citation.get(citation) or []:
-                metadata = record.get("metadata") or {}
-                if not _domain_matches(metadata, domain):
-                    continue
-                score = 900.0 + _metadata_query_bonus(metadata, query, domain)
-                expanded.append(_record_to_candidate(record, score=score, retrieval=f"cross_spec:{object_name}"))
-    return _dedupe_candidates(expanded, limit=4)
+            score = 900.0 + min(object_score, 4000.0) * 0.01 + _metadata_query_bonus(metadata, query, domain)
+            expanded.append(_record_to_candidate(record, score=score, retrieval=f"cross_spec:{object_name}"))
+
+    deduped = _dedupe_candidates(expanded, limit=4)
+    # logger.info(
+    #     "knowledge_tool cross-spec expand complete: selected_seeds=%s selected_objects=%s selected_citations=%s expanded=%s deduped=%s duration_ms=%.2f",
+    #     len(selected_seeds),
+    #     len(ranked_objects),
+    #     len(ranked_citations),
+    #     len(expanded),
+    #     len(deduped),
+    #     (time.perf_counter() - started_at) * 1000.0,
+    # )
+    return deduped
 
 
 def _vector_search_candidates(query: str, domain: str) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -1545,7 +1701,7 @@ def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED
         *_operation_intent_candidates(query, domain),
     ]
     exact = _exact_search_candidates(query, domain)
-    rerank_pool_limit = max(limit * 4, 20)
+    rerank_pool_limit = max(limit * 4, MAX_RERANK_POOL)
     seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
     if direct and _looks_like_exact_identifier_query(query):
         return _bge_rerank_candidates(query, domain, seeds, limit=limit), []
@@ -1584,6 +1740,195 @@ def _format_results(
     if errors:
         blocks.append("Warnings: Dense retrieval failed for collections: " + " | ".join(errors))
     return "\n\n---\n\n".join(blocks)
+
+
+def debug_search_semantic_knowledge_pipeline(
+    query: str,
+    category: Optional[str] = None,
+    limit: int = DEFAULT_RETURNED_RESULTS,
+    *,
+    verbose: bool = True,
+    stage_timeout_seconds: int = DEBUG_STAGE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """
+    调试 search_semantic_knowledge 的内部链路。
+
+    返回每个阶段的耗时、候选数、错误信息和最终结果预览，用于定位是
+    exact/glossary、PGVector embedding 检索，还是 BGE rerank 出现阻塞。
+    """
+    normalized_query = str(query or "").strip()
+    if not normalized_query:
+        raise ValueError("query must not be empty")
+
+    sanitized_limit = _sanitize_limit(limit)
+    timings_ms: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    debug_errors: List[str] = []
+    total_start = time.perf_counter()
+
+    def _emit(message: str) -> None:
+        if verbose:
+            print(f"[knowledge-debug] {message}", flush=True)
+
+    class _StageTimeoutError(TimeoutError):
+        pass
+
+    def _run_with_timeout(stage_name: str, func):
+        if stage_timeout_seconds <= 0:
+            return func()
+        previous_handler = signal.getsignal(signal.SIGALRM)
+
+        def _handle_timeout(_signum, _frame):
+            raise _StageTimeoutError(f"{stage_name} timed out after {stage_timeout_seconds}s")
+
+        signal.signal(signal.SIGALRM, _handle_timeout)
+        signal.alarm(stage_timeout_seconds)
+        try:
+            return func()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_handler)
+
+    stage_start = time.perf_counter()
+    _emit("stage=ensure_processed_corpus start")
+    _ensure_processed_corpus()
+    timings_ms["ensure_processed_corpus"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=ensure_processed_corpus done duration_ms={timings_ms['ensure_processed_corpus']}")
+
+    stage_start = time.perf_counter()
+    _emit("stage=infer_policy_domain start")
+    domain = _infer_policy_domain(normalized_query, category)
+    timings_ms["infer_policy_domain"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=infer_policy_domain done duration_ms={timings_ms['infer_policy_domain']} domain={domain}")
+
+    stage_start = time.perf_counter()
+    _emit("stage=direct_record_matches start")
+    direct = _direct_record_matches(normalized_query, domain)
+    counts["direct"] = len(direct)
+    timings_ms["direct_record_matches"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=direct_record_matches done duration_ms={timings_ms['direct_record_matches']} count={counts['direct']}")
+
+    stage_start = time.perf_counter()
+    _emit("stage=glossary_strong_candidates start")
+    glossary = _glossary_strong_candidates(normalized_query, domain)
+    counts["glossary"] = len(glossary)
+    timings_ms["glossary_strong_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=glossary_strong_candidates done duration_ms={timings_ms['glossary_strong_candidates']} count={counts['glossary']}")
+
+    stage_start = time.perf_counter()
+    _emit("stage=domain_special_candidates start")
+    domain_special = [
+        *_schema_object_graph_candidates(normalized_query, domain),
+        *_schema_definition_candidates(normalized_query, domain),
+        *_sm_qos_requirement_candidates(normalized_query, domain),
+        *_am_rfsp_clause_candidates(normalized_query, domain),
+        *_operation_intent_candidates(normalized_query, domain),
+    ]
+    counts["domain_special"] = len(domain_special)
+    timings_ms["domain_special_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=domain_special_candidates done duration_ms={timings_ms['domain_special_candidates']} count={counts['domain_special']}")
+
+    stage_start = time.perf_counter()
+    _emit("stage=exact_search_candidates start")
+    exact = _exact_search_candidates(normalized_query, domain)
+    counts["exact"] = len(exact)
+    timings_ms["exact_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=exact_search_candidates done duration_ms={timings_ms['exact_search_candidates']} count={counts['exact']}")
+
+    rerank_pool_limit = max(sanitized_limit * 4, 20)
+    stage_start = time.perf_counter()
+    _emit("stage=seed_dedupe start")
+    seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
+    counts["seeds"] = len(seeds)
+    timings_ms["seed_dedupe"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=seed_dedupe done duration_ms={timings_ms['seed_dedupe']} count={counts['seeds']}")
+
+    stage_start = time.perf_counter()
+    _emit("stage=expand_cross_spec_candidates start")
+    cross_spec = _run_with_timeout(
+        "expand_cross_spec_candidates",
+        lambda: _expand_cross_spec_candidates(seeds, domain, normalized_query, emit=_emit),
+    )
+    counts["cross_spec"] = len(cross_spec)
+    timings_ms["expand_cross_spec_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=expand_cross_spec_candidates done duration_ms={timings_ms['expand_cross_spec_candidates']} count={counts['cross_spec']}")
+
+    vector: List[Dict[str, Any]] = []
+    vector_errors: List[str] = []
+    stage_start = time.perf_counter()
+    _emit("stage=vector_search_candidates start")
+    try:
+        vector, vector_errors = _run_with_timeout(
+            "vector_search_candidates",
+            lambda: _vector_search_candidates(normalized_query, domain),
+        )
+    except Exception as exc:
+        vector_errors = [f"vector_search_exception: {exc}"]
+    counts["vector"] = len(vector)
+    debug_errors.extend(vector_errors)
+    timings_ms["vector_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(
+        f"stage=vector_search_candidates done duration_ms={timings_ms['vector_search_candidates']} count={counts['vector']} errors={len(vector_errors)}"
+    )
+
+    stage_start = time.perf_counter()
+    _emit("stage=combined_dedupe start")
+    combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=rerank_pool_limit)
+    counts["combined"] = len(combined)
+    timings_ms["combined_dedupe"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=combined_dedupe done duration_ms={timings_ms['combined_dedupe']} count={counts['combined']}")
+
+    reranked: List[Dict[str, Any]] = []
+    rerank_error = ""
+    stage_start = time.perf_counter()
+    _emit("stage=bge_rerank_candidates start")
+    try:
+        reranked = _run_with_timeout(
+            "bge_rerank_candidates",
+            lambda: _bge_rerank_candidates(normalized_query, domain, combined, limit=sanitized_limit),
+        )
+    except Exception as exc:
+        rerank_error = str(exc)
+        debug_errors.append(f"rerank_exception: {exc}")
+    counts["reranked"] = len(reranked)
+    timings_ms["bge_rerank_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(
+        f"stage=bge_rerank_candidates done duration_ms={timings_ms['bge_rerank_candidates']} count={counts['reranked']} error={'yes' if rerank_error else 'no'}"
+    )
+
+    stage_start = time.perf_counter()
+    _emit("stage=format_results start")
+    formatted_result = _format_results(
+        normalized_query,
+        reranked,
+        debug_errors,
+        include_selection_guide=True,
+    )
+    timings_ms["format_results"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    timings_ms["total"] = round((time.perf_counter() - total_start) * 1000.0, 2)
+    _emit(f"stage=format_results done duration_ms={timings_ms['format_results']}")
+    _emit(f"stage=total done duration_ms={timings_ms['total']}")
+
+    def _candidate_keys(items: List[Dict[str, Any]], *, top_k: int = 5) -> List[str]:
+        keys: List[str] = []
+        for candidate in items[:top_k]:
+            keys.append(_candidate_key(candidate["metadata"], candidate.get("id") or ""))
+        return keys
+
+    return {
+        "query": normalized_query,
+        "category": category,
+        "domain": domain,
+        "limit": sanitized_limit,
+        "counts": counts,
+        "timings_ms": timings_ms,
+        "errors": debug_errors,
+        "rerank_error": rerank_error,
+        "seed_keys": _candidate_keys(seeds),
+        "combined_keys": _candidate_keys(combined),
+        "reranked_keys": _candidate_keys(reranked),
+        "result_preview": formatted_result[:2000],
+    }
 
 
 @tool_with_reason
@@ -1658,4 +2003,8 @@ def get_knowledge_by_key(
         raise RuntimeError(f"{_log_prefix(runtime)} Key lookup failed for '{normalized_key}': {exc}") from exc
 
 
-__all__ = ["get_knowledge_by_key", "search_semantic_knowledge"]
+__all__ = [
+    "debug_search_semantic_knowledge_pipeline",
+    "get_knowledge_by_key",
+    "search_semantic_knowledge",
+]

@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import subprocess
 import sys
-import time
-from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -137,38 +133,6 @@ def _write_jsonl_incremental(path: Path, record: Dict[str, Any]) -> None:
         handle.write("\n")
         handle.flush()
 
-
-@contextmanager
-def run_mock_server() -> Any:
-    env = os.environ.copy()
-    process = subprocess.Popen(
-        [sys.executable, "-u", str(PROJECT_ROOT / "mock_server.py")],
-        cwd=str(PROJECT_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-    )
-    try:
-        deadline = time.time() + 10.0
-        while time.time() < deadline:
-            line = process.stdout.readline() if process.stdout is not None else ""
-            if "Mock PCF server running" in line:
-                break
-            if process.poll() is not None:
-                raise RuntimeError("mock_server.py exited before becoming ready")
-        else:
-            raise RuntimeError("mock_server.py did not become ready within 10 seconds")
-        yield process
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-
-
 def _scenario_id(record: Mapping[str, Any], *, prefix: str) -> str:
     explicit = str(record.get("scenario_id") or "").strip()
     if explicit:
@@ -266,7 +230,6 @@ def collect_workflow_trajectories(
     scenario_tags: List[str],
     max_rounds: int,
     reset_scenario_each_run: bool,
-    serve_mock: bool,
 ) -> Dict[str, Any]:
     ensure_agent_layout("workflow")
     init_db()
@@ -289,78 +252,76 @@ def collect_workflow_trajectories(
     result_output.parent.mkdir(parents=True, exist_ok=True)
     result_output.write_text("", encoding="utf-8")
 
-    runtime_context = run_mock_server() if serve_mock else nullcontext()
-    with runtime_context:
-        total = len(records)
-        for record in records:
-            scenario_id = _scenario_id(record, prefix=scenario_prefix)
-            merged_tags = _merge_tags(record.get("scenario_tags", []), scenario_tags)
-            orchestrator = MainControlOrchestrator(max_rounds=max_rounds)
-            preview = str(record["user_input"]).replace("\n", " ")[:120]
-            print(f"[{record['record_index']}/{total}] workflow start: {preview}", flush=True)
+    total = len(records)
+    for record in records:
+        scenario_id = _scenario_id(record, prefix=scenario_prefix)
+        merged_tags = _merge_tags(record.get("scenario_tags", []), scenario_tags)
+        orchestrator = MainControlOrchestrator(max_rounds=max_rounds, use_local_model=False)
+        preview = str(record["user_input"]).replace("\n", " ")[:120]
+        print(f"[{record['record_index']}/{total}] workflow start: {preview}", flush=True)
 
-            try:
-                run_result = orchestrator.run(
-                    str(record["user_input"]),
-                    scenario_id=scenario_id,
-                    scenario_tags=merged_tags,
-                )
-                result_record = {
-                    "record_index": record["record_index"],
-                    "scenario_id": scenario_id,
-                    "scenario_tags": merged_tags,
-                    "user_input": record["user_input"],
-                    "messages": record["messages"],
-                    "context": record["context"],
-                    "status": "success",
-                    "error_type": None,
-                    "error": None,
-                    "session_id": run_result.session_id,
-                    "snapshot_id": run_result.snapshot_id,
-                    "completed": run_result.completed,
-                    "global_intent": run_result.global_intent,
-                    "unified_plan": run_result.unified_plan,
-                    "qos_feedback": run_result.qos_feedback,
-                    "mobility_feedback": run_result.mobility_feedback,
-                    "diagnosis": run_result.diagnosis,
-                    "round_count": run_result.round_count,
-                    "retry_count": run_result.retry_count,
-                    "round_traces": run_result.round_traces,
-                }
-                print(
-                    f"[{record['record_index']}/{total}] workflow done: session_id={run_result.session_id} completed={run_result.completed}",
-                    flush=True,
-                )
-            except Exception as exc:
-                result_record = {
-                    "record_index": record["record_index"],
-                    "scenario_id": scenario_id,
-                    "scenario_tags": merged_tags,
-                    "user_input": record["user_input"],
-                    "messages": record["messages"],
-                    "context": record["context"],
-                    "status": "error",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "session_id": "",
-                    "snapshot_id": "",
-                    "completed": False,
-                    "global_intent": {},
-                    "unified_plan": {},
-                    "qos_feedback": {},
-                    "mobility_feedback": {},
-                    "diagnosis": {},
-                    "round_count": 0,
-                    "retry_count": 0,
-                    "round_traces": [],
-                }
-                print(
-                    f"[{record['record_index']}/{total}] workflow error: scenario_id={scenario_id} error={type(exc).__name__}: {exc}",
-                    flush=True,
-                )
+        try:
+            run_result = orchestrator.run(
+                str(record["user_input"]),
+                scenario_id=scenario_id,
+                scenario_tags=merged_tags,
+            )
+            result_record = {
+                "record_index": record["record_index"],
+                "scenario_id": scenario_id,
+                "scenario_tags": merged_tags,
+                "user_input": record["user_input"],
+                "messages": record["messages"],
+                "context": record["context"],
+                "status": "success",
+                "error_type": None,
+                "error": None,
+                "session_id": run_result.session_id,
+                "snapshot_id": run_result.snapshot_id,
+                "completed": run_result.completed,
+                "global_intent": run_result.global_intent,
+                "unified_plan": run_result.unified_plan,
+                "qos_feedback": run_result.qos_feedback,
+                "mobility_feedback": run_result.mobility_feedback,
+                "diagnosis": run_result.diagnosis,
+                "round_count": run_result.round_count,
+                "retry_count": run_result.retry_count,
+                "round_traces": run_result.round_traces,
+            }
+            print(
+                f"[{record['record_index']}/{total}] workflow done: session_id={run_result.session_id} completed={run_result.completed}",
+                flush=True,
+            )
+        except Exception as exc:
+            result_record = {
+                "record_index": record["record_index"],
+                "scenario_id": scenario_id,
+                "scenario_tags": merged_tags,
+                "user_input": record["user_input"],
+                "messages": record["messages"],
+                "context": record["context"],
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "session_id": "",
+                "snapshot_id": "",
+                "completed": False,
+                "global_intent": {},
+                "unified_plan": {},
+                "qos_feedback": {},
+                "mobility_feedback": {},
+                "diagnosis": {},
+                "round_count": 0,
+                "retry_count": 0,
+                "round_traces": [],
+            }
+            print(
+                f"[{record['record_index']}/{total}] workflow error: scenario_id={scenario_id} error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
-            results.append(result_record)
-            _write_jsonl_incremental(result_output, result_record)
+        results.append(result_record)
+        _write_jsonl_incremental(result_output, result_record)
 
     projection_summary = _store_projected_trajectories(
         results=results,
@@ -427,11 +388,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reuse scenario state across runs. Default behavior resets before each run to avoid cross-run contamination.",
     )
-    parser.add_argument(
-        "--skip-mock-server",
-        action="store_true",
-        help="Do not start mock_server.py. Use this only when the mock server is already running externally.",
-    )
     return parser.parse_args()
 
 
@@ -466,7 +422,6 @@ def main() -> None:
         scenario_tags=list(args.scenario_tag),
         max_rounds=args.max_rounds,
         reset_scenario_each_run=not args.no_reset_scenario,
-        serve_mock=not args.skip_mock_server,
     )
     results = collection["results"]
     projection_summary = collection["projection_summary"]

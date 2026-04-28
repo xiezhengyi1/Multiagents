@@ -117,6 +117,24 @@ def load_eval_cases(path: Path) -> List[Dict[str, Any]]:
     return payload
 
 
+def debug_tool_invocation(
+    query: str,
+    *,
+    category: Optional[str] = None,
+    limit: int = 5,
+    verbose: bool = True,
+    stage_timeout_seconds: int = 30,
+) -> Dict[str, Any]:
+    """单条调试入口：拆解 knowledge_tool 的检索流水线并返回阶段计时。"""
+    return knowledge_tool.debug_search_semantic_knowledge_pipeline(
+        query=query,
+        category=category,
+        limit=limit,
+        verbose=verbose,
+        stage_timeout_seconds=stage_timeout_seconds,
+    )
+
+
 def _flatten_trace_runs(run: Dict[str, Any]) -> List[Dict[str, Any]]:
     flattened: List[Dict[str, Any]] = []
     stack = [run]

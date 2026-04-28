@@ -55,8 +55,10 @@ def build_main_context(
     memory_context: str = "",
     feedback_context: str = "",
     previous_diagnosis: Optional[Dict[str, Any]] = None,
+    previous_execution_feedback: Optional[Dict[str, Any]] = None,
 ) -> str:
     snapshot = get_latest_snapshot_data() or {}
+    retry_source = previous_execution_feedback if isinstance(previous_execution_feedback, dict) and previous_execution_feedback else previous_diagnosis or {}
     payload = {
         "snapshot_id": snapshot_id,
         "round_index": round_index,
@@ -67,6 +69,7 @@ def build_main_context(
         "memory_context": memory_context,
         "feedback_context": feedback_context,
         "previous_diagnosis": previous_diagnosis or {},
+        "execution_retry_hint": _build_execution_retry_hint(retry_source),
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -127,6 +130,7 @@ def build_feedback_context(
     if previous_context:
         blocks.append(previous_context)
     if pda_feedback:
+        retry_hint = _build_execution_retry_hint(pda_feedback)
         blocks.append(
             "[Round Feedback]\n"
             f"round_index: {round_index}\n"
@@ -134,6 +138,7 @@ def build_feedback_context(
             f"violation_details: {pda_feedback.get('violation_details', '')}\n"
             f"correction_suggestion: {pda_feedback.get('correction_suggestion', '')}\n"
             f"recommended_consumer: {pda_feedback.get('recommended_consumer', '')}\n"
+            + (f"retry_hint: {json.dumps(retry_hint, ensure_ascii=False)}\n" if retry_hint else "")
         )
     if diagnosis:
         blocks.append(
@@ -174,3 +179,53 @@ def build_feedback_context(
         if mediator_lines:
             blocks.append("[Mediator]\n" + "\n".join(mediator_lines))
     return "\n".join(block.strip() for block in blocks if block.strip())
+
+
+def _build_execution_retry_hint(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    feedback_payload = payload.get("feedback_payload")
+    if not isinstance(feedback_payload, dict):
+        controller_feedback = {}
+    else:
+        controller_feedback = feedback_payload.get("controller_feedback")
+        if not isinstance(controller_feedback, dict):
+            controller_feedback = {}
+
+    failure = {}
+    failures = controller_feedback.get("failures")
+    if isinstance(failures, list):
+        for item in failures:
+            if isinstance(item, dict):
+                failure = item
+                break
+
+    if not failure and isinstance(feedback_payload, dict):
+        failure = feedback_payload
+
+    if not failure:
+        return {}
+
+    last_dispatch = failure.get("last_dispatch_result")
+    if not isinstance(last_dispatch, dict):
+        nested = failure.get("feedback_payload")
+        last_dispatch = nested.get("last_dispatch_result") if isinstance(nested, dict) else {}
+    if not isinstance(last_dispatch, dict):
+        last_dispatch = {}
+
+    result = {
+        "policy_id": str(failure.get("policy_id") or feedback_payload.get("policy_id") or "").strip(),
+        "policy_type": str(failure.get("policy_type") or feedback_payload.get("policy_type") or "").strip(),
+        "flow_id": str(failure.get("flow_id") or feedback_payload.get("flow_id") or "").strip(),
+        "phase": str(failure.get("phase") or feedback_payload.get("phase") or "").strip(),
+        "error": str(failure.get("error") or feedback_payload.get("reason") or payload.get("violation_details") or "").strip(),
+        "recommended_consumer": str(
+            failure.get("recommended_consumer")
+            or payload.get("recommended_consumer")
+            or feedback_payload.get("target_agent")
+            or ""
+        ).strip(),
+        "response_code": last_dispatch.get("response_code"),
+    }
+    return {key: value for key, value in result.items() if value not in ("", None, [])}

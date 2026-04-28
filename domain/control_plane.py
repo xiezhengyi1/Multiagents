@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -222,6 +222,7 @@ class GlobalControlIntent(BaseModel):
     app_name: Optional[str] = None
     target_flow_ids: List[str] = Field(default_factory=list)
     target_flow_names: List[str] = Field(default_factory=list)
+    next_agent: Literal["intent_encoding", "optimization_strategy"]
     requested_domains: List[ControlDomain] = Field(default_factory=list)
     domain_evidence: Dict[str, List[str]] = Field(default_factory=dict)
     objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)

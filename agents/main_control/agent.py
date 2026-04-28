@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import AIMessage, ToolMessage
 
 from agent_runtime import ArtifactEnvelope
-from agents.BaseAgent import BaseAgent, coerce_structured_response, extract_grounding_tool_names
+from agents.BaseAgent import BaseAgent, coerce_structured_response
 from agents.tools.user_interaction_tool import ask_user_clarification
 from agents.worker import ArtifactWorkerMixin
 from agents.tools import (
@@ -117,33 +117,12 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     current_prompt,
                     runtime_context=runtime_context,
                 )
-                grounding_tools = extract_grounding_tool_names(invocation.raw_result, self.GROUNDING_TOOLS)
                 parsed_intent = self._validate_global_intent_result(invocation.raw_result)
-                if self._grounding_gate_failed(
-                    user_input=user_input,
-                    context=context,
-                    grounding_tools=grounding_tools,
-                ):
-                    log_event(
-                        self.logger,
-                        "main_control_grounding_gate_failed",
-                        attempt=attempt_index + 1,
-                        grounding_tools=",".join(grounding_tools) or "<none>",
-                    )
-                    if attempt_index == 2:
-                        raise RuntimeError("Main Agent failed mandatory grounding-tool gate after repeated retries.")
-                    current_prompt = self._build_grounding_retry_prompt(
-                        base_prompt=payload["content"],
-                        validation_errors=["grounding tool use is required for this request but no non-think grounding tool was called"],
-                        user_input=user_input,
-                    )
-                    continue
                 intent = parsed_intent
                 validation_errors = self._validate_global_intent(
                     intent,
                     user_input=user_input,
                     context=context,
-                    grounding_tools=grounding_tools,
                 )
                 if not validation_errors:
                     log_event(
@@ -159,7 +138,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     self.logger,
                     "main_control_validation_failed",
                     attempt=attempt_index + 1,
-                    grounding_tools=",".join(grounding_tools) or "<none>",
                     validation_errors=" || ".join(validation_errors),
                     supi=str(intent.supi or "").strip() or "<empty>",
                     app_id=str(intent.app_id or "").strip() or "<empty>",
@@ -235,51 +213,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
     @staticmethod
-    def _recommended_grounding_tools(user_input: str) -> List[str]:
-        recommended: List[str] = []
-        normalized = str(user_input or "")
-        lowered = normalized.lower()
-        has_policy_object_signal = any(
-            token in lowered
-            for token in (
-                "allowed nssai",
-                "target nssai",
-                "service area",
-                "rfsp",
-                "amf",
-                "am policy",
-                "ue policy",
-                "npcf_",
-            )
-        )
-
-        if has_policy_object_signal:
-            recommended.extend(["get_knowledge_by_key", "search_semantic_knowledge"])
-        deduped: List[str] = []
-        for item in recommended:
-            if item not in deduped:
-                deduped.append(item)
-        return deduped
-
-    @classmethod
-    def _build_grounding_retry_prompt(
-        cls,
-        *,
-        base_prompt: str,
-        validation_errors: List[str],
-        user_input: str,
-    ) -> str:
-        recommended_tools = cls._recommended_grounding_tools(user_input)
-        tool_line = ", ".join(recommended_tools) if recommended_tools else "get_knowledge_by_key or search_semantic_knowledge"
-        return (
-            f"{base_prompt}\n\n"
-            "Your previous draft failed validation because it did not use the required grounding tools.\n"
-            "Validation errors:\n- " + "\n- ".join(validation_errors) + "\n\n"
-            f"Before returning JSON, call at least one applicable non-think grounding tool first. Recommended tools: {tool_line}.\n"
-            "After the tool result arrives, return one corrected GlobalControlIntent JSON object only."
-        )
-
-    @staticmethod
     def _build_validation_retry_prompt(*, base_prompt: str, validation_errors: List[str]) -> str:
         extra_rules: List[str] = []
         joined_errors = " ".join(validation_errors)
@@ -307,37 +240,12 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
     @staticmethod
-    def _grounding_gate_failed(
-        *,
-        user_input: str,
-        context: str,
-        grounding_tools: List[str],
-    ) -> bool:
-        if not MainControlAgent._requires_grounding_tools(user_input=user_input, context=context):
-            return False
-        return not grounding_tools
-
-    @staticmethod
     def _validate_global_intent_result(result: Dict[str, Any]) -> GlobalControlIntent:
         return coerce_structured_response(
             result,
             GlobalControlIntent,
             error_message="Main Agent returned no structured_response",
         )
-
-    @staticmethod
-    def _requires_grounding_tools(*, user_input: str, context: str) -> bool:
-        normalized_input = str(user_input or "")
-        lowered = normalized_input.lower()
-        if any(token in lowered for token in ("allowed nssai", "target nssai", "service area", "rfsp", "amf", "am policy", "ue policy", "npcf_")):
-            return True
-        try:
-            payload = json.loads(str(context or ""))
-        except Exception:
-            payload = {}
-        if isinstance(payload, dict) and int(payload.get("round_index") or 1) > 1:
-            return True
-        return False
 
     @staticmethod
     def _has_explicit_mobility_signal(*, user_input: str, context: str) -> bool:
@@ -397,7 +305,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         *,
         user_input: str,
         context: str = "",
-        grounding_tools: Optional[List[str]] = None,
     ) -> List[str]:
         errors: List[str] = []
         if not intent.requested_domains:
@@ -410,6 +317,8 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 errors.append(
                     "mobility must not be requested unless the user request or retry context contains explicit mobility-control signals"
                 )
+                if str(intent.next_agent or "").strip() not in {"intent_encoding", "optimization_strategy"}:
+                    errors.append("next_agent must be either intent_encoding or optimization_strategy")
         explicit_supi = ""
         match = re.search(r"(?i)(imsi-\d{5,})", str(user_input or ""))
         if match:
@@ -463,8 +372,5 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 errors.append(
                     f"prompt_injections[{key}] must stay at routing level and must not contain semantic policy/object details"
                 )
-        if MainControlAgent._requires_grounding_tools(user_input=user_input, context=context):
-            if not grounding_tools:
-                errors.append("grounding tool use is required for this request but no non-think grounding tool was called")
         # 关键步骤：诊断类别只作为上下文交给 LLM，不在这里做域级硬裁决。
         return errors

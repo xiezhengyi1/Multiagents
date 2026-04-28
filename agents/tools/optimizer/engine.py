@@ -1,3 +1,4 @@
+import time
 import pulp
 import pandas as pd
 from typing import List, Tuple, Optional, Dict

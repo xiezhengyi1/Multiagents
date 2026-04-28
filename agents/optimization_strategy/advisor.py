@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable
 
 from agents.BaseAgent import coerce_structured_response
+from utils.logger import setup_logger
 
 from .prompts import OSA_SYSTEM_PROMPT
 from .response_models import OsaAdvisorOutput
 from .tools import _summarize_optimizer_result, build_request_tools
+
+logger = setup_logger(__name__)
 
 
 @dataclass
@@ -94,9 +97,12 @@ class OptimizationStrategyAdvisor:
                 "path_label": "strategy_advisor",
             },
         }
+        logger.info("OSA advisor invoke start: attempt=1")
         try:
             result = advisor_agent.invoke(invoke_payload, context=runtime_context)
+            logger.info("OSA advisor invoke complete: attempt=1")
         except Exception as exc:
+            logger.warning(f"OSA advisor invoke failed: attempt=1, error={exc}")
             repair_messages = [
                 {
                     "role": "user",
@@ -118,7 +124,9 @@ class OptimizationStrategyAdvisor:
                     "path_label": "strategy_advisor",
                 },
             }
+            logger.info("OSA advisor invoke start: attempt=2")
             result = advisor_agent.invoke(invoke_payload, context=runtime_context)
+            logger.info("OSA advisor invoke complete: attempt=2")
 
         advisor_output = coerce_structured_response(
             result,

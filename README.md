@@ -1,5 +1,20 @@
 # MultiAgents
 
+启动实验：
+cd /home/yyx/6gcore/Multiagents
+source .venv/bin/activate
+
+export PCF_BASE_URL=http://127.0.0.1:18080
+export NO_PROXY=127.0.0.1,localhost
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+
+python run_workflow_experiment.py --user-inputs /home/yyx/6gcore/Multiagents/workflow_experiment_user_inputs.json --max-rounds 2 --summary-output /home/yyx/6gcore/Multiagents/workflow-summary.json
+
+
+ns3:
+python scripts/start_stack.py scenarios/new_scenatios.yaml --run-id exp-001
+
+
 ## 项目说明
 
 这是一个面向 5G/PCF 策略控制场景的多智能体项目。当前仓库里已经接入了一套面向 `SmPolicy` 和 `URSP` 的标准知识库流水线，核心脚本是：
