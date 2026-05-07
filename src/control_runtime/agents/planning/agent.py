@@ -1,0 +1,320 @@
+from __future__ import annotations
+
+import copy
+import time
+from typing import Any
+
+from shared.runtime import ArtifactEnvelope
+from shared.agents import BaseAgent, coerce_structured_response, extract_grounding_tool_names
+from knowledge_runtime.retrieval.raw import get_knowledge_by_key, search_semantic_knowledge
+from shared.runtime import ToolLoopExecutionError
+from shared.runtime import ArtifactWorkerMixin
+from shared.tools import think_tool as think
+from ...domain.collaboration import PlanningRequest
+from ...domain.policy_plan import PolicyPlanDraft
+from shared.logging import log_event, log_timing
+
+from .compiler import OptimizationStrategyCompiler
+from .policy_normalizer import json_friendly as _json_friendly
+from .policy_normalizer import normalize_app_id as _normalize_app_id
+from .prompts import OSA_SYSTEM_PROMPT, build_advisor_user_prompt
+from .response_models import OsaAdvisorOutput
+from .tool_result_adapter import extract_planning_tool_evidence
+from .tools import build_request_tools
+
+
+class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
+    agent_name = "optimization_strategy"
+    QOS_GROUNDING_TOOLS = {
+        "preview_qos_optimizer",
+        "fetch_qos_network_status",
+    }
+    MOBILITY_GROUNDING_TOOLS = {
+        "inspect_mobility_ue_policies",
+    }
+    GROUNDING_TOOLS = {
+        *QOS_GROUNDING_TOOLS,
+        *MOBILITY_GROUNDING_TOOLS,
+        "search_semantic_knowledge",
+        "get_knowledge_by_key",
+    }
+    _RAG_TOOLS = [search_semantic_knowledge, get_knowledge_by_key]
+
+    def __init__(
+        self,
+        model_name: str = "qwen3-30b-a3b-instruct-2507",
+        use_local_model: bool = False,
+        rag_enabled: bool = True,
+    ) -> None:
+        super().__init__(model_name=model_name, use_local_model=use_local_model)
+        self.agent_name = "optimization_strategy"
+        self.rag_enabled = rag_enabled
+        self.compiler = OptimizationStrategyCompiler()
+        self.initialize_agent_runtime(logger_color="\033[94m")
+
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> PolicyPlanDraft:
+        planning_request = PlanningRequest.model_validate(envelope.payload)
+        return self._generate_strategy(planning_request=planning_request, request_envelope=envelope)
+
+    def _cache_received_request(self, planning_request: PlanningRequest) -> ArtifactEnvelope:
+        return self.cache_received_artifact(
+            artifact_type="PlanningRequest",
+            payload=planning_request,
+            session_id=planning_request.context.session_id,
+            snapshot_id=planning_request.context.snapshot_id,
+        )
+
+    def _cache_produced_result(
+        self,
+        *,
+        request_envelope: ArtifactEnvelope,
+        policy_plan: PolicyPlanDraft,
+    ) -> None:
+        self.cache_produced_artifact(
+            artifact_type="PolicyPlanDraft",
+            request_envelope=request_envelope,
+            payload=policy_plan,
+        )
+
+    def generate_strategy(self, planning_request: PlanningRequest) -> PolicyPlanDraft:
+        self.ensure_worker_runtime_initialized()
+        if not isinstance(planning_request, PlanningRequest):
+            raise TypeError("generate_strategy expects a PlanningRequest instance")
+        request_envelope = self._cache_received_request(planning_request)
+        return self._generate_strategy(planning_request=planning_request, request_envelope=request_envelope)
+
+    def _generate_strategy(
+        self,
+        *,
+        planning_request: PlanningRequest,
+        request_envelope: ArtifactEnvelope,
+    ) -> PolicyPlanDraft:
+        effective_request = self._effective_planning_request(planning_request)
+        operation_intent = effective_request.operation_intent
+        normalized_user_intent = _json_friendly(operation_intent.model_dump(mode="json"))
+        normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
+        coordination_context = _json_friendly(effective_request.context.model_dump(mode="json"))
+
+        total_start = time.perf_counter()
+        log_event(self.logger, "osa_generate_start")
+        advisor_trace = None
+        try:
+            planning_evidence = self.compiler.build_planning_evidence(effective_request)
+            advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
+                planning_request=effective_request,
+                normalized_user_intent=normalized_user_intent,
+                coordination_context=coordination_context,
+                planning_evidence=planning_evidence,
+            )
+            self._validate_advisor_policy_presence(
+                advisor_output=advisor_output,
+                planning_request=effective_request,
+            )
+            planning_tool_evidence = extract_planning_tool_evidence(advisor_result=advisor_result)
+            grounding_tools = extract_grounding_tool_names(
+                advisor_result,
+                self.GROUNDING_TOOLS,
+            )
+            contract_errors = self.compiler.validate_advisor_output(
+                advisor_output=advisor_output,
+                planning_request=effective_request,
+                grounding_tools=grounding_tools,
+                planning_evidence=planning_evidence,
+                planning_tool_evidence=planning_tool_evidence,
+            )
+            if contract_errors:
+                raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
+
+            final_output = self.compiler.assemble_policy_plan(
+                advisor_output=advisor_output,
+                planning_request=effective_request,
+                planning_tool_evidence=planning_tool_evidence,
+            )
+            self._write_advisor_trace(
+                advisor_trace=advisor_trace,
+                advisor_output=advisor_output,
+                compiler_output=final_output.model_dump(mode="json"),
+                status="success",
+            )
+            self._cache_produced_result(
+                request_envelope=request_envelope,
+                policy_plan=final_output,
+            )
+            log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="success")
+            return final_output
+        except Exception as exc:
+            if advisor_trace is not None:
+                self._write_advisor_trace(
+                    advisor_trace=advisor_trace,
+                    advisor_output=advisor_output if "advisor_output" in locals() else None,
+                    compiler_output=None,
+                    status="error",
+                    error=str(exc),
+                )
+            self.logger.exception(f"Failed to generate optimization strategy: {exc}")
+            log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="error")
+            raise
+        finally:
+            if hasattr(self, "_pending_invoke_messages"):
+                delattr(self, "_pending_invoke_messages")
+
+    @staticmethod
+    def _effective_planning_request(planning_request: PlanningRequest) -> PlanningRequest:
+        semantics = planning_request.operation_intent.control_semantics
+        stages = semantics.stages or []
+        if not stages:
+            return planning_request
+        current_stage_index = max(1, int(semantics.current_stage or 1))
+        current_stage = next(
+            (stage for stage in stages if int(stage.stage_index or 0) == current_stage_index),
+            stages[0],
+        )
+        active_flow_ids = {
+            str(flow_id or "").strip()
+            for flow_id in (current_stage.active_flow_ids or [])
+            if str(flow_id or "").strip()
+        }
+        if not active_flow_ids:
+            return planning_request
+        filtered_intent = planning_request.operation_intent.model_copy(deep=True)
+        filtered_intent.flows = [
+            flow for flow in filtered_intent.flows
+            if str(flow.flow_id or "").strip() in active_flow_ids
+        ]
+        filtered_intent.qos_target_envelopes = [
+            envelope for envelope in filtered_intent.qos_target_envelopes
+            if str(envelope.flow_id or "").strip() in active_flow_ids
+        ]
+        return planning_request.model_copy(update={"operation_intent": filtered_intent}, deep=True)
+
+    def _invoke_strategy_advisor(
+        self,
+        *,
+        planning_request: PlanningRequest,
+        normalized_user_intent: dict[str, Any],
+        coordination_context: dict[str, Any],
+        planning_evidence: dict[str, Any],
+    ) -> tuple[OsaAdvisorOutput, dict[str, Any], dict[str, Any]]:
+        runtime_context = self.build_runtime_context(
+            agent_name=self.agent_name,
+            session_id=planning_request.context.session_id,
+            snapshot_id=planning_request.context.snapshot_id,
+            supi=planning_request.operation_intent.supi,
+            thread_id=planning_request.context.session_id,
+        )
+        prompt = build_advisor_user_prompt(
+            normalized_user_intent=normalized_user_intent,
+            coordination_context=coordination_context,
+            planning_evidence=planning_evidence,
+        )
+        advisor_agent = self.create_json_agent(
+            tools=[
+                think,
+                *([] if not self.rag_enabled else self._RAG_TOOLS),
+                *build_request_tools(planning_request),
+            ],
+            system_prompt=OSA_SYSTEM_PROMPT,
+            response_model=OsaAdvisorOutput,
+            max_iterations=12,
+        )
+        messages = [{"role": "user", "content": prompt}]
+        invoke_payload = {
+            "messages": messages,
+            "trace_write_mode": "manual",
+            "trace_metadata": {
+                **(getattr(self, "_pending_trace_metadata", {}) or {}),
+                "path_label": "strategy_advisor",
+            },
+        }
+        self._pending_invoke_messages = messages
+        try:
+            result = advisor_agent.invoke(invoke_payload, context=runtime_context)
+        except Exception as exc:
+            if isinstance(exc, ToolLoopExecutionError):
+                failed_tool_call = exc.failed_tool_call or {}
+                if failed_tool_call:
+                    raise RuntimeError(
+                        f"OSA advisor tool call failed: {failed_tool_call.get('name') or '<unknown>'}: {exc}"
+                    ) from exc
+                if "max iterations" in str(exc).lower():
+                    raise RuntimeError(f"OSA advisor did not converge: {exc}") from exc
+                error_text = str(exc)
+                if "Input should be a valid dictionary or instance of OsaAdvisorOutput" in error_text:
+                    raise RuntimeError(
+                        "OSA advisor violated top-level output contract: expected one OsaAdvisorOutput JSON object, "
+                        "but returned a bare array or non-object payload"
+                    ) from exc
+                if "Extra inputs are not permitted" in error_text and "flow_id" in error_text:
+                    raise RuntimeError(
+                        "OSA advisor violated top-level output contract: returned a bare SmPolicySpec object instead "
+                        "of wrapping it inside OsaAdvisorOutput.sm_policies"
+                    ) from exc
+            raise
+        advisor_output = coerce_structured_response(
+            result,
+            OsaAdvisorOutput,
+            error_message="OSA advisor returned no structured_response",
+        )
+        return advisor_output, result, {
+            "agent": advisor_agent,
+            "payload": invoke_payload,
+            "runtime_context": runtime_context,
+            "result": result,
+        }
+
+    @staticmethod
+    def _validate_advisor_policy_presence(
+        *,
+        advisor_output: OsaAdvisorOutput,
+        planning_request: PlanningRequest,
+    ) -> None:
+        requested_domains = {
+            str(domain or "").strip().lower()
+            for domain in (planning_request.operation_intent.requested_domains or [])
+            if str(domain or "").strip()
+        }
+        has_sm = bool(advisor_output.sm_policies)
+        has_am = advisor_output.am_policy is not None
+        has_ursp = bool(advisor_output.ursp_policies)
+
+        if not has_sm and not has_am and not has_ursp:
+            raise RuntimeError("OSA advisor returned empty policy output")
+        if "qos" in requested_domains and not has_sm:
+            raise RuntimeError("OSA advisor omitted sm_policies for a qos request")
+        if "qos" not in requested_domains and has_sm:
+            raise RuntimeError("OSA advisor returned sm_policies for a non-qos request")
+        if "mobility" in requested_domains and not has_am:
+            raise RuntimeError("OSA advisor omitted am_policy for a mobility request")
+        if "mobility" not in requested_domains and has_am:
+            raise RuntimeError("OSA advisor returned am_policy for a non-mobility request")
+
+    @staticmethod
+    def _write_advisor_trace(
+        *,
+        advisor_trace: dict[str, Any],
+        advisor_output: OsaAdvisorOutput | None,
+        compiler_output: Any,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        payload = copy.deepcopy(advisor_trace["payload"])
+        metadata = dict(payload.get("trace_metadata") or {})
+        metadata["advisor_decision"] = (
+            advisor_output.model_dump(mode="json")
+            if advisor_output is not None
+            else None
+        )
+        metadata["compiler_output"] = compiler_output
+        payload["trace_metadata"] = metadata
+        advisor_trace["agent"].write_trace(
+            payload=payload,
+            context=advisor_trace["runtime_context"],
+            result=advisor_trace["result"],
+            status=status,
+            error=error,
+            structured_response_override=compiler_output,
+        )
+
+
+__all__ = ["OptimizationStrategyAgent"]
+

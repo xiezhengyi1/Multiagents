@@ -1,0 +1,604 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import Any, Dict, List, Optional
+
+from knowledge_runtime.retrieval.raw import warmup_knowledge_tool_models
+from shared.memory import MemoryManager
+
+from ..agents.dispatch import PolicyDispatchAgent
+from ..agents.grounding import IntentEncodingAgent
+from ..agents.main import MainControlAgent
+from ..agents.planning import OptimizationStrategyAgent
+from ..diagnostics.diagnosis import AssuranceDiagnosisTool
+from ..diagnostics.mediation import ConflictResolutionTool
+from ..domain.collaboration import PlanningRequest
+from ..domain.control_plane import GlobalControlIntent, MainRetryScope
+from ..domain.policy_plan import OperationIntent
+from .main_control_support import (
+    ControlRoundResult,
+    build_feedback_context,
+    build_main_context,
+    build_planning_context,
+)
+from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
+from .round_execution import execute_planned_round
+from shared.logging import log_event
+
+
+class MainControlOrchestrator:
+    _DEEPSEEK_MODEL = "deepseek-v4-flash"
+
+    def __init__(
+        self,
+        *,
+        main_agent: Optional[MainControlAgent] = None,
+        ie_agent: Optional[IntentEncodingAgent] = None,
+        os_agent: Optional[OptimizationStrategyAgent] = None,
+        pd_agent: Optional[PolicyDispatchAgent] = None,
+        cr_tool: Optional[ConflictResolutionTool] = None,
+        ad_tool: Optional[AssuranceDiagnosisTool] = None,
+        memory_manager: Optional[MemoryManager] = None,
+        max_rounds: int = 3,
+        use_local_model: bool = False,
+        use_deepseek: bool = False,
+        preload_models: bool = True,
+        rag_enabled: bool = True,
+    ) -> None:
+        if max_rounds < 1:
+            raise ValueError("max_rounds must be at least 1")
+        _deepseek_kwargs = {"model_name": self._DEEPSEEK_MODEL} if use_deepseek else {}
+        self.main_agent = main_agent or MainControlAgent(use_local_model=use_local_model, **_deepseek_kwargs)
+        self.ie_agent = ie_agent or IntentEncodingAgent(use_local_model=use_local_model, rag_enabled=rag_enabled, **_deepseek_kwargs)
+        self.os_agent = os_agent or OptimizationStrategyAgent(use_local_model=use_local_model, rag_enabled=rag_enabled, **_deepseek_kwargs)
+        self.pd_agent = pd_agent or PolicyDispatchAgent(use_local_model=use_local_model, **_deepseek_kwargs)
+        self.cr_tool = cr_tool or ConflictResolutionTool()
+        self.ad_tool = ad_tool or AssuranceDiagnosisTool()
+        self.memory_manager = memory_manager or MemoryManager(
+            short_term_limit=max(20, max_rounds * 8),
+            enable_llm_summarization=False,
+        )
+        self.max_rounds = max_rounds
+        self.rag_enabled = rag_enabled
+        self.preloaded_models: Dict[str, Any] = {}
+        if preload_models:
+            self.preloaded_models = self._preload_runtime_models()
+
+    def _preload_runtime_models(self) -> Dict[str, Any]:
+        try:
+            llm_models: List[str] = []
+            preloaded_llm_agents: List[str] = []
+            for agent in (self.main_agent, self.ie_agent, self.os_agent, self.pd_agent):
+                model_name = str(getattr(agent, "model_name", "") or "").strip()
+                if model_name:
+                    llm_models.append(model_name)
+
+                get_llm = getattr(agent, "get_llm", None)
+                if callable(get_llm):
+                    get_llm()
+                    preloaded_llm_agents.append(str(getattr(agent, "agent_name", agent.__class__.__name__) or agent.__class__.__name__))
+
+            knowledge_models = warmup_knowledge_tool_models() if self.rag_enabled else {}
+            log_event(
+                self.main_agent.logger,
+                "runtime_model_preload_complete",
+                llm_models=",".join(model for model in llm_models if model) or "<none>",
+                llm_agents=",".join(preloaded_llm_agents) or "<none>",
+                rerankers=",".join(knowledge_models.get("rerankers") or []) or "<none>",
+                vectorstores=",".join(knowledge_models.get("vectorstores") or []) or "<none>",
+            )
+            return {
+                "llm_models": llm_models,
+                "knowledge_tool": knowledge_models,
+            }
+        except Exception as exc:
+            raise RuntimeError(f"failed to preload runtime models: {exc}") from exc
+
+    @staticmethod
+    def _apply_trace_metadata(agent: Any, *, scenario_id: str = "", scenario_tags: Optional[List[str]] = None) -> None:
+        if not scenario_id and not scenario_tags:
+            return
+        setattr(
+            agent,
+            "_pending_trace_metadata",
+            {
+                "scenario_id": str(scenario_id or "").strip(),
+                "scenario_tags": [str(item).strip() for item in (scenario_tags or []) if str(item).strip()],
+            },
+        )
+
+    @staticmethod
+    def _clear_trace_metadata(agent: Any) -> None:
+        if hasattr(agent, "_pending_trace_metadata"):
+            delattr(agent, "_pending_trace_metadata")
+
+    def _remember(self, role: str, payload: Any) -> None:
+        if isinstance(payload, str):
+            content = payload
+        elif hasattr(payload, "model_dump"):
+            content = json.dumps(payload.model_dump(mode="json"), ensure_ascii=False)
+        else:
+            content = json.dumps(payload, ensure_ascii=False)
+        if role == "IEA":
+            try:
+                parsed = json.loads(content)
+            except Exception:
+                parsed = {}
+            if isinstance(parsed, dict):
+                supi = str(parsed.get("supi") or "").strip()
+                if supi:
+                    self.memory_manager.bind_supi(supi)
+        self.memory_manager.add_memory(role, content)
+
+    def _build_memory_context(self, user_input: str) -> str:
+        bundle = self.memory_manager.retrieve(user_input)
+        short_term = bundle.get("short_term", []) if isinstance(bundle, dict) else []
+        long_term = bundle.get("long_term", []) if isinstance(bundle, dict) else []
+        blocks: List[str] = []
+        if short_term:
+            blocks.append("[Memory][Short-Term]\n" + "\n".join(f"{item.get('role', 'unknown')}: {item.get('content', '')}" for item in short_term[-5:] if isinstance(item, dict)))
+        if long_term:
+            blocks.append("[Memory][Long-Term]\n" + "\n".join(str(item) for item in long_term))
+        return "\n\n".join(block for block in blocks if block.strip())
+
+    def _build_ie_context(
+        self,
+        *,
+        global_intent: Dict[str, Any],
+        round_index: int,
+        diagnosis: Dict[str, Any],
+        feedback_context: str,
+    ) -> str:
+        return json.dumps(
+            {
+                "round_index": round_index,
+                "main_intent": global_intent,
+                "guidance": global_intent.get("intent_encoding_guidance", ""),
+                "retry_scope": global_intent.get("retry_scope") or "",
+                "previous_diagnosis": diagnosis,
+                "feedback_context": feedback_context,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _retry_consumer(feedback_payload: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(feedback_payload, dict):
+            return ""
+        return str(feedback_payload.get("recommended_consumer") or "").strip().lower()
+
+    @staticmethod
+    def _classify_planning_failure(exc: Exception) -> tuple[str, str]:
+        message = str(exc or "").strip()
+        lowered = message.lower()
+        if "main agent" in lowered or "globalcontrolintent" in lowered:
+            return "main_control", "main_control_failure"
+        if "iea" in lowered or "intent" in lowered:
+            return "intent_encoding", "intent_grounding_failure"
+        if "osa" in lowered or "optimization" in lowered or "policy plan" in lowered:
+            return "optimization_strategy", "planning_failure"
+        return "main_control", "planning_failure"
+
+    @classmethod
+    def _build_planning_failure_payload(cls, exc: Exception) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        recommended_consumer, root_cause_category = cls._classify_planning_failure(exc)
+        message = str(exc or "").strip() or exc.__class__.__name__
+        report_payload = {
+            "execution_status": "Failed",
+            "violation_details": message,
+            "correction_suggestion": "Repair planning-stage grounding or control routing before the next round.",
+            "recommended_consumer": recommended_consumer,
+            "feedback_payload": {
+                "phase": "planning",
+                "error": message,
+                "target_agent": recommended_consumer,
+            },
+        }
+        diagnosis = {
+            "root_cause_category": root_cause_category,
+            "root_cause": message,
+            "reason_summary": message,
+            "recommended_actions": [
+                "Retry the failed planning stage with stricter grounding and output constraints.",
+            ],
+        }
+        return report_payload, diagnosis
+
+    def _plan_round(
+        self,
+        *,
+        user_input: str,
+        session_id: str,
+        snapshot_id: str,
+        round_index: int,
+        scenario_id: str,
+        scenario_tags: Optional[List[str]],
+        memory_context: str,
+        feedback_context: str,
+        previous_diagnosis: Dict[str, Any],
+        previous_report_payload: Dict[str, Any],
+        previous_mediator_decision: Optional[Dict[str, Any]],
+        previous_operation_intent: Optional[OperationIntent],
+        round_traces: List[Dict[str, Any]],
+    ) -> tuple[GlobalControlIntent, OperationIntent, Any]:
+        self._apply_trace_metadata(self.main_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
+        try:
+            global_intent = self.main_agent.analyze_global_intent(
+                user_input=user_input,
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                context=build_main_context(
+                    snapshot_id,
+                    round_index=round_index,
+                    memory_context=memory_context,
+                    feedback_context=feedback_context,
+                    previous_diagnosis=previous_diagnosis,
+                    previous_execution_feedback=previous_report_payload,
+                    previous_operation_intent=(
+                        previous_operation_intent.model_dump(mode="json")
+                        if previous_operation_intent is not None
+                        else {}
+                    ),
+                ),
+            )
+        finally:
+            self._clear_trace_metadata(self.main_agent)
+        if not global_intent.requested_domains:
+            raise RuntimeError("Main Agent returned no requested_domains; refusing to infer domains outside the agent.")
+        if not str(global_intent.supi or "").strip():
+            raise RuntimeError("Main Agent returned no SUPI; refusing to patch identifiers outside the agent.")
+        self._remember("MAIN", global_intent)
+
+        selected_next_agent = str(global_intent.next_agent or "").strip().lower()
+        retry_scope = (
+            global_intent.retry_scope
+            if isinstance(global_intent.retry_scope, MainRetryScope)
+            else MainRetryScope(str(global_intent.retry_scope))
+            if str(getattr(global_intent, "retry_scope", "") or "").strip()
+            else None
+        )
+        reuse_operation_intent = (
+            round_index > 1
+            and selected_next_agent == "optimization_strategy"
+            and retry_scope == MainRetryScope.POLICY_REPAIR
+            and previous_operation_intent is not None
+            and str(previous_operation_intent.supi or "").strip() == str(global_intent.supi or "").strip()
+            and set(previous_operation_intent.requested_domains or []) == {item.value for item in global_intent.requested_domains}
+        )
+
+        if reuse_operation_intent:
+            operation_intent = previous_operation_intent.model_copy(deep=True)
+            log_event(
+                self.main_agent.logger,
+                "control_round_resume",
+                session_id=session_id,
+                round_index=round_index,
+                entrypoint="optimization_strategy",
+                selected_next_agent=selected_next_agent,
+            )
+        else:
+            self._apply_trace_metadata(self.ie_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
+            try:
+                operation_intent = self.ie_agent.analyze_operation_intent(
+                    user_input=user_input,
+                    context=self._build_ie_context(
+                        global_intent=global_intent.model_dump(mode="json"),
+                        round_index=round_index,
+                        diagnosis=previous_diagnosis,
+                        feedback_context=feedback_context,
+                    ),
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                )
+            finally:
+                self._clear_trace_metadata(self.ie_agent)
+            self._remember("IEA", operation_intent)
+
+        operation_intent = self._activate_control_stage(
+            operation_intent=operation_intent,
+            round_index=round_index,
+        )
+
+        planning_request = PlanningRequest(
+            operation_intent=operation_intent,
+            context=build_planning_context(
+                global_intent,
+                session_id,
+                snapshot_id,
+                round_index=round_index,
+                memory_context=memory_context,
+                feedback_context=feedback_context,
+                handoff_history=round_traces,
+                revision_requests=(previous_mediator_decision or {}).get("revision_requests") if isinstance(previous_mediator_decision, dict) else None,
+                unified_constraints=(previous_mediator_decision or {}).get("unified_constraints") if isinstance(previous_mediator_decision, dict) else None,
+            ),
+        )
+        self._apply_trace_metadata(self.os_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
+        try:
+            policy_plan = self.os_agent.generate_strategy(planning_request)
+        finally:
+            self._clear_trace_metadata(self.os_agent)
+        self._remember("OSA", policy_plan)
+        return global_intent, operation_intent, policy_plan
+
+    @staticmethod
+    def _activate_control_stage(
+        *,
+        operation_intent: OperationIntent,
+        round_index: int,
+    ) -> OperationIntent:
+        semantics = operation_intent.control_semantics
+        if not semantics.stages:
+            return operation_intent
+        activated = operation_intent.model_copy(deep=True)
+        max_stage = max(stage.stage_index for stage in semantics.stages)
+        activated.control_semantics.current_stage = min(max(1, round_index), max_stage)
+        return activated
+
+    def run(
+        self,
+        user_input: str,
+        *,
+        scenario_id: str = "",
+        scenario_tags: Optional[List[str]] = None,
+        snapshot_id: str = "",
+    ) -> ControlRoundResult:
+        session_id, snapshot_id = start_control_session(step_name="main_control", user_input=user_input, snapshot_id=snapshot_id)
+        self.memory_manager.bind_thread(session_id)
+        state = OrchestratorLoopState()
+        previous_operation_intent: Optional[OperationIntent] = None
+
+        for round_index in range(1, self.max_rounds + 1):
+            log_event(
+                self.main_agent.logger,
+                "control_round_start",
+                session_id=session_id,
+                round_index=round_index,
+                retry_count=max(0, round_index - 1),
+                previous_root_cause=str(state.previous_diagnosis.get("root_cause_category") or "").strip() or "<none>",
+            )
+            memory_context = self._build_memory_context(user_input)
+            try:
+                global_intent, operation_intent, policy_plan = self._plan_round(
+                    user_input=user_input,
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    round_index=round_index,
+                    scenario_id=scenario_id,
+                    scenario_tags=scenario_tags,
+                    memory_context=memory_context,
+                    feedback_context=state.feedback_context,
+                    previous_diagnosis=state.previous_diagnosis,
+                    previous_report_payload=state.previous_report_payload,
+                    previous_mediator_decision=state.previous_mediator_decision,
+                    previous_operation_intent=previous_operation_intent,
+                    round_traces=state.round_traces,
+                )
+            except Exception as exc:
+                state.completed = False
+                report_payload, diagnosis = self._build_planning_failure_payload(exc)
+                append_round_trace(
+                    state,
+                    trace_payload={
+                        "round_index": round_index,
+                        "global_intent": {},
+                        "operation_intent": {},
+                        "policy_plan": {},
+                        "domain_verdicts": [],
+                        "pda_feedback": report_payload,
+                        "qos_feedback": {},
+                        "mobility_feedback": {},
+                        "diagnosis": diagnosis,
+                    },
+                )
+                state.latest_result = ControlRoundResult(
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    completed=False,
+                    global_intent={},
+                    unified_plan={},
+                    qos_feedback={},
+                    mobility_feedback={},
+                    diagnosis=diagnosis,
+                    round_count=round_index,
+                    retry_count=max(0, round_index - 1),
+                    round_traces=state.round_traces,
+                )
+                log_event(
+                    self.main_agent.logger,
+                    "control_round_complete",
+                    session_id=session_id,
+                    round_index=round_index,
+                    completed=False,
+                    requested_domains="<planning_failed>",
+                    diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
+                    execution_status="Failed",
+                )
+                state.previous_diagnosis = diagnosis
+                state.previous_report_payload = dict(report_payload)
+                state.feedback_context = build_feedback_context(
+                    state.feedback_context,
+                    pda_feedback=report_payload,
+                    diagnosis=diagnosis,
+                    domain_verdicts=[],
+                    mediator_decision={},
+                    round_index=round_index,
+                )
+                if round_index >= self.max_rounds:
+                    break
+                log_event(
+                    self.main_agent.logger,
+                    "control_round_retry_scheduled",
+                    session_id=session_id,
+                    next_round=round_index + 1,
+                    diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
+                    recommended_consumer=self._retry_consumer(state.previous_report_payload) or "<none>",
+                )
+                continue
+            previous_operation_intent = operation_intent.model_copy(deep=True)
+
+            self._apply_trace_metadata(self.pd_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
+            try:
+                round_execution = execute_planned_round(
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    round_index=round_index,
+                    global_intent=global_intent,
+                    operation_intent=operation_intent,
+                    policy_plan=policy_plan,
+                    cr_tool=self.cr_tool,
+                    pd_agent=self.pd_agent,
+                    ad_tool=self.ad_tool,
+                )
+            finally:
+                self._clear_trace_metadata(self.pd_agent)
+            state.completed = round_execution.completed
+            report = round_execution.report
+            qos_feedback = round_execution.qos_feedback
+            mobility_feedback = round_execution.mobility_feedback
+            diagnosis = round_execution.diagnosis
+            self._remember("AD", diagnosis)
+            append_round_trace(
+                state,
+                trace_payload=json.loads(json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
+            )
+
+            state.latest_result = ControlRoundResult(
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                completed=state.completed,
+                global_intent=global_intent.model_dump(mode="json"),
+                unified_plan=round_execution.unified_plan.model_dump(mode="json"),
+                qos_feedback=qos_feedback,
+                mobility_feedback=mobility_feedback,
+                diagnosis=diagnosis,
+                round_count=round_index,
+                retry_count=max(0, round_index - 1),
+                round_traces=state.round_traces,
+            )
+            log_event(
+                self.main_agent.logger,
+                "control_round_complete",
+                session_id=session_id,
+                round_index=round_index,
+                completed=state.completed,
+                requested_domains=",".join(item.value for item in global_intent.requested_domains) or "<empty>",
+                diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
+                execution_status=report.execution_status if report is not None else "blocked",
+            )
+            if state.completed:
+                break
+
+            state.previous_diagnosis = diagnosis
+            state.previous_mediator_decision = dict(round_execution.mediator_decision_payload)
+            report_payload = report.model_dump(mode="json") if report is not None else {
+                "execution_status": "Failed",
+                "violation_details": diagnosis.get("reason_summary") or "round execution failed",
+                "correction_suggestion": "; ".join(diagnosis.get("recommended_actions") or []),
+                "recommended_consumer": "optimization_strategy",
+            }
+            state.previous_report_payload = dict(report_payload)
+            state.feedback_context = build_feedback_context(
+                state.feedback_context,
+                pda_feedback=report_payload,
+                diagnosis=diagnosis,
+                domain_verdicts=round_execution.domain_verdict_payloads,
+                mediator_decision=round_execution.mediator_decision_payload,
+                round_index=round_index,
+            )
+            log_event(
+                self.main_agent.logger,
+                "control_round_retry_scheduled",
+                session_id=session_id,
+                next_round=round_index + 1,
+                diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
+                recommended_consumer=self._retry_consumer(state.previous_report_payload) or "<none>",
+            )
+
+        finish_control_session(session_id=session_id, snapshot_id=snapshot_id, state=state)
+        if state.latest_result is None:
+            raise RuntimeError("main control orchestrator produced no result")
+        return state.latest_result
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the main control orchestrator end-to-end.",
+    )
+    parser.add_argument(
+        "user_input",
+        nargs="?",
+        help="Natural-language control request. If omitted, stdin is used.",
+    )
+    parser.add_argument(
+        "--scenario-id",
+        dest="scenario_id",
+        default="",
+        help="Optional trace scenario identifier.",
+    )
+    parser.add_argument(
+        "--scenario-tag",
+        dest="scenario_tags",
+        action="append",
+        default=[],
+        help="Optional trace scenario tag. Repeat to provide multiple tags.",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        dest="max_rounds",
+        type=int,
+        default=3,
+        help="Maximum control-loop rounds to run.",
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Pretty-print the JSON result.",
+    )
+    parser.add_argument(
+        "--deepseek",
+        action="store_true",
+        dest="use_deepseek",
+        help="Use deepseek-v4-flash for all agents instead of the default models.",
+    )
+    return parser.parse_args(argv)
+
+
+def _resolve_user_input(cli_value: Optional[str]) -> str:
+    text = str(cli_value or "").strip()
+    if text:
+        return text
+    if not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+        if text:
+            return text
+    raise ValueError("user_input is required either as a positional argument or via stdin")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _parse_args(argv)
+    try:
+        user_input = _resolve_user_input(args.user_input)
+        orchestrator = MainControlOrchestrator(max_rounds=args.max_rounds, use_local_model=True, use_deepseek=args.use_deepseek)
+        result = orchestrator.run(
+            user_input,
+            scenario_id=args.scenario_id,
+            scenario_tags=args.scenario_tags,
+        )
+        payload = result.__dict__
+        print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
+        return 0
+    except Exception as exc:
+        error_payload = {
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        print(json.dumps(error_payload, ensure_ascii=False, indent=2 if args.pretty else None), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

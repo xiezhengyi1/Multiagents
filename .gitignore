@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.vscode
+.agent
+.env
+# 运行存储
+experiments/results
+runtime
+tests
+training/intent_encoding
+training/main_control
+training/optimization_strategy
+training/optimizer
+training/policy_dispatch
+training/projections
+training/single_control
+training/trajectories
+training/workflow
+!src/shared/runtime
+# 知识库
+data
+
+*.go
+*.json
+*.jsonl
+*.yaml
+*.yml
+*.md
+*.log
+*.env
+*.sqlite3
+*.db
+*.bak
+*.zip
+*.tar.gz
+*.exe
+*.dll
+*.csv
