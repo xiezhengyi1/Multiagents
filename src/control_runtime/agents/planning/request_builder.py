@@ -50,12 +50,19 @@ def build_joint_optimizer_request(
             requested_domains = [ControlDomain.QOS, ControlDomain.MOBILITY]
             break
         requested_domains.append(ControlDomain(normalized))
+    if not requested_domains:
+        raise ValueError("optimizer request requires non-empty active_domains from Main/IEA")
 
     ue_contexts = {supi: (get_ue_context_by_supi(supi, snapshot_id=snapshot_id) or {}) for supi in target_supis}
 
-    objective_profile_payload = dict(planning_request.context.objective_profile or {"profile_name": "balanced"})
+    objective_profile_payload = dict(planning_request.context.objective_profile or {})
+    if not objective_profile_payload:
+        raise ValueError("optimizer request requires an explicit objective_profile")
     if profile_name is not None:
-        objective_profile_payload["profile_name"] = str(profile_name or "").strip().lower() or "balanced"
+        normalized_profile = str(profile_name or "").strip().lower()
+        if not normalized_profile:
+            raise ValueError("profile_name must not be empty when provided")
+        objective_profile_payload["profile_name"] = normalized_profile
 
     problem_config = OptimizationProblemConfig()
     if template_name is not None:
@@ -75,7 +82,7 @@ def build_joint_optimizer_request(
         session_id=planning_request.context.session_id,
         snapshot_id=snapshot_id,
         target_ues=target_supis,
-        requested_domains=requested_domains or [ControlDomain.QOS],
+        requested_domains=requested_domains,
         operation_intent=operation_intent.model_dump(mode="json"),
         traffic_state={
             "apps": snapshot.get("apps", []),

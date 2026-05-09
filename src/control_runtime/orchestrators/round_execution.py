@@ -10,6 +10,7 @@ from ..diagnostics.diagnosis import AssuranceDiagnosisTool
 from ..diagnostics.diagnosis.contracts import AssuranceDiagnosisRequest
 from ..diagnostics.mediation import ConflictResolutionTool
 from ..diagnostics.mediation.contracts import ConflictResolutionRequest
+from ..domain.collaboration import ExecutionReentryRequest, PlanningBlockerReport
 from ..domain.control_loop import (
     build_conflict_request_payload,
     build_domain_feedback,
@@ -36,6 +37,8 @@ class RoundExecutionArtifacts:
     trace: ControlRoundTrace
     mediator_decision_payload: Dict[str, Any]
     domain_verdict_payloads: List[Dict[str, Any]]
+    planning_blocker: Optional[PlanningBlockerReport] = None
+    execution_reentry: Optional[ExecutionReentryRequest] = None
 
 
 def execution_order(policy_plan: Optional[PolicyPlanDraft]) -> List[ControlDomain]:
@@ -86,12 +89,75 @@ def execute_planned_round(
     snapshot_data = get_snapshot_data_by_id(snapshot_id) or {}
     if not snapshot_data:
         raise LookupError(f"bound snapshot not found: snapshot_id={snapshot_id}")
+    planning_status = str(policy_plan.planning_status or "").strip().lower()
+    if planning_status != "executable_plan":
+        blocker = PlanningBlockerReport(
+            round_index=round_index,
+            source_agent="optimization_strategy",
+            planning_status=planning_status or "needs_upstream_reground",
+            missing_evidence=list(policy_plan.missing_evidence or []),
+            blocked_targets=list(policy_plan.blocked_targets or []),
+            upstream_requests=list(policy_plan.upstream_requests or []),
+            planner_conflicts=list(policy_plan.planner_conflicts or []),
+            recommended_consumers=[],
+            summary=str(policy_plan.planning_rationale.explanation or "").strip(),
+        )
+        diagnosis = {
+            "root_cause_category": "planning_blocked",
+            "root_cause": "; ".join(
+                policy_plan.upstream_requests
+                or policy_plan.missing_evidence
+                or policy_plan.blocked_targets
+                or policy_plan.planner_conflicts
+            ),
+            "reason_summary": policy_plan.planning_rationale.explanation,
+            "recommended_actions": list(
+                policy_plan.upstream_requests
+                or policy_plan.missing_evidence
+                or policy_plan.blocked_targets
+                or policy_plan.planner_conflicts
+            ),
+        }
+        unified_plan = UnifiedControlPlan(
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            supi=global_intent.supi or operation_intent.supi,
+            global_intent=global_intent,
+            domain_verdicts=[],
+            blocked_domains=[ControlDomain(item) for item in operation_intent.requested_domains if item in {ControlDomain.QOS.value, ControlDomain.MOBILITY.value}],
+            objective_breakdown=policy_plan.optimizer_result or global_intent.objective_profile.model_dump(mode="json"),
+            open_questions=list(operation_intent.open_questions + policy_plan.open_questions),
+        )
+        trace = ControlRoundTrace(
+            round_index=round_index,
+            global_intent=global_intent.model_dump(mode="json"),
+            operation_intent=operation_intent.model_dump(mode="json"),
+            policy_plan=policy_plan.model_dump(mode="json"),
+            domain_verdicts=[],
+            pda_feedback={},
+            qos_feedback={},
+            mobility_feedback={},
+            diagnosis=diagnosis,
+            planning_blocker=blocker.model_dump(mode="json"),
+        )
+        return RoundExecutionArtifacts(
+            completed=False,
+            report=None,
+            diagnosis=diagnosis,
+            qos_feedback={},
+            mobility_feedback={},
+            unified_plan=unified_plan,
+            trace=trace,
+            mediator_decision_payload={},
+            domain_verdict_payloads=[],
+            planning_blocker=blocker,
+        )
     qos_proposal, mobility_proposal = split_domain_proposals(policy_plan)
     initial_verdicts: List[DomainVerdict] = []
     if qos_proposal:
-        initial_verdicts.append(DomainVerdict(domain=ControlDomain.QOS, status=DomainStatus.APPROVED, summary="QoS proposal ready."))
+        initial_verdicts.append(DomainVerdict(domain=ControlDomain.QOS, status=DomainStatus.PROPOSED, summary="QoS proposal ready for mediation."))
     if mobility_proposal:
-        initial_verdicts.append(DomainVerdict(domain=ControlDomain.MOBILITY, status=DomainStatus.APPROVED, summary="AM policy proposal ready."))
+        initial_verdicts.append(DomainVerdict(domain=ControlDomain.MOBILITY, status=DomainStatus.PROPOSED, summary="AM policy proposal ready for mediation."))
 
     conflict_result = cr_tool.run(
         ConflictResolutionRequest(
@@ -158,6 +224,20 @@ def execute_planned_round(
         },
     )
     diagnosis = ad_tool.run(diagnosis_request).model_dump(mode="json")
+    execution_reentry = None
+    if report is not None and report.execution_status != "Success":
+        feedback_payload = report.feedback_payload if isinstance(report.feedback_payload, dict) else {}
+        execution_reentry = ExecutionReentryRequest(
+            round_index=round_index,
+            source_agent="policy_dispatch",
+            recommended_consumers=[],
+            target_bindings_at_risk=list(feedback_payload.get("target_bindings_at_risk") or []),
+            policy_objects_at_risk=list(feedback_payload.get("policy_objects_at_risk") or []),
+            reason_by_domain=dict(feedback_payload.get("reason_by_domain") or {}),
+            failure_scope=str(report.failure_scope or "none"),
+            failures=list(feedback_payload.get("failures") or []),
+            summary=str(report.violation_details or diagnosis.get("reason_summary") or "").strip(),
+        )
 
     unified_plan = UnifiedControlPlan(
         session_id=session_id,
@@ -176,8 +256,38 @@ def execute_planned_round(
             for verdict in domain_verdicts
             if verdict.status in {DomainStatus.REJECTED, DomainStatus.NEEDS_REVISION, DomainStatus.INCOMPLETE_CONTEXT, DomainStatus.FAILED}
         ],
-        objective_breakdown=policy_plan.planning_metadata or global_intent.objective_profile.model_dump(mode="json"),
+        objective_breakdown=policy_plan.optimizer_result or global_intent.objective_profile.model_dump(mode="json"),
         control_churn_count=len(approved_policies(report)),
+        agent_contributions=[
+            {"agent": "main_control", "summary": str(global_intent.routing_rationale or "").strip(), "payload": global_intent.model_dump(mode="json")},
+            {
+                "agent": "intent_encoding",
+                "summary": str(
+                    operation_intent.domain_revision_rationale
+                    or operation_intent.operation_type
+                    or ""
+                ).strip(),
+                "payload": operation_intent.model_dump(mode="json"),
+            },
+            {"agent": "optimization_strategy", "summary": str(policy_plan.planning_rationale.explanation or "").strip(), "payload": policy_plan.model_dump(mode="json")},
+        ],
+        agent_conflicts=[
+            {
+                "agents": ["main_control", "intent_encoding"],
+                "summary": str(operation_intent.domain_revision_rationale or "").strip(),
+                "impact": str(operation_intent.domain_resolution or "").strip(),
+            }
+            for _ in [1]
+            if operation_intent.domain_revision_needed
+        ],
+        handoff_records=[
+            {"source_agent": "main_control", "target_agent": "intent_encoding", "artifact_type": "GlobalControlIntent", "summary": str(global_intent.routing_decision or "").strip()},
+            {"source_agent": "intent_encoding", "target_agent": "optimization_strategy", "artifact_type": "OperationIntent", "summary": str(operation_intent.domain_resolution or "").strip()},
+        ],
+        open_questions=[
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else item
+            for item in (operation_intent.open_questions + policy_plan.open_questions)
+        ],
     )
     trace = ControlRoundTrace(
         round_index=round_index,
@@ -189,6 +299,7 @@ def execute_planned_round(
         qos_feedback=qos_feedback,
         mobility_feedback=mobility_feedback,
         diagnosis=diagnosis,
+        execution_reentry=execution_reentry.model_dump(mode="json") if execution_reentry is not None else {},
     )
     return RoundExecutionArtifacts(
         completed=completed,
@@ -200,6 +311,7 @@ def execute_planned_round(
         trace=trace,
         mediator_decision_payload=mediator_decision.model_dump(mode="json"),
         domain_verdict_payloads=[item.model_dump(mode="json") for item in domain_verdicts],
+        execution_reentry=execution_reentry,
     )
 
 

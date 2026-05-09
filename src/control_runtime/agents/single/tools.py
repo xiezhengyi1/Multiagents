@@ -146,6 +146,9 @@ def _derive_strictest_bandwidth(
 
 
 def _build_qos_target_envelopes(flows: List[FlowSelector], objective_profile: str) -> List[QosTargetEnvelope]:
+    normalized_profile = str(objective_profile or "").strip()
+    if not normalized_profile:
+        raise ValueError("objective_profile must not be empty")
     request_signals = _profile_request_signals(objective_profile)
     envelopes: List[QosTargetEnvelope] = []
     for flow in flows:
@@ -173,7 +176,7 @@ def _build_qos_target_envelopes(flows: List[FlowSelector], objective_profile: st
                 strictest_max_br_dl_mbps=_derive_strictest_bandwidth(flow.bw_dl, request_signals, direction="dl"),
                 strictest_gbr_ul_mbps=_derive_strictest_bandwidth(flow.gbr_ul, request_signals, direction="ul"),
                 strictest_gbr_dl_mbps=_derive_strictest_bandwidth(flow.gbr_dl, request_signals, direction="dl"),
-                rationale=[f"grounded_from_flow:{flow_id}", f"objective_profile:{str(objective_profile or 'balanced').strip() or 'balanced'}"],
+                rationale=[f"grounded_from_flow:{flow_id}", f"objective_profile:{normalized_profile}"],
             )
         )
     return envelopes
@@ -192,6 +195,9 @@ def _build_runtime_planning_request(
     if not normalized_supi:
         raise ValueError("supi must not be empty")
     normalized_domains = _normalize_domains(requested_domains)
+    normalized_profile = str(objective_profile or "").strip().lower()
+    if not normalized_profile:
+        raise ValueError("objective_profile must not be empty")
     flow_rows = _resolve_flow_catalog_rows(normalized_supi, flow_ids, snapshot_id)
     flows = [_flow_selector_from_catalog(item, normalized_supi) for item in flow_rows]
     operation_intent = OperationIntent(
@@ -205,9 +211,9 @@ def _build_runtime_planning_request(
         resolution_status="resolved",
         requested_domains=normalized_domains,
         domain_evidence={},
-        objective_profile_hint=str(objective_profile or "").strip(),
+        objective_profile_hint=normalized_profile,
         flows=flows,
-        qos_target_envelopes=_build_qos_target_envelopes(flows, objective_profile),
+        qos_target_envelopes=_build_qos_target_envelopes(flows, normalized_profile),
     )
     return PlanningRequest(
         operation_intent=operation_intent,
@@ -218,7 +224,7 @@ def _build_runtime_planning_request(
             snapshot_metadata={},
             active_domains=normalized_domains,
             main_round_strategy="initial_grounding",
-            objective_profile={"profile_name": str(objective_profile or "balanced").strip() or "balanced"},
+            objective_profile={"profile_name": normalized_profile},
             required_evidence=["qos_runtime_evidence"],
         ),
     )
@@ -244,7 +250,7 @@ def build_single_agent_tools(
         supi: str,
         flow_ids: List[str],
         requested_domains: List[str],
-        objective_profile: Literal["balanced", "latency", "throughput", "stability"] = "balanced",
+        objective_profile: Literal["balanced", "latency", "throughput", "stability"],
         runtime: ToolRuntime[AgentRuntimeContext] = None,
     ) -> str:
         """Run the optimizer after single-agent grounding and return summary plus full result."""
@@ -260,7 +266,7 @@ def build_single_agent_tools(
         result = run_optimizer(
             build_joint_optimizer_request(
                 planning_request,
-                profile_name=str(objective_profile or "balanced").strip().lower(),
+                profile_name=str(objective_profile or "").strip().lower(),
                 template_name="joint_balanced",
                 qos_relaxation_ratio=0.2,
                 slice_kpi_source="qos",
@@ -315,7 +321,7 @@ def build_single_agent_tools(
             raise RuntimeError(f"UE context for {normalized_supi} contains no policy-relevant mobility fields")
         return json.dumps(trimmed, ensure_ascii=False)
 
-    normalized_domains = _normalize_domains(requested_domains or ["qos", "mobility"])
+    normalized_domains = _normalize_domains(requested_domains) if requested_domains is not None else ["qos", "mobility"]
     tools: List[Any] = []
     if "qos" in normalized_domains:
         tools.extend(

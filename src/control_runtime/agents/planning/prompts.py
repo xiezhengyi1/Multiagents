@@ -28,6 +28,7 @@ Output contract:
 - Return `OsaAdvisorOutput`.
 - The top-level JSON value must be an object with `sm_policies`, `am_policy`, `ursp_policies`, and optional `planning_metadata`.
 - Never return a bare `SmPolicySpec` object, a bare `AmPolicySpec` object, a bare array, or plain text.
+- Never add top-level keys outside the `OsaAdvisorOutput` schema.
 - Do not return action labels such as `accept_preview` or `rerun_with_profile`.
 - Do not invent unsupported identifiers or nested policy payloads.
 - Return complete grounded policy values for every field required by the schema.
@@ -69,6 +70,8 @@ Hard rules:
 - If mediator revision requests or unified hard constraints exist, repair those issues in this round.
 - Treat `main_retry_scope`, `revision_requests`, and `unified_constraints` in the planning context as binding control guidance.
 - If the optimizer preview is infeasible due to missing context, do not pretend it is executable.
+- If the optimizer preview is infeasible, incomplete, or missing grounded assignments for one or more targeted flows, do not return `planning_status="executable_plan"`.
+- In those cases, return `partial_plan` or `needs_upstream_reground` and preserve the blocking reason in `missing_evidence`, `blocked_targets`, `upstream_requests`, or `planner_conflicts`.
 - Prefer the smallest executable policy set that satisfies the request.
 - Do not treat the QoS optimizer as a soft-violation scorer. The current session-domain solver uses hard slice feasibility checks for latency, jitter, and loss before assigning a flow to a slice.
 - Do not suggest `PRA_CH` when the inspected mobility context lacks `presenceAreas`.
@@ -126,7 +129,9 @@ def build_advisor_user_prompt(
 		"- Inspect the structured evidence and return one complete grounded OsaAdvisorOutput.\n"
 		"- The top-level JSON must be an OsaAdvisorOutput object, never a bare policy item or bare array.\n"
 		"- `sm_policies` and `ursp_policies` must be arrays; use `[]`, not `null`.\n"
-		"- Use tools to ground every required executable field before returning.\n"
+		"- If the evidence is sufficient, return `planning_status=\"executable_plan\"` and ground every required executable field.\n"
+		"- If the evidence is insufficient, or optimizer output is infeasible/incomplete, return `partial_plan` or `needs_upstream_reground` instead of inventing a full executable plan.\n"
+		"- Never add top-level keys outside the OsaAdvisorOutput schema.\n"
 		"- Prefer optimizer preview `sla` values over `telemetry` values when filling final policy fields.\n"
 		"- Respect `control_semantics.current_stage`; optimize only the active stage carried in this round's OperationIntent.\n"
 		"- Do not emit empty placeholder objects for optional sections; omit them instead.\n"
@@ -137,4 +142,38 @@ def build_advisor_user_prompt(
 	)
 
 
-__all__ = ["OSA_SYSTEM_PROMPT", "build_advisor_user_prompt"]
+def build_validation_retry_prompt(
+	*,
+	base_prompt: str,
+	issues: list[str],
+) -> str:
+	repair_rules = [
+		"Return one corrected OsaAdvisorOutput JSON object only.",
+		"Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
+		"The top-level JSON value must be an object, never a bare array and never a bare policy item.",
+		"Do not invent identifiers or executable fields that are not grounded by this round's evidence.",
+		"If the optimizer preview is infeasible, incomplete, or missing grounded assignments, do not return executable_plan.",
+		"In that case return partial_plan or needs_upstream_reground with explicit blocking reasons.",
+	]
+	joined = " | ".join(issues)
+	if "bare array" in joined or "non-object payload" in joined:
+		repair_rules.append("Your previous answer used the wrong top-level shape. Wrap all policy arrays inside OsaAdvisorOutput.")
+	if "bare SmPolicySpec" in joined or "bare policy item" in joined:
+		repair_rules.append("Do not emit a standalone policy object. Put SM policies inside `sm_policies`.")
+	if "Extra inputs are not permitted" in joined:
+		repair_rules.append("Remove every unsupported top-level field. Only emit fields defined by OsaAdvisorOutput.")
+	if "did not converge" in joined or "max iterations" in joined:
+		repair_rules.append("Stop extra tool use unless it adds new evidence. Finalize from current evidence with executable_plan only if fully grounded; otherwise return partial_plan or needs_upstream_reground.")
+	if "infeasible" in joined:
+		repair_rules.append("Preserve infeasibility explicitly in planning_status and blocking fields instead of forcing executable output.")
+	return (
+		f"{base_prompt}\n\n"
+		"Your previous attempt failed validation.\n"
+		"Validation errors:\n- "
+		+ "\n- ".join(issues)
+		+ "\n\n"
+		+ "\n".join(repair_rules)
+	)
+
+
+__all__ = ["OSA_SYSTEM_PROMPT", "build_advisor_user_prompt", "build_validation_retry_prompt"]

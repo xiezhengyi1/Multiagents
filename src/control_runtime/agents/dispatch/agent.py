@@ -263,19 +263,16 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         )
         failure_phase = str((getattr(outcome, "feedback_payload", {}) or {}).get("phase") or "").strip()
 
-        compile_result = metrics_payload.get("policy_plan") or {
-            "session_id": strategy_payload.get("session_id"),
-            "snapshot_id": strategy_payload.get("snapshot_id"),
-            "supi": strategy_payload.get("supi"),
-            "policies": strategy_payload.get("all_policies") or [],
-        }
-        compile_status = "error" if failure_phase == "compile" else "success"
+        compile_result = metrics_payload.get("policy_plan")
+        compile_status = "error" if failure_phase == "compile" else ("success" if isinstance(compile_result, dict) else "missing")
         compile_payload: Any = compile_result
         if compile_status == "error":
             compile_payload = {
                 "error": str(getattr(outcome, "violation_details", "") or "compile failed"),
                 "feedback_payload": getattr(outcome, "feedback_payload", {}) or {},
             }
+        elif compile_status == "missing":
+            compile_payload = {"compile_status": "missing", "osa_output": strategy_payload}
         self._append_trace_tool_call(
             messages,
             tool_name="compile_policy_plan",
@@ -283,10 +280,10 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
             result=compile_payload,
             status=compile_status,
         )
-        if compile_status == "error":
+        if compile_status != "success":
             return messages
 
-        policies = compile_result.get("policies") or strategy_payload.get("all_policies") or []
+        policies = compile_result.get("policies") or []
         if not isinstance(policies, list):
             raise TypeError("Compiled policy list must be a list")
         for policy in policies:
@@ -345,7 +342,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
             self._append_trace_tool_call(
                 messages,
                 tool_name="build_feedback_payload",
-                args={"recommended_consumer": feedback_payload.get("recommended_consumer")},
+                args={"failure_scope": feedback_payload_data.get("failure_scope") or ""},
                 result=feedback_payload_data,
                 status="success",
             )
@@ -367,19 +364,15 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         return messages
 
     def _build_feedback_payload(self, *, strategy_output: Any, outcome: Any) -> Dict[str, Any]:
-        if str(getattr(outcome, "recommended_action", "") or "").strip() != "feedback":
+        execution_status = str(getattr(outcome, "execution_status", "") or "").strip().lower()
+        if execution_status not in {"failed", "partial success"}:
             return getattr(outcome, "feedback_payload", {}) or {}
 
         seed = getattr(outcome, "feedback_payload", {}) or {}
         failures = seed.get("failures") if isinstance(seed.get("failures"), list) else []
         first_failure = failures[0] if failures else {}
-        recommended_consumer = str(getattr(outcome, "recommended_consumer", "") or "").strip()
-        if recommended_consumer not in {"intent_encoding", "optimization_strategy"}:
-            return seed
 
         payload = {
-            "target_agent": recommended_consumer,
-            "feedback_type": "intent_resolution" if recommended_consumer == "intent_encoding" else "policy_plan_adjustment",
             "supi": str(getattr(strategy_output, "supi", "") or seed.get("supi") or "").strip(),
             "policy_id": str(first_failure.get("policy_id") or seed.get("policy_id") or "").strip(),
             "flow_id": str(first_failure.get("flow_id") or seed.get("flow_id") or "").strip(),
@@ -389,8 +382,31 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
                 or seed.get("error")
                 or ""
             ).strip(),
-            "correction_suggestion": str(getattr(outcome, "correction_suggestion", "") or "").strip(),
             "dispatch_attempts": int(getattr(outcome, "dispatch_attempts", 0) or 0),
+            "target_bindings_at_risk": [
+                str(value).strip()
+                for value in [
+                    first_failure.get("supi"),
+                    first_failure.get("app_id"),
+                    first_failure.get("flow_id"),
+                ]
+                if str(value or "").strip()
+            ],
+            "policy_objects_at_risk": [
+                str(value).strip()
+                for value in [
+                    first_failure.get("policy_id"),
+                    first_failure.get("policy_type"),
+                ]
+                if str(value or "").strip()
+            ],
+            "reason_by_domain": {
+                str(first_failure.get("domain") or "unknown"): str(
+                    first_failure.get("error")
+                    or getattr(outcome, "violation_details", "")
+                    or ""
+                ).strip()
+            },
         }
         if seed:
             payload["controller_feedback"] = seed

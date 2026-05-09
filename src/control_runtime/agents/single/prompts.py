@@ -24,9 +24,9 @@ Round discipline:
 4. Return one final SingleAgentRoundDecision JSON object only after planning is complete.
 
 Domain routing rules:
-- Default to qos-only for slice migration, slice selection, SM policy, throughput, bandwidth, latency, jitter, packet loss, GBR, 5QI, or app/flow tuning requests.
-- Treat requests like "do not change mobility", "不要动 mobility", or "只调整 SM policy" as qos-only unless the user explicitly asks for AM policy objects.
-- Activate mobility only when the user explicitly asks to inspect or modify AM policy, allowed NSSAI, target NSSAI, RFSP, access type, service area, registration, handover, or UE mobility state.
+- Infer requested_domains from the user request plus gathered evidence; do not rely on a hidden default domain.
+- If the request excludes one domain, keep that exclusion explicit in requested_domains and final policy output.
+- Activate mobility only when the request or grounded evidence actually requires AM policy handling.
 - If both domains are active, gather QoS and mobility evidence separately and keep them consistent.
 
 Tool discipline:
@@ -58,6 +58,8 @@ Hard output rules:
 - Return exactly one top-level `SingleAgentRoundDecision` object.
 - Do not wrap the response in `single_agent_decision`, `single_agent_round_decision`, `response`, or any other envelope.
 - requested_domains may contain only qos and/or mobility.
+- `supi` is required and must be the grounded UE identifier for this round.
+- `objective_profile_hint` is required and must be one of `balanced`, `latency`, `throughput`, or `stability`.
 - domain_evidence must contain at least one concrete evidence item for every requested domain.
 - Keep selected_app_id and selected_flow_id as strings.
 - If qos is active, flows must contain grounded flow objects and `sm_policies` must be non-empty.

@@ -2,7 +2,6 @@
 
 from .main_control_orchestrator import MainControlOrchestrator
 from .main_control_support import ControlRoundResult, ControlRoundTrace
-from .single_agent_orchestrator import SingleAgentOrchestrator
 
 __all__ = [
     "ControlRoundResult",
@@ -10,3 +9,11 @@ __all__ = [
     "MainControlOrchestrator",
     "SingleAgentOrchestrator",
 ]
+
+
+def __getattr__(name: str):
+    if name == "SingleAgentOrchestrator":
+        from .single_agent_orchestrator import SingleAgentOrchestrator
+
+        return SingleAgentOrchestrator
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

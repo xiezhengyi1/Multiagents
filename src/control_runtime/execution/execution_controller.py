@@ -20,9 +20,6 @@ class ExecutionOutcome:
     execution_status: str
     performance_metrics: str
     violation_details: str
-    correction_suggestion: str
-    recommended_consumer: str = "none"
-    recommended_action: str = "none"
     failure_scope: str = "none"
     feedback_payload: Dict[str, Any] = field(default_factory=dict)
     dispatch_attempts: int = 0
@@ -33,9 +30,6 @@ class ExecutionOutcome:
             "execution_status": self.execution_status,
             "performance_metrics": self.performance_metrics,
             "violation_details": self.violation_details,
-            "correction_suggestion": self.correction_suggestion,
-            "recommended_consumer": self.recommended_consumer,
-            "recommended_action": self.recommended_action,
             "failure_scope": self.failure_scope,
             "feedback_payload": self.feedback_payload,
             "dispatch_attempts": self.dispatch_attempts,
@@ -48,14 +42,10 @@ class ExecutionDecisionError(RuntimeError):
         self,
         message: str,
         *,
-        recommended_consumer: str,
-        correction_suggestion: str,
         feedback_payload: Optional[Dict[str, Any]] = None,
         dispatch_attempts: int = 0,
     ) -> None:
         super().__init__(message)
-        self.recommended_consumer = recommended_consumer
-        self.correction_suggestion = correction_suggestion
         self.feedback_payload = feedback_payload or {}
         self.dispatch_attempts = dispatch_attempts
 
@@ -94,8 +84,6 @@ class ExecutionController:
     def _build_failure_outcome(
         *,
         detail: str,
-        correction_suggestion: str,
-        recommended_consumer: str,
         failure_scope: str = "none",
         feedback_payload: Optional[Dict[str, Any]] = None,
         dispatch_attempts: int = 0,
@@ -103,7 +91,6 @@ class ExecutionController:
         metrics = json.dumps(
             {
                 "dispatch_attempts": dispatch_attempts,
-                "recommended_consumer": recommended_consumer,
                 "failure_scope": failure_scope,
                 "feedback_payload": feedback_payload or {},
             },
@@ -113,9 +100,6 @@ class ExecutionController:
             execution_status="Failed",
             performance_metrics=metrics,
             violation_details=detail,
-            correction_suggestion=correction_suggestion,
-            recommended_consumer=recommended_consumer,
-            recommended_action="feedback",
             failure_scope=failure_scope,
             feedback_payload=feedback_payload or {},
             dispatch_attempts=dispatch_attempts,
@@ -133,34 +117,6 @@ class ExecutionController:
     def _is_mobility_policy(self, policy: Optional[Dict[str, Any]]) -> bool:
         return isinstance(policy, dict) and str(policy.get("policy_type") or "").strip() == self.AM_POLICY_TYPE
 
-    def _classify_feedback_consumer(
-        self,
-        *,
-        detail: str,
-        policy: Optional[Dict[str, Any]],
-        phase: str,
-    ) -> str:
-        normalized_detail = str(detail or "").strip().lower()
-        if phase == "assurance":
-            return "optimization_strategy"
-        if any(token in normalized_detail for token in ("supi is required", "unknown ue")):
-            return "intent_encoding"
-        if self._is_mobility_policy(policy):
-            return "optimization_strategy"
-        if any(token in normalized_detail for token in ("flow_id is required", "app_id is required", "unknown flow", "unknown app", "not found")):
-            return "intent_encoding"
-        if policy and not self._policy_flow_id(policy):
-            return "intent_encoding"
-        return "optimization_strategy"
-
-    @staticmethod
-    def _build_correction_suggestion(*, recommended_consumer: str, phase: str) -> str:
-        if phase == "assurance":
-            return "Adjust policy parameters or optimization target before re-dispatch."
-        if recommended_consumer == "intent_encoding":
-            return "Re-check SUPI, app_id, flow_id, and intent resolution before building the next plan."
-        return "Revise the policy plan or dispatch strategy before the next execution round."
-
     def _failure_scope_from_policies(self, policies: list[Dict[str, Any]]) -> str:
         if not policies:
             return "none"
@@ -177,26 +133,6 @@ class ExecutionController:
     def _failure_scope_from_entries(self, entries: list[Dict[str, Any]]) -> str:
         policy_types = [entry.get("policy_type") for entry in entries if isinstance(entry, dict)]
         return self._failure_scope_from_policies([{"policy_type": item} for item in policy_types if item])
-
-    @staticmethod
-    def _select_recommended_consumer(failures: list[Dict[str, Any]]) -> str:
-        consumers = [str(item.get("recommended_consumer") or "").strip() for item in failures if isinstance(item, dict)]
-        normalized = {item for item in consumers if item}
-        if not normalized:
-            return "optimization_strategy"
-        if normalized == {"intent_encoding"}:
-            return "intent_encoding"
-        return "optimization_strategy"
-
-    @staticmethod
-    def _build_partial_correction_suggestion(*, recommended_consumer: str, failure_scope: str) -> str:
-        if recommended_consumer == "intent_encoding":
-            return "Re-check UE, app, or flow binding before retrying the failed execution scope."
-        if failure_scope == "mobility":
-            return "Revise the AM policy payload or mobility constraints before retrying mobility execution."
-        if failure_scope == "qos":
-            return "Revise the QoS policy payload or optimization output before retrying QoS execution."
-        return "Revise the failed policy subset before the next execution round."
 
     def _dispatch_single_policy(
         self,
@@ -219,18 +155,8 @@ class ExecutionController:
             f"policy {policy['policy_id']} dispatch failed: "
             f"{str(last_result.get('error') or 'unknown dispatch error').strip()}"
         )
-        recommended_consumer = self._classify_feedback_consumer(
-            detail=failure_message,
-            policy=policy,
-            phase="dispatch",
-        )
         raise ExecutionDecisionError(
             failure_message,
-            recommended_consumer=recommended_consumer,
-            correction_suggestion=self._build_correction_suggestion(
-                recommended_consumer=recommended_consumer,
-                phase="dispatch",
-            ),
             feedback_payload={
                 "phase": "dispatch",
                 "policy_id": policy.get("policy_id"),
@@ -285,8 +211,6 @@ class ExecutionController:
                         "flow_id": policy.get("flow_id"),
                         "phase": "dispatch",
                         "error": str(exc),
-                        "recommended_consumer": exc.recommended_consumer,
-                        "correction_suggestion": exc.correction_suggestion,
                         "dispatch_attempts": exc.dispatch_attempts,
                         "feedback_payload": exc.feedback_payload,
                     }
@@ -300,7 +224,6 @@ class ExecutionController:
                     status="dispatch_failed",
                     failure_scope="mobility" if self._is_mobility_policy(policy) else "qos",
                     error_summary=str(exc),
-                    recommended_consumer=exc.recommended_consumer,
                 )
                 continue
 
@@ -319,11 +242,6 @@ class ExecutionController:
                             f"policy {policy['policy_id']} assurance violated for flow {policy.get('flow_id')}"
                             if verdict.status == "violated"
                             else f"policy {policy['policy_id']} assurance failed: {verdict.reason}"
-                        ),
-                        "recommended_consumer": "optimization_strategy",
-                        "correction_suggestion": self._build_correction_suggestion(
-                            recommended_consumer="optimization_strategy",
-                            phase="assurance",
                         ),
                         "assurance_result": verdict_payload,
                     }
@@ -509,10 +427,10 @@ class ExecutionController:
                 setattr(flow.telemetry, attr, telemetry_patch[key])
 
     def _extract_snapshot_flow_patches(self, strategy_output: Any) -> list[tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]]:
-        planning_metadata = getattr(strategy_output, "planning_metadata", {}) or {}
-        if not isinstance(planning_metadata, dict):
+        execution_writeback = getattr(strategy_output, "execution_writeback", {}) or {}
+        if not isinstance(execution_writeback, dict):
             return []
-        writeback_patch = planning_metadata.get("snapshot_writeback_patch") or {}
+        writeback_patch = execution_writeback.get("snapshot_writeback_patch") or {}
         if not isinstance(writeback_patch, dict):
             return []
         qos_plan = writeback_patch.get("qos_plan") or {}
@@ -621,20 +539,13 @@ class ExecutionController:
             policies = [self.guard.validate_policy(policy) for policy in plan.policies]
         except Exception as exc:
             log_timing(self.logger, "pda_total", datetime.now().timestamp() - total_start, status="error")
-            recommended_consumer = self._classify_feedback_consumer(
-                detail=str(exc),
-                policy=None,
-                phase="compile",
-            )
             return self._build_failure_outcome(
                 detail=str(exc),
-                correction_suggestion=self._build_correction_suggestion(
-                    recommended_consumer=recommended_consumer,
-                    phase="compile",
-                ),
-                recommended_consumer=recommended_consumer,
                 failure_scope="compile",
-                feedback_payload={"phase": "compile", "error": str(exc)},
+                feedback_payload={
+                    "phase": "compile",
+                    "error": str(exc),
+                },
                 dispatch_attempts=0,
             )
 
@@ -657,11 +568,6 @@ class ExecutionController:
                     if str(item.get("policy_id") or "").strip()
                 ]
                 failure_scope = self._failure_scope_from_entries(failures)
-                recommended_consumer = self._select_recommended_consumer(failures)
-                correction_suggestion = self._build_partial_correction_suggestion(
-                    recommended_consumer=recommended_consumer,
-                    failure_scope=failure_scope,
-                )
                 performance_metrics = json.dumps(
                     {
                         "policy_plan": policy_plan.model_dump(mode="json"),
@@ -687,7 +593,6 @@ class ExecutionController:
                     datetime.now().timestamp() - total_start,
                     status="partial" if execution_status == "Partial Success" else "error",
                     failure_scope=failure_scope,
-                    recommended_consumer=recommended_consumer,
                     failed_policy_count=len(failed_policy_ids),
                     successful_policy_count=len(successful_policy_ids),
                 )
@@ -695,9 +600,6 @@ class ExecutionController:
                     execution_status=execution_status,
                     performance_metrics=performance_metrics,
                     violation_details=violation_details or "execution failed",
-                    correction_suggestion=correction_suggestion,
-                    recommended_consumer=recommended_consumer,
-                    recommended_action="feedback",
                     failure_scope=failure_scope,
                     feedback_payload={
                         "phase": "execution",
@@ -736,9 +638,6 @@ class ExecutionController:
                 execution_status="Success",
                 performance_metrics=performance_metrics,
                 violation_details="None",
-                correction_suggestion="None",
-                recommended_consumer="none",
-                recommended_action="commit",
                 failure_scope="none",
                 feedback_payload={},
                 dispatch_attempts=total_dispatch_attempts,
@@ -748,8 +647,6 @@ class ExecutionController:
             log_timing(self.logger, "pda_total", datetime.now().timestamp() - total_start, status="error")
             return self._build_failure_outcome(
                 detail=str(exc),
-                correction_suggestion=exc.correction_suggestion,
-                recommended_consumer=exc.recommended_consumer,
                 failure_scope="mixed",
                 feedback_payload=exc.feedback_payload,
                 dispatch_attempts=exc.dispatch_attempts,

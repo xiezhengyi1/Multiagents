@@ -87,6 +87,10 @@ def _normalize_record(record: Mapping[str, Any], index: int) -> Dict[str, Any]:
     if scenario_tags and not isinstance(scenario_tags, list):
         raise TypeError(f"record #{index} field 'scenario_tags' must be a list when present")
 
+    task_metadata = record.get("task_metadata") or {}
+    if task_metadata and not isinstance(task_metadata, Mapping):
+        raise TypeError(f"record #{index} field 'task_metadata' must be an object when present")
+
     return {
         "record_index": index,
         "user_input": user_input,
@@ -94,6 +98,7 @@ def _normalize_record(record: Mapping[str, Any], index: int) -> Dict[str, Any]:
         "context": str(record.get("context") or record.get("conversation_context") or ""),
         "scenario_id": str(record.get("scenario_id") or record.get("scenarioId") or "").strip(),
         "scenario_tags": [str(item).strip() for item in scenario_tags if str(item).strip()],
+        "task_metadata": dict(task_metadata or {}),
     }
 
 
@@ -338,11 +343,14 @@ def collect_workflow_trajectories(
             )
             result_record = {
                 "record_index": record["record_index"],
+                "task_id": str((record.get("task_metadata") or {}).get("task_id") or "").strip(),
+                "category": str((record.get("task_metadata") or {}).get("category") or "").strip(),
                 "scenario_id": scenario_id,
                 "scenario_tags": merged_tags,
                 "user_input": record["user_input"],
                 "messages": record["messages"],
                 "context": record["context"],
+                "task_metadata": dict(record.get("task_metadata") or {}),
                 "status": "success",
                 "error_type": None,
                 "error": None,
@@ -365,11 +373,14 @@ def collect_workflow_trajectories(
         except Exception as exc:
             result_record = {
                 "record_index": record["record_index"],
+                "task_id": str((record.get("task_metadata") or {}).get("task_id") or "").strip(),
+                "category": str((record.get("task_metadata") or {}).get("category") or "").strip(),
                 "scenario_id": scenario_id,
                 "scenario_tags": merged_tags,
                 "user_input": record["user_input"],
                 "messages": record["messages"],
                 "context": record["context"],
+                "task_metadata": dict(record.get("task_metadata") or {}),
                 "status": "error",
                 "error_type": type(exc).__name__,
                 "error": str(exc),

@@ -10,16 +10,7 @@ from shared.runtime import ToolLoopExecutionError
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.runtime import ArtifactWorkerMixin
 from ...domain.control_plane import (
-    ControlSemanticMode,
-    ControlSemantics,
-    ControlStage,
     GlobalControlIntent,
-    MainRetryScope,
-    MainRoundStrategy,
-    SemanticGoal,
-    SemanticTarget,
-    SemanticTargetType,
-    StageTrigger,
 )
 from shared.logging import log_event
 
@@ -52,10 +43,8 @@ class MainControlInvocation:
 
 class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "main_control"
-    LEGACY_GROUNDING_TOOLS = set()
-    GROUNDING_TOOLS = set()
 
-    def __init__(self, model_name: str = "qwen-plus", use_local_model: bool = False) -> None:
+    def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507", use_local_model: bool = False) -> None:
         super().__init__(model_name=model_name, use_local_model=use_local_model)
         self.agent_name = "main_control"
         self.initialize_agent_runtime(logger_color="\033[93m")
@@ -238,7 +227,11 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             f"{base_prompt}\n\n"
             "Your previous draft failed validation.\n"
             "Validation errors:\n- " + "\n- ".join(issues) + "\n\n"
-            "Return a corrected GlobalControlIntent JSON only."
+            "Correct the output now.\n"
+            "Return exactly one GlobalControlIntent JSON object.\n"
+            "Top-level output must be an object, never a list.\n"
+            "Do not return markdown or explanation.\n"
+            "Return every routing field even when the value is an empty list or empty string."
         )
 
     @staticmethod
@@ -249,7 +242,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 GlobalControlIntent,
                 error_message="Main Agent returned no structured_response",
             )
-            intent.intent_encoding_guidance = ""
             return intent
         except Exception as exc:
             raise RuntimeError(f"Main Agent returned invalid GlobalControlIntent payload: {exc}") from exc
@@ -282,7 +274,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         allowed_retry_scopes = {
             "full_reground",
             "partial_reground",
-            "policy_repair",
+            "target_stable",
             "execution_retry_forbidden",
             "",
         }
@@ -311,12 +303,12 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             errors.append(f"round_strategy contains unsupported value: {round_strategy or '<empty>'}")
         elif round_index <= 1 and round_strategy != "initial_grounding":
             errors.append("round-1 main routing must set round_strategy=initial_grounding")
-        explicit_supi = ""
-        match = re.search(r"(?i)(imsi-\d{5,})", str(user_input or ""))
-        if match:
-            explicit_supi = match.group(1)
-        if explicit_supi and str(intent.supi or "").strip() != explicit_supi:
-            errors.append(f"supi must equal explicit user-provided identifier {explicit_supi}")
+        explicit_supis = re.findall(r"(?i)(imsi-\d{5,})", str(user_input or ""))
+        unique_explicit_supis = list(dict.fromkeys(explicit_supis))
+        if len(unique_explicit_supis) == 1:
+            explicit_supi = unique_explicit_supis[0]
+            if str(intent.supi or "").strip() != explicit_supi:
+                errors.append(f"supi must equal explicit user-provided identifier {explicit_supi}")
         if isinstance(intent.domain_evidence, dict) and any(intent.domain_evidence.values()):
             unknown_domains = [key for key in intent.domain_evidence.keys() if key not in {"qos", "mobility"}]
             if unknown_domains:
@@ -359,10 +351,18 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         if round_index <= 1 and retry_scope and retry_scope != "full_reground":
             errors.append("round-1 main routing must not request retry scopes other than full_reground")
         next_agent = str(intent.next_agent or "").strip()
-        if next_agent == "optimization_strategy" and retry_scope != "policy_repair":
-            errors.append("next_agent=optimization_strategy requires retry_scope=policy_repair")
-        if retry_scope == "policy_repair" and next_agent != "optimization_strategy":
-            errors.append("retry_scope=policy_repair requires next_agent=optimization_strategy")
+        if not str(intent.routing_decision or "").strip():
+            errors.append("routing_decision must not be empty")
+        if not str(intent.routing_rationale or "").strip():
+            errors.append("routing_rationale must not be empty")
+        if next_agent == "optimization_strategy" and not bool(intent.reuse_contract.allowed):
+            errors.append("next_agent=optimization_strategy requires reuse_contract.allowed=true")
+        if next_agent == "intent_encoding" and intent.reuse_contract.allowed:
+            errors.append("reuse_contract.allowed must be false when next_agent=intent_encoding")
+        if next_agent == "intent_encoding" and not str(intent.intent_encoding_guidance or "").strip() and round_index > 1:
+            errors.append("retry routing into intent_encoding requires explicit intent_encoding_guidance")
+        if not intent.handoff_expectations:
+            errors.append("handoff_expectations must not be empty")
         # 关键步骤：诊断类别只作为上下文交给 LLM，不在这里做域级硬裁决。
         return errors
 
@@ -373,239 +373,5 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         context: str,
         user_input: str,
     ) -> None:
-        try:
-            payload = json.loads(str(context or "").strip()) if str(context or "").strip() else {}
-        except Exception:
-            payload = {}
-
-        if intent.retry_scope is None:
-            if intent.round_strategy == MainRoundStrategy.INITIAL_GROUNDING:
-                intent.retry_scope = None
-            elif intent.round_strategy == MainRoundStrategy.REGROUNDING:
-                intent.retry_scope = MainRetryScope.FULL_REGROUND
-            elif intent.round_strategy == MainRoundStrategy.POLICY_REVISION:
-                intent.retry_scope = MainRetryScope.POLICY_REPAIR
-            elif intent.round_strategy == MainRoundStrategy.JOINT_REPLAN:
-                intent.retry_scope = MainRetryScope.PARTIAL_REGROUND
-
-        if not intent.diagnosis_summary:
-            if isinstance(payload, dict):
-                diagnosis = payload.get("previous_diagnosis")
-                if isinstance(diagnosis, dict):
-                    intent.diagnosis_summary = str(
-                        diagnosis.get("reason_summary")
-                        or diagnosis.get("root_cause")
-                        or ""
-                    ).strip()
-        intent.control_semantics = MainControlAgent._derive_control_semantics(user_input)
-        intent.intent_encoding_guidance = MainControlAgent._derive_intent_encoding_guidance(intent)
-
-    @staticmethod
-    def _derive_control_semantics(user_input: str) -> ControlSemantics:
-        text = str(user_input or "").strip()
-        if not text:
-            return ControlSemantics()
-
-        primary_text = text
-        fallback_text = ""
-        secondary_text = ""
-        final_text = ""
-        mode = ControlSemanticMode.SINGLE_STEP
-
-        fallback_match = re.search(r"(必要时|失败时|若失败则|如果失败就|不行就)", text)
-        if fallback_match:
-            mode = ControlSemanticMode.CONDITIONAL_FALLBACK
-            primary_text = text[: fallback_match.start()].strip(" ，,。；;")
-            fallback_text = text[fallback_match.end() :].strip(" ，,。；;")
-        elif "再看" in text or "然后看" in text:
-            mode = ControlSemanticMode.STAGED_PRIORITY
-            splitter = "再看" if "再看" in text else "然后看"
-            first, second = text.split(splitter, 1)
-            primary_text = first.strip(" ，,。；;")
-            secondary_text = second.strip(" ，,。；;")
-        final_source = secondary_text or fallback_text or primary_text or text
-        if "最后处理" in final_source:
-            before, after = final_source.rsplit("最后处理", 1)
-            if before.strip():
-                if secondary_text:
-                    secondary_text = before.strip(" ，,。；;")
-                elif fallback_text:
-                    fallback_text = before.strip(" ，,。；;")
-                elif mode == ControlSemanticMode.SINGLE_STEP:
-                    mode = ControlSemanticMode.STAGED_PRIORITY
-                    primary_text = before.strip(" ，,。；;")
-            final_text = after.strip(" ，,。；;")
-        elif "其余业务延后" in text or "其余业务最后处理" in text:
-            if mode == ControlSemanticMode.SINGLE_STEP:
-                mode = ControlSemanticMode.STAGED_PRIORITY
-            final_text = "其余业务"
-
-        stages: List[ControlStage] = []
-        primary_stage = MainControlAgent._build_semantic_stage(
-            stage_index=1,
-            name="primary",
-            trigger=StageTrigger.INITIAL,
-            clause=primary_text,
-            default_goal=SemanticGoal.PROTECT,
-        )
-        if primary_stage.targets:
-            stages.append(primary_stage)
-
-        if fallback_text:
-            fallback_stage = MainControlAgent._build_semantic_stage(
-                stage_index=len(stages) + 1,
-                name="fallback",
-                trigger=StageTrigger.ON_PREVIOUS_FAILURE,
-                clause=fallback_text,
-                default_goal=SemanticGoal.DEPRIORITIZE,
-            )
-            if primary_stage.targets:
-                fallback_stage.targets = [target.model_copy(deep=True) for target in primary_stage.targets] + fallback_stage.targets
-            if fallback_stage.targets:
-                stages.append(fallback_stage)
-
-        if secondary_text:
-            secondary_stage = MainControlAgent._build_semantic_stage(
-                stage_index=len(stages) + 1,
-                name="secondary",
-                trigger=StageTrigger.AFTER_PREVIOUS_STAGE,
-                clause=secondary_text,
-                default_goal=SemanticGoal.PROTECT,
-            )
-            if secondary_stage.targets:
-                stages.append(secondary_stage)
-
-        if final_text:
-            final_stage = MainControlAgent._build_semantic_stage(
-                stage_index=len(stages) + 1,
-                name="deprioritized",
-                trigger=StageTrigger.AFTER_PREVIOUS_STAGE,
-                clause=final_text,
-                default_goal=SemanticGoal.DEFER if "其余业务" in final_text else SemanticGoal.DEPRIORITIZE,
-            )
-            if final_stage.targets:
-                stages.append(final_stage)
-
-        if not stages:
-            single_stage = MainControlAgent._build_semantic_stage(
-                stage_index=1,
-                name="primary",
-                trigger=StageTrigger.INITIAL,
-                clause=text,
-                default_goal=SemanticGoal.PROTECT,
-            )
-            if single_stage.targets:
-                stages.append(single_stage)
-
-        if len(stages) <= 1:
-            mode = ControlSemanticMode.SINGLE_STEP
-        return ControlSemantics(mode=mode, current_stage=1, stages=stages)
-
-    @staticmethod
-    def _build_semantic_stage(
-        *,
-        stage_index: int,
-        name: str,
-        trigger: StageTrigger,
-        clause: str,
-        default_goal: SemanticGoal,
-    ) -> ControlStage:
-        targets = MainControlAgent._extract_semantic_targets(clause, default_goal=default_goal)
-        summary = clause.strip()
-        return ControlStage(
-            stage_index=stage_index,
-            name=name,
-            trigger=trigger,
-            summary=summary,
-            targets=targets,
-        )
-
-    @staticmethod
-    def _extract_semantic_targets(clause: str, *, default_goal: SemanticGoal) -> List[SemanticTarget]:
-        text = str(clause or "").strip()
-        if not text:
-            return []
-        metric_focus = MainControlAgent._detect_metric_focus(text)
-        goal = MainControlAgent._detect_goal(text, default_goal=default_goal)
-        entities = MainControlAgent._extract_named_entities(text)
-        if not entities and "其余业务" in text:
-            entities = [("其余业务", SemanticTargetType.SCOPE)]
-        targets: List[SemanticTarget] = []
-        for entity_name, target_type in entities:
-            targets.append(
-                SemanticTarget(
-                    semantic_name=entity_name,
-                    target_type=target_type,
-                    goal=goal,
-                    metric_focus=metric_focus,
-                    note=text,
-                )
-            )
-        return targets
-
-    @staticmethod
-    def _extract_named_entities(text: str) -> List[tuple[str, SemanticTargetType]]:
-        token_pattern = r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b"
-        raw_tokens = [token.strip() for token in re.findall(token_pattern, text) if token.strip()]
-        results: List[tuple[str, SemanticTargetType]] = []
-        seen: set[str] = set()
-        for token in raw_tokens:
-            normalized = token.lower()
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            token_type = SemanticTargetType.FLOW if re.search(r"_\d+$", token) else SemanticTargetType.APP
-            results.append((token, token_type))
-        return results
-
-    @staticmethod
-    def _detect_metric_focus(text: str) -> Optional[str]:
-        lowered = str(text or "").lower()
-        if any(token in lowered for token in ("时延", "延迟", "latency", "delay")):
-            return "latency"
-        if any(token in lowered for token in ("吞吐", "带宽", "throughput", "bandwidth", "资源")):
-            return "throughput"
-        if any(token in lowered for token in ("抖动", "jitter", "稳定")):
-            return "jitter"
-        if any(token in lowered for token in ("丢包", "可靠", "loss", "reliability")):
-            return "reliability"
-        return None
-
-    @staticmethod
-    def _detect_goal(text: str, *, default_goal: SemanticGoal) -> SemanticGoal:
-        lowered = str(text or "").lower()
-        if any(token in lowered for token in ("压低", "降", "降低", "牺牲", "最后处理", "deprioritize")):
-            return SemanticGoal.DEPRIORITIZE
-        if any(token in lowered for token in ("延后", "推迟", "defer")):
-            return SemanticGoal.DEFER
-        if any(token in lowered for token in ("观察", "监控", "observe")):
-            return SemanticGoal.OBSERVE
-        return default_goal
-
-    @staticmethod
-    def _derive_intent_encoding_guidance(intent: GlobalControlIntent) -> str:
-        next_agent = str(intent.next_agent or "").strip()
-        if next_agent != "intent_encoding":
-            return ""
-
-        requested_domains = [item.value for item in (intent.requested_domains or [])]
-        requested_set = set(requested_domains)
-        retry_scope = (
-            intent.retry_scope.value
-            if getattr(intent, "retry_scope", None) is not None and hasattr(intent.retry_scope, "value")
-            else str(getattr(intent, "retry_scope", "") or "").strip()
-        )
-
-        if requested_set == {"qos"}:
-            if retry_scope == "partial_reground":
-                return "preserve qos-only domain boundary and reground the qos target binding"
-            return "preserve qos-only domain boundary and ground the requested qos target"
-        if requested_set == {"mobility"}:
-            if retry_scope == "partial_reground":
-                return "preserve mobility-only domain boundary and reground the mobility target binding"
-            return "preserve mobility-only domain boundary and ground the requested mobility target"
-        if requested_set == {"qos", "mobility"}:
-            if retry_scope == "partial_reground":
-                return "preserve joint domain boundary and reground cross-domain target bindings"
-            return "preserve joint domain boundary and ground qos and mobility targets consistently"
-        return ""
+        if intent.intent_encoding_guidance and str(intent.next_agent or "").strip() != "intent_encoding":
+            raise ValueError("intent_encoding_guidance must stay empty unless next_agent=intent_encoding")

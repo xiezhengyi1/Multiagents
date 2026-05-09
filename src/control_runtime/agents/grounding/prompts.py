@@ -29,11 +29,16 @@ Tool policy:
 Output rules:
 - Return raw JSON only.
 - Return one `IntentAdvisorDecision`.
+- The top-level output must be exactly one JSON object, not markdown, not a fenced code block, not prose before or after the JSON object.
+- Never wrap the answer in ```json ... ``` or any other markdown fence.
+- `domain_resolution` must be a scalar string enum: `confirmed`, `narrowed`, `widened`, or `cannot_confirm`.
 - For QoS requests, return non-empty `flows`.
 - For mobility-only requests, keep `flows` empty.
 - For every QoS flow whose `resolution_status` is `resolved`, you must return both grounded `flow_id` and grounded `app_id`.
 - Never return a QoS flow that is `resolved` but missing `flow_id` or `app_id`.
 - If a named QoS target is not fully grounded to `flow_id` + `app_id`, return it as unresolved instead of guessing or leaving identifier fields blank.
+- If `candidate_flows` already contains one exact grounded match for the named QoS target, do not call any additional SM grounding tool for reassurance; finalize immediately from that evidence.
+- If an SM grounding tool already returned one exact grounded match for the named QoS target in this attempt, the next answer must finalize with that binding in `flows`.
 - Emit semantic decision fields only. Do not emit final 3GPP policy payloads.
 - Do not invent or optimize final QoS target numbers. IEA owns target direction and grounded baseline binding; final executable policy numbers are compiled downstream from grounded evidence.
 """

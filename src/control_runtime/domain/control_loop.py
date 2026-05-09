@@ -118,7 +118,7 @@ def build_conflict_request_payload(
         "conflict_scope": {"domains": sorted(domains)},
         "upstream_context": {
             "ue_context": ue_context or {},
-            "planner_cross_domain_verdicts": list((policy_plan.planning_metadata or {}).get("optimizer_cross_domain_verdicts") or []),
+            "planner_cross_domain_verdicts": list((policy_plan.optimizer_result or {}).get("cross_domain_verdicts") or []),
         },
     }
 

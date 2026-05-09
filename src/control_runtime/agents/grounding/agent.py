@@ -22,6 +22,7 @@ from ...domain.policy_plan import OperationIntent
 from shared.logging import log_event, log_timing
 
 from .compiler import IntentCompiler
+from .common import extract_requested_supis, merge_candidate_dicts, merge_catalog_payloads
 from .contracts import IntentAdvisorDecision, IntentEvidence
 from .prompts import IEA_SYSTEM_PROMPT
 from .tool_result_adapter import extract_grounding_tool_payloads
@@ -74,7 +75,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         self.rag_enabled = rag_enabled
         self.compiler = IntentCompiler()
         self.initialize_agent_runtime(logger_color="\033[95m")
-        self._ensure_intent_caches()
         self.tools = [
             search_sm_flow_targets,
             get_sm_ue_context,
@@ -90,120 +90,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             response_model=IntentAdvisorDecision,
             max_iterations=14,
         )
-
-    def _ensure_intent_caches(self) -> None:
-        if not hasattr(self, "compiler"):
-            self.compiler = IntentCompiler()
-
-    # 关键步骤：SM 与 AM grounding 缓存分桶，避免上一轮跨域工具结果污染当前 evidence。
-    def _get_cached_sm_flow_catalog(self, supi: str, *, snapshot_id: str = "") -> Dict[str, Any]:
-        self._ensure_intent_caches()
-        return self.get_cached_runtime_value(
-            "sm_ue_flow_catalog",
-            str(supi or "").strip(),
-            snapshot_id=snapshot_id,
-            default={},
-        ) or {}
-
-    def _cache_sm_flow_catalog(self, supi: str, payload: Dict[str, Any], *, snapshot_id: str = "") -> None:
-        normalized_supi = str(supi or payload.get("supi") or "").strip()
-        if not normalized_supi or not isinstance(payload, dict):
-            return
-        normalized_payload = dict(payload)
-        normalized_payload["supi"] = normalized_supi
-        self.cache_runtime_value(
-            "sm_ue_flow_catalog",
-            normalized_supi,
-            normalized_payload,
-            snapshot_id=snapshot_id,
-        )
-
-    def _cache_sm_ue_context(self, supi: str, payload: Dict[str, Any], *, snapshot_id: str = "") -> None:
-        normalized_supi = str(supi or "").strip()
-        if not normalized_supi or not isinstance(payload, dict):
-            return
-        self.cache_runtime_value(
-            "sm_ue_context",
-            normalized_supi,
-            dict(payload),
-            snapshot_id=snapshot_id,
-        )
-
-    def _get_cached_am_policy_context(self, supi: str, *, snapshot_id: str = "") -> Dict[str, Any]:
-        self._ensure_intent_caches()
-        return self.get_cached_runtime_value(
-            "am_policy_context",
-            str(supi or "").strip(),
-            snapshot_id=snapshot_id,
-            default={},
-        ) or {}
-
-    def _cache_am_policy_context(self, supi: str, payload: Dict[str, Any], *, snapshot_id: str = "") -> None:
-        normalized_supi = str(supi or payload.get("supi") or "").strip()
-        if not normalized_supi or not isinstance(payload, dict):
-            return
-        normalized_payload = dict(payload)
-        normalized_payload["supi"] = normalized_supi
-        self.cache_runtime_value(
-            "am_policy_context",
-            normalized_supi,
-            normalized_payload,
-            snapshot_id=snapshot_id,
-        )
-
-    def _cache_sm_flow_search(
-        self,
-        *,
-        snapshot_id: str,
-        app_name: str,
-        flow_name: str,
-        limit: int,
-        payload: Dict[str, Any],
-    ) -> None:
-        if not isinstance(payload, dict):
-            return
-        self.cache_runtime_value(
-            "sm_flow_search",
-            (
-                str(app_name or "").strip().lower(),
-                str(flow_name or "").strip().lower(),
-                int(limit or 5),
-            ),
-            dict(payload),
-            snapshot_id=snapshot_id,
-        )
-
-    def _cache_am_policy_search(
-        self,
-        *,
-        snapshot_id: str,
-        supi: str,
-        association_id: str,
-        allowed_snssai: str,
-        target_snssai: str,
-        service_area: str,
-        rfsp: str,
-        access_type: str,
-        limit: int,
-        payload: Dict[str, Any],
-    ) -> None:
-        if not isinstance(payload, dict):
-            return
-        self.cache_runtime_value(
-            "am_policy_search",
-            (
-                str(supi or "").strip().lower(),
-                str(association_id or "").strip().lower(),
-                str(allowed_snssai or "").strip().lower(),
-                str(target_snssai or "").strip().lower(),
-                str(service_area or "").strip().lower(),
-                str(rfsp or "").strip().lower(),
-                str(access_type or "").strip().lower(),
-                int(limit or 5),
-            ),
-            dict(payload),
-            snapshot_id=snapshot_id,
-        )
+        self.last_failure_debug: Dict[str, Any] = {}
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> OperationIntent:
         payload = envelope.payload or {}
@@ -303,6 +190,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         total_start = time.perf_counter()
         log_event(self.logger, "iea_analyze_start")
         main_directives = self.compiler.extract_main_directives(context)
+        self.last_failure_debug = {}
 
         try:
             evidence = self._extract_intent_evidence(
@@ -362,6 +250,15 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     evidence=refreshed_evidence,
                     grounding_tools=grounding_tools,
                 )
+                self.last_failure_debug = {
+                    "phase": "intent_encoding",
+                    "attempt_index": attempt_index + 1,
+                    "grounding_tools": list(grounding_tools or []),
+                    "advisor_decision": advisor_decision.model_dump(mode="json"),
+                    "advisor_validation_errors": list(advisor_validation_errors or []),
+                    "grounding_validation_errors": list(validation_errors or []),
+                    "evidence_snapshot": refreshed_evidence.model_dump(mode="json"),
+                }
                 evidence = refreshed_evidence
                 if not advisor_validation_errors and not validation_errors:
                     break
@@ -391,6 +288,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 status="success",
             )
             log_timing(self.logger, "iea_total", time.perf_counter() - total_start, status="success")
+            self.last_failure_debug = {}
             return compiled
         except Exception as exc:
             if "advisor_invocation" in locals() and "advisor_decision" in locals():
@@ -409,6 +307,83 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _build_advisor_prompt(*, evidence: IntentEvidence, context: str) -> str:
+        requested_domains = [str(item or "").strip() for item in (evidence.requested_domains or []) if str(item or "").strip()]
+        domain_mode = ",".join(requested_domains) or "<empty>"
+        qos_required = "qos" in requested_domains
+        mobility_only = requested_domains == ["mobility"]
+        domain_specific_rules: List[str] = [
+            f"- Domain mode for this request: {domain_mode}.",
+            "- Final answer must be exactly one raw JSON object with no markdown fence and no surrounding prose.",
+            "- `domain_resolution` must be one scalar string value, never an object.",
+        ]
+        if qos_required:
+            domain_specific_rules.extend(
+                [
+                    "- This request includes QoS grounding. Final JSON must contain a non-empty flows array.",
+                    "- Every resolved QoS flow must include grounded app_id and grounded flow_id.",
+                    "- If the current evidence does not already ground the QoS target, keep using SM grounding tools until flows is populated or the target is explicitly unresolved.",
+                    "- Do not stop at selected_app_id / selected_flow_id alone; the grounded binding must appear inside flows.",
+                ]
+            )
+            if evidence.candidate_flows:
+                domain_specific_rules.extend(
+                    [
+                        "- Current evidence already contains candidate_flows. Reuse those grounded identifiers directly instead of searching again unless they are ambiguous.",
+                        "- If candidate_flows contains a single exact match for the named QoS target, finalize immediately with that binding in flows.",
+                        "- Do not leave flows empty when candidate_flows is already non-empty.",
+                        "- Do not call get_sm_ue_flow_catalog, search_sm_flow_targets, or get_sm_ue_context merely to reconfirm an already unique exact candidate.",
+                    ]
+                )
+            elif str(evidence.explicit_flow_name or "").strip():
+                domain_specific_rules.extend(
+                    [
+                        f"- No grounded candidate_flows currently exist for the explicit QoS target '{evidence.explicit_flow_name}'.",
+                        "- Before final JSON, call search_sm_flow_targets for that explicit flow target.",
+                        "- After search returns a grounded exact match, copy that app_id + flow_id into flows immediately.",
+                    ]
+                )
+            explicit_target_names = [
+                str(item.flow_name or "").strip()
+                for item in (evidence.explicit_flow_targets or [])
+                if str(item.flow_name or "").strip()
+            ]
+            if len(explicit_target_names) > 1:
+                grounded_explicit_target_names = {
+                    str(item.flow_name or "").strip()
+                    for item in (evidence.candidate_flows or [])
+                    if str(item.flow_name or "").strip() in explicit_target_names
+                }
+                unresolved_explicit_target_names = [
+                    item for item in explicit_target_names
+                    if item not in grounded_explicit_target_names
+                ]
+                domain_specific_rules.extend(
+                    [
+                        "- This request names multiple QoS flow targets.",
+                        f"- Explicit QoS targets in this request: {json.dumps(explicit_target_names, ensure_ascii=False)}.",
+                        "- Every resolved flow in `flows` must correspond to one of those explicit targets and be grounded by catalog/search evidence for that exact target.",
+                        "- When a resolved flow corresponds to an explicit target, keep `flows[].name` equal to that explicit flow name.",
+                        "- If candidate_flows does not already cover all explicit targets, search unresolved explicit targets individually before finalizing.",
+                        "- If any explicit target remains ungrounded, do not substitute a nearby flow name.",
+                    ]
+                )
+                if grounded_explicit_target_names and unresolved_explicit_target_names:
+                    domain_specific_rules.extend(
+                        [
+                            f"- Evidence already grounds these explicit QoS targets: {json.dumps(sorted(grounded_explicit_target_names), ensure_ascii=False)}.",
+                            f"- These explicit QoS targets are still unresolved in current evidence: {json.dumps(unresolved_explicit_target_names, ensure_ascii=False)}.",
+                            "- The next answer must return a mixed flows array: resolved entries for grounded explicit targets, plus unresolved entries for still-unresolved explicit targets.",
+                            "- Never leave flows empty when at least one explicit target is already grounded.",
+                        ]
+                    )
+        if mobility_only:
+            domain_specific_rules.extend(
+                [
+                    "- This is mobility-only grounding. Final JSON must keep flows empty.",
+                    "- Do not call any SM grounding tool: search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
+                    "- Use only AM grounding if more evidence is needed.",
+                ]
+            )
         return (
             "User request:\n"
             f"{evidence.user_input}\n\n"
@@ -419,8 +394,12 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             "Task:\n"
             "- Resolve only the semantic choices that remain ambiguous.\n"
             "- Use tools only when the structured evidence does not already ground the required target.\n"
+            "- You may revise Main's requested domain boundary when grounding evidence proves it is too narrow, too wide, or cannot be confirmed.\n"
+            "- If you revise the domain boundary, populate grounded_requested_domains, domain_resolution, domain_revision_needed, and domain_revision_rationale explicitly.\n"
             "- For every QoS flow with resolution_status='resolved', include grounded flow_id and app_id in the final JSON.\n"
             "- If a QoS target is not fully grounded to flow_id + app_id, do not mark it resolved.\n"
+            "- If the structured evidence already contains the grounded answer, finalize from that evidence without extra tool calls.\n"
+            f"{chr(10).join(domain_specific_rules)}\n"
             "- Return one IntentAdvisorDecision JSON object only."
         )
 
@@ -439,16 +418,75 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             issues.extend(advisor_validation_errors)
         if grounding_validation_errors:
             issues.extend(grounding_validation_errors)
+        repair_rules: List[str] = [
+            "Return one corrected IntentAdvisorDecision JSON object only.",
+            "Do not guess missing identifiers, and do not rely on downstream compilation to fill them.",
+            "Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
+            "`domain_resolution` must be a scalar string, not an object.",
+        ]
+        joined = " | ".join(issues)
+        if "QoS advisor decision must include grounded target flows." in joined:
+            repair_rules.extend(
+                [
+                    "This retry is specifically failing because your previous JSON omitted flows.",
+                    "For the next answer, flows must be non-empty.",
+                    "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
+                    "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
+                    "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return either a resolved or explicitly unresolved flow entry.",
+                    "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
+                ]
+            )
+        if "domain_resolution must be confirmed, narrowed, widened, or cannot_confirm" in joined:
+            repair_rules.extend(
+                [
+                    "Set `domain_resolution` to exactly one of: confirmed, narrowed, widened, cannot_confirm.",
+                    "Do not output a nested object under `domain_resolution`.",
+                ]
+            )
+        if "cannot_confirm domain resolution requires domain_revision_rationale" in joined:
+            repair_rules.extend(
+                [
+                    "If you set `domain_resolution` to `cannot_confirm`, you must include a non-empty `domain_revision_rationale`.",
+                    "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
+                ]
+            )
+        if (
+            "explicitly named QoS flow '" in joined
+            and (
+                "was not grounded by catalog/search evidence" in joined
+                or "must appear in advisor decision flows as resolved or unresolved" in joined
+            )
+        ):
+            repair_rules.extend(
+                [
+                    "For each explicitly named QoS flow, either ground it via catalog/search evidence or leave it unresolved.",
+                    "When a flow is resolved, set `flows[].name` to the explicit flow name that the resolved binding satisfies.",
+                    "Do not return a resolved flow binding for any name that is missing from catalog/search evidence.",
+                ]
+            )
+        if "mobility-only intent must not call SM grounding tools" in joined:
+            repair_rules.extend(
+                [
+                    "This retry is mobility-only.",
+                    "Do not call search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
+                ]
+            )
+        if "QoS-only intent must not call AM grounding tools" in joined:
+            repair_rules.extend(
+                [
+                    "This retry is QoS-only.",
+                    "Do not call get_am_policy_context or search_am_policy_targets.",
+                ]
+            )
         return (
             f"{base_prompt}\n\n"
-            "Your previous attempt failed and must be repaired deterministically.\n"
+            "Your previous attempt failed validation.\n"
             "Validation errors:\n- "
             + "\n- ".join(issues)
             + "\n\n"
-            "Repair the semantic grounding or tool usage first.\n"
+            "Re-ground the semantic target or correct tool usage before returning the next answer.\n"
             "Do not return any resolved QoS flow unless both flow_id and app_id are present and grounded.\n"
-            "If the prior attempt stalled in tool use, stop exploring and return the minimum final IntentAdvisorDecision JSON grounded by the evidence already available.\n"
-            "Return one corrected IntentAdvisorDecision JSON object only."
+            + "\n".join(repair_rules)
         )
 
     def _invoke_intent_advisor(
@@ -494,26 +532,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         snapshot_id: str,
         main_directives: Dict[str, Any],
     ) -> IntentEvidence:
-        self._ensure_intent_caches()
         normalized_input = str(user_input or "").strip()
-        supi_match = re.search(r"(?i)(imsi-\d{5,})", normalized_input)
-        supi = str(main_directives.get("supi") or "").strip() or (supi_match.group(1) if supi_match else "")
-        requested_domains = list(main_directives.get("requested_domains") or [])
+        explicit_supis = extract_requested_supis(str(main_directives.get("supi") or ""), normalized_input)
+        supi = str(main_directives.get("supi") or "").strip()
+        if not supi and explicit_supis:
+            supi = ", ".join(explicit_supis)
         return self.compiler.build_intent_evidence(
             user_input=normalized_input,
             supi=supi,
             main_directives=main_directives,
-            catalog_payload=(
-                self._get_cached_sm_flow_catalog(supi, snapshot_id=snapshot_id)
-                if self.compiler.uses_sm_grounding(requested_domains)
-                else {}
-            ),
+            catalog_payload={},
             semantic_candidates=[],
-            am_context_payload=(
-                self._get_cached_am_policy_context(supi, snapshot_id=snapshot_id)
-                if self.compiler.uses_am_grounding(requested_domains)
-                else {}
-            ),
+            am_context_payload={},
             am_policy_candidates=[],
         )
 
@@ -525,53 +555,29 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         main_directives: Dict[str, Any],
         snapshot_id: str,
     ) -> IntentEvidence:
-        self._ensure_intent_caches()
-        semantic_candidates: List[Dict[str, Any]] = list(evidence.cached_semantic_candidates or [])
-        catalog_payload = dict(evidence.cached_catalog or {})
-        am_context_payload = dict(evidence.cached_am_context or {})
-        am_policy_candidates: List[Dict[str, Any]] = list(evidence.cached_am_policy_candidates or [])
+        semantic_candidates: List[Dict[str, Any]] = []
+        catalog_payload: Dict[str, Any] = {}
+        am_context_payload: Dict[str, Any] = {}
+        am_policy_candidates: List[Dict[str, Any]] = []
         requested_domains = list(evidence.requested_domains or [])
+        requested_supis = set(extract_requested_supis(evidence.supi, evidence.user_input))
 
-        for entry in extract_grounding_tool_payloads(advisor_result=advisor_result, compiler=self.compiler):
+        for entry in extract_grounding_tool_payloads(advisor_result=advisor_result):
             tool_name = str(entry.get("tool_name") or "").strip()
             call_args = dict(entry.get("call_args") or {})
             payload = dict(entry.get("payload") or {})
             if tool_name == "get_sm_ue_flow_catalog" and self.compiler.uses_sm_grounding(requested_domains):
-                cached_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
-                self._cache_sm_flow_catalog(cached_supi, payload, snapshot_id=snapshot_id)
-                if cached_supi == str(evidence.supi or "").strip():
-                    catalog_payload = dict(payload)
-            elif tool_name == "get_sm_ue_context" and self.compiler.uses_sm_grounding(requested_domains):
-                cached_supi = str(call_args.get("supi") or evidence.supi or "").strip()
-                self._cache_sm_ue_context(cached_supi, payload, snapshot_id=snapshot_id)
+                payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
+                if not requested_supis or payload_supi in requested_supis:
+                    catalog_payload = merge_catalog_payloads(catalog_payload, payload)
             elif tool_name == "search_sm_flow_targets" and self.compiler.uses_sm_grounding(requested_domains):
-                self._cache_sm_flow_search(
-                    snapshot_id=snapshot_id,
-                    app_name=str(call_args.get("app_name") or "").strip(),
-                    flow_name=str(call_args.get("flow_name") or "").strip(),
-                    limit=int(call_args.get("limit") or 5),
-                    payload=payload,
-                )
-                semantic_candidates = list(payload.get("candidates") or [])
+                semantic_candidates = merge_candidate_dicts(semantic_candidates, list(payload.get("candidates") or []))
             elif tool_name == "get_am_policy_context" and self.compiler.uses_am_grounding(requested_domains):
-                cached_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
-                self._cache_am_policy_context(cached_supi, payload, snapshot_id=snapshot_id)
-                if cached_supi == str(evidence.supi or "").strip():
+                payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
+                if not requested_supis or payload_supi in requested_supis:
                     am_context_payload = dict(payload)
             elif tool_name == "search_am_policy_targets" and self.compiler.uses_am_grounding(requested_domains):
-                self._cache_am_policy_search(
-                    snapshot_id=snapshot_id,
-                    supi=str(call_args.get("supi") or "").strip(),
-                    association_id=str(call_args.get("association_id") or "").strip(),
-                    allowed_snssai=str(call_args.get("allowed_snssai") or "").strip(),
-                    target_snssai=str(call_args.get("target_snssai") or "").strip(),
-                    service_area=str(call_args.get("service_area") or "").strip(),
-                    rfsp=str(call_args.get("rfsp") or "").strip(),
-                    access_type=str(call_args.get("access_type") or "").strip(),
-                    limit=int(call_args.get("limit") or 5),
-                    payload=payload,
-                )
-                am_policy_candidates = list(payload.get("candidates") or [])
+                am_policy_candidates = merge_candidate_dicts(am_policy_candidates, list(payload.get("candidates") or []))
 
         return self.compiler.build_intent_evidence(
             user_input=evidence.user_input,

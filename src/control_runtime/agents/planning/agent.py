@@ -17,7 +17,7 @@ from shared.logging import log_event, log_timing
 from .compiler import OptimizationStrategyCompiler
 from .policy_normalizer import json_friendly as _json_friendly
 from .policy_normalizer import normalize_app_id as _normalize_app_id
-from .prompts import OSA_SYSTEM_PROMPT, build_advisor_user_prompt
+from .prompts import OSA_SYSTEM_PROMPT, build_advisor_user_prompt, build_validation_retry_prompt
 from .response_models import OsaAdvisorOutput
 from .tool_result_adapter import extract_planning_tool_evidence
 from .tools import build_request_tools
@@ -51,6 +51,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         self.rag_enabled = rag_enabled
         self.compiler = OptimizationStrategyCompiler()
         self.initialize_agent_runtime(logger_color="\033[94m")
+        self.last_failure_debug: dict[str, Any] = {}
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> PolicyPlanDraft:
         planning_request = PlanningRequest.model_validate(envelope.payload)
@@ -89,7 +90,13 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         planning_request: PlanningRequest,
         request_envelope: ArtifactEnvelope,
     ) -> PolicyPlanDraft:
-        effective_request = self._effective_planning_request(planning_request)
+        try:
+            effective_request = self._effective_planning_request(planning_request)
+        except ValueError as exc:
+            return self.compiler.build_upstream_reground_plan(
+                planning_request=planning_request,
+                reason=str(exc),
+            )
         operation_intent = effective_request.operation_intent
         normalized_user_intent = _json_friendly(operation_intent.model_dump(mode="json"))
         normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
@@ -98,32 +105,72 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         total_start = time.perf_counter()
         log_event(self.logger, "osa_generate_start")
         advisor_trace = None
+        self.last_failure_debug = {}
         try:
             planning_evidence = self.compiler.build_planning_evidence(effective_request)
-            advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
-                planning_request=effective_request,
+            base_prompt = build_advisor_user_prompt(
                 normalized_user_intent=normalized_user_intent,
                 coordination_context=coordination_context,
                 planning_evidence=planning_evidence,
             )
-            self._validate_advisor_policy_presence(
-                advisor_output=advisor_output,
-                planning_request=effective_request,
-            )
-            planning_tool_evidence = extract_planning_tool_evidence(advisor_result=advisor_result)
-            grounding_tools = extract_grounding_tool_names(
-                advisor_result,
-                self.GROUNDING_TOOLS,
-            )
-            contract_errors = self.compiler.validate_advisor_output(
-                advisor_output=advisor_output,
-                planning_request=effective_request,
-                grounding_tools=grounding_tools,
-                planning_evidence=planning_evidence,
-                planning_tool_evidence=planning_tool_evidence,
-            )
-            if contract_errors:
-                raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
+            current_prompt = base_prompt
+            advisor_output = None
+            advisor_result = None
+            planning_tool_evidence: dict[str, Any] = {}
+            grounding_tools: list[str] = []
+            contract_errors: list[str] = []
+            invocation_error = ""
+            for attempt_index in range(3):
+                try:
+                    advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
+                        planning_request=effective_request,
+                        prompt=current_prompt,
+                    )
+                except RuntimeError as exc:
+                    invocation_error = str(exc)
+                    self.last_failure_debug = {
+                        "phase": "optimization_strategy",
+                        "attempt_index": attempt_index + 1,
+                        "invocation_error": invocation_error,
+                    }
+                    if attempt_index == 2:
+                        raise
+                    current_prompt = build_validation_retry_prompt(
+                        base_prompt=base_prompt,
+                        issues=[invocation_error],
+                    )
+                    continue
+
+                planning_tool_evidence = extract_planning_tool_evidence(advisor_result=advisor_result)
+                grounding_tools = extract_grounding_tool_names(
+                    advisor_result,
+                    self.GROUNDING_TOOLS,
+                )
+                contract_errors = self.compiler.validate_advisor_output(
+                    advisor_output=advisor_output,
+                    planning_request=effective_request,
+                    grounding_tools=grounding_tools,
+                    planning_tool_evidence=planning_tool_evidence,
+                )
+                self.last_failure_debug = {
+                    "phase": "optimization_strategy",
+                    "attempt_index": attempt_index + 1,
+                    "grounding_tools": list(grounding_tools or []),
+                    "advisor_output": advisor_output.model_dump(mode="json"),
+                    "contract_errors": list(contract_errors or []),
+                    "planning_tool_evidence": _json_friendly(planning_tool_evidence),
+                }
+                if not contract_errors:
+                    break
+                if attempt_index == 2:
+                    raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
+                current_prompt = build_validation_retry_prompt(
+                    base_prompt=base_prompt,
+                    issues=list(contract_errors),
+                )
+
+            if advisor_output is None or advisor_result is None:
+                raise RuntimeError("OSA advisor returned no structured_response")
 
             final_output = self.compiler.assemble_policy_plan(
                 advisor_output=advisor_output,
@@ -140,6 +187,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 request_envelope=request_envelope,
                 policy_plan=final_output,
             )
+            self.last_failure_debug = {}
             log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="success")
             return final_output
         except Exception as exc:
@@ -175,7 +223,9 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             if str(flow_id or "").strip()
         }
         if not active_flow_ids:
-            return planning_request
+            raise ValueError(
+                "current control stage has no grounded active_flow_ids; OSA must request upstream reground instead of expanding to all flows"
+            )
         filtered_intent = planning_request.operation_intent.model_copy(deep=True)
         filtered_intent.flows = [
             flow for flow in filtered_intent.flows
@@ -191,9 +241,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         self,
         *,
         planning_request: PlanningRequest,
-        normalized_user_intent: dict[str, Any],
-        coordination_context: dict[str, Any],
-        planning_evidence: dict[str, Any],
+        prompt: str,
     ) -> tuple[OsaAdvisorOutput, dict[str, Any], dict[str, Any]]:
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
@@ -201,11 +249,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             snapshot_id=planning_request.context.snapshot_id,
             supi=planning_request.operation_intent.supi,
             thread_id=planning_request.context.session_id,
-        )
-        prompt = build_advisor_user_prompt(
-            normalized_user_intent=normalized_user_intent,
-            coordination_context=coordination_context,
-            planning_evidence=planning_evidence,
         )
         advisor_agent = self.create_json_agent(
             tools=[
@@ -241,13 +284,13 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 error_text = str(exc)
                 if "Input should be a valid dictionary or instance of OsaAdvisorOutput" in error_text:
                     raise RuntimeError(
-                        "OSA advisor violated top-level output contract: expected one OsaAdvisorOutput JSON object, "
-                        "but returned a bare array or non-object payload"
+                        "OSA advisor returned an invalid planning payload: expected one OsaAdvisorOutput JSON object, "
+                        "but received a bare array or non-object payload"
                     ) from exc
                 if "Extra inputs are not permitted" in error_text and "flow_id" in error_text:
                     raise RuntimeError(
-                        "OSA advisor violated top-level output contract: returned a bare SmPolicySpec object instead "
-                        "of wrapping it inside OsaAdvisorOutput.sm_policies"
+                        "OSA advisor returned a policy item without the required top-level planning object: "
+                        "a bare SmPolicySpec appeared instead of OsaAdvisorOutput.sm_policies"
                     ) from exc
             raise
         advisor_output = coerce_structured_response(
@@ -261,32 +304,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             "runtime_context": runtime_context,
             "result": result,
         }
-
-    @staticmethod
-    def _validate_advisor_policy_presence(
-        *,
-        advisor_output: OsaAdvisorOutput,
-        planning_request: PlanningRequest,
-    ) -> None:
-        requested_domains = {
-            str(domain or "").strip().lower()
-            for domain in (planning_request.operation_intent.requested_domains or [])
-            if str(domain or "").strip()
-        }
-        has_sm = bool(advisor_output.sm_policies)
-        has_am = advisor_output.am_policy is not None
-        has_ursp = bool(advisor_output.ursp_policies)
-
-        if not has_sm and not has_am and not has_ursp:
-            raise RuntimeError("OSA advisor returned empty policy output")
-        if "qos" in requested_domains and not has_sm:
-            raise RuntimeError("OSA advisor omitted sm_policies for a qos request")
-        if "qos" not in requested_domains and has_sm:
-            raise RuntimeError("OSA advisor returned sm_policies for a non-qos request")
-        if "mobility" in requested_domains and not has_am:
-            raise RuntimeError("OSA advisor omitted am_policy for a mobility request")
-        if "mobility" not in requested_domains and has_am:
-            raise RuntimeError("OSA advisor returned am_policy for a non-mobility request")
 
     @staticmethod
     def _write_advisor_trace(

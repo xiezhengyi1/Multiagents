@@ -17,6 +17,12 @@ class FlowCandidateEvidence(BaseModel):
     score: float = 1.0
 
 
+class ExplicitFlowTarget(BaseModel):
+    flow_name: str = ""
+    app_name: Optional[str] = None
+    supi: Optional[str] = None
+
+
 class IntentEvidence(BaseModel):
     user_input: str = ""
     supi: str = ""
@@ -26,31 +32,28 @@ class IntentEvidence(BaseModel):
     explicit_app_name: str = ""
     explicit_flow_id: str = ""
     explicit_flow_name: str = ""
+    explicit_flow_targets: List[ExplicitFlowTarget] = Field(default_factory=list)
     candidate_flows: List[FlowCandidateEvidence] = Field(default_factory=list)
     candidate_apps: List[Dict[str, Any]] = Field(default_factory=list)
-    ambiguities: List[str] = Field(default_factory=list)
-    cache_hits: List[str] = Field(default_factory=list)
-    operation_type_hint: str = "modify"
-    mobility_intent_hint: Dict[str, Any] = Field(default_factory=dict)
-    objective_profile_hint: str = ""
     domain_evidence: Dict[str, List[str]] = Field(default_factory=dict)
+    main_requested_domains: List[str] = Field(default_factory=list)
     am_context_summary: Dict[str, Any] = Field(default_factory=dict)
     am_policy_candidates: List[Dict[str, Any]] = Field(default_factory=list)
-    # 缓存 catalog，避免 compile 阶段重复查询
-    cached_catalog: Dict[str, Any] = Field(default_factory=dict, exclude=True)
-    cached_semantic_candidates: List[Dict[str, Any]] = Field(default_factory=list, exclude=True)
-    cached_am_context: Dict[str, Any] = Field(default_factory=dict, exclude=True)
-    cached_am_policy_candidates: List[Dict[str, Any]] = Field(default_factory=list, exclude=True)
+    catalog_payload: Dict[str, Any] = Field(default_factory=dict, exclude=True)
+    semantic_candidates: List[Dict[str, Any]] = Field(default_factory=list, exclude=True)
+    am_context_payload: Dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
 class IntentAdvisorDecision(BaseModel):
     selected_app_id: str = ""
     selected_flow_id: str = ""
     operation_type: str = "modify"
-    raw_intent_summary: str = ""
     rationale: str = ""
     mobility_intent: Dict[str, Any] = Field(default_factory=dict)
-    objective_profile_hint: str = ""
+    grounded_requested_domains: List[str] = Field(default_factory=list)
+    domain_revision_needed: bool = False
+    domain_revision_rationale: str = ""
+    domain_resolution: str = "confirmed"
     flows: List[FlowSelector] = Field(
         default_factory=list,
         description="QoS-relevant semantic flow selections produced by IEA.",
@@ -72,4 +75,9 @@ class IntentAdvisorDecision(BaseModel):
         return self
 
 
-__all__ = ["IntentEvidence", "IntentAdvisorDecision", "FlowCandidateEvidence"]
+__all__ = [
+    "ExplicitFlowTarget",
+    "FlowCandidateEvidence",
+    "IntentAdvisorDecision",
+    "IntentEvidence",
+]

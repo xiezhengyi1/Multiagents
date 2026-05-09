@@ -65,6 +65,9 @@ DEFAULT_IEA_GOLD_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_ie
 DEFAULT_EXTENDED_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_extended_cases.json"
 DEFAULT_STRICT_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_strict_cases.json"
 DEFAULT_AGENT_EXPANDED_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_agent_expanded_cases.json"
+DEFAULT_EVAL_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_eval_cases.json"
+DEFAULT_AUGMENTED_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_augmented_cases.json"
+DEFAULT_MERGED_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_merged_cases.json"
 DEFAULT_IEA_TRACE_PATHS = (
     PROJECT_ROOT / "training" / "main_control" / "raw_traces" / "main_control.jsonl",
     PROJECT_ROOT / "training" / "intent_encoding" / "raw_traces" / "intent_encoding.jsonl",
@@ -114,12 +117,49 @@ PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+QUERY_TYPES = {
+    "exact_identifier",
+    "schema_relation",
+    "clause_location",
+    "operation_lookup",
+    "glossary_term",
+    "cross_spec_link",
+    "negative",
+}
+
 
 def load_eval_cases(path: Path) -> List[Dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise TypeError("Evaluation cases JSON must be a list.")
     return payload
+
+
+def infer_query_type(case: Dict[str, Any]) -> str:
+    explicit = str(case.get("query_type") or "").strip()
+    if explicit:
+        return explicit
+    query = str(case.get("query") or "").strip()
+    lowered = query.lower()
+    target_kind = str(case.get("target_kind") or "").strip().lower()
+    query_intent = str(case.get("query_intent") or "").strip().lower()
+    if query_intent == "domain_boundary":
+        if len(query.split()) <= 3 or query.startswith("Npcf_") or query in {"RFSP", "OS Id", "Allowed NSSAI", "target NSSAI"}:
+            return "exact_identifier"
+        return "glossary_term"
+    if target_kind == "openapi" or any(term in lowered for term in ("endpoint", "operation", "method", "create", "update", "delete", "read ")):
+        return "operation_lookup"
+    if target_kind == "glossary":
+        return "glossary_term"
+    if target_kind == "clause":
+        return "clause_location"
+    if target_kind == "schema":
+        if any(term in lowered for term in ("relationship", "relate", "boundary", "cross", "between")):
+            return "cross_spec_link"
+        if len(query.split()) <= 3 or query.startswith("Npcf_"):
+            return "exact_identifier"
+        return "schema_relation"
+    return "schema_relation"
 
 
 def debug_tool_invocation(
@@ -302,6 +342,28 @@ def write_eval_cases(path: Path, cases: Iterable[Dict[str, Any]]) -> None:
     path.write_text(json.dumps(list(cases), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def merge_eval_cases(paths: Iterable[Path]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen_keys: set[Tuple[str, str, str, Tuple[str, ...]]] = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        for case in load_eval_cases(path):
+            normalized_case = dict(case)
+            normalized_case["query_type"] = infer_query_type(normalized_case)
+            key = (
+                str(normalized_case.get("query") or "").strip(),
+                str(normalized_case.get("category") or "").strip(),
+                str(normalized_case.get("policy_domain") or "").strip(),
+                tuple(sorted(str(item).strip() for item in normalized_case.get("expected_result_keys") or [] if str(item).strip())),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            merged.append(normalized_case)
+    return merged
+
+
 def validate_eval_cases(cases: Iterable[Dict[str, Any]]) -> None:
     domain_coverage: Dict[str, set[str]] = defaultdict(set)
     seen_ids: set[str] = set()
@@ -327,6 +389,9 @@ def validate_eval_cases(cases: Iterable[Dict[str, Any]]) -> None:
             raise ValueError(f"Evaluation case {case_id} has unsupported policy_domain: {domain}")
         if target_kind not in {"schema", "clause", "glossary", "openapi"}:
             raise ValueError(f"Evaluation case {case_id} has unsupported target_kind: {target_kind}")
+        query_type = infer_query_type(case)
+        if query_type not in QUERY_TYPES:
+            raise ValueError(f"Evaluation case {case_id} has unsupported query_type: {query_type}")
         domain_coverage[domain].add(target_kind)
 
     for domain in ("am_policy", "sm_policy", "ursp"):
@@ -435,6 +500,7 @@ def evaluate_case(case: Dict[str, Any], *, limit: int) -> Dict[str, Any]:
     return {
         "id": case["id"],
         "query": query,
+        "query_type": infer_query_type(case),
         "category": category,
         "policy_domain": case["policy_domain"],
         "target_kind": case["target_kind"],
@@ -446,6 +512,8 @@ def evaluate_case(case: Dict[str, Any], *, limit: int) -> Dict[str, Any]:
         "accuracy_at_1": round(accuracy_at_1, 4),
         "reciprocal_rank": round(reciprocal_rank, 4),
         "success": bool(relevant_hits),
+        "top1_domain": str((candidates[0]["metadata"].get("policy_domain") if candidates else "") or "").strip(),
+        "empty_result": not bool(retrieved_top_k),
         "warnings": errors,
     }
 
@@ -453,9 +521,11 @@ def evaluate_case(case: Dict[str, Any], *, limit: int) -> Dict[str, Any]:
 def summarize_results(results: List[Dict[str, Any]], *, profile: str, limit: int, case_source: Path) -> Dict[str, Any]:
     by_domain: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     by_target_kind: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    by_query_type: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for result in results:
         by_domain[str(result["policy_domain"])].append(result)
         by_target_kind[str(result["target_kind"])].append(result)
+        by_query_type[str(result["query_type"])].append(result)
 
     def _group_summary(group_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {
@@ -465,6 +535,13 @@ def summarize_results(results: List[Dict[str, Any]], *, profile: str, limit: int
             "accuracy_at_1": _safe_mean(item["accuracy_at_1"] for item in group_results),
             "mrr": _safe_mean(item["reciprocal_rank"] for item in group_results),
             "success_rate": _safe_mean(1.0 if item["success"] else 0.0 for item in group_results),
+            "wrong_domain_top1_rate": _safe_mean(
+                1.0
+                if item.get("top1_domain") and str(item.get("top1_domain")) != str(item.get("policy_domain"))
+                else 0.0
+                for item in group_results
+            ),
+            "empty_result_rate": _safe_mean(1.0 if item.get("empty_result") else 0.0 for item in group_results),
         }
 
     return {
@@ -474,6 +551,7 @@ def summarize_results(results: List[Dict[str, Any]], *, profile: str, limit: int
         "overall": _group_summary(results),
         "by_domain": {name: _group_summary(group) for name, group in sorted(by_domain.items())},
         "by_target_kind": {name: _group_summary(group) for name, group in sorted(by_target_kind.items())},
+        "by_query_type": {name: _group_summary(group) for name, group in sorted(by_query_type.items())},
         "results": results,
     }
 
@@ -491,7 +569,9 @@ def render_summary(report: Dict[str, Any]) -> str:
             f"recall@{report['top_k']}={report['overall']['recall_at_k']:.4f} "
             f"accuracy@1={report['overall']['accuracy_at_1']:.4f} "
             f"mrr={report['overall']['mrr']:.4f} "
-            f"success_rate={report['overall']['success_rate']:.4f}"
+            f"success_rate={report['overall']['success_rate']:.4f} "
+            f"wrong_domain_top1_rate={report['overall']['wrong_domain_top1_rate']:.4f} "
+            f"empty_result_rate={report['overall']['empty_result_rate']:.4f}"
         ),
         "",
         "**By Domain**",
@@ -517,6 +597,17 @@ def render_summary(report: Dict[str, Any]) -> str:
             )
         )
     lines.append("")
+    lines.append("**By Query Type**")
+    for query_type, summary in report["by_query_type"].items():
+        lines.append(
+            (
+                f"{query_type}: cases={summary['cases']} "
+                f"precision@{report['top_k']}={summary['precision_at_k']:.4f} "
+                f"recall@{report['top_k']}={summary['recall_at_k']:.4f} "
+                f"accuracy@1={summary['accuracy_at_1']:.4f}"
+            )
+        )
+    lines.append("")
     lines.append("**Misses**")
     misses = [item for item in report["results"] if not item["success"]]
     if not misses:
@@ -526,6 +617,23 @@ def render_summary(report: Dict[str, Any]) -> str:
             lines.append(
                 f"{miss['id']}: expected={miss['expected_result_keys']} retrieved={miss['retrieved_result_keys']}"
             )
+    return "\n".join(lines)
+
+
+def render_comparison(comparison: Dict[str, Any]) -> str:
+    lines = [
+        f"Case Source Type: {comparison['case_source_type']}",
+        f"Top-K: {comparison['top_k']}",
+        "",
+        "**Base Overall**",
+        json.dumps(comparison["base"], ensure_ascii=False, indent=2),
+        "",
+        "**Docling Overall**",
+        json.dumps(comparison["docling"], ensure_ascii=False, indent=2),
+        "",
+        "**Delta (Docling - Base)**",
+        json.dumps(comparison["delta_docling_minus_base"], ensure_ascii=False, indent=2),
+    ]
     return "\n".join(lines)
 
 
@@ -544,6 +652,19 @@ def run_evaluation(
             cases = load_eval_cases(cases_path)
             validate_eval_cases(cases)
             case_source = cases_path
+        elif case_source_type == "merged":
+            cases = merge_eval_cases(
+                [
+                    DEFAULT_AGENT_EXPANDED_CASES_PATH,
+                    DEFAULT_EXTENDED_CASES_PATH,
+                    DEFAULT_STRICT_CASES_PATH,
+                    DEFAULT_IEA_GOLD_CASES_PATH,
+                    DEFAULT_EVAL_CASES_PATH,
+                    DEFAULT_AUGMENTED_CASES_PATH,
+                ]
+            )
+            validate_eval_cases(cases)
+            case_source = DEFAULT_MERGED_CASES_PATH
         elif case_source_type == "extended":
             cases = load_eval_cases(DEFAULT_EXTENDED_CASES_PATH)
             validate_trace_eval_cases(cases)
@@ -589,16 +710,56 @@ def run_evaluation(
     return report
 
 
+def compare_profiles(
+    *,
+    cases_path: Path,
+    limit: int,
+    case_source_type: str,
+    trace_min_frequency: int = 1,
+    trace_max_cases: Optional[int] = None,
+) -> Dict[str, Any]:
+    base_report = run_evaluation(
+        profile="base",
+        cases_path=cases_path,
+        limit=limit,
+        case_source_type=case_source_type,
+        trace_min_frequency=trace_min_frequency,
+        trace_max_cases=trace_max_cases,
+    )
+    docling_report = run_evaluation(
+        profile="docling",
+        cases_path=cases_path,
+        limit=limit,
+        case_source_type=case_source_type,
+        trace_min_frequency=trace_min_frequency,
+        trace_max_cases=trace_max_cases,
+    )
+    comparison = {
+        "case_source_type": case_source_type,
+        "top_k": limit,
+        "base": base_report["overall"],
+        "docling": docling_report["overall"],
+        "delta_docling_minus_base": {
+            metric: round(float(docling_report["overall"].get(metric) or 0.0) - float(base_report["overall"].get(metric) or 0.0), 4)
+            for metric in ("precision_at_k", "recall_at_k", "accuracy_at_1", "mrr", "success_rate", "wrong_domain_top1_rate", "empty_result_rate")
+        },
+        "base_report": base_report,
+        "docling_report": docling_report,
+    }
+    return comparison
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate the PCF policy RAG knowledge base retrieval quality.")
     parser.add_argument("--profile", choices=sorted(PROFILE_CONFIGS.keys()), default="docling")
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
-    parser.add_argument("--case-source", choices=("curated", "extended", "iea_trace", "iea_trace_weak"), default="curated")
+    parser.add_argument("--case-source", choices=("curated", "merged", "extended", "iea_trace", "iea_trace_weak"), default="curated")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--trace-min-frequency", type=int, default=1)
     parser.add_argument("--trace-max-cases", type=int)
     parser.add_argument("--case-output", type=Path)
     parser.add_argument("--json-output", type=Path)
+    parser.add_argument("--compare-baseline", action="store_true")
     args = parser.parse_args()
 
     if args.case_source == "iea_trace_weak" and args.case_output:
@@ -608,6 +769,33 @@ def main() -> None:
         )
         validate_trace_eval_cases(cases)
         write_eval_cases(args.case_output, cases)
+    elif args.case_source == "merged" and args.case_output:
+        cases = merge_eval_cases(
+            [
+                DEFAULT_AGENT_EXPANDED_CASES_PATH,
+                DEFAULT_EXTENDED_CASES_PATH,
+                DEFAULT_STRICT_CASES_PATH,
+                DEFAULT_IEA_GOLD_CASES_PATH,
+                DEFAULT_EVAL_CASES_PATH,
+                DEFAULT_AUGMENTED_CASES_PATH,
+            ]
+        )
+        validate_eval_cases(cases)
+        write_eval_cases(args.case_output, cases)
+
+    if args.compare_baseline:
+        comparison = compare_profiles(
+            cases_path=args.cases,
+            limit=max(1, int(args.top_k)),
+            case_source_type=args.case_source,
+            trace_min_frequency=max(1, int(args.trace_min_frequency)),
+            trace_max_cases=args.trace_max_cases,
+        )
+        print(render_comparison(comparison))
+        if args.json_output:
+            args.json_output.parent.mkdir(parents=True, exist_ok=True)
+            args.json_output.write_text(json.dumps(comparison, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
 
     report = run_evaluation(
         profile=args.profile,

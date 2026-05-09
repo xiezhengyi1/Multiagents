@@ -179,7 +179,24 @@ class UrspPolicySpec(BaseModel):
 class OsaAdvisorOutput(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
+    planning_status: str = Field(default="executable_plan")
     rationale: str = Field(default="")
+    missing_evidence: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("missing_evidence", "missingEvidence"),
+    )
+    blocked_targets: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("blocked_targets", "blockedTargets"),
+    )
+    upstream_requests: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("upstream_requests", "upstreamRequests"),
+    )
+    planner_conflicts: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("planner_conflicts", "plannerConflicts"),
+    )
     sm_policies: List[SmPolicySpec] = Field(
         default_factory=list,
         validation_alias=AliasChoices("sm_policies", "smPolicies"),
@@ -192,33 +209,19 @@ class OsaAdvisorOutput(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("ursp_policies", "urspPolicies"),
     )
-    planning_metadata: Dict[str, Any] = Field(
-        default_factory=dict,
-        validation_alias=AliasChoices("planning_metadata", "planningMetadata"),
+    partial_policies: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("partial_policies", "partialPolicies"),
     )
-
-    @field_validator("am_policy", mode="before")
+    @field_validator("planning_status", mode="before")
     @classmethod
-    def _normalize_empty_am_policy(cls, value: Any) -> Any:
-        if value is None:
-            return None
-        if isinstance(value, dict) and not value:
-            return None
-        return value
-
-    @field_validator("sm_policies", "ursp_policies", mode="before")
-    @classmethod
-    def _normalize_null_policy_lists(cls, value: Any) -> Any:
-        if value is None:
-            return []
-        return value
-
-    @field_validator("planning_metadata", mode="before")
-    @classmethod
-    def _normalize_null_planning_metadata(cls, value: Any) -> Any:
-        if value is None:
-            return {}
-        return value
+    def _normalize_planning_status(cls, value: Any) -> str:
+        normalized = str(value or "executable_plan").strip().lower()
+        if normalized not in {"executable_plan", "partial_plan", "needs_upstream_reground"}:
+            raise ValueError(
+                "planning_status must be one of executable_plan, partial_plan, or needs_upstream_reground"
+            )
+        return normalized
 
     @model_validator(mode="after")
     def _validate_policy_collections(self) -> "OsaAdvisorOutput":
@@ -227,6 +230,16 @@ class OsaAdvisorOutput(BaseModel):
             if item.flow_id in seen_flow_ids:
                 raise ValueError(f"duplicate sm_policies flow_id={item.flow_id}")
             seen_flow_ids.add(item.flow_id)
+        if self.planning_status == "needs_upstream_reground":
+            if self.sm_policies or self.am_policy is not None or self.ursp_policies:
+                raise ValueError("needs_upstream_reground must not include executable policy payloads")
+            if not self.missing_evidence and not self.upstream_requests and not self.blocked_targets:
+                raise ValueError("needs_upstream_reground must explain what is missing or blocked")
+        if self.planning_status == "partial_plan":
+            if not self.partial_policies and not self.sm_policies and self.am_policy is None and not self.ursp_policies:
+                raise ValueError("partial_plan must include partial policy output or executable fragments")
+            if not self.missing_evidence and not self.blocked_targets and not self.planner_conflicts:
+                raise ValueError("partial_plan must explain what blocks full execution")
         return self
 
 

@@ -6,7 +6,13 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
-from .control_plane import ControlSemantics
+from .control_plane import (
+    AgentConflict,
+    AgentContribution,
+    ControlSemantics,
+    HandoffRecord,
+    OpenQuestion,
+)
 
 
 def _json_friendly(value: Any) -> Any:
@@ -56,9 +62,6 @@ class GroundingEvidenceBundle(BaseModel):
     grounded_flows: List[Dict[str, Any]] = Field(default_factory=list, description="Grounded candidate or selected flows")
     grounded_mobility_targets: Dict[str, Any] = Field(default_factory=dict, description="Grounded mobility-target summary")
     evidence_sources: Dict[str, List[str]] = Field(default_factory=dict, description="Evidence grouped by source")
-    unresolved_ambiguities: List[str] = Field(default_factory=list, description="Ambiguities still exposed after grounding")
-    rejected_hypotheses: List[str] = Field(default_factory=list, description="Discarded grounding hypotheses")
-    cache_hits: List[str] = Field(default_factory=list, description="Cache or tool evidence reused during grounding")
 
 
 class QosTargetEnvelope(BaseModel):
@@ -93,16 +96,23 @@ class OperationIntent(BaseModel):
     operation_type: str = Field(default="modify", description="Requested operation type")
     urgency: str = Field(default="Normal", description="Requested urgency")
     raw_input: str = Field(default="", description="Original user input")
-    raw_intent_summary: str = Field(default="", description="Structured intent summary")
     resolution_status: str = Field(default="", description="Top-level resolution status")
     requested_domains: List[str] = Field(default_factory=list, description="Requested control domains inferred from intent")
+    main_requested_domains: List[str] = Field(default_factory=list, description="Domain set explicitly requested by Main")
+    grounded_requested_domains: List[str] = Field(default_factory=list, description="Domain set confirmed or revised by IEA")
+    domain_revision_needed: bool = Field(default=False, description="Whether IEA revised or could not confirm Main's domain boundary")
+    domain_revision_rationale: str = Field(default="", description="Why IEA revised or could not confirm the domain boundary")
+    domain_resolution: str = Field(default="confirmed", description="confirmed, narrowed, widened, or cannot_confirm")
     domain_evidence: Dict[str, List[str]] = Field(default_factory=dict, description="Evidence supporting each domain decision")
     control_semantics: ControlSemantics = Field(default_factory=ControlSemantics, description="Structured staged control semantics derived from the user intent")
     mobility_intent: Dict[str, Any] = Field(default_factory=dict, description="Mobility / AM policy goals extracted from the user request")
-    objective_profile_hint: str = Field(default="", description="Semantic optimization profile hint inferred from the request")
     grounding_evidence: GroundingEvidenceBundle = Field(default_factory=GroundingEvidenceBundle, description="Structured grounding evidence carried forward for traceability")
     flows: List[FlowSelector] = Field(default_factory=list, description="Resolved flow selectors")
     qos_target_envelopes: List[QosTargetEnvelope] = Field(default_factory=list, description="IEA-owned QoS target envelopes derived from grounded baselines")
+    agent_contributions: List[AgentContribution] = Field(default_factory=list, description="Structured multi-agent contribution trace")
+    agent_conflicts: List[AgentConflict] = Field(default_factory=list, description="Structured multi-agent conflict trace")
+    handoff_records: List[HandoffRecord] = Field(default_factory=list, description="Structured handoff trace")
+    open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
     @field_validator("domain_evidence", mode="before")
     @classmethod
@@ -129,14 +139,6 @@ class OperationIntent(BaseModel):
             return value
         return {}
 
-    @field_validator("objective_profile_hint", mode="before")
-    @classmethod
-    def _normalize_objective_profile_hint(cls, value: Any) -> str:
-        if isinstance(value, dict):
-            candidate = str(value.get("profile_name") or "").strip()
-            return candidate
-        return str(value or "").strip()
-
 
 class PolicyDraft(BaseModel):
     recommended_actions: List[str] = Field(default_factory=list, description="Recommended actions")
@@ -156,33 +158,36 @@ class PolicyDraft(BaseModel):
 
 class PlanningRationale(BaseModel):
     selected_strategy_profile: str = Field(default="", description="Selected strategy or heuristic profile")
-    objective_tradeoff_summary: str = Field(default="", description="High-level tradeoff summary")
     decisive_evidence: List[str] = Field(default_factory=list, description="Evidence items that determined the chosen plan")
     active_constraints: List[str] = Field(default_factory=list, description="Constraints active in the chosen plan")
     explanation: str = Field(default="", description="Planner explanation for the chosen plan")
     rejected_alternatives: List[str] = Field(default_factory=list, description="Alternatives explicitly not selected")
-
-
-class RevisionHandle(BaseModel):
-    scope: str = Field(default="", description="Repair scope such as qos, mobility, or joint_coupling")
-    target_policy_ids: List[str] = Field(default_factory=list, description="Policies safe to revise in this scope")
-    target_flow_ids: List[str] = Field(default_factory=list, description="Flows safe to revise in this scope")
-    required_recompute: List[str] = Field(default_factory=list, description="Deterministic recompute steps needed before revision")
-    rationale: str = Field(default="", description="Why this repair scope exists")
-
-
-class RevisionHandles(BaseModel):
-    handles: List[RevisionHandle] = Field(default_factory=list, description="Revision entry points for future rounds")
+    main_constraints: List[str] = Field(default_factory=list, description="Constraints handed down by Main")
+    iea_grounding_basis: List[str] = Field(default_factory=list, description="Grounding basis inherited from IEA")
+    osa_decision_basis: List[str] = Field(default_factory=list, description="Planner basis for the current decision")
+    unresolved_gaps: List[str] = Field(default_factory=list, description="Unresolved gaps that block full execution")
 
 
 class PolicyPlanDraft(BaseModel):
     supi: str = Field(default="", description="User SUPI")
     session_id: str = Field(default="", description="Session identifier for deterministic execution")
     snapshot_id: str = Field(default="", description="Snapshot identifier for deterministic execution")
-    planning_metadata: Dict[str, Any] = Field(default_factory=dict, description="Planning metadata such as domains, templates, and objective breakdown")
+    planning_status: str = Field(default="executable_plan", description="executable_plan, partial_plan, or needs_upstream_reground")
+    planning_basis: Dict[str, Any] = Field(default_factory=dict, description="Structured planning basis and planner-owned reasoning inputs")
+    constraint_sources: Dict[str, Any] = Field(default_factory=dict, description="Structured constraint sources inherited from Main and Mediator")
+    optimizer_result: Dict[str, Any] = Field(default_factory=dict, description="Structured optimizer output and cross-domain verdicts")
+    execution_writeback: Dict[str, Any] = Field(default_factory=dict, description="Structured execution writeback patch information")
     planning_rationale: PlanningRationale = Field(default_factory=PlanningRationale, description="Structured rationale for the selected plan")
-    revision_handles: RevisionHandles = Field(default_factory=RevisionHandles, description="Structured revision entry points for later rounds")
     all_policies: List[PolicyDraft] = Field(default_factory=list, description="All generated policy drafts")
+    partial_policies: List[PolicyDraft] = Field(default_factory=list, description="Partially grounded policy drafts that are not yet executable")
+    missing_evidence: List[str] = Field(default_factory=list, description="Evidence missing for full planning")
+    blocked_targets: List[str] = Field(default_factory=list, description="Targets blocked by missing evidence or conflicts")
+    upstream_requests: List[str] = Field(default_factory=list, description="Structured requests that must be sent upstream")
+    planner_conflicts: List[str] = Field(default_factory=list, description="Planner-side conflicts or infeasibility notes")
+    agent_contributions: List[AgentContribution] = Field(default_factory=list, description="Structured multi-agent contribution trace")
+    agent_conflicts: List[AgentConflict] = Field(default_factory=list, description="Structured multi-agent conflict trace")
+    handoff_records: List[HandoffRecord] = Field(default_factory=list, description="Structured handoff trace")
+    open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
 
 class PolicyPlan(BaseModel):

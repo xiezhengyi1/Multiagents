@@ -58,6 +58,7 @@ MIN_CHUNK_TOKENS = 120
 MAX_CHUNK_TOKENS = 280
 TARGET_EMBED_CHUNK_LENGTH = 1800
 MAX_EMBED_INPUT_LENGTH = 8192
+CHUNK_OVERLAP_RATIO = 0.15
 
 HEADING_RE = re.compile(r"^(?P<num>\d+(?:\.\d+){0,5})\s+(?P<title>.+)$")
 TABLE_RE = re.compile(r"^(Table\s+\d+(?:\.\d+)?(?:[-:]\d+)?[^\n]*)$", re.MULTILINE)
@@ -613,14 +614,47 @@ def _record_with_safe_chunks(*, record_id: str, page_content: str, metadata: Dic
     records: List[Dict[str, Any]] = []
     for chunk_index, chunk in enumerate(chunks, start=1):
         suffix = f"-part-{chunk_index}" if len(chunks) > 1 else ""
-        records.append(make_record(record_id=f"{record_id}{suffix}", page_content=chunk, metadata=metadata))
+        chunk_metadata = dict(metadata)
+        if len(chunks) > 1:
+            chunk_metadata["chunk_strategy"] = "hard_split"
+            chunk_metadata["chunk_overlap_from"] = f"{record_id}-part-{chunk_index - 1}" if chunk_index > 1 else None
+        else:
+            chunk_metadata.setdefault("chunk_strategy", "single_section")
+            chunk_metadata.setdefault("chunk_overlap_from", None)
+        records.append(make_record(record_id=f"{record_id}{suffix}", page_content=chunk, metadata=chunk_metadata))
     return records
 
 
-def split_large_section(text: str) -> List[str]:
+def _chunk_overlap_text(text: str, *, overlap_tokens: int) -> str:
+    if overlap_tokens <= 0:
+        return ""
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", str(text or "").strip()) if part.strip()]
+    if not paragraphs:
+        return ""
+    selected: List[str] = []
+    accumulated = 0
+    for paragraph in reversed(paragraphs):
+        selected.insert(0, paragraph)
+        accumulated += estimate_tokens(paragraph)
+        if accumulated >= overlap_tokens:
+            break
+    overlap_text = "\n\n".join(selected).strip()
+    if not overlap_text:
+        return ""
+    if overlap_text == str(text or "").strip():
+        words = overlap_text.split()
+        if len(words) <= overlap_tokens:
+            return overlap_text
+        overlap_text = " ".join(words[-overlap_tokens:]).strip()
+    return overlap_text
+
+
+def split_large_section_units(text: str, *, enable_overlap: bool = True) -> List[Dict[str, Any]]:
     cleaned = sanitize_text(text)
+    if not cleaned:
+        return []
     if estimate_tokens(cleaned) <= MAX_CHUNK_TOKENS:
-        return [cleaned]
+        return [{"text": cleaned, "chunk_strategy": "single_section", "chunk_overlap_from": None}]
     parts = [part.strip() for part in re.split(r"\n\s*\n", cleaned) if part.strip()]
     chunks: List[str] = []
     current: List[str] = []
@@ -642,7 +676,36 @@ def split_large_section(text: str) -> List[str]:
             merged[-1] = f"{merged[-1]}\n\n{chunk}".strip()
         else:
             merged.append(chunk)
-    return [chunk for chunk in merged if chunk.strip()]
+    merged = [chunk for chunk in merged if chunk.strip()]
+    if not merged:
+        return []
+    if not enable_overlap or len(merged) == 1:
+        strategy = "semantic_chunk" if len(merged) > 1 else "single_section"
+        return [
+            {"text": chunk, "chunk_strategy": strategy, "chunk_overlap_from": None}
+            for chunk in merged
+        ]
+
+    overlap_tokens = max(1, int(round(MAX_CHUNK_TOKENS * CHUNK_OVERLAP_RATIO)))
+    chunk_units: List[Dict[str, Any]] = []
+    for index, chunk in enumerate(merged):
+        if index == 0:
+            chunk_units.append({"text": chunk, "chunk_strategy": "semantic_chunk", "chunk_overlap_from": None})
+            continue
+        overlap_text = _chunk_overlap_text(merged[index - 1], overlap_tokens=overlap_tokens)
+        combined = f"{overlap_text}\n\n{chunk}".strip() if overlap_text and overlap_text not in chunk else chunk
+        chunk_units.append(
+            {
+                "text": combined,
+                "chunk_strategy": "semantic_overlap" if overlap_text else "semantic_chunk",
+                "chunk_overlap_from": f"section_chunk_{index}" if overlap_text else None,
+            }
+        )
+    return chunk_units
+
+
+def split_large_section(text: str, *, enable_overlap: bool = True) -> List[str]:
+    return [item["text"] for item in split_large_section_units(text, enable_overlap=enable_overlap)]
 
 
 def split_tables(section_text: str) -> List[Dict[str, str]]:
@@ -742,14 +805,29 @@ def extract_pdf_sections(source: Dict[str, Any]) -> List[Dict[str, Any]]:
                 normalized_terms=normalize_query_terms(f"{canonical_title} {segment['text'][:240]}"),
                 strategy_domains=strategy_domains,
             )
-            for chunk_index, chunk in enumerate(split_large_section(segment["text"]), start=1):
+            chunk_units = split_large_section_units(
+                segment["text"],
+                enable_overlap=(segment["kind"] == "body"),
+            )
+            for chunk_index, chunk_unit in enumerate(chunk_units, start=1):
                 record_counter += 1
                 record_id = (
                     f"{source['spec_id']}-{section_number}-"
                     f"{'tbl' if segment['kind'] == 'table' else 'clause'}-"
                     f"{segment_index}-{chunk_index}-{record_counter}"
                 )
-                records.extend(_record_with_safe_chunks(record_id=record_id, page_content=chunk, metadata=metadata))
+                chunk_metadata = {
+                    **metadata,
+                    "chunk_strategy": chunk_unit["chunk_strategy"],
+                    "chunk_overlap_from": chunk_unit["chunk_overlap_from"],
+                }
+                records.extend(
+                    _record_with_safe_chunks(
+                        record_id=record_id,
+                        page_content=chunk_unit["text"],
+                        metadata=chunk_metadata,
+                    )
+                )
         buffer = []
 
     for page_number, page in enumerate(reader.pages, start=1):

@@ -44,8 +44,9 @@ from knowledge_build.scripts.build_pcf_policy_kb import (
     make_metadata,
     normalize_query_terms,
     normalize_records_for_embedding,
+    estimate_tokens,
     sanitize_text,
-    split_large_section,
+    split_large_section_units,
     TOKEN_RE,
     write_jsonl,
 )
@@ -58,6 +59,7 @@ DOCLING_PROCESSED_ROOT = DOCLING_DATA_ROOT / "processed"
 DOCLING_CLAUSE_JSONL = DOCLING_PROCESSED_ROOT / "clauses.jsonl"
 DOCLING_SCHEMA_JSONL = DOCLING_PROCESSED_ROOT / "schema.jsonl"
 DOCLING_GLOSSARY_JSONL = DOCLING_PROCESSED_ROOT / "glossary.jsonl"
+DOCLING_BUILD_STATS_JSON = DOCLING_PROCESSED_ROOT / "build_stats.json"
 DOCLING_SPEC_OBJECT_MAP_JSON = DOCLING_PROCESSED_ROOT / "spec_object_map.json"
 DOCLING_TERM_ALIAS_MAP_JSON = DOCLING_PROCESSED_ROOT / "term_alias_map.json"
 DOCLING_CLAUSE_EXACT_INDEX_JSON = DOCLING_PROCESSED_ROOT / "clause_exact_index.json"
@@ -285,13 +287,22 @@ def extract_pdf_sections_with_docling(source: Dict[str, Any]) -> List[Dict[str, 
                 normalized_terms=normalize_query_terms(f"{canonical_title} {segment['text'][:240]}"),
             )
             kind = "tbl" if segment["kind"] == "table" else "clause"
-            for chunk_index, chunk in enumerate(split_large_section(segment["text"]), start=1):
+            chunk_units = split_large_section_units(
+                segment["text"],
+                enable_overlap=(segment["kind"] == "body"),
+            )
+            for chunk_index, chunk_unit in enumerate(chunk_units, start=1):
                 record_counter += 1
+                chunk_metadata = {
+                    **metadata,
+                    "chunk_strategy": chunk_unit["chunk_strategy"],
+                    "chunk_overlap_from": chunk_unit["chunk_overlap_from"],
+                }
                 records.append(
                     {
                         "id": f"{source['spec_id']}-{section_number}-{kind}-{segment_index}-{chunk_index}-{record_counter}",
-                        "page_content": chunk,
-                        "metadata": metadata,
+                        "page_content": chunk_unit["text"],
+                        "metadata": chunk_metadata,
                     }
                 )
         segments = []
@@ -492,24 +503,78 @@ def _promote_embedded_table_markers(records: List[Dict[str, Any]]) -> List[Dict[
     return promoted
 
 
-def clean_docling_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _clean_docling_records_with_summary(records: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     中文标注：完整的数据清洗流水线。
     1. 移除模板化/非技术内容 (版权、前言、版本说明)
     2. 移除低信息量记录 (<40字符、纯标点)
     3. 去除重复内容
     """
-    # 第一轮：过滤噪声
-    filtered = [
-        r
-        for r in records
-        if not _is_boilerplate(r)
-        and not _is_low_information(r)
-        and not _is_ocr_noise(r)
-    ]
-    filtered = _promote_embedded_table_markers(filtered)
-    # 第二轮：去重
-    return _deduplicate_records(filtered)
+    summary = {
+        "input_records": len(records),
+        "boilerplate": 0,
+        "low_information": 0,
+        "ocr_noise": 0,
+        "duplicate": 0,
+        "embedded_table_promotions": 0,
+        "output_records": 0,
+    }
+    filtered: List[Dict[str, Any]] = []
+    for record in records:
+        if _is_boilerplate(record):
+            summary["boilerplate"] += 1
+            continue
+        if _is_low_information(record):
+            summary["low_information"] += 1
+            continue
+        if _is_ocr_noise(record):
+            summary["ocr_noise"] += 1
+            continue
+        filtered.append(record)
+    promoted = _promote_embedded_table_markers(filtered)
+    summary["embedded_table_promotions"] = max(0, len(promoted) - len(filtered))
+    deduped = _deduplicate_records(promoted)
+    summary["duplicate"] = max(0, len(promoted) - len(deduped))
+    summary["output_records"] = len(deduped)
+    return deduped, summary
+
+
+def clean_docling_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    filtered, _summary = _clean_docling_records_with_summary(records)
+    return filtered
+
+
+def _record_summary(records: Iterable[Dict[str, Any]], *, cleaning_summary: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    records = list(records)
+    by_doc_type: Dict[str, int] = {}
+    by_policy_domain: Dict[str, int] = {}
+    token_counts: List[int] = []
+    hard_split_count = 0
+    for record in records:
+        metadata = record.get("metadata") or {}
+        doc_type = str(metadata.get("doc_type") or "unknown").strip() or "unknown"
+        domain = str(metadata.get("policy_domain") or "unknown").strip() or "unknown"
+        by_doc_type[doc_type] = by_doc_type.get(doc_type, 0) + 1
+        by_policy_domain[domain] = by_policy_domain.get(domain, 0) + 1
+        token_counts.append(estimate_tokens(str(record.get("page_content") or "")))
+        if str(metadata.get("chunk_strategy") or "") == "hard_split":
+            hard_split_count += 1
+    sorted_tokens = sorted(token_counts)
+    avg_chunk_tokens = round(sum(sorted_tokens) / len(sorted_tokens), 2) if sorted_tokens else 0.0
+    if sorted_tokens:
+        p95_index = max(0, min(len(sorted_tokens) - 1, int(len(sorted_tokens) * 0.95) - 1))
+        p95_chunk_tokens = sorted_tokens[p95_index]
+    else:
+        p95_chunk_tokens = 0
+    return {
+        "total_records": len(records),
+        "by_doc_type": dict(sorted(by_doc_type.items())),
+        "by_policy_domain": dict(sorted(by_policy_domain.items())),
+        "avg_chunk_tokens": avg_chunk_tokens,
+        "p95_chunk_tokens": p95_chunk_tokens,
+        "hard_split_count": hard_split_count,
+        "cleaning_summary": dict(cleaning_summary or {}),
+    }
 
 
 def _namespace_docling_records(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -530,8 +595,8 @@ def build_corpus_from_docling(manifest: Optional[Iterable[Dict[str, Any]]] = Non
         clause_records.extend(extract_pdf_sections_with_docling(source))
 
     # 中文标注：数据清洗 — 移除 docling 解析产生的噪声数据
-    raw_count = len(clause_records)
-    clause_records = clean_docling_records(clause_records)
+    clause_records, cleaning_summary = _clean_docling_records_with_summary(clause_records)
+    raw_count = int(cleaning_summary.get("input_records") or 0)
     logger.info("Data cleaning: %d -> %d records (removed %d noise entries).", raw_count, len(clause_records), raw_count - len(clause_records))
 
     schema_records: List[Dict[str, Any]] = []
@@ -570,6 +635,17 @@ def build_corpus_from_docling(manifest: Optional[Iterable[Dict[str, Any]]] = Non
             target = target.replace(base_collection, docling_collection)
         eval_queries.append({**item, "target_collection": target})
     DOCLING_RETRIEVAL_EVAL_JSON.write_text(json.dumps(eval_queries, ensure_ascii=False, indent=2), encoding="utf-8")
+    DOCLING_BUILD_STATS_JSON.write_text(
+        json.dumps(
+            _record_summary(
+                clause_records + schema_records + glossary_records,
+                cleaning_summary=cleaning_summary,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     return {"clauses": len(clause_records), "schema": len(schema_records), "glossary": len(glossary_records)}
 

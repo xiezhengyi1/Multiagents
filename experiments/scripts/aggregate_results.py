@@ -40,6 +40,14 @@ def _task_map() -> Dict[str, Dict[str, Any]]:
 
 
 def _extract_task_id(item: Dict[str, Any]) -> str:
+    direct = str(item.get("task_id") or "").strip()
+    if direct:
+        return direct
+    task_metadata = item.get("task_metadata")
+    if isinstance(task_metadata, dict):
+        nested = str(task_metadata.get("task_id") or "").strip()
+        if nested:
+            return nested
     return str(item.get("scenario_id") or "").strip()
 
 

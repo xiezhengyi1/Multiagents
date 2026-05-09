@@ -87,6 +87,23 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
         return keys
 
     @classmethod
+    def _normalize_valid_snssai_values(cls, raw_items: Any) -> Set[str]:
+        values: Set[str] = set()
+        if not isinstance(raw_items, list):
+            return values
+        for raw_item in raw_items:
+            text = str(raw_item or "").strip()
+            if not text.startswith("snssai:"):
+                continue
+            try:
+                payload = json.loads(text.split(":", 1)[1])
+            except Exception:
+                continue
+            if isinstance(payload, dict) and payload.get("sst") is not None:
+                values.add(f"{payload.get('sst')}:{payload.get('sd') or ''}")
+        return values
+
+    @classmethod
     def _extract_qos_snssai_keys(cls, policy: Dict[str, Any]) -> List[str]:
         details = policy.get("policy_details") if isinstance(policy.get("policy_details"), dict) else {}
         keys: List[str] = []
@@ -245,6 +262,7 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
             for item in (resource_view.get("valid_snssai_keys") or [])
             if str(item or "").strip()
         }
+        valid_snssai_values = self._normalize_valid_snssai_values(resource_view.get("valid_snssai_keys"))
         if not valid_slice_keys and not valid_snssai_keys:
             return []
 
@@ -255,7 +273,7 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
                 if valid_slice_keys and item not in valid_slice_keys:
                     unknown_items.append(item)
             for item in summary["qos_snssai_keys"]:
-                if valid_snssai_keys and item not in valid_snssai_keys:
+                if valid_snssai_values and item not in valid_snssai_values:
                     unknown_items.append(item)
             if not unknown_items:
                 continue

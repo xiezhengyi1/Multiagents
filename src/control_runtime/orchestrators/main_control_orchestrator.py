@@ -14,12 +14,19 @@ from ..agents.main import MainControlAgent
 from ..agents.planning import OptimizationStrategyAgent
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool
 from ..diagnostics.mediation import ConflictResolutionTool
-from ..domain.collaboration import PlanningRequest
-from ..domain.control_plane import GlobalControlIntent, MainRetryScope
+from ..domain.collaboration import (
+    DomainNegotiationRequest,
+    ExecutionReentryRequest,
+    PlanningBlockerReport,
+    PlanningRequest,
+)
+from ..domain.control_plane import GlobalControlIntent
 from ..domain.policy_plan import OperationIntent
+from ..integrations.storage import get_snapshot_data_by_id
 from .main_control_support import (
     ControlRoundResult,
     build_feedback_context,
+    _build_snapshot_summary,
     build_main_context,
     build_planning_context,
 )
@@ -147,16 +154,23 @@ class MainControlOrchestrator:
         self,
         *,
         global_intent: Dict[str, Any],
+        snapshot_id: str,
         round_index: int,
         diagnosis: Dict[str, Any],
         feedback_context: str,
     ) -> str:
+        snapshot = get_snapshot_data_by_id(snapshot_id) or {}
         return json.dumps(
             {
                 "round_index": round_index,
                 "main_intent": global_intent,
+                "snapshot_summary": _build_snapshot_summary(snapshot) if snapshot else {},
                 "guidance": global_intent.get("intent_encoding_guidance", ""),
                 "retry_scope": global_intent.get("retry_scope") or "",
+                "routing_decision": global_intent.get("routing_decision") or "",
+                "routing_rationale": global_intent.get("routing_rationale") or "",
+                "reuse_contract": global_intent.get("reuse_contract") or {},
+                "handoff_expectations": global_intent.get("handoff_expectations") or [],
                 "previous_diagnosis": diagnosis,
                 "feedback_context": feedback_context,
             },
@@ -164,47 +178,170 @@ class MainControlOrchestrator:
         )
 
     @staticmethod
-    def _retry_consumer(feedback_payload: Optional[Dict[str, Any]]) -> str:
-        if not isinstance(feedback_payload, dict):
-            return ""
-        return str(feedback_payload.get("recommended_consumer") or "").strip().lower()
+    def _scope_global_intent_for_ie(
+        *,
+        global_intent: GlobalControlIntent,
+        round_index: int,
+    ) -> GlobalControlIntent:
+        semantics = global_intent.control_semantics
+        stages = list(semantics.stages or [])
+        if not stages:
+            return global_intent
+
+        ordered_stages = sorted(stages, key=lambda stage: int(stage.stage_index or 0))
+        scoped_position = min(max(1, int(round_index or 1)), len(ordered_stages)) - 1
+        scoped_stage = ordered_stages[scoped_position].model_copy(deep=True)
+        scoped_semantics = semantics.model_copy(
+            update={
+                "current_stage": 1,
+                "stages": [
+                    scoped_stage.model_copy(
+                        update={"stage_index": 1},
+                        deep=True,
+                    )
+                ],
+            },
+            deep=True,
+        )
+        return global_intent.model_copy(
+            update={"control_semantics": scoped_semantics},
+            deep=True,
+        )
 
     @staticmethod
-    def _classify_planning_failure(exc: Exception) -> tuple[str, str]:
-        message = str(exc or "").strip()
-        lowered = message.lower()
-        if "main agent" in lowered or "globalcontrolintent" in lowered:
-            return "main_control", "main_control_failure"
-        if "iea" in lowered or "intent" in lowered:
-            return "intent_encoding", "intent_grounding_failure"
-        if "osa" in lowered or "optimization" in lowered or "policy plan" in lowered:
-            return "optimization_strategy", "planning_failure"
-        return "main_control", "planning_failure"
-
-    @classmethod
-    def _build_planning_failure_payload(cls, exc: Exception) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        recommended_consumer, root_cause_category = cls._classify_planning_failure(exc)
+    def _build_planning_failure_payload(
+        exc: Exception,
+        *,
+        debug_context: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         message = str(exc or "").strip() or exc.__class__.__name__
         report_payload = {
             "execution_status": "Failed",
             "violation_details": message,
-            "correction_suggestion": "Repair planning-stage grounding or control routing before the next round.",
-            "recommended_consumer": recommended_consumer,
             "feedback_payload": {
                 "phase": "planning",
                 "error": message,
-                "target_agent": recommended_consumer,
+                "target_bindings_at_risk": [],
+                "policy_objects_at_risk": [],
+                "reason_by_domain": {},
+                "debug_context": dict(debug_context or {}),
             },
         }
         diagnosis = {
-            "root_cause_category": root_cause_category,
+            "root_cause_category": "planning_failure",
             "root_cause": message,
             "reason_summary": message,
-            "recommended_actions": [
-                "Retry the failed planning stage with stricter grounding and output constraints.",
-            ],
+            "recommended_actions": [],
+            "debug_context": dict(debug_context or {}),
         }
         return report_payload, diagnosis
+
+    @staticmethod
+    def _build_negotiation_request(operation_intent: OperationIntent, *, round_index: int) -> DomainNegotiationRequest:
+        issues = []
+        for question in operation_intent.open_questions:
+            payload = question.model_dump(mode="json") if hasattr(question, "model_dump") else dict(question)
+            issues.append(
+                {
+                    "source_agent": "intent_encoding",
+                    "issue_type": "domain_boundary",
+                    "domain": str((payload.get("related_domains") or [""])[0] or ""),
+                    "binding_keys": [],
+                    "policy_objects": [],
+                    "missing_evidence": [str(payload.get("question") or "").strip()] if str(payload.get("question") or "").strip() else [],
+                    "rationale": str(payload.get("question") or "").strip(),
+                }
+            )
+        return DomainNegotiationRequest(
+            round_index=round_index,
+            source_agent="intent_encoding",
+            main_requested_domains=list(operation_intent.main_requested_domains or []),
+            grounded_requested_domains=list(operation_intent.grounded_requested_domains or operation_intent.requested_domains or []),
+            domain_resolution=str(operation_intent.domain_resolution or "cannot_confirm"),
+            domain_revision_needed=bool(operation_intent.domain_revision_needed),
+            issues=issues,
+            recommended_consumers=["main_control", "intent_encoding"],
+            summary=str(operation_intent.domain_revision_rationale or "").strip(),
+        )
+
+    @staticmethod
+    def _build_negotiation_diagnosis(request: DomainNegotiationRequest) -> Dict[str, Any]:
+        issue_reasons = [
+            str(item.rationale or "").strip()
+            for item in (request.issues or [])
+            if str(item.rationale or "").strip()
+        ]
+        return {
+            "root_cause_category": "domain_negotiation_required",
+            "root_cause": request.summary,
+            "reason_summary": request.summary,
+            "recommended_actions": issue_reasons,
+        }
+
+    @staticmethod
+    def _build_reentry_report_payload(request: ExecutionReentryRequest) -> Dict[str, Any]:
+        return {
+            "execution_status": "Failed",
+            "violation_details": request.summary,
+            "feedback_payload": {
+                "failure_scope": request.failure_scope,
+                "target_bindings_at_risk": list(request.target_bindings_at_risk or []),
+                "policy_objects_at_risk": list(request.policy_objects_at_risk or []),
+                "reason_by_domain": dict(request.reason_by_domain or {}),
+                "failures": list(request.failures or []),
+            },
+        }
+
+    @staticmethod
+    def _should_reuse_operation_intent(
+        *,
+        global_intent: GlobalControlIntent,
+        previous_operation_intent: Optional[OperationIntent],
+        previous_report_payload: Dict[str, Any],
+        previous_mediator_decision: Optional[Dict[str, Any]],
+    ) -> bool:
+        if previous_operation_intent is None:
+            return False
+        if str(global_intent.next_agent or "").strip().lower() != "optimization_strategy":
+            return False
+        contract = global_intent.reuse_contract
+        if not contract.allowed:
+            return False
+        if contract.preserve_bindings and str(previous_operation_intent.supi or "").strip() != str(global_intent.supi or "").strip():
+            return False
+        previous_domains = {str(item or "").strip().lower() for item in (previous_operation_intent.requested_domains or []) if str(item or "").strip()}
+        current_domains = {item.value for item in global_intent.requested_domains}
+        if contract.preserve_domains and previous_domains != current_domains:
+            return False
+        if contract.preserve_stage_scope:
+            stages = previous_operation_intent.control_semantics.stages or []
+            active_stage = next(
+                (
+                    stage
+                    for stage in stages
+                    if int(stage.stage_index or 0) == int(previous_operation_intent.control_semantics.current_stage or 1)
+                ),
+                None,
+            )
+            if active_stage is None:
+                return False
+            if not [flow_id for flow_id in (active_stage.active_flow_ids or []) if str(flow_id or "").strip()]:
+                return False
+        invalidate_text = json.dumps(
+            {
+                "report": previous_report_payload or {},
+                "mediator": previous_mediator_decision or {},
+                "open_questions": previous_operation_intent.open_questions,
+            },
+            ensure_ascii=False,
+        ).lower()
+        for token in contract.invalidate_on:
+            normalized = str(token or "").strip().lower()
+            if normalized and normalized in invalidate_text:
+                return False
+        if previous_operation_intent.open_questions:
+            return False
+        return True
 
     def _plan_round(
         self,
@@ -221,8 +358,11 @@ class MainControlOrchestrator:
         previous_report_payload: Dict[str, Any],
         previous_mediator_decision: Optional[Dict[str, Any]],
         previous_operation_intent: Optional[OperationIntent],
+        previous_negotiation_request: Dict[str, Any],
+        previous_planning_blocker: Dict[str, Any],
+        previous_execution_reentry: Dict[str, Any],
         round_traces: List[Dict[str, Any]],
-    ) -> tuple[GlobalControlIntent, OperationIntent, Any]:
+    ) -> tuple[GlobalControlIntent, Optional[OperationIntent], Optional[Any], Optional[DomainNegotiationRequest]]:
         self._apply_trace_metadata(self.main_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
         try:
             global_intent = self.main_agent.analyze_global_intent(
@@ -241,6 +381,9 @@ class MainControlOrchestrator:
                         if previous_operation_intent is not None
                         else {}
                     ),
+                    previous_negotiation_request=previous_negotiation_request,
+                    previous_planning_blocker=previous_planning_blocker,
+                    previous_execution_reentry=previous_execution_reentry,
                 ),
             )
         finally:
@@ -252,20 +395,14 @@ class MainControlOrchestrator:
         self._remember("MAIN", global_intent)
 
         selected_next_agent = str(global_intent.next_agent or "").strip().lower()
-        retry_scope = (
-            global_intent.retry_scope
-            if isinstance(global_intent.retry_scope, MainRetryScope)
-            else MainRetryScope(str(global_intent.retry_scope))
-            if str(getattr(global_intent, "retry_scope", "") or "").strip()
-            else None
-        )
         reuse_operation_intent = (
             round_index > 1
-            and selected_next_agent == "optimization_strategy"
-            and retry_scope == MainRetryScope.POLICY_REPAIR
-            and previous_operation_intent is not None
-            and str(previous_operation_intent.supi or "").strip() == str(global_intent.supi or "").strip()
-            and set(previous_operation_intent.requested_domains or []) == {item.value for item in global_intent.requested_domains}
+            and self._should_reuse_operation_intent(
+                global_intent=global_intent,
+                previous_operation_intent=previous_operation_intent,
+                previous_report_payload=previous_report_payload,
+                previous_mediator_decision=previous_mediator_decision,
+            )
         )
 
         if reuse_operation_intent:
@@ -279,12 +416,17 @@ class MainControlOrchestrator:
                 selected_next_agent=selected_next_agent,
             )
         else:
+            ie_scoped_intent = self._scope_global_intent_for_ie(
+                global_intent=global_intent,
+                round_index=round_index,
+            )
             self._apply_trace_metadata(self.ie_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
             try:
                 operation_intent = self.ie_agent.analyze_operation_intent(
                     user_input=user_input,
                     context=self._build_ie_context(
-                        global_intent=global_intent.model_dump(mode="json"),
+                        global_intent=ie_scoped_intent.model_dump(mode="json"),
+                        snapshot_id=snapshot_id,
                         round_index=round_index,
                         diagnosis=previous_diagnosis,
                         feedback_context=feedback_context,
@@ -295,6 +437,11 @@ class MainControlOrchestrator:
             finally:
                 self._clear_trace_metadata(self.ie_agent)
             self._remember("IEA", operation_intent)
+            if str(operation_intent.domain_resolution or "").strip().lower() == "cannot_confirm":
+                return global_intent, operation_intent, None, self._build_negotiation_request(
+                    operation_intent,
+                    round_index=round_index,
+                )
 
         operation_intent = self._activate_control_stage(
             operation_intent=operation_intent,
@@ -307,6 +454,7 @@ class MainControlOrchestrator:
                 global_intent,
                 session_id,
                 snapshot_id,
+                active_domains=list(operation_intent.requested_domains or []),
                 round_index=round_index,
                 memory_context=memory_context,
                 feedback_context=feedback_context,
@@ -321,7 +469,7 @@ class MainControlOrchestrator:
         finally:
             self._clear_trace_metadata(self.os_agent)
         self._remember("OSA", policy_plan)
-        return global_intent, operation_intent, policy_plan
+        return global_intent, operation_intent, policy_plan, None
 
     @staticmethod
     def _activate_control_stage(
@@ -361,7 +509,7 @@ class MainControlOrchestrator:
             )
             memory_context = self._build_memory_context(user_input)
             try:
-                global_intent, operation_intent, policy_plan = self._plan_round(
+                global_intent, operation_intent, policy_plan, negotiation_request = self._plan_round(
                     user_input=user_input,
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -374,11 +522,22 @@ class MainControlOrchestrator:
                     previous_report_payload=state.previous_report_payload,
                     previous_mediator_decision=state.previous_mediator_decision,
                     previous_operation_intent=previous_operation_intent,
+                    previous_negotiation_request=state.previous_negotiation_request,
+                    previous_planning_blocker=state.previous_planning_blocker,
+                    previous_execution_reentry=state.previous_execution_reentry,
                     round_traces=state.round_traces,
                 )
             except Exception as exc:
                 state.completed = False
-                report_payload, diagnosis = self._build_planning_failure_payload(exc)
+                debug_context = {
+                    "intent_encoding": getattr(self.ie_agent, "last_failure_debug", {}) or {},
+                    "optimization_strategy": getattr(self.os_agent, "last_failure_debug", {}) or {},
+                }
+                debug_context = {key: value for key, value in debug_context.items() if value}
+                report_payload, diagnosis = self._build_planning_failure_payload(
+                    exc,
+                    debug_context=debug_context,
+                )
                 append_round_trace(
                     state,
                     trace_payload={
@@ -391,6 +550,9 @@ class MainControlOrchestrator:
                         "qos_feedback": {},
                         "mobility_feedback": {},
                         "diagnosis": diagnosis,
+                        "negotiation_request": {},
+                        "planning_blocker": {},
+                        "execution_reentry": {},
                     },
                 )
                 state.latest_result = ControlRoundResult(
@@ -402,6 +564,9 @@ class MainControlOrchestrator:
                     qos_feedback={},
                     mobility_feedback={},
                     diagnosis=diagnosis,
+                    negotiation_request={},
+                    planning_blocker={},
+                    execution_reentry={},
                     round_count=round_index,
                     retry_count=max(0, round_index - 1),
                     round_traces=state.round_traces,
@@ -424,6 +589,9 @@ class MainControlOrchestrator:
                     diagnosis=diagnosis,
                     domain_verdicts=[],
                     mediator_decision={},
+                    negotiation_request={},
+                    planning_blocker={},
+                    execution_reentry={},
                     round_index=round_index,
                 )
                 if round_index >= self.max_rounds:
@@ -434,9 +602,60 @@ class MainControlOrchestrator:
                     session_id=session_id,
                     next_round=round_index + 1,
                     diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
-                    recommended_consumer=self._retry_consumer(state.previous_report_payload) or "<none>",
+                    recommended_consumers="<none>",
                 )
                 continue
+            if negotiation_request is not None:
+                diagnosis = self._build_negotiation_diagnosis(negotiation_request)
+                negotiation_payload = negotiation_request.model_dump(mode="json")
+                append_round_trace(
+                    state,
+                    trace_payload={
+                        "round_index": round_index,
+                        "global_intent": global_intent.model_dump(mode="json"),
+                        "operation_intent": operation_intent.model_dump(mode="json") if operation_intent is not None else {},
+                        "policy_plan": {},
+                        "domain_verdicts": [],
+                        "pda_feedback": {},
+                        "qos_feedback": {},
+                        "mobility_feedback": {},
+                        "diagnosis": diagnosis,
+                        "negotiation_request": negotiation_payload,
+                        "planning_blocker": {},
+                        "execution_reentry": {},
+                    },
+                )
+                state.latest_result = ControlRoundResult(
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    completed=False,
+                    global_intent=global_intent.model_dump(mode="json"),
+                    unified_plan={},
+                    qos_feedback={},
+                    mobility_feedback={},
+                    diagnosis=diagnosis,
+                    negotiation_request=negotiation_payload,
+                    planning_blocker={},
+                    execution_reentry={},
+                    round_count=round_index,
+                    retry_count=max(0, round_index - 1),
+                    round_traces=state.round_traces,
+                )
+                state.previous_diagnosis = diagnosis
+                state.previous_report_payload = {}
+                state.previous_negotiation_request = negotiation_payload
+                state.previous_planning_blocker = {}
+                state.previous_execution_reentry = {}
+                state.feedback_context = build_feedback_context(
+                    state.feedback_context,
+                    diagnosis=diagnosis,
+                    negotiation_request=negotiation_payload,
+                    round_index=round_index,
+                )
+                continue
+
+            if operation_intent is None or policy_plan is None:
+                raise RuntimeError("main control planning round produced no executable planning artifacts")
             previous_operation_intent = operation_intent.model_copy(deep=True)
 
             self._apply_trace_metadata(self.pd_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
@@ -474,6 +693,17 @@ class MainControlOrchestrator:
                 qos_feedback=qos_feedback,
                 mobility_feedback=mobility_feedback,
                 diagnosis=diagnosis,
+                negotiation_request={},
+                planning_blocker=(
+                    round_execution.planning_blocker.model_dump(mode="json")
+                    if round_execution.planning_blocker is not None
+                    else {}
+                ),
+                execution_reentry=(
+                    round_execution.execution_reentry.model_dump(mode="json")
+                    if round_execution.execution_reentry is not None
+                    else {}
+                ),
                 round_count=round_index,
                 retry_count=max(0, round_index - 1),
                 round_traces=state.round_traces,
@@ -493,19 +723,46 @@ class MainControlOrchestrator:
 
             state.previous_diagnosis = diagnosis
             state.previous_mediator_decision = dict(round_execution.mediator_decision_payload)
-            report_payload = report.model_dump(mode="json") if report is not None else {
-                "execution_status": "Failed",
-                "violation_details": diagnosis.get("reason_summary") or "round execution failed",
-                "correction_suggestion": "; ".join(diagnosis.get("recommended_actions") or []),
-                "recommended_consumer": "optimization_strategy",
-            }
+            if round_execution.execution_reentry is not None:
+                report_payload = self._build_reentry_report_payload(round_execution.execution_reentry)
+            elif round_execution.planning_blocker is not None:
+                report_payload = {
+                    "execution_status": "Failed",
+                    "violation_details": round_execution.planning_blocker.summary,
+                    "feedback_payload": {
+                        "missing_evidence": list(round_execution.planning_blocker.missing_evidence or []),
+                        "blocked_targets": list(round_execution.planning_blocker.blocked_targets or []),
+                        "upstream_requests": list(round_execution.planning_blocker.upstream_requests or []),
+                        "planner_conflicts": list(round_execution.planning_blocker.planner_conflicts or []),
+                    },
+                }
+            elif report is not None:
+                report_payload = report.model_dump(mode="json")
+            else:
+                report_payload = {
+                    "execution_status": "Failed",
+                    "violation_details": diagnosis.get("reason_summary") or "round execution failed",
+                }
             state.previous_report_payload = dict(report_payload)
+            state.previous_negotiation_request = {}
+            state.previous_planning_blocker = (
+                round_execution.planning_blocker.model_dump(mode="json")
+                if round_execution.planning_blocker is not None
+                else {}
+            )
+            state.previous_execution_reentry = (
+                round_execution.execution_reentry.model_dump(mode="json")
+                if round_execution.execution_reentry is not None
+                else {}
+            )
             state.feedback_context = build_feedback_context(
                 state.feedback_context,
                 pda_feedback=report_payload,
                 diagnosis=diagnosis,
                 domain_verdicts=round_execution.domain_verdict_payloads,
                 mediator_decision=round_execution.mediator_decision_payload,
+                planning_blocker=state.previous_planning_blocker,
+                execution_reentry=state.previous_execution_reentry,
                 round_index=round_index,
             )
             log_event(
@@ -514,7 +771,7 @@ class MainControlOrchestrator:
                 session_id=session_id,
                 next_round=round_index + 1,
                 diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
-                recommended_consumer=self._retry_consumer(state.previous_report_payload) or "<none>",
+                recommended_consumers="<none>",
             )
 
         finish_control_session(session_id=session_id, snapshot_id=snapshot_id, state=state)

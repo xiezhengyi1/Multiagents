@@ -193,7 +193,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             thread_id=session_id,
             allow_user_interaction=allow_user_interaction,
         )
-        requested_domains = self._infer_requested_domains(user_input)
+        requested_domains = self._hint_requested_domains(user_input)
         allow_knowledge_tools = self._should_allow_knowledge_tools(user_input)
         advisor_agent = self.create_json_agent(
             tools=build_single_agent_tools(
@@ -301,20 +301,9 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             elif tool_name == "search_am_policy_targets":
                 am_policy_candidates = list(payload.get("candidates") or [])
 
-        resolved_supi = str(base_evidence.supi or "").strip()
+        resolved_supi = str(decision.supi or base_evidence.supi or "").strip()
         if not resolved_supi:
-            for flow in decision.flows or []:
-                candidate = str(flow.supi or "").strip()
-                if candidate:
-                    resolved_supi = candidate
-                    break
-        if not resolved_supi and isinstance(catalog_payload, dict):
-            for row in catalog_payload.get("flow_catalog") or []:
-                if isinstance(row, dict) and str(row.get("supi") or "").strip():
-                    resolved_supi = str(row.get("supi") or "").strip()
-                    break
-        if not resolved_supi and isinstance(am_context_payload, dict):
-            resolved_supi = str(am_context_payload.get("supi") or "").strip()
+            raise ValueError("Single control round decision must provide a grounded supi")
 
         return self.intent_compiler.build_intent_evidence(
             user_input=base_evidence.user_input,
@@ -346,7 +335,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
     @classmethod
-    def _infer_requested_domains(cls, user_input: str) -> List[str]:
+    def _hint_requested_domains(cls, user_input: str) -> Optional[List[str]]:
         lowered = str(user_input or "").lower()
         has_mobility = any(token in lowered for token in cls.MOBILITY_HINT_TOKENS)
         has_qos = any(token in lowered for token in cls.QOS_HINT_TOKENS)
@@ -356,7 +345,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             return ["mobility"]
         if has_qos:
             return ["qos"]
-        return ["qos", "mobility"]
+        return None
 
     @classmethod
     def _should_allow_knowledge_tools(cls, user_input: str) -> bool:
@@ -374,8 +363,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     raise RuntimeError(f"Single control round advisor did not converge: {message}") from exc
                 if "SingleAgentRoundDecision" in message:
                     raise RuntimeError(
-                        "Single control round advisor violated the unified output contract and did not return one "
-                        f"SingleAgentRoundDecision JSON object. Raw validator error: {message}"
+                        "Single control round advisor returned an invalid unified round decision. "
+                        f"Validator error: {message}"
                     ) from exc
             raise RuntimeError(f"Single control round advisor invocation failed: {exc}") from exc
 
@@ -543,17 +532,27 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> str:
         from ...domain.policy_compiler import PolicyCompiler
 
-        grounded_flow_id = str(
-            decision.selected_flow_id
-            or (decision.flows[0].flow_id if decision.flows else "")
-            or ""
-        ).strip()
         inferred_flow_id = str(PolicyCompiler.extract_flow_id(policy_details) or "").strip()
-
-        resolved = grounded_flow_id or inferred_flow_id
-        if not resolved and not allow_missing:
+        if not inferred_flow_id and not allow_missing:
             raise ValueError("PCF-style policy payload does not contain a grounded flow_id")
-        return resolved
+        if not inferred_flow_id:
+            return ""
+
+        grounded_flow_ids = {
+            str(flow.flow_id or "").strip()
+            for flow in decision.flows or []
+            if str(flow.flow_id or "").strip()
+        }
+        if grounded_flow_ids and inferred_flow_id not in grounded_flow_ids:
+            raise ValueError(
+                f"PCF-style policy payload flow_id {inferred_flow_id} is not present in grounded decision.flows"
+            )
+        if decision.selected_flow_id and inferred_flow_id != str(decision.selected_flow_id).strip():
+            raise ValueError(
+                f"PCF-style policy payload flow_id {inferred_flow_id} does not match selected_flow_id "
+                f"{str(decision.selected_flow_id).strip()}"
+            )
+        return inferred_flow_id
 
     @staticmethod
     def _main_directives_from_decision(decision: SingleAgentRoundDecision) -> Dict[str, Any]:
@@ -607,7 +606,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             domain_evidence=decision.domain_evidence,
             control_semantics=operation_intent.control_semantics,
             objective_profile=ObjectiveProfile(
-                profile_name=str(decision.objective_profile_hint or "balanced").strip() or "balanced"
+                profile_name=str(decision.objective_profile_hint or "").strip()
             ),
             investigation_targets=[],
             uncertainty_flags=[],

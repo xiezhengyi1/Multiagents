@@ -111,24 +111,25 @@ class PolicyCompiler:
         policy_id = str(policy.get("policy_id") or "").strip()
         policy_type = str(policy.get("policy_type") or "").strip()
         app_id = str(policy.get("app_id") or "").strip()
-        default_target_type = "ue" if policy_type == cls.AM_POLICY_TYPE else "flow"
-        target_type = str(policy.get("target_type") or default_target_type).strip() or default_target_type
+        target_type = str(policy.get("target_type") or "").strip()
         policy_details = _json_friendly(policy.get("policy_details"))
         if not isinstance(policy_details, dict):
             raise ValueError(f"policy {policy_id or '<unknown>'} missing policy_details object")
 
-        supi = str(policy.get("supi") or top_level_supi or "").strip()
+        supi = str(policy.get("supi") or "").strip()
         flow_id = str(policy.get("flow_id") or "").strip()
+        if not policy_id:
+            raise ValueError("policy_id is required")
+        if not policy_type:
+            raise ValueError(f"policy {policy_id} missing policy_type")
+        if not supi:
+            raise ValueError(f"policy {policy_id} missing supi")
+        if not target_type:
+            raise ValueError(f"policy {policy_id} missing target_type")
         if policy_type != cls.AM_POLICY_TYPE and not flow_id:
-            extracted_flow_id = cls.extract_flow_id(policy_details)
-            if extracted_flow_id:
-                flow_id = extracted_flow_id
-
-        if policy_type != cls.AM_POLICY_TYPE:
-            policy_details.setdefault("policy_id", policy_id)
-            policy_details.setdefault("target_type", target_type)
-            if flow_id:
-                policy_details.setdefault("flow_id", flow_id)
+            raise ValueError(f"policy {policy_id} missing flow_id")
+        if policy_type != cls.AM_POLICY_TYPE and not app_id:
+            raise ValueError(f"policy {policy_id} missing app_id")
 
         return _json_friendly(
             {

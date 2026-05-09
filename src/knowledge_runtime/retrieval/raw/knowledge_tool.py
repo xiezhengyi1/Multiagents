@@ -391,6 +391,28 @@ def _domain_matches(metadata_domain: Any, requested_domain: str) -> bool:
     return normalized_domain == normalized_request
 
 
+def _domain_match_label(metadata: Dict[str, Any], requested_domain: str) -> str:
+    normalized_request = _normalized(requested_domain)
+    if normalized_request in {"", "all"}:
+        return "all"
+    if _domain_matches(metadata, requested_domain):
+        strategy_domains = [_normalized(item) for item in (metadata.get("strategy_domains") or []) if _normalized(item)]
+        if strategy_domains and normalized_request in strategy_domains:
+            return "exact"
+        normalized_domain = _normalized(metadata.get("policy_domain") or "")
+        if normalized_domain == "shared":
+            return "shared"
+        if normalized_request == "mobility" and normalized_domain in {"am_policy", "ursp"}:
+            return "exact"
+        return "exact" if normalized_domain == normalized_request else "shared"
+    return "soft_mismatch"
+
+
+def _candidate_domain_allowed(metadata: Dict[str, Any], requested_domain: str, query: str) -> bool:
+    del query
+    return _domain_matches(metadata, requested_domain)
+
+
 def _spec_priority(spec_id: str, domain: str) -> int:
     normalized_domain = _normalized(domain)
     if normalized_domain == "am_policy":
@@ -929,8 +951,21 @@ def _glossary_strong_candidates(query: str, domain: str) -> List[Dict[str, Any]]
         phrase_bonus = _glossary_phrase_bonus(metadata, query)
         if phrase_bonus <= 0:
             continue
-        score = 1500.0 + phrase_bonus + _metadata_query_bonus(metadata, query, domain)
-        candidates.append(_record_to_candidate(record, score=score, retrieval="glossary_phrase"))
+        score = 420.0 + phrase_bonus + _metadata_query_bonus(metadata, query, domain)
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="glossary_phrase",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="glossary_phrase",
+                    lexical_score=phrase_bonus,
+                ),
+            )
+        )
     return _dedupe_candidates(candidates, limit=6)
 
 
@@ -954,6 +989,36 @@ def _metadata_term_sets(metadata: Dict[str, Any]) -> Tuple[set[str], set[str], s
         if term not in SEARCH_STOPWORDS and (len(term) > 2 or term in {"am", "sm", "ue", "os"})
     )
     return title_terms, object_terms, normalized_terms
+
+
+def _doc_type_matches_query(metadata: Dict[str, Any], query: str, domain: str) -> bool:
+    return _doc_type_priority(str(metadata.get("doc_type") or ""), query, domain) > 0
+
+
+def _candidate_features(
+    metadata: Dict[str, Any],
+    *,
+    query: str,
+    domain: str,
+    match_type: str,
+    lexical_score: float = 0.0,
+    vector_rank: Optional[int] = None,
+    cross_spec_source: Optional[str] = None,
+    is_exact_identifier: bool = False,
+) -> Dict[str, Any]:
+    query_terms = set(_expanded_query_terms_cached(query, domain))
+    _title_terms, object_terms, _normalized_terms = _metadata_term_sets(metadata)
+    object_overlap_count = len(query_terms.intersection(object_terms))
+    return {
+        "match_type": match_type,
+        "lexical_score": round(float(lexical_score), 4),
+        "vector_rank": vector_rank,
+        "domain_match": _domain_match_label(metadata, domain),
+        "doc_type_match": _doc_type_matches_query(metadata, query, domain),
+        "object_overlap_count": object_overlap_count,
+        "cross_spec_source": cross_spec_source,
+        "is_exact_identifier": bool(is_exact_identifier),
+    }
 
 
 def _is_generic_clause_candidate(metadata: Dict[str, Any]) -> bool:
@@ -991,7 +1056,12 @@ def _should_skip_generic_clause_candidate(metadata: Dict[str, Any], query: str) 
 
 
 def _metadata_query_bonus(metadata: Dict[str, Any], query: str, domain: str) -> float:
+    domain_match = _domain_match_label(metadata, domain)
     score = _spec_priority(str(metadata.get("spec_id") or ""), domain)
+    if domain_match == "soft_mismatch":
+        score -= 260.0
+    elif domain_match == "shared":
+        score += 25.0
     score += _doc_type_priority(str(metadata.get("doc_type") or ""), query, domain)
     normalized_doc_type = _normalized(metadata.get("doc_type") or "")
     query_terms = set(_expanded_query_terms_cached(query, domain))
@@ -1055,11 +1125,23 @@ def _sm_qos_requirement_candidates(query: str, domain: str) -> List[Dict[str, An
             continue
         if doc_type not in {"table", "openapi", "glossary"}:
             continue
-        base = 2480.0 if doc_type == "table" else 1700.0 if doc_type == "openapi" else 1260.0
+        base = 320.0 if doc_type == "table" else 240.0 if doc_type == "openapi" else 180.0
         page_text = _normalized(record.get("page_content") or "")
         if "5.6.2.8" in title or "definition of type qosdata" in title or "packetdelaybudget" in page_text:
-            base += 820.0
-        candidates.append(_record_to_candidate(record, score=base + _metadata_query_bonus(metadata, query, domain), retrieval="sm_qos_requirements"))
+            base += 180.0
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=base + _metadata_query_bonus(metadata, query, domain),
+                retrieval="sm_qos_requirements",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="sm_qos_requirements",
+                ),
+            )
+        )
     return _dedupe_candidates(candidates, limit=6)
 
 
@@ -1085,18 +1167,30 @@ def _schema_object_graph_candidates(query: str, domain: str) -> List[Dict[str, A
         schema_overlap = len(query_terms.intersection(schema_name_terms))
         if title_overlap == 0 and object_overlap == 0 and schema_overlap == 0:
             continue
-        score = 2440.0 + 180.0 * schema_overlap + 120.0 * title_overlap + 90.0 * object_overlap
+        score = 280.0 + 90.0 * schema_overlap + 60.0 * title_overlap + 45.0 * object_overlap
         normalized_schema_name = _normalized(metadata.get("schema_name") or "")
         if matched_schema_names_normalized:
-            score += 420.0 if normalized_schema_name in matched_schema_names_normalized else -180.0
+            score += 110.0 if normalized_schema_name in matched_schema_names_normalized else -60.0
         object_phrase_overlap = sum(
             1
             for object_tag in metadata.get("object_tags") or []
             if _normalized(object_tag) in matched_object_phrases_normalized
         )
-        score += 170.0 * object_phrase_overlap
+        score += 70.0 * object_phrase_overlap
         score += _metadata_query_bonus(metadata, query, domain)
-        candidates.append(_record_to_candidate(record, score=score, retrieval="schema_object_graph"))
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="schema_object_graph",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="schema_object_graph",
+                ),
+            )
+        )
     return _dedupe_candidates(candidates, limit=8)
 
 
@@ -1128,20 +1222,32 @@ def _schema_definition_candidates(query: str, domain: str) -> List[Dict[str, Any
         schema_overlap = len(query_terms.intersection(schema_terms))
         if title_overlap == 0 and object_overlap == 0 and content_overlap == 0 and schema_overlap == 0:
             continue
-        score = 2320.0 + 220.0 * schema_overlap + 105.0 * title_overlap + 90.0 * object_overlap + 32.0 * content_overlap
+        score = 260.0 + 110.0 * schema_overlap + 52.0 * title_overlap + 45.0 * object_overlap + 18.0 * content_overlap
         normalized_schema_name = _normalized(schema_name)
         if normalized_schema_name in query_text:
-            score += 380.0
+            score += 140.0
         if matched_schema_names_normalized:
-            score += 460.0 if normalized_schema_name in matched_schema_names_normalized else -180.0
+            score += 120.0 if normalized_schema_name in matched_schema_names_normalized else -60.0
         object_phrase_overlap = sum(
             1
             for object_tag in metadata.get("object_tags") or []
             if _normalized(object_tag) in matched_object_phrases_normalized
         )
-        score += 140.0 * object_phrase_overlap
+        score += 65.0 * object_phrase_overlap
         score += _metadata_query_bonus(metadata, query, domain)
-        candidates.append(_record_to_candidate(record, score=score, retrieval="schema_definition"))
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="schema_definition",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="schema_definition",
+                ),
+            )
+        )
     return _dedupe_candidates(candidates, limit=8)
 
 
@@ -1161,10 +1267,22 @@ def _am_rfsp_clause_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
         page_text = _normalized(record.get("page_content") or "")
         if "RfspIndex" not in object_tags and "rfsp" not in title and "rfsp index" not in page_text:
             continue
-        base = 2520.0
+        base = 320.0
         if "4.2.2.3.2" in title or "rfsp index" in title or "rfsp index" in page_text:
-            base += 760.0
-        candidates.append(_record_to_candidate(record, score=base + _metadata_query_bonus(metadata, query, domain), retrieval="am_rfsp_clause"))
+            base += 140.0
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=base + _metadata_query_bonus(metadata, query, domain),
+                retrieval="am_rfsp_clause",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="am_rfsp_clause",
+                ),
+            )
+        )
     return _dedupe_candidates(candidates, limit=6)
 
 
@@ -1186,15 +1304,33 @@ def _operation_intent_candidates(query: str, domain: str) -> List[Dict[str, Any]
         overlap = len(query_terms.intersection(operation_terms))
         if not overlap and not any(verb in _normalized(operation_id) for verb in requested_verbs):
             continue
-        score = 2300.0 + 120.0 * overlap + _metadata_query_bonus(metadata, query, domain)
+        score = 280.0 + 70.0 * overlap + _metadata_query_bonus(metadata, query, domain)
         normalized_operation = _normalized(operation_id)
         for verb in requested_verbs:
-            score += 260.0 if verb in normalized_operation else -140.0
-        candidates.append(_record_to_candidate(record, score=score, retrieval="operation_intent"))
+            score += 90.0 if verb in normalized_operation else -50.0
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="operation_intent",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="operation_intent",
+                ),
+            )
+        )
     return _dedupe_candidates(candidates, limit=6)
 
 
-def _record_to_candidate(record: Dict[str, Any], *, score: float, retrieval: str) -> Dict[str, Any]:
+def _record_to_candidate(
+    record: Dict[str, Any],
+    *,
+    score: float,
+    retrieval: str,
+    features: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     metadata = dict(record.get("metadata") or {})
     return {
         "id": record.get("id"),
@@ -1202,10 +1338,17 @@ def _record_to_candidate(record: Dict[str, Any], *, score: float, retrieval: str
         "metadata": metadata,
         "score": score,
         "retrieval": retrieval,
+        "features": dict(features or {}),
     }
 
 
-def _doc_to_candidate(doc: Any, *, score: float, retrieval: str) -> Dict[str, Any]:
+def _doc_to_candidate(
+    doc: Any,
+    *,
+    score: float,
+    retrieval: str,
+    features: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     metadata = doc.metadata if isinstance(getattr(doc, "metadata", None), dict) else {}
     return {
         "id": None,
@@ -1213,6 +1356,7 @@ def _doc_to_candidate(doc: Any, *, score: float, retrieval: str) -> Dict[str, An
         "metadata": metadata,
         "score": score,
         "retrieval": retrieval,
+        "features": dict(features or {}),
     }
 
 
@@ -1279,6 +1423,7 @@ def _bge_rerank_query(query: str, domain: str) -> str:
 
 def _candidate_rerank_text(candidate: Dict[str, Any]) -> str:
     metadata = candidate["metadata"]
+    features = candidate.get("features") or {}
     result_key = _candidate_key(metadata, candidate.get("id") or "")
     aliases = _limited_terms(metadata.get("aliases") or [])
     objects = _limited_terms(metadata.get("object_tags") or [])
@@ -1295,6 +1440,9 @@ def _candidate_rerank_text(candidate: Dict[str, Any]) -> str:
         f"Candidate aliases: {aliases}",
         f"Candidate object tags: {objects}",
         f"Candidate normalized technical terms: {normalized_terms}",
+        f"Candidate match type: {features.get('match_type', '')}",
+        f"Candidate domain match: {features.get('domain_match', '')}",
+        f"Candidate object overlap count: {features.get('object_overlap_count', 0)}",
         f"Content: {candidate.get('page_content', '')}",
     ]
     return _shorten(" ".join(part for part in parts if part), limit=BGE_RERANK_INPUT_CHARS)
@@ -1382,6 +1530,7 @@ def _aggregate_parent_candidates(
         ranked_group = sorted(group, key=lambda item: item["score"], reverse=True)
         representative = dict(ranked_group[0])
         representative_metadata = dict(representative["metadata"])
+        representative_features = dict(representative.get("features") or {})
         support_count = len(ranked_group)
         retrieval_families = sorted({_retrieval_family(item.get("retrieval") or "") for item in ranked_group})
         rrf_score = 0.0
@@ -1389,7 +1538,7 @@ def _aggregate_parent_candidates(
             rank = family_rankings.get(family, {}).get(parent_key)
             if rank is not None:
                 rrf_score += 1.0 / (RRF_K + float(rank))
-        representative["score"] = round(float(representative["score"]) + rrf_score * RRF_SCORE_SCALE, 4)
+        representative["score"] = round(rrf_score * RRF_SCORE_SCALE + float(ranked_group[0]["score"]) * 0.01, 4)
         representative_retrieval = str(representative.get("retrieval") or "")
         if support_count > 1 or len(retrieval_families) > 1:
             representative["retrieval"] = (
@@ -1406,6 +1555,9 @@ def _aggregate_parent_candidates(
             "supporting_retrievals": retrieval_families,
             "rrf_score": round(rrf_score, 6),
         }
+        representative_features["support_count"] = support_count
+        representative_features["supporting_retrievals"] = retrieval_families
+        representative["features"] = representative_features
         aggregated.append(representative)
 
     return sorted(aggregated, key=lambda item: item["score"], reverse=True)[:limit]
@@ -1417,7 +1569,7 @@ def _direct_record_matches(key: str, domain: str) -> List[Dict[str, Any]]:
     direct_hits: List[Dict[str, Any]] = []
     for record in catalog.values():
         metadata = record.get("metadata") or {}
-        if not _domain_matches(metadata, domain):
+        if not _candidate_domain_allowed(metadata, domain, key):
             continue
         search_fields = [
             metadata.get("canonical_title"),
@@ -1444,7 +1596,21 @@ def _direct_record_matches(key: str, domain: str) -> List[Dict[str, Any]]:
             score = 1800.0
         if score > 0:
             score += _metadata_query_bonus(metadata, key, domain)
-            direct_hits.append(_record_to_candidate(record, score=score, retrieval="exact_identifier"))
+            direct_hits.append(
+                _record_to_candidate(
+                    record,
+                    score=score,
+                    retrieval="exact_identifier",
+                    features=_candidate_features(
+                        metadata,
+                        query=key,
+                        domain=domain,
+                        match_type="exact_identifier",
+                        lexical_score=score,
+                        is_exact_identifier=True,
+                    ),
+                )
+            )
     return _dedupe_candidates(direct_hits, limit=3)
 
 
@@ -1457,32 +1623,71 @@ def _exact_search_candidates(query: str, domain: str) -> List[Dict[str, Any]]:
         if record is None:
             continue
         metadata = record.get("metadata") or {}
-        if not _domain_matches(metadata, domain):
+        if not _candidate_domain_allowed(metadata, domain, query):
             continue
         if _should_skip_generic_clause_candidate(metadata, query):
             continue
-        clause_base = 1120.0 if prefers_schema else 1260.0
+        clause_base = 120.0 if prefers_schema else 180.0
         score = clause_base + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
-        candidates.append(_record_to_candidate(record, score=score, retrieval="exact_clause"))
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="exact_clause",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="exact_clause",
+                    lexical_score=float(hit["score"]),
+                ),
+            )
+        )
     for hit in search_exact_index(_schema_exact_index(), query, top_k=12):
         record = catalog.get(hit["id"])
         if record is None:
             continue
         metadata = record.get("metadata") or {}
-        if not _domain_matches(metadata, domain):
+        if not _candidate_domain_allowed(metadata, domain, query):
             continue
-        schema_base = 1380.0 if prefers_schema else 1200.0
+        schema_base = 220.0 if prefers_schema else 150.0
         score = schema_base + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
-        candidates.append(_record_to_candidate(record, score=score, retrieval="exact_schema"))
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="exact_schema",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="exact_schema",
+                    lexical_score=float(hit["score"]),
+                ),
+            )
+        )
     for hit in search_exact_index(_glossary_exact_index(), query, top_k=12):
         record = catalog.get(hit["id"])
         if record is None:
             continue
         metadata = record.get("metadata") or {}
-        if not _domain_matches(metadata, domain):
+        if not _candidate_domain_allowed(metadata, domain, query):
             continue
-        score = 1000.0 + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
-        candidates.append(_record_to_candidate(record, score=score, retrieval="exact_glossary"))
+        score = 140.0 + float(hit["score"]) + _metadata_query_bonus(metadata, query, domain)
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="exact_glossary",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="exact_glossary",
+                    lexical_score=float(hit["score"]),
+                ),
+            )
+        )
     return _dedupe_candidates(candidates, limit=6)
 
 
@@ -1578,10 +1783,23 @@ def _expand_cross_spec_candidates(
     for citation, object_name, object_score in ranked_citations:
         for record in by_citation.get(citation) or []:
             metadata = record.get("metadata") or {}
-            if not _domain_matches(metadata, domain):
+            if not _candidate_domain_allowed(metadata, domain, query):
                 continue
-            score = 900.0 + min(object_score, 4000.0) * 0.01 + _metadata_query_bonus(metadata, query, domain)
-            expanded.append(_record_to_candidate(record, score=score, retrieval=f"cross_spec:{object_name}"))
+            score = 110.0 + min(object_score, 4000.0) * 0.01 + _metadata_query_bonus(metadata, query, domain)
+            expanded.append(
+                _record_to_candidate(
+                    record,
+                    score=score,
+                    retrieval=f"cross_spec:{object_name}",
+                    features=_candidate_features(
+                        metadata,
+                        query=query,
+                        domain=domain,
+                        match_type="cross_spec",
+                        cross_spec_source=object_name,
+                    ),
+                )
+            )
 
     deduped = _dedupe_candidates(expanded, limit=4)
     # logger.info(
@@ -1610,7 +1828,7 @@ def _vector_search_candidates(query: str, domain: str) -> Tuple[List[Dict[str, A
             continue
         for rank, (doc, raw_score) in enumerate(docs):
             metadata = doc.metadata if isinstance(getattr(doc, "metadata", None), dict) else {}
-            if not _domain_matches(metadata, domain):
+            if not _candidate_domain_allowed(metadata, domain, query):
                 continue
             if _is_generic_clause_candidate(metadata):
                 continue
@@ -1624,7 +1842,20 @@ def _vector_search_candidates(query: str, domain: str) -> Tuple[List[Dict[str, A
             score += 10.0 * len(query_terms.intersection(title_terms))
             score += 8.0 * len(query_terms.intersection(object_terms))
             score += 4.0 * len(query_terms.intersection(normalized_terms))
-            candidates.append(_doc_to_candidate(doc, score=score, retrieval=f"vector:{collection_name}"))
+            candidates.append(
+                _doc_to_candidate(
+                    doc,
+                    score=score,
+                    retrieval=f"vector:{collection_name}",
+                    features=_candidate_features(
+                        metadata,
+                        query=query,
+                        domain=domain,
+                        match_type="vector",
+                        vector_rank=rank + 1,
+                    ),
+                )
+            )
     return _aggregate_parent_candidates(candidates, limit=20), errors
 
 
@@ -1636,13 +1867,27 @@ def _resolve_explicit_key_candidates(key: str, domain: str) -> List[Dict[str, An
     matches: List[Dict[str, Any]] = []
     for record in _record_catalog().values():
         metadata = record.get("metadata") or {}
-        if not _domain_matches(metadata, domain):
+        if not _candidate_domain_allowed(metadata, domain, key):
             continue
         candidate_key = _candidate_key(metadata, record.get("id") or "")
         if _normalized(candidate_key) != normalized_key:
             continue
         score = 2600.0 + _metadata_query_bonus(metadata, key, domain)
-        matches.append(_record_to_candidate(record, score=score, retrieval="selected_key"))
+        matches.append(
+            _record_to_candidate(
+                record,
+                score=score,
+                retrieval="selected_key",
+                features=_candidate_features(
+                    metadata,
+                    query=key,
+                    domain=domain,
+                    match_type="selected_key",
+                    lexical_score=score,
+                    is_exact_identifier=True,
+                ),
+            )
+        )
     return _dedupe_candidates(matches, limit=6)
 
 
@@ -1661,6 +1906,7 @@ def _result_summary(candidate: Dict[str, Any]) -> str:
 
 def _render_result(candidate: Dict[str, Any]) -> str:
     metadata = candidate["metadata"]
+    features = candidate.get("features") or {}
     result_key = _candidate_key(metadata, candidate.get("id") or "")
     locator_parts = []
     if metadata.get("schema_name"):
@@ -1679,6 +1925,7 @@ def _render_result(candidate: Dict[str, Any]) -> str:
         f"Retrieval: {candidate['retrieval']}",
         f"Spec: {metadata.get('spec_id', '')} Release {metadata.get('release', '')} Version {metadata.get('version', '')}",
         f"Type: {metadata.get('doc_type', '')} Domain: {metadata.get('policy_domain', '')}",
+        f"Features: match_type={features.get('match_type', '')} domain_match={features.get('domain_match', '')} doc_type_match={features.get('doc_type_match', False)} object_overlap_count={features.get('object_overlap_count', 0)}",
         f"Locator: {locator}",
         f"Objects: {', '.join(metadata.get('object_tags') or []) or 'none'}",
         f"Citation: {metadata.get('citation_anchor', '')}",

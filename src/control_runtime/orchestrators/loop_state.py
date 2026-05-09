@@ -13,6 +13,9 @@ class OrchestratorLoopState:
     previous_diagnosis: Dict[str, Any] = field(default_factory=dict)
     previous_report_payload: Dict[str, Any] = field(default_factory=dict)
     previous_mediator_decision: Optional[Dict[str, Any]] = None
+    previous_negotiation_request: Dict[str, Any] = field(default_factory=dict)
+    previous_planning_blocker: Dict[str, Any] = field(default_factory=dict)
+    previous_execution_reentry: Dict[str, Any] = field(default_factory=dict)
     latest_result: Optional[ControlRoundResult] = None
     round_traces: List[Dict[str, Any]] = field(default_factory=list)
     completed: bool = False

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 from shared.runtime import extract_tool_calls, extract_tool_results
@@ -14,7 +15,26 @@ TOOL_RESULT_MARKERS: Dict[str, str] = {
 }
 
 
-def extract_grounding_tool_payloads(*, advisor_result: Dict[str, Any], compiler: Any) -> List[Dict[str, Any]]:
+def parse_json_payload_from_tool_result(content: Any, *, marker: str) -> Dict[str, Any]:
+    text = str(content or "").strip()
+    if not text:
+        return {}
+    payload_text = text
+    marker_index = text.find(marker)
+    if marker_index >= 0:
+        payload_text = text[marker_index + len(marker):].strip()
+    start = payload_text.find("{")
+    end = payload_text.rfind("}")
+    if start < 0 or end < start:
+        return {}
+    try:
+        payload = json.loads(payload_text[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def extract_grounding_tool_payloads(*, advisor_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     tool_calls = {
         str(call.get("id") or "").strip(): call
         for call in extract_tool_calls(advisor_result.get("messages") or [])
@@ -30,7 +50,7 @@ def extract_grounding_tool_payloads(*, advisor_result: Dict[str, Any], compiler:
         call_args = tool_calls.get(tool_call_id, {}).get("args") if tool_call_id else {}
         if not isinstance(call_args, dict):
             call_args = {}
-        payload = compiler.parse_json_payload_from_tool_result(
+        payload = parse_json_payload_from_tool_result(
             result.get("content"),
             marker=marker,
         )
@@ -46,4 +66,4 @@ def extract_grounding_tool_payloads(*, advisor_result: Dict[str, Any], compiler:
     return payloads
 
 
-__all__ = ["TOOL_RESULT_MARKERS", "extract_grounding_tool_payloads"]
+__all__ = ["TOOL_RESULT_MARKERS", "extract_grounding_tool_payloads", "parse_json_payload_from_tool_result"]

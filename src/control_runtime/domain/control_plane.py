@@ -56,7 +56,7 @@ class MainUncertaintyFlag(str, Enum):
 class MainRetryScope(str, Enum):
     FULL_REGROUND = "full_reground"
     PARTIAL_REGROUND = "partial_reground"
-    POLICY_REPAIR = "policy_repair"
+    TARGET_STABLE = "target_stable"
     EXECUTION_RETRY_FORBIDDEN = "execution_retry_forbidden"
 
 
@@ -70,6 +70,7 @@ class OptimizationTemplate(str, Enum):
 
 class DomainStatus(str, Enum):
     READY = "ready"
+    PROPOSED = "proposed"
     APPROVED = "approved"
     REJECTED = "rejected"
     NEEDS_REVISION = "needs_revision"
@@ -315,6 +316,49 @@ class OptimizationProblemConfig(BaseModel):
         )
 
 
+class ReuseContract(BaseModel):
+    allowed: bool = False
+    preserve_bindings: bool = False
+    preserve_domains: bool = False
+    preserve_stage_scope: bool = False
+    invalidate_on: List[str] = Field(default_factory=list)
+
+
+class HandoffExpectation(BaseModel):
+    target_agent: str = Field(default="")
+    expectations: List[str] = Field(default_factory=list)
+    blocking_questions: List[str] = Field(default_factory=list)
+
+
+class AgentContribution(BaseModel):
+    agent: str = Field(default="")
+    summary: str = Field(default="")
+    evidence: List[str] = Field(default_factory=list)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentConflict(BaseModel):
+    agents: List[str] = Field(default_factory=list)
+    summary: str = Field(default="")
+    impact: str = Field(default="")
+    evidence: List[str] = Field(default_factory=list)
+
+
+class HandoffRecord(BaseModel):
+    source_agent: str = Field(default="")
+    target_agent: str = Field(default="")
+    artifact_type: str = Field(default="")
+    summary: str = Field(default="")
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OpenQuestion(BaseModel):
+    owner_agent: str = Field(default="")
+    question: str = Field(default="")
+    blocking: bool = False
+    related_domains: List[str] = Field(default_factory=list)
+
+
 class GlobalControlIntent(BaseModel):
     session_id: str = ""
     snapshot_id: str = ""
@@ -331,8 +375,12 @@ class GlobalControlIntent(BaseModel):
     retry_scope: Optional[MainRetryScope] = Field(default=None)
     required_evidence: List[str] = Field(default_factory=list)
     forbidden_assumptions: List[str] = Field(default_factory=list)
-    diagnosis_summary: str = Field(default="")
     intent_encoding_guidance: str = ""
+    routing_decision: str = Field(default="")
+    routing_rationale: str = Field(default="")
+    routing_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    reuse_contract: ReuseContract = Field(default_factory=ReuseContract)
+    handoff_expectations: List[HandoffExpectation] = Field(default_factory=list)
 
     @field_validator("objective_profile", mode="before")
     @classmethod
@@ -445,6 +493,10 @@ class UnifiedControlPlan(BaseModel):
     blocked_domains: List[ControlDomain] = Field(default_factory=list)
     objective_breakdown: Dict[str, Any] = Field(default_factory=dict)
     control_churn_count: int = 0
+    agent_contributions: List[AgentContribution] = Field(default_factory=list)
+    agent_conflicts: List[AgentConflict] = Field(default_factory=list)
+    handoff_records: List[HandoffRecord] = Field(default_factory=list)
+    open_questions: List[OpenQuestion] = Field(default_factory=list)
 
 
 class JointOptimizationRequest(BaseModel):

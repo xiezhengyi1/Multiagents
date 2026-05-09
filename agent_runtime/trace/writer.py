@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from agent_runtime.io.paths import trace_root
-from agent_runtime.messages import build_tool_specs
+from agent_runtime.tooling import build_tool_specs
 from agent_runtime.trace.builder import TRACE_UNSET, build_run_tree_record, utc_now
 
 _FILE_LOCKS: dict[Path, threading.Lock] = {}

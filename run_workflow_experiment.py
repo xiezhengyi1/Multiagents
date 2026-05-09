@@ -174,6 +174,8 @@ def summarize_run_results(
             main_judgement_wrong_cases.append(
                 {
                     "record_index": item.get("record_index"),
+                    "task_id": item.get("task_id"),
+                    "category": item.get("category"),
                     "scenario_id": item.get("scenario_id"),
                     "user_input": item.get("user_input"),
                     "global_intent": item.get("global_intent"),
@@ -185,6 +187,8 @@ def summarize_run_results(
             correct_cases.append(
                 {
                     "record_index": item.get("record_index"),
+                    "task_id": item.get("task_id"),
+                    "category": item.get("category"),
                     "scenario_id": item.get("scenario_id"),
                     "status_code": status_code,
                     "user_input": item.get("user_input"),
@@ -200,6 +204,8 @@ def summarize_run_results(
         error_cases.append(
             {
                 "record_index": item.get("record_index"),
+                "task_id": item.get("task_id"),
+                "category": item.get("category"),
                 "scenario_id": item.get("scenario_id"),
                 "status": item.get("status"),
                 "completed": item.get("completed"),

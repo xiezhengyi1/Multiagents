@@ -120,6 +120,13 @@ class SingleAgentRoundDecision(BaseModel):
             raise ValueError("requested_domains must not be empty")
         if any(item not in allowed for item in self.requested_domains):
             raise ValueError("requested_domains contains unsupported values")
+        if not str(self.supi or "").strip():
+            raise ValueError("grounded supi is required")
+        profile_name = str(self.objective_profile_hint or "").strip().lower()
+        if not profile_name:
+            raise ValueError("objective_profile_hint is required")
+        if profile_name not in {"balanced", "latency", "throughput", "stability"}:
+            raise ValueError("objective_profile_hint contains unsupported value")
 
         has_qos = "qos" in self.requested_domains
         has_mobility = "mobility" in self.requested_domains
