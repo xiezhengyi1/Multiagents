@@ -27,30 +27,14 @@ class PlanningEvidenceBuilder:
                     "flow_id": str(flow.flow_id or "").strip(),
                     "app_id": _normalize_app_id(flow.app_id),
                     "name": str(flow.name or "").strip(),
-                    "bw_ul": flow.bw_ul,
-                    "bw_dl": flow.bw_dl,
-                    "gbr_ul": flow.gbr_ul,
-                    "gbr_dl": flow.gbr_dl,
-                    "lat": flow.lat,
-                    "jitter_req": flow.jitter_req,
-                    "loss_req": flow.loss_req,
                     "priority": flow.priority,
                     "service_type_id": flow.service_type_id,
-                    "five_tuple": flow.five_tuple,
                 }
             )
         qos_objectives = [
             objective.model_dump(mode="json")
             for objective in operation_intent.qos_target_envelopes
         ]
-        current_stage = next(
-            (
-                stage.model_dump(mode="json")
-                for stage in (operation_intent.control_semantics.stages or [])
-                if int(stage.stage_index or 0) == int(operation_intent.control_semantics.current_stage or 1)
-            ),
-            {},
-        )
         return {
             "requested_domains": list(planning_request.context.active_domains or []),
             "main_retry_scope": str(planning_request.context.main_retry_scope or "").strip(),
@@ -61,8 +45,6 @@ class PlanningEvidenceBuilder:
             "unified_constraints": dict(planning_request.context.unified_constraints or {}),
             "flows": flows,
             "qos_target_envelopes": qos_objectives,
-            "control_semantics": operation_intent.control_semantics.model_dump(mode="json"),
-            "current_stage": current_stage,
         }
 
 

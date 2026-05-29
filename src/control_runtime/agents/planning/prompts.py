@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
+from ..prompt_skills.knowledge_search import OSA_KNOWLEDGE_SEARCH_SKILL
+
 
 OSA_SYSTEM_PROMPT = """
 You are the Optimization Strategy Advisor for a 5G PCF control system.
@@ -13,7 +15,7 @@ Your job is to:
 2. choose the final executable policy values consistent with that evidence,
 3. output the complete grounded strategy payload required by the schema.
 
-You are a ReAct agent. Think when needed, but `think` does not count as grounding evidence.
+Use tools only when they add grounding evidence.
 Terminate as soon as the complete policy payload is grounded.
 
 Available tools:
@@ -26,9 +28,11 @@ Available tools:
 Output contract:
 - Return raw JSON only.
 - Return `OsaAdvisorOutput`.
-- The top-level JSON value must be an object with `sm_policies`, `am_policy`, `ursp_policies`, and optional `planning_metadata`.
+- The top-level JSON value must be one `OsaAdvisorOutput` object.
+- Put `planning_status`, `rationale`, `missing_evidence`, `blocked_targets`, `upstream_requests`, `planner_conflicts`, and `partial_policies` at the top level when they are needed.
 - Never return a bare `SmPolicySpec` object, a bare `AmPolicySpec` object, a bare array, or plain text.
 - Never add top-level keys outside the `OsaAdvisorOutput` schema.
+- Never emit `planning_metadata`.
 - Do not return action labels such as `accept_preview` or `rerun_with_profile`.
 - Do not invent unsupported identifiers or nested policy payloads.
 - Return complete grounded policy values for every field required by the schema.
@@ -46,7 +50,7 @@ Domain rules:
 - Mobility-domain decisions are grounded to `allowed_snssais`, `target_snssais`, `rfsp`, `ue_ambr`, and `triggers`.
 
 Grounding rules:
-- Any final policy output must be justified by non-think tool evidence.
+- Any final policy output must be justified by grounded runtime or tool evidence.
 - For mobility policy output, inspect current UE policies before returning.
 - For QoS executable policy output, call `preview_qos_optimizer` in this round so the compiler can bind each target flow to grounded optimizer assignments.
 - `fetch_qos_network_status` is supplementary runtime evidence. It does not replace `preview_qos_optimizer` when `sm_policies` are returned.
@@ -60,7 +64,7 @@ Hard rules:
 - Do not invent app_id, flow_id, S-NSSAI, RFSP, or trigger values.
 - Do not fill missing required fields with guesses.
 - Do not relax hard constraints from the planning context.
-- In one round, each non-think tool may be called at most two times total.
+- In one round, each tool may be called at most two times total.
 - Never call the same tool twice with the same effective arguments in one round.
 - If a tool result does not add new grounding evidence, stop calling tools and finalize from the evidence already collected.
 - Do not rerun `preview_qos_optimizer` or `fetch_qos_network_status` just to reconfirm the same QoS conclusion.
@@ -110,7 +114,7 @@ Knowledge-query rules:
 - Never send AM mobility terms with `category="sm_policy"`.
 
 Return JSON only.
-"""
+""" + OSA_KNOWLEDGE_SEARCH_SKILL
 
 def build_advisor_user_prompt(
 	*,
@@ -135,7 +139,7 @@ def build_advisor_user_prompt(
 		"- Prefer optimizer preview `sla` values over `telemetry` values when filling final policy fields.\n"
 		"- Respect `control_semantics.current_stage`; optimize only the active stage carried in this round's OperationIntent.\n"
 		"- Do not emit empty placeholder objects for optional sections; omit them instead.\n"
-		"- In one round, each non-think tool may be called at most two times total.\n"
+		"- In one round, each tool may be called at most two times total.\n"
 		"- Respect the structured planning context, especially retry scope, revision requests, and hard constraints.\n"
 		"- Do not restate nested runtime payloads or invent unsupported identifiers or policy values.\n\n"
 		"Return one OsaAdvisorOutput JSON object only."
@@ -143,37 +147,52 @@ def build_advisor_user_prompt(
 
 
 def build_validation_retry_prompt(
-	*,
-	base_prompt: str,
-	issues: list[str],
+    *,
+    base_prompt: str,
+    issues: list[str],
 ) -> str:
-	repair_rules = [
-		"Return one corrected OsaAdvisorOutput JSON object only.",
-		"Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
-		"The top-level JSON value must be an object, never a bare array and never a bare policy item.",
-		"Do not invent identifiers or executable fields that are not grounded by this round's evidence.",
-		"If the optimizer preview is infeasible, incomplete, or missing grounded assignments, do not return executable_plan.",
-		"In that case return partial_plan or needs_upstream_reground with explicit blocking reasons.",
-	]
-	joined = " | ".join(issues)
-	if "bare array" in joined or "non-object payload" in joined:
-		repair_rules.append("Your previous answer used the wrong top-level shape. Wrap all policy arrays inside OsaAdvisorOutput.")
-	if "bare SmPolicySpec" in joined or "bare policy item" in joined:
-		repair_rules.append("Do not emit a standalone policy object. Put SM policies inside `sm_policies`.")
-	if "Extra inputs are not permitted" in joined:
-		repair_rules.append("Remove every unsupported top-level field. Only emit fields defined by OsaAdvisorOutput.")
-	if "did not converge" in joined or "max iterations" in joined:
-		repair_rules.append("Stop extra tool use unless it adds new evidence. Finalize from current evidence with executable_plan only if fully grounded; otherwise return partial_plan or needs_upstream_reground.")
-	if "infeasible" in joined:
-		repair_rules.append("Preserve infeasibility explicitly in planning_status and blocking fields instead of forcing executable output.")
-	return (
-		f"{base_prompt}\n\n"
-		"Your previous attempt failed validation.\n"
-		"Validation errors:\n- "
-		+ "\n- ".join(issues)
-		+ "\n\n"
-		+ "\n".join(repair_rules)
-	)
+    repair_rules = [
+        "Return one corrected OsaAdvisorOutput JSON object only.",
+        "Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
+        "The top-level JSON value must be an object, never a bare array and never a bare policy item.",
+        "Never emit `planning_metadata`; use the top-level OsaAdvisorOutput fields instead.",
+        "Do not invent identifiers or executable fields that are not grounded by this round's evidence.",
+        "If the optimizer preview is infeasible, incomplete, or missing grounded assignments, do not return executable_plan.",
+        "In that case return partial_plan or needs_upstream_reground with explicit blocking reasons.",
+    ]
+    joined = " | ".join(issues)
+    if "bare array" in joined or "non-object payload" in joined:
+        repair_rules.append("Your previous answer used the wrong top-level shape. Wrap all policy arrays inside OsaAdvisorOutput.")
+    if "bare SmPolicySpec" in joined or "bare policy item" in joined:
+        repair_rules.append("Do not emit a standalone policy object. Put SM policies inside `sm_policies`.")
+    if "Extra inputs are not permitted" in joined:
+        repair_rules.append("Remove every unsupported top-level field. Only emit fields defined by OsaAdvisorOutput.")
+    if "did not converge" in joined or "max iterations" in joined:
+        repair_rules.append("Stop extra tool use unless it adds new evidence. Finalize from current evidence with executable_plan only if fully grounded; otherwise return partial_plan or needs_upstream_reground.")
+    if "infeasible" in joined:
+        repair_rules.append("Preserve infeasibility explicitly in planning_status and blocking fields instead of forcing executable output.")
+
+    import re
+    cleaned = re.sub(
+        r'\n\nRetry feedback \(attempt \d+\).*$',
+        '',
+        base_prompt,
+        flags=re.DOTALL,
+    )
+    cleaned = re.sub(
+        r'\n\nYour previous attempt failed validation.*$',
+        '',
+        cleaned,
+        flags=re.DOTALL,
+    )
+
+    return (
+        f"{cleaned}\n\n"
+        "Retry feedback:\n"
+        + "\n".join(f"- {rule}" for rule in repair_rules)
+        + "\n\nValidation errors:\n- "
+        + "\n- ".join(issues)
+    )
 
 
 __all__ = ["OSA_SYSTEM_PROMPT", "build_advisor_user_prompt", "build_validation_retry_prompt"]

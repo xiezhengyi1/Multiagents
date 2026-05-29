@@ -68,7 +68,6 @@ def build_main_context(
         "memory_context": memory_context,
         "feedback_context": feedback_context,
         "previous_diagnosis": previous_diagnosis or {},
-        "previous_operation_intent": previous_operation_intent or {},
         "previous_operation_intent_summary": _build_previous_operation_intent_summary(previous_operation_intent or {}),
         "execution_retry_hints": _build_execution_retry_hints(retry_source),
         "mediator_conflict_summary": _build_mediator_conflict_summary(previous_execution_feedback or previous_diagnosis or {}),
@@ -100,7 +99,7 @@ def build_planning_context(
         snapshot_metadata={**(get_latest_snapshot_metadata() or {}), "snapshot_id": snapshot_id},
         memory_context=memory_context,
         feedback_context=feedback_context,
-        handoff_history=handoff_history or [],
+        handoff_history=handoff_history[-2:] if len(handoff_history or []) > 2 else (handoff_history or []),
         active_domains=list(active_domains or [item.value for item in global_intent.requested_domains]),
         main_round_strategy=global_intent.round_strategy.value,
         main_retry_scope=(
@@ -219,7 +218,33 @@ def build_feedback_context(
                 mediator_lines.append(f"constraint: {text}")
         if mediator_lines:
             blocks.append("[Mediator]\n" + "\n".join(mediator_lines))
-    return "\n".join(block.strip() for block in blocks if block.strip())
+    result = "\n".join(block.strip() for block in blocks if block.strip())
+    return _truncate_feedback_context(result)
+
+
+_MAX_FEEDBACK_CHARS = 4000
+
+
+def _truncate_feedback_context(feedback: str) -> str:
+    """Limit feedback context, keeping the most recent blocks when truncated."""
+    if len(feedback) <= _MAX_FEEDBACK_CHARS:
+        return feedback
+    sections = feedback.split("\n[")
+    keep: list[str] = []
+    chars = 0
+    for i in range(len(sections) - 1, -1, -1):
+        section = sections[i]
+        if i > 0:
+            section = "[" + section
+        overhead = len("\n") if keep else 0
+        if chars + len(section) + overhead <= _MAX_FEEDBACK_CHARS:
+            keep.insert(0, section)
+            chars += len(section) + overhead
+        else:
+            break
+    if not keep:
+        return feedback[-_MAX_FEEDBACK_CHARS:]
+    return "\n".join(keep)
 
 
 def _build_execution_retry_hints(payload: Dict[str, Any]) -> List[Dict[str, Any]]:

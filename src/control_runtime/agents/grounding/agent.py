@@ -89,6 +89,15 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             system_prompt=IEA_SYSTEM_PROMPT,
             response_model=IntentAdvisorDecision,
             max_iterations=14,
+            tool_result_limits={
+                "get_sm_ue_flow_catalog": 8000,
+                "get_sm_ue_context": 4000,
+                "search_sm_flow_targets": 4000,
+                "get_am_policy_context": 4000,
+                "search_am_policy_targets": 4000,
+                "search_semantic_knowledge": 4000,
+                "get_knowledge_by_key": 4000,
+            },
         )
         self.last_failure_debug: Dict[str, Any] = {}
 
@@ -426,30 +435,24 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         ]
         joined = " | ".join(issues)
         if "QoS advisor decision must include grounded target flows." in joined:
-            repair_rules.extend(
-                [
-                    "This retry is specifically failing because your previous JSON omitted flows.",
-                    "For the next answer, flows must be non-empty.",
-                    "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
-                    "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
-                    "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return either a resolved or explicitly unresolved flow entry.",
-                    "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
-                ]
-            )
+            repair_rules.extend([
+                "This retry is specifically failing because your previous JSON omitted flows.",
+                "For the next answer, flows must be non-empty.",
+                "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
+                "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
+                "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return either a resolved or explicitly unresolved flow entry.",
+                "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
+            ])
         if "domain_resolution must be confirmed, narrowed, widened, or cannot_confirm" in joined:
-            repair_rules.extend(
-                [
-                    "Set `domain_resolution` to exactly one of: confirmed, narrowed, widened, cannot_confirm.",
-                    "Do not output a nested object under `domain_resolution`.",
-                ]
-            )
+            repair_rules.extend([
+                "Set `domain_resolution` to exactly one of: confirmed, narrowed, widened, cannot_confirm.",
+                "Do not output a nested object under `domain_resolution`.",
+            ])
         if "cannot_confirm domain resolution requires domain_revision_rationale" in joined:
-            repair_rules.extend(
-                [
-                    "If you set `domain_resolution` to `cannot_confirm`, you must include a non-empty `domain_revision_rationale`.",
-                    "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
-                ]
-            )
+            repair_rules.extend([
+                "If you set `domain_resolution` to `cannot_confirm`, you must include a non-empty `domain_revision_rationale`.",
+                "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
+            ])
         if (
             "explicitly named QoS flow '" in joined
             and (
@@ -457,36 +460,42 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 or "must appear in advisor decision flows as resolved or unresolved" in joined
             )
         ):
-            repair_rules.extend(
-                [
-                    "For each explicitly named QoS flow, either ground it via catalog/search evidence or leave it unresolved.",
-                    "When a flow is resolved, set `flows[].name` to the explicit flow name that the resolved binding satisfies.",
-                    "Do not return a resolved flow binding for any name that is missing from catalog/search evidence.",
-                ]
-            )
+            repair_rules.extend([
+                "For each explicitly named QoS flow, either ground it via catalog/search evidence or leave it unresolved.",
+                "When a flow is resolved, set `flows[].name` to the explicit flow name that the resolved binding satisfies.",
+                "Do not return a resolved flow binding for any name that is missing from catalog/search evidence.",
+            ])
         if "mobility-only intent must not call SM grounding tools" in joined:
-            repair_rules.extend(
-                [
-                    "This retry is mobility-only.",
-                    "Do not call search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
-                ]
-            )
+            repair_rules.extend([
+                "This retry is mobility-only.",
+                "Do not call search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
+            ])
         if "QoS-only intent must not call AM grounding tools" in joined:
-            repair_rules.extend(
-                [
-                    "This retry is QoS-only.",
-                    "Do not call get_am_policy_context or search_am_policy_targets.",
-                ]
-            )
+            repair_rules.extend([
+                "This retry is QoS-only.",
+                "Do not call get_am_policy_context or search_am_policy_targets.",
+            ])
+
+        import re
+        cleaned = re.sub(
+            r'\n\nRetry feedback \(attempt \d+\).*$',
+            '',
+            base_prompt,
+            flags=re.DOTALL,
+        )
+        cleaned = re.sub(
+            r'\n\nYour previous attempt failed validation.*$',
+            '',
+            cleaned,
+            flags=re.DOTALL,
+        )
+
         return (
-            f"{base_prompt}\n\n"
-            "Your previous attempt failed validation.\n"
-            "Validation errors:\n- "
+            f"{cleaned}\n\n"
+            "Retry feedback:\n"
+            + "\n".join(f"- {rule}" for rule in repair_rules)
+            + "\n\nValidation errors:\n- "
             + "\n- ".join(issues)
-            + "\n\n"
-            "Re-ground the semantic target or correct tool usage before returning the next answer.\n"
-            "Do not return any resolved QoS flow unless both flow_id and app_id are present and grounded.\n"
-            + "\n".join(repair_rules)
         )
 
     def _invoke_intent_advisor(

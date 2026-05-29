@@ -223,15 +223,30 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             issues.append(invocation_error)
         if validation_errors:
             issues.extend(validation_errors)
+
+        import re
+        cleaned = re.sub(
+            r'\n\nRetry feedback \(attempt \d+\).*$',
+            '',
+            base_prompt,
+            flags=re.DOTALL,
+        )
+        cleaned = re.sub(
+            r'\n\nYour previous draft failed validation.*$',
+            '',
+            cleaned,
+            flags=re.DOTALL,
+        )
+
         return (
-            f"{base_prompt}\n\n"
-            "Your previous draft failed validation.\n"
-            "Validation errors:\n- " + "\n- ".join(issues) + "\n\n"
+            f"{cleaned}\n\n"
+            "Retry feedback:\n"
             "Correct the output now.\n"
             "Return exactly one GlobalControlIntent JSON object.\n"
             "Top-level output must be an object, never a list.\n"
             "Do not return markdown or explanation.\n"
-            "Return every routing field even when the value is an empty list or empty string."
+            "Return every routing field even when the value is an empty list or empty string.\n\n"
+            "Validation errors:\n- " + "\n- ".join(issues)
         )
 
     @staticmethod

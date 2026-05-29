@@ -41,6 +41,8 @@ def append_round_trace(
     trace_payload: Dict[str, Any],
 ) -> None:
     state.round_traces.append(dict(trace_payload))
+    if len(state.round_traces) > 3:
+        state.round_traces = state.round_traces[-3:]
     if state.latest_result is not None:
         state.latest_result.round_traces = state.round_traces
 

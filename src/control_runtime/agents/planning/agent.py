@@ -9,7 +9,6 @@ from shared.agents import BaseAgent, coerce_structured_response, extract_groundi
 from knowledge_runtime.retrieval.raw import get_knowledge_by_key, search_semantic_knowledge
 from shared.runtime import ToolLoopExecutionError
 from shared.runtime import ArtifactWorkerMixin
-from shared.tools import think_tool as think
 from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import PolicyPlanDraft
 from shared.logging import log_event, log_timing
@@ -21,6 +20,25 @@ from .prompts import OSA_SYSTEM_PROMPT, build_advisor_user_prompt, build_validat
 from .response_models import OsaAdvisorOutput
 from .tool_result_adapter import extract_planning_tool_evidence
 from .tools import build_request_tools
+
+
+def _build_lean_operation_intent(operation_intent: Any) -> dict:
+    """Build a lean version of OperationIntent for OSA prompt, removing numerical
+    fields that the optimizer tool provides (bw, gbr, latency, jitter, loss, five_tuple)."""
+    raw = _json_friendly(operation_intent.model_dump(mode="json"))
+    lean_flows = []
+    for f in raw.get("flows") or []:
+        if not isinstance(f, dict):
+            lean_flows.append(f)
+            continue
+        lean_flows.append({
+            k: v for k, v in f.items()
+            if k in ("flow_id", "app_id", "supi", "name", "flow_name",
+                     "service_type", "service_type_id", "priority",
+                     "resolution_status", "requested_domains", "dnn")
+        })
+    raw["flows"] = lean_flows
+    return raw
 
 
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
@@ -98,7 +116,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 reason=str(exc),
             )
         operation_intent = effective_request.operation_intent
-        normalized_user_intent = _json_friendly(operation_intent.model_dump(mode="json"))
+        normalized_user_intent = _build_lean_operation_intent(operation_intent)
         normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
         coordination_context = _json_friendly(effective_request.context.model_dump(mode="json"))
 
@@ -252,13 +270,19 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         )
         advisor_agent = self.create_json_agent(
             tools=[
-                think,
                 *([] if not self.rag_enabled else self._RAG_TOOLS),
                 *build_request_tools(planning_request),
             ],
             system_prompt=OSA_SYSTEM_PROMPT,
             response_model=OsaAdvisorOutput,
             max_iterations=12,
+            tool_result_limits={
+                "preview_qos_optimizer": 8000,
+                "fetch_qos_network_status": 4000,
+                "inspect_mobility_ue_policies": 4000,
+                "search_semantic_knowledge": 4000,
+                "get_knowledge_by_key": 4000,
+            },
         )
         messages = [{"role": "user", "content": prompt}]
         invoke_payload = {

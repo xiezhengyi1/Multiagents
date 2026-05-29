@@ -65,7 +65,7 @@ class MainControlOrchestrator:
         self.ad_tool = ad_tool or AssuranceDiagnosisTool()
         self.memory_manager = memory_manager or MemoryManager(
             short_term_limit=max(20, max_rounds * 8),
-            enable_llm_summarization=False,
+            enable_llm_summarization=True,
         )
         self.max_rounds = max_rounds
         self.rag_enabled = rag_enabled

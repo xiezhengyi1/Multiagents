@@ -184,10 +184,7 @@ def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
         result = run_optimizer(request)
         full_payload = _serialize_optimizer_result(result)
         return json.dumps(
-            {
-                "summary": _summarize_optimizer_result(full_payload),
-                "result": full_payload,
-            },
+            {"summary": _summarize_optimizer_result(full_payload)},
             ensure_ascii=False,
         )
 
