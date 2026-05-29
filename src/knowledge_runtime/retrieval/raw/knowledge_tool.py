@@ -39,6 +39,8 @@ from knowledge_build.scripts.build_pcf_policy_kb import (
     search_exact_index,
 )
 from shared.logging import setup_logger
+from knowledge_runtime.retrieval.colbert_encoder import get_colbert_encoder
+from knowledge_runtime.retrieval.colbert_retriever import get_colbert_retriever
 
 logger = setup_logger(__name__)
 
@@ -1397,6 +1399,7 @@ def warmup_knowledge_tool_models() -> Dict[str, Any]:
         "corpus": [],
         "vectorstores": [],
         "rerankers": [],
+        "colbert": None,
     }
 
     warmed["corpus"] = [str(path) for path in _ensure_processed_corpus()]
@@ -1415,6 +1418,20 @@ def warmup_knowledge_tool_models() -> Dict[str, Any]:
 
     _bge_reranker(1)
     warmed["rerankers"].append(BGE_RERANK_MODEL)
+
+    if _colbert_available():
+        try:
+            encoder = get_colbert_encoder()
+            retriever = get_colbert_retriever()
+            retriever.preload()
+            warmed["colbert"] = {
+                "model": encoder.model_name,
+                "dim": encoder.dim,
+                "records": retriever.record_count,
+            }
+        except Exception:
+            warmed["colbert"] = {"error": "colbert_warmup_failed"}
+
     return warmed
 
 
@@ -1881,6 +1898,96 @@ def _vector_search_candidates(query: str, domain: str) -> Tuple[List[Dict[str, A
     return _aggregate_parent_candidates(candidates, limit=20), errors
 
 
+def _colbert_search_candidates(
+    query: str,
+    domain: str,
+    *,
+    top_k: int = 20,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Retrieve candidates via ColBERT late interaction MaxSim search."""
+    retriever = get_colbert_retriever()
+    if retriever is None:
+        return [], ["ColBERT index not available — run build_colbert_index.py"]
+
+    encoder = get_colbert_encoder()
+    query_emb = encoder.encode_query(query)
+    if query_emb.shape[0] == 0:
+        return [], []
+
+    def _domain_filter(record_meta: Dict[str, Any]) -> bool:
+        return _domain_matches(record_meta, domain)
+
+    ranked = retriever.retrieve(query_emb, top_k=top_k, domain_filter=_domain_filter)
+
+    catalog = _record_catalog()
+    candidates: List[Dict[str, Any]] = []
+    for record_id, maxsim_score, _doc_emb in ranked:
+        record = catalog.get(record_id)
+        if record is None:
+            continue
+        metadata = record.get("metadata") or {}
+        candidates.append(
+            _record_to_candidate(
+                record,
+                score=maxsim_score * 100.0,
+                retrieval="colbert_maxsim",
+                features=_candidate_features(
+                    metadata,
+                    query=query,
+                    domain=domain,
+                    match_type="colbert_maxsim",
+                    lexical_score=maxsim_score,
+                ),
+            )
+        )
+    return candidates, []
+
+
+def _colbert_rerank_candidates(
+    query: str,
+    candidates: Iterable[Dict[str, Any]],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Re-rank candidates using ColBERT MaxSim scores."""
+    retriever = get_colbert_retriever()
+    if retriever is None:
+        return list(candidates)[:limit]
+
+    encoder = get_colbert_encoder()
+    query_emb = encoder.encode_query(query)
+    if query_emb.shape[0] == 0:
+        return list(candidates)[:limit]
+
+    candidate_list = list(candidates)
+    if not candidate_list:
+        return []
+
+    record_ids = [
+        candidate.get("id") or _candidate_key(candidate.get("metadata", {}))
+        for candidate in candidate_list
+    ]
+
+    scored = retriever.rerank(query_emb, record_ids, top_k=limit)
+
+    score_map: Dict[str, float] = {rid: s for rid, s in scored}
+    scored_candidates = []
+    for candidate in candidate_list:
+        rid = candidate.get("id") or _candidate_key(candidate.get("metadata", {}))
+        if rid in score_map:
+            candidate = dict(candidate)
+            candidate["score"] = score_map[rid] * 100.0
+            candidate["retrieval"] = f"colbert_rerank:{candidate.get('retrieval', '')}"
+        scored_candidates.append(candidate)
+
+    scored_candidates.sort(key=lambda c: c["score"], reverse=True)
+    return scored_candidates[:limit]
+
+
+def _colbert_available() -> bool:
+    return get_colbert_retriever() is not None
+
+
 def _resolve_explicit_key_candidates(key: str, domain: str) -> List[Dict[str, Any]]:
     normalized_key = _normalized(key)
     if not normalized_key:
@@ -1972,37 +2079,49 @@ def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED
     ]
     exact = _exact_search_candidates(query, domain)
     rerank_pool_limit = max(limit * 4, MAX_RERANK_POOL)
-    vector: List[Dict[str, Any]] = []
+    dense: List[Dict[str, Any]] = []
     cross_spec: List[Dict[str, Any]] = []
     errors: List[str] = []
+
+    use_colbert = _colbert_available()
+
+    def _dense_search(q: str, d: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        if use_colbert:
+            return _colbert_search_candidates(q, d, top_k=20)
+        return _vector_search_candidates(q, d)
+
+    def _final_rerank(q: str, candidates: Iterable[Dict[str, Any]], *, n: int) -> List[Dict[str, Any]]:
+        if use_colbert:
+            return _colbert_rerank_candidates(q, candidates, limit=n)
+        return _bge_rerank_candidates(q, domain, candidates, limit=n)
 
     if intent == "exact_identifier":
         seeds = _dedupe_candidates([*direct, *glossary, *exact], limit=rerank_pool_limit)
         if len(seeds) < limit:
-            vector, errors = _vector_search_candidates(query, domain)
-        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+            dense, errors = _dense_search(query, domain)
+        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
     elif intent == "glossary_term":
         seeds = _dedupe_candidates([*glossary, *direct, *exact], limit=rerank_pool_limit)
-        vector, errors = _vector_search_candidates(query, domain)
-        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+        dense, errors = _dense_search(query, domain)
+        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
     elif intent == "operation_lookup":
         seeds = _dedupe_candidates([*domain_special, *direct, *exact], limit=rerank_pool_limit)
-        vector, errors = _vector_search_candidates(query, domain)
-        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+        dense, errors = _dense_search(query, domain)
+        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
     elif intent == "clause_location":
         seeds = _dedupe_candidates([*domain_special, *direct, *exact], limit=rerank_pool_limit)
-        vector, errors = _vector_search_candidates(query, domain)
-        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+        dense, errors = _dense_search(query, domain)
+        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
     elif intent == "schema_relation":
         seeds = _dedupe_candidates([*domain_special, *direct, *exact, *glossary], limit=rerank_pool_limit)
         cross_spec = _expand_cross_spec_candidates(seeds, domain, query)
-        vector, errors = _vector_search_candidates(query, domain)
-        combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=rerank_pool_limit)
+        dense, errors = _dense_search(query, domain)
+        combined = _dedupe_candidates([*seeds, *cross_spec, *dense], limit=rerank_pool_limit)
     else:
         seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
-        vector, errors = _vector_search_candidates(query, domain)
-        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
-    return _bge_rerank_candidates(query, domain, combined, limit=limit), errors
+        dense, errors = _dense_search(query, domain)
+        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
+    return _final_rerank(query, combined, n=limit), errors
 
 
 def _format_results(
@@ -2168,27 +2287,43 @@ def debug_search_semantic_knowledge_pipeline(
         counts["cross_spec"] = 0
         timings_ms["expand_cross_spec_candidates"] = 0.0
 
-    vector: List[Dict[str, Any]] = []
-    vector_errors: List[str] = []
+    use_colbert = _colbert_available()
+    dense_errors: List[str] = []
     stage_start = time.perf_counter()
-    _emit("stage=vector_search_candidates start")
-    try:
-        vector, vector_errors = _run_with_timeout(
-            "vector_search_candidates",
-            lambda: _vector_search_candidates(normalized_query, domain),
+    if use_colbert:
+        _emit("stage=colbert_search_candidates start")
+        try:
+            dense, dense_errors = _run_with_timeout(
+                "colbert_search_candidates",
+                lambda: _colbert_search_candidates(normalized_query, domain, top_k=20),
+            )
+        except Exception as exc:
+            dense_errors = [f"colbert_search_exception: {exc}"]
+        counts["colbert"] = len(dense)
+        debug_errors.extend(dense_errors)
+        timings_ms["colbert_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+        _emit(
+            f"stage=colbert_search_candidates done duration_ms={timings_ms['colbert_search_candidates']} count={counts['colbert']} errors={len(dense_errors)}"
         )
-    except Exception as exc:
-        vector_errors = [f"vector_search_exception: {exc}"]
-    counts["vector"] = len(vector)
-    debug_errors.extend(vector_errors)
-    timings_ms["vector_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(
-        f"stage=vector_search_candidates done duration_ms={timings_ms['vector_search_candidates']} count={counts['vector']} errors={len(vector_errors)}"
-    )
+    else:
+        _emit("stage=vector_search_candidates start")
+        try:
+            dense, dense_errors = _run_with_timeout(
+                "vector_search_candidates",
+                lambda: _vector_search_candidates(normalized_query, domain),
+            )
+        except Exception as exc:
+            dense_errors = [f"vector_search_exception: {exc}"]
+        counts["vector"] = len(dense)
+        debug_errors.extend(dense_errors)
+        timings_ms["vector_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+        _emit(
+            f"stage=vector_search_candidates done duration_ms={timings_ms['vector_search_candidates']} count={counts['vector']} errors={len(dense_errors)}"
+        )
 
     stage_start = time.perf_counter()
     _emit("stage=combined_dedupe start")
-    combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=rerank_pool_limit)
+    combined = _dedupe_candidates([*seeds, *cross_spec, *dense], limit=rerank_pool_limit)
     counts["combined"] = len(combined)
     timings_ms["combined_dedupe"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
     _emit(f"stage=combined_dedupe done duration_ms={timings_ms['combined_dedupe']} count={counts['combined']}")
@@ -2196,20 +2331,36 @@ def debug_search_semantic_knowledge_pipeline(
     reranked: List[Dict[str, Any]] = []
     rerank_error = ""
     stage_start = time.perf_counter()
-    _emit("stage=bge_rerank_candidates start")
-    try:
-        reranked = _run_with_timeout(
-            "bge_rerank_candidates",
-            lambda: _bge_rerank_candidates(normalized_query, domain, combined, limit=sanitized_limit),
+    if use_colbert:
+        _emit("stage=colbert_rerank_candidates start")
+        try:
+            reranked = _run_with_timeout(
+                "colbert_rerank_candidates",
+                lambda: _colbert_rerank_candidates(normalized_query, combined, limit=sanitized_limit),
+            )
+        except Exception as exc:
+            rerank_error = str(exc)
+            debug_errors.append(f"colbert_rerank_exception: {exc}")
+        counts["reranked"] = len(reranked)
+        timings_ms["colbert_rerank_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+        _emit(
+            f"stage=colbert_rerank_candidates done duration_ms={timings_ms['colbert_rerank_candidates']} count={counts['reranked']} error={'yes' if rerank_error else 'no'}"
         )
-    except Exception as exc:
-        rerank_error = str(exc)
-        debug_errors.append(f"rerank_exception: {exc}")
-    counts["reranked"] = len(reranked)
-    timings_ms["bge_rerank_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(
-        f"stage=bge_rerank_candidates done duration_ms={timings_ms['bge_rerank_candidates']} count={counts['reranked']} error={'yes' if rerank_error else 'no'}"
-    )
+    else:
+        _emit("stage=bge_rerank_candidates start")
+        try:
+            reranked = _run_with_timeout(
+                "bge_rerank_candidates",
+                lambda: _bge_rerank_candidates(normalized_query, domain, combined, limit=sanitized_limit),
+            )
+        except Exception as exc:
+            rerank_error = str(exc)
+            debug_errors.append(f"rerank_exception: {exc}")
+        counts["reranked"] = len(reranked)
+        timings_ms["bge_rerank_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+        _emit(
+            f"stage=bge_rerank_candidates done duration_ms={timings_ms['bge_rerank_candidates']} count={counts['reranked']} error={'yes' if rerank_error else 'no'}"
+        )
 
     stage_start = time.perf_counter()
     _emit("stage=format_results start")
