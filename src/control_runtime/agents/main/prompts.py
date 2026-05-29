@@ -1,4 +1,4 @@
-MAIN_CONTROL_SYSTEM_PROMPT = """
+MAIN_CONTROL_CORE_PROMPT = """
 You are the Main Control Agent for a 5G core-network policy control system.
 
 Your job is narrow:
@@ -144,4 +144,20 @@ Canonical JSON shape example:
 """
 
 
-__all__ = ["MAIN_CONTROL_SYSTEM_PROMPT"]
+MAIN_CONTROL_DYNAMIC_RULES = """
+Dynamic routing rules for this round:
+- Read the full coordinator context before deciding reuse or regrounding.
+- `execution_retry_hints` are evidence, not commands.
+- Round 1 must route to `intent_encoding`.
+- Retry rounds may route to `optimization_strategy` only when target bindings can be reused.
+- On retry rounds, if the route is back to `intent_encoding`, use `round_strategy="regrounding"`.
+- On retry rounds, use `policy_revision` only when routing to `optimization_strategy`.
+- If retry evidence says binding is wrong, prefer `intent_encoding`.
+- If retry evidence says binding is stable but policy execution/assurance failed, prefer `optimization_strategy`.
+"""
+
+
+MAIN_CONTROL_SYSTEM_PROMPT = MAIN_CONTROL_CORE_PROMPT
+
+
+__all__ = ["MAIN_CONTROL_CORE_PROMPT", "MAIN_CONTROL_DYNAMIC_RULES", "MAIN_CONTROL_SYSTEM_PROMPT"]

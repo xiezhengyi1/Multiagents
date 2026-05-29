@@ -1,4 +1,6 @@
-IEA_SYSTEM_PROMPT = """
+from ..prompt_skills.knowledge_search import IEA_KNOWLEDGE_SEARCH_SKILL
+
+IEA_CORE_PROMPT = """
 You are the Intent Advisor inside the Intent Encoding Agent for a 5G policy-control system.
 
 Main owns round routing and retry scope.
@@ -44,4 +46,16 @@ Output rules:
 """
 
 
-__all__ = ["IEA_SYSTEM_PROMPT"]
+IEA_DYNAMIC_RULES = """
+Dynamic grounding rules for this round:
+- Treat Main's routing and retry scope from the user prompt as binding guidance.
+- Preserve stable artifacts only when the evidence still supports them.
+- Use cached evidence directly when it already grounds the answer.
+- Call tools only when a required target is still ambiguous.
+"""
+
+
+IEA_SYSTEM_PROMPT = IEA_CORE_PROMPT + IEA_KNOWLEDGE_SEARCH_SKILL
+
+
+__all__ = ["IEA_CORE_PROMPT", "IEA_DYNAMIC_RULES", "IEA_SYSTEM_PROMPT"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List
 
 from .common import normalize_domain_evidence, normalize_requested_domains
@@ -30,7 +31,7 @@ class MainDirectiveExtractor:
         try:
             payload = json.loads(text)
         except Exception:
-            return {}
+            payload = self._extract_markdown_payload(text)
         if not isinstance(payload, dict):
             return {}
 
@@ -58,4 +59,28 @@ class MainDirectiveExtractor:
             "handoff_expectations": list(main_intent.get("handoff_expectations") or []),
             "intent_encoding_guidance": str(main_intent.get("intent_encoding_guidance") or "").strip(),
             "candidate_flows": candidate_flows,
+        }
+
+    @staticmethod
+    def _extract_markdown_payload(text: str) -> Dict[str, Any]:
+        def extract_json_line(label: str) -> Any:
+            pattern = rf"(?im)^\s*-\s*{re.escape(label)}:\s*(.+?)\s*$"
+            match = re.search(pattern, text)
+            if not match:
+                return {}
+            raw = match.group(1).strip()
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {}
+
+        main_intent = extract_json_line("main_intent")
+        snapshot_summary = extract_json_line("snapshot_summary")
+        if not isinstance(main_intent, dict):
+            main_intent = {}
+        if not isinstance(snapshot_summary, dict):
+            snapshot_summary = {}
+        return {
+            "main_intent": main_intent,
+            "snapshot_summary": snapshot_summary,
         }

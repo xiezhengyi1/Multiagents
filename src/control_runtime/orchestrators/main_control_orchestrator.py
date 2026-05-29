@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from typing import Any, Dict, List, Optional
 
 from knowledge_runtime.retrieval.raw import warmup_knowledge_tool_models
 from shared.memory import MemoryManager
+from agent_runtime.core.token_budget import TokenCounter, TokenBudget
 
 from ..agents.dispatch import PolicyDispatchAgent
 from ..agents.grounding import IntentEncodingAgent
@@ -25,7 +27,8 @@ from ..domain.policy_plan import OperationIntent
 from ..integrations.storage import get_snapshot_data_by_id
 from .main_control_support import (
     ControlRoundResult,
-    build_feedback_context,
+    build_feedback_context_from_snapshots,
+    build_round_feedback_block,
     _build_snapshot_summary,
     build_main_context,
     build_planning_context,
@@ -65,10 +68,11 @@ class MainControlOrchestrator:
         self.ad_tool = ad_tool or AssuranceDiagnosisTool()
         self.memory_manager = memory_manager or MemoryManager(
             short_term_limit=max(20, max_rounds * 8),
-            enable_llm_summarization=False,
+            enable_llm_summarization=True,
         )
         self.max_rounds = max_rounds
         self.rag_enabled = rag_enabled
+        self._token_counter = TokenCounter()
         self.preloaded_models: Dict[str, Any] = {}
         if preload_models:
             self.preloaded_models = self._preload_runtime_models()
@@ -104,22 +108,16 @@ class MainControlOrchestrator:
             raise RuntimeError(f"failed to preload runtime models: {exc}") from exc
 
     @staticmethod
-    def _apply_trace_metadata(agent: Any, *, scenario_id: str = "", scenario_tags: Optional[List[str]] = None) -> None:
-        if not scenario_id and not scenario_tags:
-            return
-        setattr(
-            agent,
-            "_pending_trace_metadata",
-            {
-                "scenario_id": str(scenario_id or "").strip(),
-                "scenario_tags": [str(item).strip() for item in (scenario_tags or []) if str(item).strip()],
-            },
-        )
+    def _trace_metadata(*, scenario_id: str = "", scenario_tags: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {
+            "scenario_id": str(scenario_id or "").strip(),
+            "scenario_tags": [str(item).strip() for item in (scenario_tags or []) if str(item).strip()],
+        }
 
-    @staticmethod
-    def _clear_trace_metadata(agent: Any) -> None:
-        if hasattr(agent, "_pending_trace_metadata"):
-            delattr(agent, "_pending_trace_metadata")
+    def _inject_token_context(self) -> None:
+        for agent in (self.main_agent, self.ie_agent, self.os_agent, self.pd_agent):
+            agent._token_budget = self._token_budget
+            agent._token_counter = self._token_counter
 
     def _remember(self, role: str, payload: Any) -> None:
         if isinstance(payload, str):
@@ -139,16 +137,45 @@ class MainControlOrchestrator:
                     self.memory_manager.bind_supi(supi)
         self.memory_manager.add_memory(role, content)
 
-    def _build_memory_context(self, user_input: str) -> str:
+    def _build_memory_context(self, user_input: str, *, diagnosis_hint: str = "", routing_hint: str = "") -> str:
         bundle = self.memory_manager.retrieve(user_input)
         short_term = bundle.get("short_term", []) if isinstance(bundle, dict) else []
         long_term = bundle.get("long_term", []) if isinstance(bundle, dict) else []
+        short_term = self._rerank_by_hint(short_term, diagnosis_hint, routing_hint)[:5]
+        long_term = self._rerank_by_hint(long_term, diagnosis_hint, routing_hint)[:5]
         blocks: List[str] = []
         if short_term:
-            blocks.append("[Memory][Short-Term]\n" + "\n".join(f"{item.get('role', 'unknown')}: {item.get('content', '')}" for item in short_term[-5:] if isinstance(item, dict)))
+            blocks.append("[Memory][Short-Term]\n" + "\n".join(f"{item.get('role', 'unknown')}: {item.get('content', '')}" for item in short_term if isinstance(item, dict)))
         if long_term:
             blocks.append("[Memory][Long-Term]\n" + "\n".join(str(item) for item in long_term))
         return "\n\n".join(block for block in blocks if block.strip())
+
+    @staticmethod
+    def _rerank_by_hint(items: List[Any], diagnosis_hint: str = "", routing_hint: str = "") -> List[Any]:
+        hint_text = f"{diagnosis_hint} {routing_hint}".lower()
+        hint_tokens = {
+            token
+            for token in re.split(r"[^a-zA-Z0-9_]+", hint_text)
+            if len(token) >= 3
+        }
+        if not hint_tokens:
+            return list(items)
+
+        def score_item(index_item: tuple[int, Any]) -> tuple[int, int]:
+            index, item = index_item
+            if isinstance(item, dict):
+                text = json.dumps(item, ensure_ascii=False).lower()
+            else:
+                text = str(item or "").lower()
+            item_tokens = {
+                token
+                for token in re.split(r"[^a-zA-Z0-9_]+", text)
+                if len(token) >= 3
+            }
+            return (len(hint_tokens & item_tokens), -index)
+
+        ranked = sorted(enumerate(items), key=score_item, reverse=True)
+        return [item for _, item in ranked]
 
     def _build_ie_context(
         self,
@@ -160,21 +187,22 @@ class MainControlOrchestrator:
         feedback_context: str,
     ) -> str:
         snapshot = get_snapshot_data_by_id(snapshot_id) or {}
-        return json.dumps(
-            {
-                "round_index": round_index,
-                "main_intent": global_intent,
-                "snapshot_summary": _build_snapshot_summary(snapshot) if snapshot else {},
-                "guidance": global_intent.get("intent_encoding_guidance", ""),
-                "retry_scope": global_intent.get("retry_scope") or "",
-                "routing_decision": global_intent.get("routing_decision") or "",
-                "routing_rationale": global_intent.get("routing_rationale") or "",
-                "reuse_contract": global_intent.get("reuse_contract") or {},
-                "handoff_expectations": global_intent.get("handoff_expectations") or [],
-                "previous_diagnosis": diagnosis,
-                "feedback_context": feedback_context,
-            },
-            ensure_ascii=False,
+        return (
+            "## Guidance\n"
+            f"- round_index: {round_index}\n"
+            f"- intent_encoding_guidance: {global_intent.get('intent_encoding_guidance', '') or 'N/A'}\n"
+            f"- retry_scope: {global_intent.get('retry_scope') or 'N/A'}\n"
+            f"- routing_decision: {global_intent.get('routing_decision') or 'N/A'}\n"
+            f"- routing_rationale: {global_intent.get('routing_rationale') or 'N/A'}\n\n"
+            "## Evidence\n"
+            f"- main_intent: {json.dumps(global_intent, ensure_ascii=False)}\n"
+            f"- snapshot_summary: {json.dumps(_build_snapshot_summary(snapshot) if snapshot else {}, ensure_ascii=False)}\n"
+            f"- reuse_contract: {json.dumps(global_intent.get('reuse_contract') or {}, ensure_ascii=False)}\n"
+            f"- handoff_expectations: {json.dumps(global_intent.get('handoff_expectations') or [], ensure_ascii=False)}\n\n"
+            "## Previous Diagnosis\n"
+            f"{json.dumps(diagnosis or {}, ensure_ascii=False)}\n\n"
+            "## Feedback\n"
+            f"{feedback_context or 'N/A'}"
         )
 
     @staticmethod
@@ -363,31 +391,29 @@ class MainControlOrchestrator:
         previous_execution_reentry: Dict[str, Any],
         round_traces: List[Dict[str, Any]],
     ) -> tuple[GlobalControlIntent, Optional[OperationIntent], Optional[Any], Optional[DomainNegotiationRequest]]:
-        self._apply_trace_metadata(self.main_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
-        try:
-            global_intent = self.main_agent.analyze_global_intent(
-                user_input=user_input,
-                session_id=session_id,
-                snapshot_id=snapshot_id,
-                context=build_main_context(
-                    snapshot_id,
-                    round_index=round_index,
-                    memory_context=memory_context,
-                    feedback_context=feedback_context,
-                    previous_diagnosis=previous_diagnosis,
-                    previous_execution_feedback=previous_report_payload,
-                    previous_operation_intent=(
-                        previous_operation_intent.model_dump(mode="json")
-                        if previous_operation_intent is not None
-                        else {}
-                    ),
-                    previous_negotiation_request=previous_negotiation_request,
-                    previous_planning_blocker=previous_planning_blocker,
-                    previous_execution_reentry=previous_execution_reentry,
+        trace_metadata = self._trace_metadata(scenario_id=scenario_id, scenario_tags=scenario_tags)
+        global_intent = self.main_agent.analyze_global_intent(
+            user_input=user_input,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            context=build_main_context(
+                snapshot_id,
+                round_index=round_index,
+                memory_context=memory_context,
+                feedback_context=feedback_context,
+                previous_diagnosis=previous_diagnosis,
+                previous_execution_feedback=previous_report_payload,
+                previous_operation_intent=(
+                    previous_operation_intent.model_dump(mode="json")
+                    if previous_operation_intent is not None
+                    else {}
                 ),
-            )
-        finally:
-            self._clear_trace_metadata(self.main_agent)
+                previous_negotiation_request=previous_negotiation_request,
+                previous_planning_blocker=previous_planning_blocker,
+                previous_execution_reentry=previous_execution_reentry,
+            ),
+            trace_metadata=trace_metadata,
+        )
         if not global_intent.requested_domains:
             raise RuntimeError("Main Agent returned no requested_domains; refusing to infer domains outside the agent.")
         if not str(global_intent.supi or "").strip():
@@ -420,22 +446,19 @@ class MainControlOrchestrator:
                 global_intent=global_intent,
                 round_index=round_index,
             )
-            self._apply_trace_metadata(self.ie_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
-            try:
-                operation_intent = self.ie_agent.analyze_operation_intent(
-                    user_input=user_input,
-                    context=self._build_ie_context(
-                        global_intent=ie_scoped_intent.model_dump(mode="json"),
-                        snapshot_id=snapshot_id,
-                        round_index=round_index,
-                        diagnosis=previous_diagnosis,
-                        feedback_context=feedback_context,
-                    ),
-                    session_id=session_id,
+            operation_intent = self.ie_agent.analyze_operation_intent(
+                user_input=user_input,
+                context=self._build_ie_context(
+                    global_intent=ie_scoped_intent.model_dump(mode="json"),
                     snapshot_id=snapshot_id,
-                )
-            finally:
-                self._clear_trace_metadata(self.ie_agent)
+                    round_index=round_index,
+                    diagnosis=previous_diagnosis,
+                    feedback_context=feedback_context,
+                ),
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                trace_metadata=trace_metadata,
+            )
             self._remember("IEA", operation_intent)
             if str(operation_intent.domain_resolution or "").strip().lower() == "cannot_confirm":
                 return global_intent, operation_intent, None, self._build_negotiation_request(
@@ -463,11 +486,7 @@ class MainControlOrchestrator:
                 unified_constraints=(previous_mediator_decision or {}).get("unified_constraints") if isinstance(previous_mediator_decision, dict) else None,
             ),
         )
-        self._apply_trace_metadata(self.os_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
-        try:
-            policy_plan = self.os_agent.generate_strategy(planning_request)
-        finally:
-            self._clear_trace_metadata(self.os_agent)
+        policy_plan = self.os_agent.generate_strategy(planning_request, trace_metadata=trace_metadata)
         self._remember("OSA", policy_plan)
         return global_intent, operation_intent, policy_plan, None
 
@@ -495,6 +514,8 @@ class MainControlOrchestrator:
     ) -> ControlRoundResult:
         session_id, snapshot_id = start_control_session(step_name="main_control", user_input=user_input, snapshot_id=snapshot_id)
         self.memory_manager.bind_thread(session_id)
+        self._token_budget = TokenBudget()
+        self._inject_token_context()
         state = OrchestratorLoopState()
         previous_operation_intent: Optional[OperationIntent] = None
 
@@ -507,7 +528,17 @@ class MainControlOrchestrator:
                 retry_count=max(0, round_index - 1),
                 previous_root_cause=str(state.previous_diagnosis.get("root_cause_category") or "").strip() or "<none>",
             )
-            memory_context = self._build_memory_context(user_input)
+            memory_context = self._build_memory_context(
+                user_input,
+                diagnosis_hint=str(state.previous_diagnosis.get("root_cause_category") or ""),
+                routing_hint=str((state.previous_mediator_decision or {}).get("status") or ""),
+            )
+            feedback_context = build_feedback_context_from_snapshots(
+                state.rounds,
+                token_counter=self._token_counter,
+                summarizer_llm=getattr(self.memory_manager, "summarizer_llm", None),
+            )
+            trace_metadata = self._trace_metadata(scenario_id=scenario_id, scenario_tags=scenario_tags)
             try:
                 global_intent, operation_intent, policy_plan, negotiation_request = self._plan_round(
                     user_input=user_input,
@@ -517,7 +548,7 @@ class MainControlOrchestrator:
                     scenario_id=scenario_id,
                     scenario_tags=scenario_tags,
                     memory_context=memory_context,
-                    feedback_context=state.feedback_context,
+                    feedback_context=feedback_context,
                     previous_diagnosis=state.previous_diagnosis,
                     previous_report_payload=state.previous_report_payload,
                     previous_mediator_decision=state.previous_mediator_decision,
@@ -538,23 +569,31 @@ class MainControlOrchestrator:
                     exc,
                     debug_context=debug_context,
                 )
-                append_round_trace(
-                    state,
-                    trace_payload={
-                        "round_index": round_index,
-                        "global_intent": {},
-                        "operation_intent": {},
-                        "policy_plan": {},
-                        "domain_verdicts": [],
-                        "pda_feedback": report_payload,
-                        "qos_feedback": {},
-                        "mobility_feedback": {},
-                        "diagnosis": diagnosis,
-                        "negotiation_request": {},
-                        "planning_blocker": {},
-                        "execution_reentry": {},
-                    },
+                trace_payload = {
+                    "round_index": round_index,
+                    "global_intent": {},
+                    "operation_intent": {},
+                    "policy_plan": {},
+                    "domain_verdicts": [],
+                    "pda_feedback": report_payload,
+                    "qos_feedback": {},
+                    "mobility_feedback": {},
+                    "diagnosis": diagnosis,
+                    "negotiation_request": {},
+                    "planning_blocker": {},
+                    "execution_reentry": {},
+                }
+                feedback_added = build_round_feedback_block(
+                    pda_feedback=report_payload,
+                    diagnosis=diagnosis,
+                    domain_verdicts=[],
+                    mediator_decision={},
+                    negotiation_request={},
+                    planning_blocker={},
+                    execution_reentry={},
+                    round_index=round_index,
                 )
+                append_round_trace(state, trace_payload=trace_payload, feedback_added=feedback_added)
                 state.latest_result = ControlRoundResult(
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -581,19 +620,6 @@ class MainControlOrchestrator:
                     diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
                     execution_status="Failed",
                 )
-                state.previous_diagnosis = diagnosis
-                state.previous_report_payload = dict(report_payload)
-                state.feedback_context = build_feedback_context(
-                    state.feedback_context,
-                    pda_feedback=report_payload,
-                    diagnosis=diagnosis,
-                    domain_verdicts=[],
-                    mediator_decision={},
-                    negotiation_request={},
-                    planning_blocker={},
-                    execution_reentry={},
-                    round_index=round_index,
-                )
                 if round_index >= self.max_rounds:
                     break
                 log_event(
@@ -608,23 +634,26 @@ class MainControlOrchestrator:
             if negotiation_request is not None:
                 diagnosis = self._build_negotiation_diagnosis(negotiation_request)
                 negotiation_payload = negotiation_request.model_dump(mode="json")
-                append_round_trace(
-                    state,
-                    trace_payload={
-                        "round_index": round_index,
-                        "global_intent": global_intent.model_dump(mode="json"),
-                        "operation_intent": operation_intent.model_dump(mode="json") if operation_intent is not None else {},
-                        "policy_plan": {},
-                        "domain_verdicts": [],
-                        "pda_feedback": {},
-                        "qos_feedback": {},
-                        "mobility_feedback": {},
-                        "diagnosis": diagnosis,
-                        "negotiation_request": negotiation_payload,
-                        "planning_blocker": {},
-                        "execution_reentry": {},
-                    },
+                trace_payload = {
+                    "round_index": round_index,
+                    "global_intent": global_intent.model_dump(mode="json"),
+                    "operation_intent": operation_intent.model_dump(mode="json") if operation_intent is not None else {},
+                    "policy_plan": {},
+                    "domain_verdicts": [],
+                    "pda_feedback": {},
+                    "qos_feedback": {},
+                    "mobility_feedback": {},
+                    "diagnosis": diagnosis,
+                    "negotiation_request": negotiation_payload,
+                    "planning_blocker": {},
+                    "execution_reentry": {},
+                }
+                feedback_added = build_round_feedback_block(
+                    diagnosis=diagnosis,
+                    negotiation_request=negotiation_payload,
+                    round_index=round_index,
                 )
+                append_round_trace(state, trace_payload=trace_payload, feedback_added=feedback_added)
                 state.latest_result = ControlRoundResult(
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -641,49 +670,30 @@ class MainControlOrchestrator:
                     retry_count=max(0, round_index - 1),
                     round_traces=state.round_traces,
                 )
-                state.previous_diagnosis = diagnosis
-                state.previous_report_payload = {}
-                state.previous_negotiation_request = negotiation_payload
-                state.previous_planning_blocker = {}
-                state.previous_execution_reentry = {}
-                state.feedback_context = build_feedback_context(
-                    state.feedback_context,
-                    diagnosis=diagnosis,
-                    negotiation_request=negotiation_payload,
-                    round_index=round_index,
-                )
                 continue
 
             if operation_intent is None or policy_plan is None:
                 raise RuntimeError("main control planning round produced no executable planning artifacts")
             previous_operation_intent = operation_intent.model_copy(deep=True)
 
-            self._apply_trace_metadata(self.pd_agent, scenario_id=scenario_id, scenario_tags=scenario_tags)
-            try:
-                round_execution = execute_planned_round(
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
-                    round_index=round_index,
-                    global_intent=global_intent,
-                    operation_intent=operation_intent,
-                    policy_plan=policy_plan,
-                    cr_tool=self.cr_tool,
-                    pd_agent=self.pd_agent,
-                    ad_tool=self.ad_tool,
-                )
-            finally:
-                self._clear_trace_metadata(self.pd_agent)
+            round_execution = execute_planned_round(
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                round_index=round_index,
+                global_intent=global_intent,
+                operation_intent=operation_intent,
+                policy_plan=policy_plan,
+                cr_tool=self.cr_tool,
+                pd_agent=self.pd_agent,
+                ad_tool=self.ad_tool,
+                trace_metadata=trace_metadata,
+            )
             state.completed = round_execution.completed
             report = round_execution.report
             qos_feedback = round_execution.qos_feedback
             mobility_feedback = round_execution.mobility_feedback
             diagnosis = round_execution.diagnosis
             self._remember("AD", diagnosis)
-            append_round_trace(
-                state,
-                trace_payload=json.loads(json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
-            )
-
             state.latest_result = ControlRoundResult(
                 session_id=session_id,
                 snapshot_id=snapshot_id,
@@ -719,10 +729,12 @@ class MainControlOrchestrator:
                 execution_status=report.execution_status if report is not None else "blocked",
             )
             if state.completed:
+                append_round_trace(
+                    state,
+                    trace_payload=json.loads(json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
+                )
                 break
 
-            state.previous_diagnosis = diagnosis
-            state.previous_mediator_decision = dict(round_execution.mediator_decision_payload)
             if round_execution.execution_reentry is not None:
                 report_payload = self._build_reentry_report_payload(round_execution.execution_reentry)
             elif round_execution.planning_blocker is not None:
@@ -743,28 +755,31 @@ class MainControlOrchestrator:
                     "execution_status": "Failed",
                     "violation_details": diagnosis.get("reason_summary") or "round execution failed",
                 }
-            state.previous_report_payload = dict(report_payload)
-            state.previous_negotiation_request = {}
-            state.previous_planning_blocker = (
+            previous_planning_blocker = (
                 round_execution.planning_blocker.model_dump(mode="json")
                 if round_execution.planning_blocker is not None
                 else {}
             )
-            state.previous_execution_reentry = (
+            previous_execution_reentry = (
                 round_execution.execution_reentry.model_dump(mode="json")
                 if round_execution.execution_reentry is not None
                 else {}
             )
-            state.feedback_context = build_feedback_context(
-                state.feedback_context,
+            trace_payload = json.loads(json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False))
+            trace_payload["pda_feedback"] = dict(report_payload)
+            trace_payload["mediator_decision"] = dict(round_execution.mediator_decision_payload)
+            trace_payload["planning_blocker"] = previous_planning_blocker
+            trace_payload["execution_reentry"] = previous_execution_reentry
+            feedback_added = build_round_feedback_block(
                 pda_feedback=report_payload,
                 diagnosis=diagnosis,
                 domain_verdicts=round_execution.domain_verdict_payloads,
                 mediator_decision=round_execution.mediator_decision_payload,
-                planning_blocker=state.previous_planning_blocker,
-                execution_reentry=state.previous_execution_reentry,
+                planning_blocker=previous_planning_blocker,
+                execution_reentry=previous_execution_reentry,
                 round_index=round_index,
             )
+            append_round_trace(state, trace_payload=trace_payload, feedback_added=feedback_added)
             log_event(
                 self.main_agent.logger,
                 "control_round_retry_scheduled",

@@ -1,6 +1,5 @@
 """Runtime orchestrator entrypoints for the refactored control system."""
 
-from .main_control_orchestrator import MainControlOrchestrator
 from .main_control_support import ControlRoundResult, ControlRoundTrace
 
 __all__ = [
@@ -12,6 +11,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    if name == "MainControlOrchestrator":
+        from .main_control_orchestrator import MainControlOrchestrator
+
+        return MainControlOrchestrator
     if name == "SingleAgentOrchestrator":
         from .single_agent_orchestrator import SingleAgentOrchestrator
 
