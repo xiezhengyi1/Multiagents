@@ -1,0 +1,82 @@
+{
+  "scenarios": [
+    {
+      "id": "S1",
+      "name": "Basic_Single_Slice",
+      "gnb_count": 1,
+      "upf_count": 1,
+      "ue_count": 2,
+      "slice_count": 1,
+      "flow_count_range": "1 per app",
+      "complexity": "low",
+      "status": "ready",
+      "source": "experiments/scenarios/s1_basic_single_slice.yaml",
+      "notes": "已落地为独立 YAML 场景，并接入 init_scenario.py。由于任务集里同时引用 Telemedicine 与 AR_Gaming 两个不同 SUPI，S1 实际采用 2 UE；同时该场景仍是单切片，因此任务集中涉及 S1 的跨切片迁移请求本身存在实验设计冲突。"
+    },
+    {
+      "id": "S2",
+      "name": "Medium_Complexity",
+      "gnb_count": "2-3",
+      "upf_count": "1-2",
+      "ue_count": 6,
+      "slice_count": "2-3",
+      "flow_count_range": "multi-flow",
+      "complexity": "medium",
+      "status": "ready",
+      "source": "experiments/scenarios/s2_medium_complexity.yaml",
+      "notes": "已落地为独立 YAML 场景，并接入 init_scenario.py。为满足任务集中的对象覆盖，S2 采用 6 UE 承载 9 个 app，属于多 app/UE 的中等复杂度设计。"
+    },
+    {
+      "id": "S3",
+      "name": "High_Complexity",
+      "gnb_count": 5,
+      "upf_count": 4,
+      "ue_count": 10,
+      "slice_count": 5,
+      "flow_count_range": "1-2 per app",
+      "complexity": "high",
+      "status": "ready",
+      "source": "experiments/scenarios/s3_high_complexity.yaml",
+      "notes": "已落地为独立 YAML 场景，并接入 init_scenario.py。结构覆盖 slices/upfs/gnbs/ues/apps/flows/free5gc/ns3/writer/topology/bridge，可直接作为 S3 初始态。"
+    },
+    {
+      "id": "S1P",
+      "name": "Basic_Single_Slice_PublicProfiles",
+      "gnb_count": 1,
+      "upf_count": 1,
+      "ue_count": 2,
+      "slice_count": 1,
+      "flow_count_range": "1 per app",
+      "complexity": "low",
+      "status": "ready",
+      "source": "experiments/scenarios_public/s1_basic_single_slice_public_datasets.yaml",
+      "notes": "S1 的公开数据集驱动变体。业务对象集合保持不变，流量统计参数由公开数据集代理特征映射生成，用于对比人工构造画像与公开数据集画像下的行为差异。"
+    },
+    {
+      "id": "S2P",
+      "name": "Medium_Complexity_PublicProfiles",
+      "gnb_count": "2-3",
+      "upf_count": "1-2",
+      "ue_count": 6,
+      "slice_count": "2-3",
+      "flow_count_range": "multi-flow",
+      "complexity": "medium",
+      "status": "ready",
+      "source": "experiments/scenarios_public/s2_medium_complexity_public_datasets.yaml",
+      "notes": "S2 的公开数据集驱动变体。对象拓扑与任务覆盖保持不变，带宽、包长、到达率及部分 QoS 目标替换为公开数据集统计特征。"
+    },
+    {
+      "id": "S3P",
+      "name": "High_Complexity_PublicProfiles",
+      "gnb_count": 5,
+      "upf_count": 4,
+      "ue_count": 10,
+      "slice_count": 5,
+      "flow_count_range": "1-2 per app",
+      "complexity": "high",
+      "status": "ready",
+      "source": "experiments/scenarios_public/s3_high_complexity_public_datasets.yaml",
+      "notes": "S3 的公开数据集驱动变体。保持复杂拓扑与多对象竞争结构，同时引入公开数据集代理流量画像，用于复杂场景下的对照实验。"
+    }
+  ]
+}

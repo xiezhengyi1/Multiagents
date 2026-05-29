@@ -15,7 +15,7 @@ for candidate in (WORKSPACE_ROOT, PACKAGE_ROOT, SRC_ROOT):
         sys.path.insert(0, candidate_text)
 
 from database.init_db import init_db
-from generate_user_inputs import (
+from experiments.scripts.generate_user_inputs import (
     DEFAULT_SAMPLE_COUNT,
     DEFAULT_SEED,
     DEFAULT_TARGET_SUCCESS_RATE,

@@ -12,7 +12,8 @@ from ..domain.policy_plan import OperationIntent, PolicyPlanDraft
 from .main_control_support import (
     ControlRoundResult,
     ControlRoundTrace,
-    build_feedback_context,
+    build_feedback_context_from_snapshots,
+    build_round_feedback_block,
     build_main_context,
 )
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
@@ -134,13 +135,14 @@ class SingleAgentOrchestrator:
             mobility_feedback: Dict[str, Any] = {}
             domain_verdicts: List[Dict[str, Any]] = []
             diagnosis: Dict[str, Any] = {}
+            exception_feedback: Dict[str, Any] = {}
             try:
                 global_intent, operation_intent, policy_plan = self._plan_round(
                     user_input=user_input,
                     session_id=session_id,
                     snapshot_id=snapshot_id,
                     round_index=round_index,
-                    feedback_context=state.feedback_context,
+                    feedback_context=build_feedback_context_from_snapshots(state.rounds),
                     previous_diagnosis=state.previous_diagnosis,
                     previous_report_payload=state.previous_report_payload,
                     previous_mediator_decision=state.previous_mediator_decision,
@@ -181,8 +183,7 @@ class SingleAgentOrchestrator:
             except Exception as exc:
                 state.completed = False
                 diagnosis = self._build_round_exception_diagnosis(exc)
-                state.previous_mediator_decision = None
-                state.previous_report_payload = self._build_round_exception_feedback(exc=exc)
+                exception_feedback = self._build_round_exception_feedback(exc=exc)
                 state.latest_result = ControlRoundResult(
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -210,16 +211,11 @@ class SingleAgentOrchestrator:
                 operation_intent=operation_intent.model_dump(mode="json") if operation_intent is not None else {},
                 policy_plan=policy_plan.model_dump(mode="json") if policy_plan is not None else {},
                 domain_verdicts=domain_verdicts,
-                pda_feedback=report.model_dump(mode="json") if report is not None else state.previous_report_payload if diagnosis.get("root_cause_category") == "single_control_round_exception" else {},
+                pda_feedback=report.model_dump(mode="json") if report is not None else exception_feedback if diagnosis.get("root_cause_category") == "single_control_round_exception" else {},
                 qos_feedback=qos_feedback,
                 mobility_feedback=mobility_feedback,
                 diagnosis=diagnosis,
             )
-            append_round_trace(
-                state,
-                trace_payload=json.loads(json.dumps(trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
-            )
-
             log_event(
                 self.single_agent.logger,
                 "single_control_round_complete",
@@ -230,25 +226,32 @@ class SingleAgentOrchestrator:
                 execution_status=report.execution_status if report is not None else "error",
             )
             if state.completed:
+                append_round_trace(
+                    state,
+                    trace_payload=json.loads(json.dumps(trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
+                )
                 break
 
-            state.previous_diagnosis = diagnosis
             if mediator_decision_payload is not None:
-                state.previous_mediator_decision = dict(mediator_decision_payload)
-            report_payload = report.model_dump(mode="json") if report is not None else state.previous_report_payload or {
+                trace.mediator_decision = dict(mediator_decision_payload)
+            report_payload = report.model_dump(mode="json") if report is not None else exception_feedback or {
                 "execution_status": "Failed",
                 "violation_details": diagnosis.get("reason_summary") or "round execution failed",
                 "correction_suggestion": "; ".join(diagnosis.get("recommended_actions") or []),
                 "recommended_consumer": "single_control",
             }
-            state.previous_report_payload = dict(report_payload)
-            state.feedback_context = build_feedback_context(
-                state.feedback_context,
+            trace.pda_feedback = dict(report_payload)
+            feedback_added = build_round_feedback_block(
                 pda_feedback=report_payload,
                 diagnosis=diagnosis,
                 domain_verdicts=domain_verdicts,
                 mediator_decision=mediator_decision_payload,
                 round_index=round_index,
+            )
+            append_round_trace(
+                state,
+                trace_payload=json.loads(json.dumps(trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
+                feedback_added=feedback_added,
             )
             log_event(
                 self.single_agent.logger,

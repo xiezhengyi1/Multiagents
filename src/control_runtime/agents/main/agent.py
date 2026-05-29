@@ -14,7 +14,7 @@ from ...domain.control_plane import (
 )
 from shared.logging import log_event
 
-from .prompts import MAIN_CONTROL_SYSTEM_PROMPT
+from .prompts import MAIN_CONTROL_DYNAMIC_RULES, MAIN_CONTROL_SYSTEM_PROMPT
 
 
 @dataclass
@@ -63,6 +63,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         session_id: str = "",
         snapshot_id: str = "",
         context: str = "",
+        trace_metadata: Dict[str, Any] | None = None,
     ) -> GlobalControlIntent:
         self.ensure_worker_runtime_initialized()
         log_event(self.logger, "main_control_start")
@@ -71,18 +72,23 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             "content": (
                 f"User input:\n{user_input}\n\n"
                 f"Coordinator context:\n{context or 'N/A'}\n\n"
+                f"{MAIN_CONTROL_DYNAMIC_RULES.strip()}\n\n"
                 "Resolve only the round-level domain routing, retry scope, explicit SUPI already present in the request, and keep intent_encoding_guidance empty unless non-empty routing guidance is strictly necessary."
             ),
         }
+        token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
             session_id=session_id,
             snapshot_id=snapshot_id,
             thread_id=session_id,
+            token_budget=token_budget,
+            token_counter=token_counter,
+            trace_metadata=trace_metadata,
         )
         self._pending_invoke_messages = [payload]
-        self._pending_trace_metadata = {
-            **(getattr(self, "_pending_trace_metadata", {}) or {}),
+        base_trace_metadata = {
+            **(trace_metadata or {}),
             "path_label": "global_intent_advisor",
         }
         try:
@@ -103,6 +109,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     invocation = self._invoke_global_intent_result(
                         current_prompt,
                         runtime_context=runtime_context,
+                        trace_metadata=base_trace_metadata,
                     )
                     parsed_intent = self._validate_global_intent_result(invocation.raw_result)
                 except RuntimeError as exc:
@@ -186,15 +193,13 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         finally:
             if hasattr(self, "_pending_invoke_messages"):
                 delattr(self, "_pending_invoke_messages")
-            if hasattr(self, "_pending_trace_metadata"):
-                delattr(self, "_pending_trace_metadata")
 
-    def _invoke_global_intent_result(self, user_prompt: str, *, runtime_context: Any) -> MainControlInvocation:
+    def _invoke_global_intent_result(self, user_prompt: str, *, runtime_context: Any, trace_metadata: Dict[str, Any]) -> MainControlInvocation:
         self._pending_invoke_messages = [{"role": "user", "content": user_prompt}]
         payload = {
             "messages": self._pending_invoke_messages,
             "trace_write_mode": "manual",
-            "trace_metadata": getattr(self, "_pending_trace_metadata", {}) or {},
+            "trace_metadata": dict(trace_metadata or {}),
         }
         try:
             result = self.agent.invoke(payload, context=runtime_context)
@@ -294,15 +299,19 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             "",
         }
         round_index = 0
-        try:
-            parsed_context = json.loads(str(context or "").strip()) if str(context or "").strip() else {}
-        except Exception:
-            parsed_context = {}
-        if isinstance(parsed_context, dict):
+        round_match = re.search(r"(?im)^\s*-\s*round_index:\s*(\d+)\s*$", str(context or ""))
+        if round_match:
+            round_index = int(round_match.group(1))
+        else:
             try:
-                round_index = int(parsed_context.get("round_index") or 0)
-            except (TypeError, ValueError):
-                round_index = 0
+                parsed_context = json.loads(str(context or "").strip()) if str(context or "").strip() else {}
+            except Exception:
+                parsed_context = {}
+            if isinstance(parsed_context, dict):
+                try:
+                    round_index = int(parsed_context.get("round_index") or 0)
+                except (TypeError, ValueError):
+                    round_index = 0
         if not intent.requested_domains:
             errors.append("requested_domains is empty")
         else:

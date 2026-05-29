@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src"
 for candidate in (PROJECT_ROOT, SRC_ROOT):
     candidate_text = str(candidate)

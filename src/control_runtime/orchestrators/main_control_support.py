@@ -61,22 +61,25 @@ def build_main_context(
     if not snapshot:
         raise LookupError(f"bound snapshot not found: snapshot_id={snapshot_id}")
     retry_source = previous_execution_feedback if isinstance(previous_execution_feedback, dict) and previous_execution_feedback else previous_diagnosis or {}
-    payload = {
-        "snapshot_id": snapshot_id,
-        "round_index": round_index,
-        "snapshot_summary": _build_snapshot_summary(snapshot),
-        "memory_context": memory_context,
-        "feedback_context": feedback_context,
-        "previous_diagnosis": previous_diagnosis or {},
-        "previous_operation_intent_summary": _build_previous_operation_intent_summary(previous_operation_intent or {}),
-        "execution_retry_hints": _build_execution_retry_hints(retry_source),
-        "mediator_conflict_summary": _build_mediator_conflict_summary(previous_execution_feedback or previous_diagnosis or {}),
-        "assurance_failure_summary": _build_assurance_failure_summary(previous_execution_feedback or {}),
-        "previous_negotiation_request": previous_negotiation_request or {},
-        "previous_planning_blocker": previous_planning_blocker or {},
-        "previous_execution_reentry": previous_execution_reentry or {},
-    }
-    return json.dumps(payload, ensure_ascii=False)
+    return (
+        "## Snapshot Summary\n"
+        f"{_render_mapping({'snapshot_id': snapshot_id, 'round_index': round_index})}\n"
+        f"{_render_snapshot_summary(_build_snapshot_summary(snapshot))}\n\n"
+        "## Previous Round Diagnosis\n"
+        f"{_render_mapping(previous_diagnosis or {})}\n\n"
+        "## Previous Operation Intent\n"
+        f"{_render_mapping(_build_previous_operation_intent_summary(previous_operation_intent or {}))}\n\n"
+        "## Retry Hints\n"
+        f"{_render_json_list(_build_execution_retry_hints(retry_source))}\n\n"
+        "## Conflict And Assurance Signals\n"
+        f"{_render_mapping({'mediator_conflict_summary': _build_mediator_conflict_summary(previous_execution_feedback or previous_diagnosis or {}), 'assurance_failure_summary': _build_assurance_failure_summary(previous_execution_feedback or {})})}\n\n"
+        "## Collaboration Requests\n"
+        f"{_render_mapping({'negotiation_request': previous_negotiation_request or {}, 'planning_blocker': previous_planning_blocker or {}, 'execution_reentry': previous_execution_reentry or {}})}\n\n"
+        "## Memory Context\n"
+        f"{memory_context or 'N/A'}\n\n"
+        "## Feedback\n"
+        f"{feedback_context or 'N/A'}"
+    )
 
 
 def build_planning_context(
@@ -99,7 +102,7 @@ def build_planning_context(
         snapshot_metadata={**(get_latest_snapshot_metadata() or {}), "snapshot_id": snapshot_id},
         memory_context=memory_context,
         feedback_context=feedback_context,
-        handoff_history=handoff_history[-2:] if len(handoff_history or []) > 2 else (handoff_history or []),
+        handoff_history=handoff_history[-2:] if len(handoff_history or []) > 2 else (handoff_history[-2:] if len(handoff_history or []) > 2 else (handoff_history or [])),
         active_domains=list(active_domains or [item.value for item in global_intent.requested_domains]),
         main_round_strategy=global_intent.round_strategy.value,
         main_retry_scope=(
@@ -135,8 +138,7 @@ def parse_pda_metrics(report: FeedbackReport) -> Tuple[List[Dict[str, Any]], Lis
     )
 
 
-def build_feedback_context(
-    previous_context: str,
+def build_round_feedback_block(
     *,
     pda_feedback: Optional[Dict[str, Any]] = None,
     diagnosis: Optional[Dict[str, Any]] = None,
@@ -148,8 +150,6 @@ def build_feedback_context(
     round_index: int,
 ) -> str:
     blocks: List[str] = []
-    if previous_context:
-        blocks.append(previous_context)
     if pda_feedback:
         retry_hints = _build_execution_retry_hints(pda_feedback)
         blocks.append(
@@ -218,15 +218,40 @@ def build_feedback_context(
                 mediator_lines.append(f"constraint: {text}")
         if mediator_lines:
             blocks.append("[Mediator]\n" + "\n".join(mediator_lines))
-    result = "\n".join(block.strip() for block in blocks if block.strip())
-    return _truncate_feedback_context(result)
+    return "\n".join(block.strip() for block in blocks if block.strip())
+
+
+def build_feedback_context_from_snapshots(
+    snapshots: List[Any],
+    *,
+    token_counter: Any = None,
+    summarizer_llm: Any = None,
+) -> str:
+    recent = list(snapshots[-2:])
+    older = list(snapshots[:-2])
+    blocks: List[str] = []
+    if older:
+        blocks.append(_summarize_old_feedback(older, summarizer_llm=summarizer_llm))
+    blocks.extend(
+        str(getattr(snap, "feedback_added", "") or "").strip()
+        for snap in recent
+        if str(getattr(snap, "feedback_added", "") or "").strip()
+    )
+    return _truncate_feedback_context("\n".join(block for block in blocks if block.strip()), token_counter=token_counter)
 
 
 _MAX_FEEDBACK_CHARS = 4000
+_MAX_FEEDBACK_TOKENS = 2000
 
 
-def _truncate_feedback_context(feedback: str) -> str:
+def _truncate_feedback_context(feedback: str, token_counter: Any = None) -> str:
     """Limit feedback context, keeping the most recent blocks when truncated."""
+    if token_counter is not None:
+        return _truncate_feedback_by_tokens(feedback, token_counter)
+    return _truncate_feedback_by_chars(feedback)
+
+
+def _truncate_feedback_by_chars(feedback: str) -> str:
     if len(feedback) <= _MAX_FEEDBACK_CHARS:
         return feedback
     sections = feedback.split("\n[")
@@ -245,6 +270,255 @@ def _truncate_feedback_context(feedback: str) -> str:
     if not keep:
         return feedback[-_MAX_FEEDBACK_CHARS:]
     return "\n".join(keep)
+
+
+def _truncate_feedback_by_tokens(feedback: str, token_counter: Any) -> str:
+    limit = int(_MAX_FEEDBACK_TOKENS)
+    if token_counter.count(feedback) <= limit:
+        return feedback
+    sections = feedback.split("\n[")
+    keep: list[str] = []
+    tokens = 0
+    for i in range(len(sections) - 1, -1, -1):
+        section = sections[i]
+        if i > 0:
+            section = "[" + section
+        overhead = token_counter.count("\n") if keep else 0
+        section_tokens = token_counter.count(section)
+        if tokens + section_tokens + overhead <= limit:
+            keep.insert(0, section)
+            tokens += section_tokens + overhead
+        else:
+            break
+    if not keep:
+        return token_counter.truncate_to_tokens(feedback, limit, suffix="")
+    return "\n".join(keep)
+
+
+def _summarize_old_feedback(old_snapshots: List[Any], *, summarizer_llm: Any = None) -> str:
+    source_blocks = [
+        {
+            "round_index": getattr(snap, "round_index", ""),
+            "diagnosis": getattr(snap, "diagnosis", {}) or {},
+            "feedback": str(getattr(snap, "feedback_added", "") or "").strip(),
+        }
+        for snap in old_snapshots
+    ]
+    if summarizer_llm is not None and source_blocks:
+        prompt = (
+            "Summarize older control-loop feedback in 1-2 concise sentences. "
+            "Preserve root cause categories, affected bindings, and retry-relevant constraints.\n\n"
+            f"{json.dumps(source_blocks, ensure_ascii=False)}"
+        )
+        try:
+            response = summarizer_llm.invoke(prompt) if hasattr(summarizer_llm, "invoke") else summarizer_llm(prompt)
+            text = str(getattr(response, "content", response) or "").strip()
+            if text:
+                return "[Older Feedback Summary]\n" + text
+        except Exception:
+            pass
+
+    lines: List[str] = []
+    for item in source_blocks:
+        diagnosis = item["diagnosis"] if isinstance(item["diagnosis"], dict) else {}
+        category = str(diagnosis.get("root_cause_category") or "").strip()
+        reason = str(diagnosis.get("reason_summary") or diagnosis.get("root_cause") or "").strip()
+        if category or reason:
+            lines.append(
+                f"round {item['round_index']}: "
+                + "; ".join(part for part in [category, reason] if part)
+            )
+    if not lines:
+        lines = [f"round {item['round_index']}: prior feedback present" for item in source_blocks]
+    return "[Older Feedback Summary]\n" + "\n".join(lines[:4])
+
+
+def _render_mapping(payload: Dict[str, Any]) -> str:
+    if not payload:
+        return "N/A"
+    lines: List[str] = []
+    for key, value in payload.items():
+        if value in ("", None, [], {}):
+            continue
+        if isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False)
+        else:
+            rendered = str(value)
+        lines.append(f"- {key}: {rendered}")
+    return "\n".join(lines) if lines else "N/A"
+
+
+def _render_json_list(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "N/A"
+    return "\n".join(f"- {json.dumps(item, ensure_ascii=False)}" for item in items)
+
+
+def _render_snapshot_summary(summary: Dict[str, Any]) -> str:
+    sections: List[str] = []
+    for key in (
+        "counts",
+        "candidate_apps",
+        "candidate_flows",
+        "candidate_slices",
+        "candidate_nodes",
+        "mobility_targets",
+    ):
+        value = summary.get(key)
+        if value in (None, {}, []):
+            continue
+        sections.append(f"- {key}: {json.dumps(value, ensure_ascii=False)}")
+    return "\n".join(sections) if sections else "- counts: {}"
+
+
+def build_feedback_context_from_snapshots(
+    snapshots: List[Any],
+    *,
+    token_counter: Any = None,
+    summarizer_llm: Any = None,
+) -> str:
+    recent = list(snapshots[-2:])
+    older = list(snapshots[:-2])
+    blocks: List[str] = []
+    if older:
+        blocks.append(_summarize_old_feedback(older, summarizer_llm=summarizer_llm))
+    blocks.extend(
+        str(getattr(snap, "feedback_added", "") or "").strip()
+        for snap in recent
+        if str(getattr(snap, "feedback_added", "") or "").strip()
+    )
+    return _truncate_feedback_context("\n".join(block for block in blocks if block.strip()), token_counter=token_counter)
+
+
+_MAX_FEEDBACK_CHARS = 4000
+_MAX_FEEDBACK_TOKENS = 2000
+
+
+def _truncate_feedback_context(feedback: str, token_counter: Any = None) -> str:
+    """Limit feedback context, keeping the most recent blocks when truncated."""
+    if token_counter is not None:
+        return _truncate_feedback_by_tokens(feedback, token_counter)
+    return _truncate_feedback_by_chars(feedback)
+
+
+def _truncate_feedback_by_chars(feedback: str) -> str:
+    if len(feedback) <= _MAX_FEEDBACK_CHARS:
+        return feedback
+    sections = feedback.split("\n[")
+    keep: list[str] = []
+    chars = 0
+    for i in range(len(sections) - 1, -1, -1):
+        section = sections[i]
+        if i > 0:
+            section = "[" + section
+        overhead = len("\n") if keep else 0
+        if chars + len(section) + overhead <= _MAX_FEEDBACK_CHARS:
+            keep.insert(0, section)
+            chars += len(section) + overhead
+        else:
+            break
+    if not keep:
+        return feedback[-_MAX_FEEDBACK_CHARS:]
+    return "\n".join(keep)
+
+
+def _truncate_feedback_by_tokens(feedback: str, token_counter: Any) -> str:
+    limit = int(_MAX_FEEDBACK_TOKENS)
+    if token_counter.count(feedback) <= limit:
+        return feedback
+    sections = feedback.split("\n[")
+    keep: list[str] = []
+    tokens = 0
+    for i in range(len(sections) - 1, -1, -1):
+        section = sections[i]
+        if i > 0:
+            section = "[" + section
+        overhead = token_counter.count("\n") if keep else 0
+        section_tokens = token_counter.count(section)
+        if tokens + section_tokens + overhead <= limit:
+            keep.insert(0, section)
+            tokens += section_tokens + overhead
+        else:
+            break
+    if not keep:
+        return token_counter.truncate_to_tokens(feedback, limit, suffix="")
+    return "\n".join(keep)
+
+
+def _summarize_old_feedback(old_snapshots: List[Any], *, summarizer_llm: Any = None) -> str:
+    source_blocks = [
+        {
+            "round_index": getattr(snap, "round_index", ""),
+            "diagnosis": getattr(snap, "diagnosis", {}) or {},
+            "feedback": str(getattr(snap, "feedback_added", "") or "").strip(),
+        }
+        for snap in old_snapshots
+    ]
+    if summarizer_llm is not None and source_blocks:
+        prompt = (
+            "Summarize older control-loop feedback in 1-2 concise sentences. "
+            "Preserve root cause categories, affected bindings, and retry-relevant constraints.\n\n"
+            f"{json.dumps(source_blocks, ensure_ascii=False)}"
+        )
+        try:
+            response = summarizer_llm.invoke(prompt) if hasattr(summarizer_llm, "invoke") else summarizer_llm(prompt)
+            text = str(getattr(response, "content", response) or "").strip()
+            if text:
+                return "[Older Feedback Summary]\n" + text
+        except Exception:
+            pass
+
+    lines: List[str] = []
+    for item in source_blocks:
+        diagnosis = item["diagnosis"] if isinstance(item["diagnosis"], dict) else {}
+        category = str(diagnosis.get("root_cause_category") or "").strip()
+        reason = str(diagnosis.get("reason_summary") or diagnosis.get("root_cause") or "").strip()
+        if category or reason:
+            lines.append(
+                f"round {item['round_index']}: "
+                + "; ".join(part for part in [category, reason] if part)
+            )
+    if not lines:
+        lines = [f"round {item['round_index']}: prior feedback present" for item in source_blocks]
+    return "[Older Feedback Summary]\n" + "\n".join(lines[:4])
+
+
+def _render_mapping(payload: Dict[str, Any]) -> str:
+    if not payload:
+        return "N/A"
+    lines: List[str] = []
+    for key, value in payload.items():
+        if value in ("", None, [], {}):
+            continue
+        if isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False)
+        else:
+            rendered = str(value)
+        lines.append(f"- {key}: {rendered}")
+    return "\n".join(lines) if lines else "N/A"
+
+
+def _render_json_list(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "N/A"
+    return "\n".join(f"- {json.dumps(item, ensure_ascii=False)}" for item in items)
+
+
+def _render_snapshot_summary(summary: Dict[str, Any]) -> str:
+    sections: List[str] = []
+    for key in (
+        "counts",
+        "candidate_apps",
+        "candidate_flows",
+        "candidate_slices",
+        "candidate_nodes",
+        "mobility_targets",
+    ):
+        value = summary.get(key)
+        if value in (None, {}, []):
+            continue
+        sections.append(f"- {key}: {json.dumps(value, ensure_ascii=False)}")
+    return "\n".join(sections) if sections else "- counts: {}"
 
 
 def _build_execution_retry_hints(payload: Dict[str, Any]) -> List[Dict[str, Any]]:

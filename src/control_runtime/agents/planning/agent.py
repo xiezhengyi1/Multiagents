@@ -41,6 +41,25 @@ def _build_lean_operation_intent(operation_intent: Any) -> dict:
     return raw
 
 
+def _build_lean_operation_intent(operation_intent: Any) -> dict:
+    """Build a lean version of OperationIntent for OSA prompt, removing numerical
+    fields that the optimizer tool provides (bw, gbr, latency, jitter, loss, five_tuple)."""
+    raw = _json_friendly(operation_intent.model_dump(mode="json"))
+    lean_flows = []
+    for f in raw.get("flows") or []:
+        if not isinstance(f, dict):
+            lean_flows.append(f)
+            continue
+        lean_flows.append({
+            k: v for k, v in f.items()
+            if k in ("flow_id", "app_id", "supi", "name", "flow_name",
+                     "service_type", "service_type_id", "priority",
+                     "resolution_status", "requested_domains", "dnn")
+        })
+    raw["flows"] = lean_flows
+    return raw
+
+
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "optimization_strategy"
     QOS_GROUNDING_TOOLS = {
@@ -95,18 +114,23 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             payload=policy_plan,
         )
 
-    def generate_strategy(self, planning_request: PlanningRequest) -> PolicyPlanDraft:
+    def generate_strategy(self, planning_request: PlanningRequest, *, trace_metadata: dict[str, Any] | None = None) -> PolicyPlanDraft:
         self.ensure_worker_runtime_initialized()
         if not isinstance(planning_request, PlanningRequest):
             raise TypeError("generate_strategy expects a PlanningRequest instance")
         request_envelope = self._cache_received_request(planning_request)
-        return self._generate_strategy(planning_request=planning_request, request_envelope=request_envelope)
+        return self._generate_strategy(
+            planning_request=planning_request,
+            request_envelope=request_envelope,
+            trace_metadata=trace_metadata,
+        )
 
     def _generate_strategy(
         self,
         *,
         planning_request: PlanningRequest,
         request_envelope: ArtifactEnvelope,
+        trace_metadata: dict[str, Any] | None = None,
     ) -> PolicyPlanDraft:
         try:
             effective_request = self._effective_planning_request(planning_request)
@@ -116,6 +140,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 reason=str(exc),
             )
         operation_intent = effective_request.operation_intent
+        normalized_user_intent = _build_lean_operation_intent(operation_intent)
         normalized_user_intent = _build_lean_operation_intent(operation_intent)
         normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
         coordination_context = _json_friendly(effective_request.context.model_dump(mode="json"))
@@ -143,6 +168,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
                         planning_request=effective_request,
                         prompt=current_prompt,
+                        trace_metadata=trace_metadata,
                     )
                 except RuntimeError as exc:
                     invocation_error = str(exc)
@@ -260,13 +286,18 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         *,
         planning_request: PlanningRequest,
         prompt: str,
+        trace_metadata: dict[str, Any] | None = None,
     ) -> tuple[OsaAdvisorOutput, dict[str, Any], dict[str, Any]]:
+        token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
             session_id=planning_request.context.session_id,
             snapshot_id=planning_request.context.snapshot_id,
             supi=planning_request.operation_intent.supi,
             thread_id=planning_request.context.session_id,
+            token_budget=token_budget,
+            token_counter=token_counter,
+            trace_metadata=trace_metadata,
         )
         advisor_agent = self.create_json_agent(
             tools=[
@@ -283,13 +314,20 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 "search_semantic_knowledge": 4000,
                 "get_knowledge_by_key": 4000,
             },
+            tool_result_limits={
+                "preview_qos_optimizer": 8000,
+                "fetch_qos_network_status": 4000,
+                "inspect_mobility_ue_policies": 4000,
+                "search_semantic_knowledge": 4000,
+                "get_knowledge_by_key": 4000,
+            },
         )
         messages = [{"role": "user", "content": prompt}]
         invoke_payload = {
             "messages": messages,
             "trace_write_mode": "manual",
             "trace_metadata": {
-                **(getattr(self, "_pending_trace_metadata", {}) or {}),
+                **(trace_metadata or {}),
                 "path_label": "strategy_advisor",
             },
         }

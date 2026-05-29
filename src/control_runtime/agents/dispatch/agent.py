@@ -101,12 +101,13 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         )
         self.cache.cache_produced(envelope)
 
-    def execute_and_evaluate(self, strategy_output: Any) -> FeedbackReport:
+    def execute_and_evaluate(self, strategy_output: Any, *, trace_metadata: Dict[str, Any] | None = None) -> FeedbackReport:
         self.ensure_worker_runtime_initialized()
         request_envelope = self._cache_received_request(strategy_output)
         return self.execute_and_evaluate_from_request(
             strategy_output=strategy_output,
             request_envelope=request_envelope,
+            trace_metadata=trace_metadata,
         )
 
     def execute_and_evaluate_from_request(
@@ -114,6 +115,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         *,
         strategy_output: Any,
         request_envelope: ArtifactEnvelope,
+        trace_metadata: Dict[str, Any] | None = None,
     ) -> FeedbackReport:
         outcome = self._execution_controller.execute(strategy_output)
         feedback_payload = self._build_feedback_payload(strategy_output=strategy_output, outcome=outcome)
@@ -126,6 +128,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
             outcome=outcome,
             feedback_report=feedback_report,
             request_envelope=request_envelope,
+            trace_metadata=trace_metadata,
         )
         self._cache_produced_result(
             request_envelope=request_envelope,
@@ -140,6 +143,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         outcome: Any,
         feedback_report: FeedbackReport,
         request_envelope: ArtifactEnvelope,
+        trace_metadata: Dict[str, Any] | None = None,
     ) -> None:
         context = AgentRuntimeContext(
             agent_name=self.agent_name,
@@ -148,6 +152,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
             supi=str(getattr(strategy_output, "supi", "") or "").strip() or None,
             thread_id=request_envelope.session_id or request_envelope.snapshot_id or self.agent_name,
             allow_user_interaction=False,
+            trace_metadata=dict(trace_metadata or {}),
         )
         payload = {
             "messages": [
@@ -159,7 +164,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
                     )
                 )
             ],
-            "trace_metadata": self._pending_trace_metadata_payload(),
+            "trace_metadata": self._trace_metadata_payload(trace_metadata),
         }
         result = {
             "messages": self._build_trace_messages(
@@ -185,15 +190,14 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         )
         self._trace_writer.write(record)
 
-    def _pending_trace_metadata_payload(self) -> Dict[str, Any]:
-        metadata = getattr(self, "_pending_trace_metadata", None)
-        if metadata is None:
+    def _trace_metadata_payload(self, metadata: Dict[str, Any] | None) -> Dict[str, Any]:
+        if not metadata:
             return {}
         if not isinstance(metadata, dict):
-            raise TypeError("_pending_trace_metadata must be a dict when present")
+            raise TypeError("trace_metadata must be a dict when present")
         scenario_tags = metadata.get("scenario_tags") or []
         if not isinstance(scenario_tags, list):
-            raise TypeError("_pending_trace_metadata.scenario_tags must be a list")
+            raise TypeError("trace_metadata.scenario_tags must be a list")
         return {
             "scenario_id": str(metadata.get("scenario_id") or "").strip() or None,
             "scenario_tags": [str(item).strip() for item in scenario_tags if str(item).strip()],

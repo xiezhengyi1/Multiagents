@@ -274,10 +274,7 @@ def build_single_agent_tools(
         )
         full_payload = _serialize_optimizer_result(result)
         return json.dumps(
-            {
-                "summary": _summarize_optimizer_result(full_payload),
-                "result": full_payload,
-            },
+            {"summary": _summarize_optimizer_result(full_payload)},
             ensure_ascii=False,
         )
 

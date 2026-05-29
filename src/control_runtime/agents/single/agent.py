@@ -14,8 +14,9 @@ from shared.logging import log_event, log_timing
 
 from ...domain.collaboration import PlanningContext, PlanningRequest
 from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
-from ...domain.policy_plan import OperationIntent, PlanningRationale, PolicyDraft, PolicyPlanDraft, RevisionHandles
+from ...domain.policy_plan import OperationIntent, PlanningRationale, PolicyDraft, PolicyPlanDraft
 from ...integrations.storage import get_latest_snapshot_metadata
+from ..common import validate_and_compile_intent
 from ..grounding.compiler import IntentCompiler
 from ..grounding.contracts import IntentAdvisorDecision
 from ..planning.policy_normalizer import normalize_policy_plan_draft
@@ -65,11 +66,13 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         "search_semantic_knowledge",
         "get_knowledge_by_key",
     }
-    PLAN_GROUNDING_TOOLS = (
-        OptimizationStrategyCompiler.QOS_GROUNDING_TOOLS
-        | OptimizationStrategyCompiler.MOBILITY_GROUNDING_TOOLS
-        | {"search_semantic_knowledge", "get_knowledge_by_key"}
-    )
+    PLAN_GROUNDING_TOOLS = {
+        "preview_qos_optimizer",
+        "fetch_qos_network_status",
+        "inspect_mobility_ue_policies",
+        "search_semantic_knowledge",
+        "get_knowledge_by_key",
+    }
     MOBILITY_HINT_TOKENS = (
         "am policy",
         "allowed nssai",
@@ -185,6 +188,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             am_context_payload={},
             am_policy_candidates=[],
         )
+        token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
             session_id=session_id,
@@ -192,6 +196,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             supi=supi or None,
             thread_id=session_id,
             allow_user_interaction=allow_user_interaction,
+            token_budget=token_budget,
+            token_counter=token_counter,
         )
         requested_domains = self._hint_requested_domains(user_input)
         allow_knowledge_tools = self._should_allow_knowledge_tools(user_input)
@@ -207,6 +213,16 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             tool_error_mode="raise",
             max_calls_per_tool=2,
             forbid_duplicate_tool_calls=True,
+            tool_result_limits={
+                "preview_qos_optimizer": 8000,
+                "get_sm_ue_context": 4000,
+                "get_sm_ue_flow_catalog": 8000,
+                "get_am_policy_context": 4000,
+                "fetch_qos_network_status": 4000,
+                "inspect_mobility_ue_policies": 4000,
+                "search_semantic_knowledge": 4000,
+                "get_knowledge_by_key": 4000,
+            },
         )
         prompt = self._build_round_prompt(
             user_input=user_input,
@@ -231,26 +247,22 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             decision=decision,
         )
         intent_grounding_tools = extract_grounding_tool_names(result, self.INTENT_GROUNDING_TOOLS)
-        advisor_validation_errors = self.intent_compiler.validate_advisor_decision(
+        intent_decision = self._to_intent_advisor_decision(decision)
+        advisor_validation_errors, grounding_validation_errors, operation_intent = validate_and_compile_intent(
+            compiler=self.intent_compiler,
             evidence=refreshed_evidence,
-            decision=self._to_intent_advisor_decision(decision),
-        )
-        grounding_validation_errors = self.intent_compiler.validate_intent_grounding(
-            evidence=refreshed_evidence,
+            decision=intent_decision,
             grounding_tools=intent_grounding_tools,
-        )
-        if advisor_validation_errors or grounding_validation_errors:
-            problems = advisor_validation_errors + grounding_validation_errors
-            raise RuntimeError("Single agent unified intent validation failed: " + "; ".join(problems))
-
-        operation_intent = self.intent_compiler.compile_operation_intent(
-            evidence=refreshed_evidence,
-            advisor_decision=self._to_intent_advisor_decision(decision),
             user_input=user_input,
             session_id=session_id,
             snapshot_id=snapshot_id,
             main_directives=self._main_directives_from_decision(decision),
         )
+        if advisor_validation_errors or grounding_validation_errors:
+            problems = advisor_validation_errors + grounding_validation_errors
+            raise RuntimeError("Single agent unified intent validation failed: " + "; ".join(problems))
+        if operation_intent is None:
+            raise RuntimeError("Single agent unified intent validation produced no OperationIntent")
         global_intent = self._build_global_intent(
             decision=decision,
             operation_intent=operation_intent,
@@ -452,21 +464,22 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 ],
                 active_constraints=[
                     str(item)
-                    for item in self.plan_compiler._normalized_hard_constraints(planning_request.context.unified_constraints)
+                    for item in self.plan_compiler.artifact_compiler._normalized_hard_constraints(
+                        planning_request.context.unified_constraints
+                    )
                     if str(item).strip()
                 ],
                 explanation=str(decision.rationale or "").strip(),
                 rejected_alternatives=[],
             ),
-            revision_handles=RevisionHandles(handles=[]),
             all_policies=[],
         )
 
         for index, policy_details in enumerate(decision.sm_policies, start=1):
             flow_id = self._resolve_pcflow_id(policy_details, decision=decision)
-            flow_ctx = self.plan_compiler._resolve_flow(planning_request, flow_id)
+            flow_ctx = self.plan_compiler.artifact_compiler._resolve_flow(planning_request, flow_id)
             app_id = str(flow_ctx.app_id or decision.selected_app_id or planning_request.operation_intent.app_id or "").strip()
-            resource_keys = self.plan_compiler._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id)
+            resource_keys = self.plan_compiler.advisor_validator._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id)
             if not resource_keys:
                 raise ValueError(f"optimizer preview does not contain a grounded QoS assignment for flow_id={flow_id}")
             plan.all_policies.append(
@@ -491,7 +504,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     app_id="",
                     flow_id=None,
                     target_type="ue",
-                    policy_id=self.plan_compiler._resolve_am_association_id(
+                    policy_id=self.plan_compiler.artifact_compiler._resolve_am_association_id(
                         planning_request=planning_request,
                         mobility_context=mobility_context,
                     ),
@@ -515,12 +528,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 )
             )
 
-        normalized = normalize_policy_plan_draft(plan, planning_request.operation_intent)
-        normalized.revision_handles = self.plan_compiler._build_revision_handles(
-            policy_plan=normalized,
-            planning_request=planning_request,
-        )
-        self.plan_compiler._validate_compiled_plan(normalized, planning_request)
+        normalized = normalize_policy_plan_draft(plan)
+        self.plan_compiler.plan_validator.validate_compiled_plan(normalized, planning_request)
         return normalized
 
     @staticmethod

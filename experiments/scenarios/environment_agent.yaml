@@ -1,0 +1,398 @@
+kind: environment_agent
+version: 1
+name: environment_generation_agent
+agent_id: environment_generation
+description: >
+  Agent specification for generating verifiable network environment YAML files,
+  launching the ns3/free5gc simulation stack, and debugging failed scenario
+  bootstraps with an EnvFactory-style generate-test-repair loop.
+
+motivation:
+  source: weekly-report-31
+  reference_method: EnvFactory
+  goal: >
+    Expand the current hand-written scenario set into a larger pool of
+    executable, validated network environments for Multiagents experiments.
+  target_scale:
+    initial_validated_scenarios: 12
+    long_term_validated_scenarios: 50
+  guiding_principles:
+    - Generate only closed-world network scenarios that can be represented by the existing YAML schema.
+    - Treat ns3/free5gc startup and graph snapshot creation as the executable verifier.
+    - Keep user-facing task generation separate from environment validation, but preserve hooks for QueryGen-style data growth.
+
+repository_context:
+  scenario_root: experiments/scenarios
+  scenario_registry: experiments/configs/scenarios.json
+  experiment_matrix: experiments/configs/experiment_matrix.json
+  existing_seed_scenarios:
+    - scenario_id: S1
+      path: experiments/scenarios/s1_basic_single_slice.yaml
+      role: low-complexity QoS grounding seed
+    - scenario_id: S2
+      path: experiments/scenarios/s2_medium_complexity.yaml
+      role: medium multi-slice and multi-UE seed
+    - scenario_id: S3
+      path: experiments/scenarios/s3_high_complexity.yaml
+      role: high-complexity multi-gNB and multi-UPF seed
+  split_mode_overlays:
+    - experiments/scenarios/split_mode/s1_basic_single_slice.yaml
+    - experiments/scenarios/split_mode/s2_medium_complexity.yaml
+    - experiments/scenarios/split_mode/s3_high_complexity.yaml
+  generated_output_roots:
+    base_scenarios: experiments/scenarios/generated
+    split_mode_overlays: experiments/scenarios/split_mode/generated
+    validation_reports: experiments/results/environment_agent
+
+role:
+  system_prompt: >
+    You are the Environment Generation Agent for a 5G/6G network-control
+    multi-agent system. Your job is to synthesize scenario YAML files, validate
+    that every generated environment is internally consistent, launch the
+    ns3/free5gc integration stack, inspect failure logs, and repair the YAML
+    until the environment is executable or rejected with a precise reason.
+  responsibilities:
+    - Propose scenario variants from a bounded topology and traffic design space.
+    - Write complete scenario YAML files under experiments/scenarios/generated.
+    - Write matching split-mode overlay YAML files when the simulator requires radio/runtime parameters.
+    - Start simulator runs through the same entrypoints used by experiments.
+    - Confirm graph snapshot creation and policy gateway health before marking an environment valid.
+    - Produce repair patches from validation errors, simulator logs, and manifest state.
+    - Save a compact validation report for each candidate scenario.
+  non_responsibilities:
+    - Do not change core runtime agent prompts while generating environments.
+    - Do not silently edit existing S1/S2/S3 seed scenarios.
+    - Do not add a generated scenario to experiments/configs/scenarios.json until validation succeeds.
+    - Do not generate user-input trajectories before the environment passes simulation startup.
+
+input_space:
+  topology:
+    gnb_count:
+      min: 1
+      max: 6
+    upf_count:
+      min: 1
+      max: 4
+    ue_count:
+      min: 2
+      max: 16
+    supported_topology_modes:
+      - single_upf
+      - ulcl
+    gnb_slice_attachment_patterns:
+      - single_slice_per_gnb
+      - overlapping_two_slice
+      - full_multi_slice
+      - sparse_edge_hotspot
+  slices:
+    allowed_sst_profiles:
+      - sst: 1
+        label_hint: eMBB
+        default_five_qi: 9
+        service_type: eMBB
+      - sst: 2
+        label_hint: URLLC
+        default_five_qi: 7
+        service_type: URLLC
+      - sst: 3
+        label_hint: mMTC
+        default_five_qi: 6
+        service_type: mMTC
+    slice_count:
+      min: 1
+      max: 5
+    sd_format: six_digit_hex_string
+  traffic:
+    app_families:
+      - Telemedicine
+      - Remote_Drive
+      - AR_Gaming
+      - Factory_Robot
+      - IoT_Sensor
+      - Web_Browse
+      - Drone_Control
+      - 4K_Video
+      - Cloud_Render
+      - XR_Collaboration
+      - Smart_Grid
+      - Emergency_Response
+    flow_count_per_app:
+      min: 1
+      max: 3
+    stress_modes:
+      - balanced_load
+      - downlink_hotspot
+      - uplink_hotspot
+      - slice_resource_contention
+      - latency_critical_mix
+      - low_priority_background_pressure
+  mobility:
+    enabled: true
+    patterns:
+      - fixed
+      - preferred_gnb_failover
+      - edge_hotspot_relocation
+      - cross_gnb_load_balancing
+
+generated_scenario_contract:
+  root_required_fields:
+    - name
+    - scenario_id
+    - tick_ms
+    - seed
+    - slices
+    - upfs
+    - gnbs
+    - ues
+    - apps
+    - flows
+    - free5gc
+    - ns3
+    - writer
+    - topology
+    - bridge
+  entity_rules:
+    slices:
+      - Every slice must define sst, sd, label, resource, and qos.
+      - label must be unique and referenced by gnbs, ues.sessions, and flows.slice_ref.
+      - sst and sd must map to current_slice_snssai consistently.
+    upfs:
+      - At least one UPF must have role anchor-upf.
+      - ULCL scenarios should include one branching-upf and one or more anchor-upf entries.
+    gnbs:
+      - Every gNB must host at least one existing slice label.
+      - backhaul_upf must reference an existing UPF name.
+    ues:
+      - Every UE must define name, supi, gnb, free5gc_policy, and at least one session.
+      - free5gc_policy.target_gnb and preferred_gnbs must reference existing gNB names.
+      - Each session app_id must reference an existing app.
+    apps:
+      - Every app_id must be unique.
+      - Every app must reference one UE by supi and ue_name.
+      - flow_ids must match flows owned by that app.
+    flows:
+      - Every flow_id must be unique.
+      - app_id, supi, ue_name, slice_ref, and session_ref must resolve to existing objects.
+      - sla_target priority must use lower numbers for more critical services.
+      - allocated bandwidth must not exceed the selected slice capacity in aggregate unless the scenario is intentionally marked as resource pressure.
+  split_mode_overlay_required_fields:
+    - name
+    - scenario_id
+    - base_scenario
+    - ns3
+    - runtime
+    - radio
+
+workflow:
+  phases:
+    - name: search
+      purpose: Select a bounded scenario design before writing YAML.
+      inputs:
+        - existing_seed_scenarios
+        - input_space
+        - experiment_matrix
+      output:
+        artifact: scenario_design_brief
+        required_fields:
+          - scenario_id
+          - complexity
+          - topology_mode
+          - slice_profile
+          - ue_app_flow_plan
+          - stress_mode
+          - expected_control_tasks
+    - name: synthesize_yaml
+      purpose: Convert the scenario design brief into executable YAML.
+      output:
+        artifacts:
+          - base_scenario_yaml
+          - split_mode_overlay_yaml
+      constraints:
+        - Use the same field names and units as S1/S2/S3.
+        - Prefer deterministic IDs and seeds for reproducibility.
+        - Keep generated file names lowercase with underscores.
+    - name: static_validate
+      purpose: Check YAML structure before launching expensive simulation.
+      checks:
+        - yaml_parse
+        - required_root_fields
+        - cross_reference_integrity
+        - snssai_consistency
+        - aggregate_slice_capacity
+        - app_flow_session_alignment
+        - split_overlay_base_scenario_exists
+    - name: launch_simulation
+      purpose: Start the ns3/free5gc integration stack using the experiments launcher semantics.
+      checks:
+        - simulator_process_started
+        - run_manifest_created
+        - live_graph_snapshot_created
+        - policy_gateway_healthcheck_responds
+    - name: debug_and_repair
+      purpose: Repair YAML from validation or startup failures.
+      max_attempts: 3
+      failure_inputs:
+        - static_validation_errors
+        - simulator_log_tail
+        - run_manifest
+        - failed_experiments_ledger_entry
+      output:
+        artifact: repair_report
+    - name: accept_or_reject
+      purpose: Mark scenario as validated or rejected.
+      accepted_outputs:
+        - generated scenario YAML
+        - split-mode overlay YAML
+        - validation report JSON
+        - suggested scenarios.json registry entry
+      rejected_outputs:
+        - rejected scenario YAML
+        - rejection report with root cause and last error
+
+simulation_startup:
+  primary_launcher:
+    description: >
+      Use the repository experiment launcher when validating a registered
+      scenario because it also builds inputs, starts the simulator, runs methods,
+      aggregates results, and records failures.
+    cwd: Multiagents
+    argv:
+      - ".venv/Scripts/python.exe"
+      - "experiments/scripts/launch_experiments.py"
+      - "--experiment"
+      - "<experiment_id>"
+      - "--scenario"
+      - "<scenario_id>"
+      - "--method"
+      - "Ours"
+      - "--start-index"
+      - "1"
+  direct_simulator_launcher:
+    description: >
+      Use this for pre-registry simulation bootstrap checks. It mirrors
+      experiments/scripts/launch_experiments.py::_start_simulator_for_scenario.
+    cwd: ns3-free5gc-integration
+    argv:
+      - "<stack_python>"
+      - "scripts/start_split_mode.py"
+      - "<scenario_yaml_path>"
+      - "--run-id"
+      - "<run_id>"
+      - "--live-graph-snapshot-id"
+      - "<live_graph_snapshot_id>"
+      - "--wait-background"
+  graph_snapshot_check:
+    cwd: ns3-free5gc-integration
+    argv:
+      - "<stack_python>"
+      - "bridge/writer/cli.py"
+      - "graph-snapshot-exists"
+      - "--graph-db-url"
+      - "<graph_db_url>"
+      - "--snapshot-id"
+      - "<live_graph_snapshot_id>"
+      - "--ensure-graph-schema"
+  healthcheck:
+    host: 127.0.0.1
+    port: 18080
+    path: /policy-executions/launch-healthcheck
+    acceptable_status_range: "200-499"
+    timeout_seconds: 2
+  startup_timeout_seconds: 180
+  restart_limit: 2
+  cleanup:
+    manifest_command_name: compose-down
+    source: run-manifest.split.json
+
+debugging_policy:
+  classify_failures:
+    yaml_schema_error:
+      symptoms:
+        - YAML root is not a mapping.
+        - Required field is missing.
+      repair_action: Add or normalize fields according to generated_scenario_contract.
+    reference_integrity_error:
+      symptoms:
+        - app_id, flow_id, slice_ref, session_ref, gnb, or upf reference does not resolve.
+      repair_action: Repair names and IDs, then rerun static validation.
+    capacity_model_error:
+      symptoms:
+        - Aggregate guaranteed bandwidth exceeds declared capacity without a stress-mode note.
+      repair_action: Lower low-priority flow guarantees or increase slice capacity within input_space bounds.
+    simulator_bootstrap_error:
+      symptoms:
+        - Manifest is absent.
+        - Graph snapshot is absent.
+        - Policy gateway healthcheck fails.
+        - Simulator exits before readiness.
+      repair_action: Read simulator log tail and run manifest, then repair ns3/free5gc/topology fields.
+    experiment_launcher_error:
+      symptoms:
+        - build_user_inputs.py rejects missing task objects.
+        - run_method.py cannot resolve scenario_id.
+      repair_action: Update task compatibility metadata or provide a validated scenarios.json entry.
+  repair_constraints:
+    - Prefer local YAML edits over code edits.
+    - Preserve generated scenario_id unless the failure is an ID collision.
+    - Keep high-priority emergency, telemedicine, remote-drive, and robot flows semantically stable during repair.
+    - Stop after max_attempts and emit a rejected report instead of looping indefinitely.
+
+output_contract:
+  accepted_report_fields:
+    - scenario_id
+    - scenario_path
+    - split_mode_overlay_path
+    - validation_status
+    - static_validation
+    - simulator_bootstrap
+    - graph_snapshot_id
+    - log_path
+    - registry_patch
+    - generated_at
+  registry_patch_template:
+    id: "<new scenario registry id, e.g. G001>"
+    name: "<human readable generated scenario name>"
+    gnb_count: "<integer>"
+    upf_count: "<integer>"
+    ue_count: "<integer>"
+    slice_count: "<integer>"
+    flow_count_range: "<summary>"
+    complexity: "<low|medium|high>"
+    status: ready
+    source: "experiments/scenarios/generated/<file>.yaml"
+    notes: "Generated and validated by environment_generation_agent."
+
+trajectory_generation_hooks:
+  enabled_after_environment_validation: true
+  external_parameters:
+    - user experience description
+    - preferred service priority
+    - location or gNB preference
+    - time or event condition
+    - acceptable degradation preference
+  internal_parameters:
+    - supi
+    - app_id
+    - flow_id
+    - session_ref
+    - slice snssai
+    - backend graph snapshot id
+  query_refinement_strategies:
+    - implicit_reference
+    - action_compression
+    - ambiguity_injection
+    - goal_expansion
+  filtering_signal:
+    - simulator KPI
+    - execution status
+    - SLA violation recovery
+    - control churn
+    - retry count
+
+acceptance_criteria:
+  - Generated YAML parses as a mapping.
+  - Static validation reports no missing references.
+  - Direct simulator startup creates a live graph snapshot.
+  - Policy gateway healthcheck responds before startup_timeout_seconds.
+  - Cleanup command is available from the run manifest.
+  - Accepted scenario includes a scenarios.json registry patch but is not registered before validation.

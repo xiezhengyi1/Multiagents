@@ -19,12 +19,13 @@ from ...integrations.pcf import (
     search_sm_flow_targets,
 )
 from ...domain.policy_plan import OperationIntent
+from ..common import validate_and_compile_intent
 from shared.logging import log_event, log_timing
 
 from .compiler import IntentCompiler
 from .common import extract_requested_supis, merge_candidate_dicts, merge_catalog_payloads
 from .contracts import IntentAdvisorDecision, IntentEvidence
-from .prompts import IEA_SYSTEM_PROMPT
+from .prompts import IEA_DYNAMIC_RULES, IEA_SYSTEM_PROMPT
 from .tool_result_adapter import extract_grounding_tool_payloads
 
 
@@ -98,6 +99,15 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 "search_semantic_knowledge": 4000,
                 "get_knowledge_by_key": 4000,
             },
+            tool_result_limits={
+                "get_sm_ue_flow_catalog": 8000,
+                "get_sm_ue_context": 4000,
+                "search_sm_flow_targets": 4000,
+                "get_am_policy_context": 4000,
+                "search_am_policy_targets": 4000,
+                "search_semantic_knowledge": 4000,
+                "get_knowledge_by_key": 4000,
+            },
         )
         self.last_failure_debug: Dict[str, Any] = {}
 
@@ -157,6 +167,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         snapshot_id: str = "",
         allow_user_interaction: bool = False,
         request_envelope: ArtifactEnvelope | None = None,
+        trace_metadata: Dict[str, Any] | None = None,
     ) -> OperationIntent:
         self.ensure_worker_runtime_initialized()
         if request_envelope is None:
@@ -179,6 +190,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         operation_intent = self.analyze_intent(
             user_input,
             **analyze_kwargs,
+            trace_metadata=trace_metadata,
         )
         self._cache_produced_result(
             request_envelope=request_envelope,
@@ -194,6 +206,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         session_id: str = "",
         snapshot_id: str = "",
         allow_user_interaction: bool = False,
+        trace_metadata: Dict[str, Any] | None = None,
     ) -> OperationIntent:
         self.ensure_worker_runtime_initialized()
         total_start = time.perf_counter()
@@ -207,6 +220,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 snapshot_id=snapshot_id,
                 main_directives=main_directives,
             )
+            token_budget, token_counter = self._resolve_token_context()
             runtime_context = self.build_runtime_context(
                 agent_name=self.agent_name,
                 session_id=session_id,
@@ -214,6 +228,9 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 supi=evidence.supi or None,
                 thread_id=session_id,
                 allow_user_interaction=allow_user_interaction,
+                token_budget=token_budget,
+                token_counter=token_counter,
+                trace_metadata=trace_metadata,
             )
             advisor_prompt = self._build_advisor_prompt(evidence=evidence, context=context)
             advisor_decision = None
@@ -251,13 +268,15 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     main_directives=main_directives,
                     snapshot_id=snapshot_id,
                 )
-                advisor_validation_errors = self.compiler.validate_advisor_decision(
+                advisor_validation_errors, validation_errors, _ = validate_and_compile_intent(
+                    compiler=self.compiler,
                     evidence=refreshed_evidence,
                     decision=advisor_decision,
-                )
-                validation_errors = self.compiler.validate_intent_grounding(
-                    evidence=refreshed_evidence,
                     grounding_tools=grounding_tools,
+                    user_input=user_input,
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    main_directives=main_directives,
                 )
                 self.last_failure_debug = {
                     "phase": "intent_encoding",
@@ -283,14 +302,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 )
             if advisor_decision is None:
                 raise RuntimeError("IEA advisor returned no decision payload")
-            compiled = self.compiler.compile_operation_intent(
+            _, _, compiled = validate_and_compile_intent(
+                compiler=self.compiler,
                 evidence=evidence,
-                advisor_decision=advisor_decision,
+                decision=advisor_decision,
+                grounding_tools=grounding_tools,
                 user_input=user_input,
                 session_id=session_id,
                 snapshot_id=snapshot_id,
                 main_directives=main_directives,
             )
+            if compiled is None:
+                raise RuntimeError("IEA could not compile OperationIntent after validation")
             advisor_invocation.write_final_trace(
                 advisor_decision=advisor_decision,
                 operation_intent=compiled,
@@ -400,6 +423,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             f"{json.dumps(evidence.model_dump(mode='json'), ensure_ascii=False)}\n\n"
             "Coordinator context:\n"
             f"{context or 'N/A'}\n\n"
+            f"{IEA_DYNAMIC_RULES.strip()}\n\n"
             "Task:\n"
             "- Resolve only the semantic choices that remain ambiguous.\n"
             "- Use tools only when the structured evidence does not already ground the required target.\n"
@@ -443,12 +467,28 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return either a resolved or explicitly unresolved flow entry.",
                 "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
             ])
+            repair_rules.extend([
+                "This retry is specifically failing because your previous JSON omitted flows.",
+                "For the next answer, flows must be non-empty.",
+                "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
+                "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
+                "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return either a resolved or explicitly unresolved flow entry.",
+                "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
+            ])
         if "domain_resolution must be confirmed, narrowed, widened, or cannot_confirm" in joined:
             repair_rules.extend([
                 "Set `domain_resolution` to exactly one of: confirmed, narrowed, widened, cannot_confirm.",
                 "Do not output a nested object under `domain_resolution`.",
             ])
+            repair_rules.extend([
+                "Set `domain_resolution` to exactly one of: confirmed, narrowed, widened, cannot_confirm.",
+                "Do not output a nested object under `domain_resolution`.",
+            ])
         if "cannot_confirm domain resolution requires domain_revision_rationale" in joined:
+            repair_rules.extend([
+                "If you set `domain_resolution` to `cannot_confirm`, you must include a non-empty `domain_revision_rationale`.",
+                "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
+            ])
             repair_rules.extend([
                 "If you set `domain_resolution` to `cannot_confirm`, you must include a non-empty `domain_revision_rationale`.",
                 "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
@@ -465,7 +505,16 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 "When a flow is resolved, set `flows[].name` to the explicit flow name that the resolved binding satisfies.",
                 "Do not return a resolved flow binding for any name that is missing from catalog/search evidence.",
             ])
+            repair_rules.extend([
+                "For each explicitly named QoS flow, either ground it via catalog/search evidence or leave it unresolved.",
+                "When a flow is resolved, set `flows[].name` to the explicit flow name that the resolved binding satisfies.",
+                "Do not return a resolved flow binding for any name that is missing from catalog/search evidence.",
+            ])
         if "mobility-only intent must not call SM grounding tools" in joined:
+            repair_rules.extend([
+                "This retry is mobility-only.",
+                "Do not call search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
+            ])
             repair_rules.extend([
                 "This retry is mobility-only.",
                 "Do not call search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
@@ -490,7 +539,30 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             flags=re.DOTALL,
         )
 
+            repair_rules.extend([
+                "This retry is QoS-only.",
+                "Do not call get_am_policy_context or search_am_policy_targets.",
+            ])
+
+        import re
+        cleaned = re.sub(
+            r'\n\nRetry feedback \(attempt \d+\).*$',
+            '',
+            base_prompt,
+            flags=re.DOTALL,
+        )
+        cleaned = re.sub(
+            r'\n\nYour previous attempt failed validation.*$',
+            '',
+            cleaned,
+            flags=re.DOTALL,
+        )
+
         return (
+            f"{cleaned}\n\n"
+            "Retry feedback:\n"
+            + "\n".join(f"- {rule}" for rule in repair_rules)
+            + "\n\nValidation errors:\n- "
             f"{cleaned}\n\n"
             "Retry feedback:\n"
             + "\n".join(f"- {rule}" for rule in repair_rules)
@@ -505,7 +577,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         runtime_context: Any,
     ) -> IntentAdvisorInvocation:
         self._pending_invoke_messages = [{"role": "user", "content": prompt}]
-        base_trace_metadata = getattr(self, "_pending_trace_metadata", {}) or {}
+        base_trace_metadata = dict(getattr(runtime_context, "trace_metadata", {}) or {})
         invoke_payload = {
             "messages": self._pending_invoke_messages,
             "trace_write_mode": "manual",

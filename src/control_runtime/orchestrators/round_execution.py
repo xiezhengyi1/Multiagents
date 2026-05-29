@@ -85,6 +85,7 @@ def execute_planned_round(
     cr_tool: ConflictResolutionTool,
     pd_agent: PolicyDispatchAgent,
     ad_tool: AssuranceDiagnosisTool,
+    trace_metadata: Optional[Dict[str, Any]] = None,
 ) -> RoundExecutionArtifacts:
     snapshot_data = get_snapshot_data_by_id(snapshot_id) or {}
     if not snapshot_data:
@@ -181,7 +182,7 @@ def execute_planned_round(
     mobility_feedback: Dict[str, Any] = {}
 
     if str(conflict_result.mediator_status or "").strip().lower() == "approved":
-        report = pd_agent.execute_and_evaluate(policy_plan)
+        report = pd_agent.execute_and_evaluate(policy_plan, trace_metadata=trace_metadata)
         dispatch_receipts, assurance_verdicts = parse_pda_metrics(report)
         qos_feedback, mobility_feedback = build_domain_feedback(
             report,

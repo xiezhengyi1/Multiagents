@@ -221,6 +221,9 @@ class BaseAgent:
         supi: Optional[str] = None,
         thread_id: str = "",
         allow_user_interaction: bool = False,
+        token_budget: Any = None,
+        token_counter: Any = None,
+        trace_metadata: dict[str, Any] | None = None,
     ) -> AgentRuntimeContext:
         normalized_session = str(session_id or "").strip()
         normalized_thread = str(thread_id or normalized_session).strip()
@@ -231,7 +234,15 @@ class BaseAgent:
             supi=str(supi or "").strip() or None,
             thread_id=normalized_thread,
             allow_user_interaction=bool(allow_user_interaction),
+            token_budget=token_budget,
+            token_counter=token_counter,
+            trace_metadata=dict(trace_metadata or {}),
         )
+
+    def _resolve_token_context(self, token_budget: Any = None, token_counter: Any = None) -> tuple[Any, Any]:
+        resolved_budget = token_budget if token_budget is not None else getattr(self, "_token_budget", None)
+        resolved_counter = token_counter if token_counter is not None else getattr(self, "_token_counter", None)
+        return resolved_budget, resolved_counter
 
     def create_json_agent(
         self,
@@ -243,6 +254,12 @@ class BaseAgent:
         tool_error_mode: str = "raise",
         max_calls_per_tool: int | None = None,
         forbid_duplicate_tool_calls: bool = False,
+        max_tool_result_chars: int = 8000,
+        tool_result_limits: dict[str, int] | None = None,
+        max_tool_result_tokens: int | None = None,
+        tool_result_token_limits: dict[str, int] | None = None,
+        token_counter: Any = None,
+        token_budget: Any = None,
     ) -> TracedStructuredAgent:
         tool_list = list(tools)
         runnable = StructuredToolLoop(
@@ -254,6 +271,12 @@ class BaseAgent:
             tool_error_mode=tool_error_mode,
             max_calls_per_tool=max_calls_per_tool,
             forbid_duplicate_tool_calls=forbid_duplicate_tool_calls,
+            max_tool_result_chars=max_tool_result_chars,
+            tool_result_limits=tool_result_limits,
+            max_tool_result_tokens=max_tool_result_tokens,
+            tool_result_token_limits=tool_result_token_limits,
+            token_counter=token_counter,
+            token_budget=token_budget,
         )
         agent_name = str(getattr(self, "agent_name", "") or "").strip()
         if not agent_name:
@@ -266,4 +289,3 @@ class BaseAgent:
             runnable=runnable,
             writer=JsonlTraceWriter(agent_name),
         )
-
