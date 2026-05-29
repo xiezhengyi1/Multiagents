@@ -1,0 +1,70 @@
+{
+  "methods": [
+    {
+      "id": "B1",
+      "name": "SingleAgent_NoRAG_NoClosedLoop",
+      "agent_count": 1,
+      "rag_enabled": false,
+      "closed_loop_enabled": false,
+      "multi_round_revision": false,
+      "implementation_status": "ready",
+      "runner": "experiments/scripts/run_single_agent_experiment.py",
+      "notes": "单智能体、无 RAG、无闭环。使用 SingleControlAgent + 现有执行后端。"
+    },
+    {
+      "id": "B2",
+      "name": "SingleAgent_RAG_NoClosedLoop",
+      "agent_count": 1,
+      "rag_enabled": true,
+      "closed_loop_enabled": false,
+      "multi_round_revision": false,
+      "implementation_status": "ready",
+      "runner": "experiments/scripts/run_single_agent_experiment.py",
+      "notes": "单智能体、有 RAG、无闭环。使用 SingleControlAgent + 现有执行后端。"
+    },
+    {
+      "id": "B3",
+      "name": "SingleAgent_RAG_ClosedLoop",
+      "agent_count": 1,
+      "rag_enabled": true,
+      "closed_loop_enabled": true,
+      "multi_round_revision": true,
+      "implementation_status": "ready",
+      "runner": "experiments/scripts/run_single_agent_experiment.py",
+      "notes": "单智能体、有 RAG、有闭环。使用 SingleControlAgent + 现有执行后端。"
+    },
+    {
+      "id": "Ours",
+      "name": "MultiAgent_RAG_ClosedLoop",
+      "agent_count": 4,
+      "rag_enabled": true,
+      "closed_loop_enabled": true,
+      "multi_round_revision": true,
+      "implementation_status": "ready",
+      "runner": "experiments/scripts/run_workflow_experiment.py",
+      "notes": "当前仓库主流程：Main + IntentEncoding + OptimizationStrategy + PolicyDispatch。"
+    },
+    {
+      "id": "Ours_wo_RAG",
+      "name": "MultiAgent_NoRAG_ClosedLoop",
+      "agent_count": 4,
+      "rag_enabled": false,
+      "closed_loop_enabled": true,
+      "multi_round_revision": true,
+      "implementation_status": "ready",
+      "runner": "experiments/scripts/run_workflow_experiment.py",
+      "notes": "以 Ours 为基础去除 RAG，仅保留多智能体与闭环；通过 workflow runner 的 --disable-rag 开关实现。"
+    },
+    {
+      "id": "Ours_wo_ClosedLoop",
+      "name": "MultiAgent_RAG_NoClosedLoop",
+      "agent_count": 4,
+      "rag_enabled": true,
+      "closed_loop_enabled": false,
+      "multi_round_revision": false,
+      "implementation_status": "ready",
+      "runner": "experiments/scripts/run_workflow_experiment.py",
+      "notes": "以 Ours 为基础去除闭环，仅保留多智能体与 RAG；通过 workflow runner 的 max_rounds=1 实现。"
+    }
+  ]
+}

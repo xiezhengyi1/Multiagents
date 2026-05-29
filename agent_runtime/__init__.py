@@ -13,7 +13,6 @@ __all__ = [
     "JsonlTraceWriter",
     "RunTreeEvent",
     "RunTreeTraceRecord",
-    "RuntimeAgentRegistry",
     "RuntimeCache",
     "StructuredToolLoop",
     "ToolLoopExecutionError",
@@ -34,7 +33,7 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    if name in {"AgentRuntimeContext", "AgentWorkspace", "RuntimeAgentRegistry", "RuntimeCache", "runtime_root"}:
+    if name in {"AgentRuntimeContext", "AgentWorkspace", "RuntimeCache", "runtime_root", "TokenBudget", "TokenCounter"}:
         return getattr(import_module(".core", __name__), name)
     if name in {"StructuredToolLoop", "ToolLoopExecutionError"}:
         return getattr(import_module(".execution.structured_tool_loop", __name__), name)

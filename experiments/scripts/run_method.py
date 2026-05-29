@@ -168,7 +168,7 @@ def _run_ours(
 
     command = [
         str(PYTHON_EXE),
-        str(PROJECT_ROOT / "run_workflow_experiment.py"),
+        str(PROJECT_ROOT / "experiments" / "scripts" / "run_workflow_experiment.py"),
         "--user-inputs",
         str(user_inputs_path),
         "--count",
@@ -218,7 +218,7 @@ def _run_single_agent(*, method_id: str, experiment_id: str, scenario_id: str, s
     summary_output = SUMMARY_DIR / f"{method_id.lower()}_summary_{stamp}.json"
     command = [
         str(PYTHON_EXE),
-        str(PROJECT_ROOT / "run_single_agent_experiment.py"),
+        str(PROJECT_ROOT / "experiments" / "scripts" / "run_single_agent_experiment.py"),
         "--user-inputs",
         str(user_inputs_path),
         "--count",

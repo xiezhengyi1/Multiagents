@@ -1,0 +1,86 @@
+{
+  "experiments": [
+    {
+      "id": "E1",
+      "name": "Overall_Comparison",
+      "methods": ["B1", "B2", "B3", "Ours"],
+      "scenarios": ["S2", "S3"],
+      "purpose": "整体性能对比实验",
+      "notes": "主对比只使用具备多切片/多对象竞争语义的 S2 与 S3。S1 过于简化，仅保留给轻量补充实验。"
+    },
+    {
+      "id": "E2",
+      "name": "MultiAgent_Ablation",
+      "methods": ["B3", "Ours"],
+      "scenarios": ["S2"],
+      "purpose": "多智能体有效性消融",
+      "notes": "使用 S2 保持变量可控，避免 S3 的复杂拓扑掩盖编排差异。"
+    },
+    {
+      "id": "E3",
+      "name": "ClosedLoop_Effectiveness_Ablation",
+      "methods": ["Ours_wo_ClosedLoop", "Ours"],
+      "scenarios": ["S2"],
+      "purpose": "闭环有效性消融",
+      "notes": "严格定义应以 Ours 为基线，仅去除闭环。当前方法定义已登记，但仓库主流程尚未提供可运行版本。"
+    },
+    {
+      "id": "E4",
+      "name": "RAG_Effectiveness_Ablation",
+      "methods": ["Ours_wo_RAG", "Ours"],
+      "scenarios": ["S1", "S2"],
+      "purpose": "RAG 有效性消融",
+      "notes": "严格定义应以 Ours 为基线，仅去除 RAG。当前方法定义已登记，但仓库主流程尚未提供可运行版本。"
+    },
+    {
+      "id": "E5",
+      "name": "Complex_Scenario_Case_Study",
+      "methods": ["B3", "Ours"],
+      "scenarios": ["S3"],
+      "purpose": "复杂场景稳定性与案例分析",
+      "notes": "只在 S3 上观察高复杂度拓扑下的闭环稳定性与典型案例。"
+    },
+    {
+      "id": "E1P",
+      "name": "Overall_Comparison_PublicProfiles",
+      "methods": ["B1", "B2", "B3", "Ours"],
+      "scenarios": ["S2P", "S3P"],
+      "purpose": "公开数据集驱动场景下的整体性能对比实验",
+      "notes": "与 E1 保持相同方法组合，但使用公开数据集驱动的场景变体，以比较不同流量画像来源对系统性能的影响。"
+    },
+    {
+      "id": "E2P",
+      "name": "MultiAgent_Ablation_PublicProfiles",
+      "methods": ["B3", "Ours"],
+      "scenarios": ["S2P"],
+      "purpose": "公开数据集驱动场景下的多智能体有效性消融",
+      "notes": "与 E2 保持相同逻辑，但在 S2P 上验证多智能体编排收益。"
+    },
+    {
+      "id": "E3P",
+      "name": "ClosedLoop_Effectiveness_Ablation_PublicProfiles",
+      "methods": ["Ours_wo_ClosedLoop", "Ours"],
+      "scenarios": ["S2P"],
+      "purpose": "公开数据集驱动场景下的闭环有效性消融",
+      "notes": "与 E3 保持同一消融目标，但切换为公开数据集驱动的中复杂度场景。"
+    },
+    {
+      "id": "E4P",
+      "name": "RAG_Effectiveness_Ablation_PublicProfiles",
+      "methods": ["Ours_wo_RAG", "Ours"],
+      "scenarios": ["S1P", "S2P"],
+      "purpose": "公开数据集驱动场景下的 RAG 有效性消融",
+      "notes": "与 E4 对齐，但在公开数据集驱动场景上比较知识增强能力。"
+    },
+    {
+      "id": "E5P",
+      "name": "Complex_Scenario_Case_Study_PublicProfiles",
+      "methods": ["B3", "Ours"],
+      "scenarios": ["S3P"],
+      "purpose": "公开数据集驱动复杂场景下的稳定性与案例分析",
+      "notes": "与 E5 对齐，用于观察公开数据集代理画像进入高复杂度拓扑后的闭环表现。"
+    }
+  ],
+  "primary_metrics": ["ISR", "GA", "SV", "ESR", "CRR", "SSI"],
+  "auxiliary_metrics": ["avg_rounds", "avg_latency_ms", "avg_retry_count", "avg_execution_ms", "failure_type_distribution"]
+}

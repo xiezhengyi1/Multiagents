@@ -5,13 +5,14 @@ from __future__ import annotations
 import inspect
 import json
 import re
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from agent_runtime.core.context import AgentRuntimeContext
+from agent_runtime.core.token_budget import TokenCounter, TokenBudget
 
 
 class ToolLoopExecutionError(RuntimeError):
@@ -43,6 +44,12 @@ class StructuredToolLoop:
         tool_error_mode: str = "raise",
         max_calls_per_tool: int | None = None,
         forbid_duplicate_tool_calls: bool = False,
+        max_tool_result_chars: int = 8000,
+        tool_result_limits: dict[str, int] | None = None,
+        max_tool_result_tokens: int | None = None,
+        tool_result_token_limits: dict[str, int] | None = None,
+        token_counter: Optional[TokenCounter] = None,
+        token_budget: Optional[TokenBudget] = None,
     ) -> None:
         self.system_prompt = str(system_prompt or "").strip()
         self.response_model = response_model
@@ -55,6 +62,12 @@ class StructuredToolLoop:
         if self.max_calls_per_tool is not None and self.max_calls_per_tool < 1:
             raise ValueError("max_calls_per_tool must be >= 1")
         self.forbid_duplicate_tool_calls = bool(forbid_duplicate_tool_calls)
+        self.max_tool_result_chars = max(1000, int(max_tool_result_chars))
+        self._tool_result_limits = dict(tool_result_limits or {})
+        self.max_tool_result_tokens = max_tool_result_tokens
+        self._tool_result_token_limits = dict(tool_result_token_limits or {})
+        self._token_counter = token_counter
+        self._token_budget = token_budget
         self.tools = list(tools)
         self.tools_by_name: dict[str, Any] = {}
         for tool in self.tools:
@@ -228,6 +241,37 @@ class StructuredToolLoop:
             raise last_error
         raise RuntimeError("Model returned empty structured response")
 
+    def _max_tool_result_chars_for(self, tool_name: str) -> int:
+        return self._tool_result_limits.get(tool_name, self.max_tool_result_chars)
+
+    def _max_tool_result_tokens_for(self, tool_name: str) -> int:
+        per_tool = self._tool_result_token_limits.get(tool_name)
+        if per_tool is not None:
+            return per_tool
+        if self.max_tool_result_tokens is not None:
+            return self.max_tool_result_tokens
+        return 0
+
+    def _dynamic_token_limit(self, tool_name: str) -> int:
+        static_limit = self._max_tool_result_tokens_for(tool_name)
+        if static_limit <= 0 or self._token_budget is None:
+            return static_limit
+        pressure = self._token_budget.pressure()
+        if pressure < 0.5:
+            return static_limit
+        if pressure < 0.8:
+            return max(1000, int(static_limit * 0.75))
+        return max(1000, int(static_limit * 0.5))
+
+    @staticmethod
+    def _estimate_message_tokens(message: BaseMessage, counter: TokenCounter | None = None) -> int:
+        if counter is not None:
+            return counter.count_messages([message])
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            return len(content) // 4
+        return 0
+
     def _invoke_tool(
         self,
         tool_name: str,
@@ -246,8 +290,30 @@ class StructuredToolLoop:
         if "runtime" in inspect.signature(func).parameters:
             kwargs["runtime"] = self._build_tool_runtime(context, tool_call_id)
         result = func(**kwargs)
+        content = self._tool_result_to_content(result)
+
+        if self._token_counter is not None:
+            token_limit = self._max_tool_result_tokens_for(tool_name)
+            if token_limit <= 0:
+                token_limit = self._dynamic_token_limit(tool_name)
+            if token_limit > 0 and self._token_counter.count(content) > token_limit:
+                content = self._token_counter.truncate_to_tokens(
+                    content, token_limit, suffix="\n... [truncated]"
+                )
+        else:
+            limit = self._max_tool_result_chars_for(tool_name)
+            if len(content) > limit:
+                content = content[:limit] + "\n... [truncated]"
+
+        if self._token_budget is not None:
+            estimated = self._estimate_message_tokens(
+                ToolMessage(content=content, tool_call_id=str(tool_call_id or ""), name=tool_name),
+                self._token_counter,
+            )
+            self._token_budget.record_tokens("default", estimated)
+
         return ToolMessage(
-            content=self._tool_result_to_content(result),
+            content=content,
             tool_call_id=str(tool_call_id or ""),
             name=tool_name,
             status="success",
@@ -283,6 +349,17 @@ class StructuredToolLoop:
         output_messages: list[BaseMessage] = []
         tool_call_counts: dict[str, int] = {}
         seen_tool_calls: set[tuple[str, str]] = set()
+
+        if self._token_budget is None and context is not None and context.token_budget is not None:
+            self._token_budget = context.token_budget
+        if self._token_counter is None and context is not None and context.token_counter is not None:
+            self._token_counter = context.token_counter
+
+        if self._token_budget is not None and self._token_counter is not None:
+            sys_tokens = self._token_counter.count(self.system_prompt)
+            self._token_budget.system_prompt_tokens = max(
+                self._token_budget.system_prompt_tokens, sys_tokens
+            )
 
         try:
             for _ in range(self.max_iterations):

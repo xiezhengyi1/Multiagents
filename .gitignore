@@ -10,6 +10,10 @@ wheels/
 .venv
 .vscode
 .agent
+.learnings
+.pytest_cache
+.claude
+.reasonix
 .env
 # 运行存储
 experiments/results
@@ -26,12 +30,12 @@ training/trajectories
 training/workflow
 !src/shared/runtime
 # 知识库
-data
+/data/
+knowledge_build/data/
 
 *.go
 *.json
 *.jsonl
-*.yaml
 *.yml
 *.md
 *.log
@@ -44,3 +48,22 @@ data
 *.exe
 *.dll
 *.csv
+*.docx
+*.pptx
+
+# Project documentation and committed experiment inputs
+!README.md
+!docs/
+!docs/**
+!experiments/
+!experiments/configs/
+!experiments/configs/**
+!experiments/scripts/
+!experiments/scripts/**
+experiments/scripts/__pycache__/
+
+# Keep data directory structure without committing runtime/cache contents.
+!/data/
+/data/*
+!/data/.gitkeep
+/data/runtime/

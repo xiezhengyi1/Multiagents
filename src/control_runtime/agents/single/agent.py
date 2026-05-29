@@ -14,7 +14,7 @@ from shared.logging import log_event, log_timing
 
 from ...domain.collaboration import PlanningContext, PlanningRequest
 from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
-from ...domain.policy_plan import OperationIntent, PlanningRationale, PolicyDraft, PolicyPlanDraft, RevisionHandles
+from ...domain.policy_plan import OperationIntent, PlanningRationale, PolicyDraft, PolicyPlanDraft
 from ...integrations.storage import get_latest_snapshot_metadata
 from ..common import validate_and_compile_intent
 from ..grounding.compiler import IntentCompiler
@@ -66,11 +66,13 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         "search_semantic_knowledge",
         "get_knowledge_by_key",
     }
-    PLAN_GROUNDING_TOOLS = (
-        OptimizationStrategyCompiler.QOS_GROUNDING_TOOLS
-        | OptimizationStrategyCompiler.MOBILITY_GROUNDING_TOOLS
-        | {"search_semantic_knowledge", "get_knowledge_by_key"}
-    )
+    PLAN_GROUNDING_TOOLS = {
+        "preview_qos_optimizer",
+        "fetch_qos_network_status",
+        "inspect_mobility_ue_policies",
+        "search_semantic_knowledge",
+        "get_knowledge_by_key",
+    }
     MOBILITY_HINT_TOKENS = (
         "am policy",
         "allowed nssai",
@@ -462,21 +464,22 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 ],
                 active_constraints=[
                     str(item)
-                    for item in self.plan_compiler._normalized_hard_constraints(planning_request.context.unified_constraints)
+                    for item in self.plan_compiler.artifact_compiler._normalized_hard_constraints(
+                        planning_request.context.unified_constraints
+                    )
                     if str(item).strip()
                 ],
                 explanation=str(decision.rationale or "").strip(),
                 rejected_alternatives=[],
             ),
-            revision_handles=RevisionHandles(handles=[]),
             all_policies=[],
         )
 
         for index, policy_details in enumerate(decision.sm_policies, start=1):
             flow_id = self._resolve_pcflow_id(policy_details, decision=decision)
-            flow_ctx = self.plan_compiler._resolve_flow(planning_request, flow_id)
+            flow_ctx = self.plan_compiler.artifact_compiler._resolve_flow(planning_request, flow_id)
             app_id = str(flow_ctx.app_id or decision.selected_app_id or planning_request.operation_intent.app_id or "").strip()
-            resource_keys = self.plan_compiler._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id)
+            resource_keys = self.plan_compiler.advisor_validator._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id)
             if not resource_keys:
                 raise ValueError(f"optimizer preview does not contain a grounded QoS assignment for flow_id={flow_id}")
             plan.all_policies.append(
@@ -501,7 +504,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     app_id="",
                     flow_id=None,
                     target_type="ue",
-                    policy_id=self.plan_compiler._resolve_am_association_id(
+                    policy_id=self.plan_compiler.artifact_compiler._resolve_am_association_id(
                         planning_request=planning_request,
                         mobility_context=mobility_context,
                     ),
@@ -525,12 +528,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 )
             )
 
-        normalized = normalize_policy_plan_draft(plan, planning_request.operation_intent)
-        normalized.revision_handles = self.plan_compiler._build_revision_handles(
-            policy_plan=normalized,
-            planning_request=planning_request,
-        )
-        self.plan_compiler._validate_compiled_plan(normalized, planning_request)
+        normalized = normalize_policy_plan_draft(plan)
+        self.plan_compiler.plan_validator.validate_compiled_plan(normalized, planning_request)
         return normalized
 
     @staticmethod

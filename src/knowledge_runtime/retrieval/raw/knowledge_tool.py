@@ -539,6 +539,22 @@ def _prefers_glossary(query: str) -> bool:
     return any(keyword in lowered for keyword in GLOSSARY_QUERY_KEYWORDS)
 
 
+def _query_intent(query: str, domain: str) -> str:
+    if _looks_like_exact_identifier_query(query):
+        return "exact_identifier"
+    if _prefers_operation(query):
+        return "operation_lookup"
+    if _prefers_clause_location(query, domain):
+        return "clause_location"
+    if _is_short_term_query(query):
+        return "glossary_term"
+    if _prefers_glossary(query):
+        return "glossary_term"
+    if _prefers_schema(query, domain):
+        return "schema_relation"
+    return "generic_fact"
+
+
 def _is_short_term_query(query: str) -> bool:
     terms = _search_terms(query)
     if len(terms) > 6:
@@ -1013,6 +1029,7 @@ def _candidate_features(
         "match_type": match_type,
         "lexical_score": round(float(lexical_score), 4),
         "vector_rank": vector_rank,
+        "query_intent": _query_intent(query, domain),
         "domain_match": _domain_match_label(metadata, domain),
         "doc_type_match": _doc_type_matches_query(metadata, query, domain),
         "object_overlap_count": object_overlap_count,
@@ -1416,9 +1433,10 @@ def _limited_terms(values: Iterable[Any], *, limit: int = BGE_RERANK_TERM_CHARS)
 
 def _bge_rerank_query(query: str, domain: str) -> str:
     expanded_terms = _limited_terms(sorted(_expanded_query_terms(query, domain)))
+    intent = _query_intent(query, domain)
     if not expanded_terms:
-        return query
-    return f"Query: {query}\nExpanded technical terms: {expanded_terms}"
+        return f"Query: {query}\nQuery intent: {intent}"
+    return f"Query: {query}\nQuery intent: {intent}\nExpanded technical terms: {expanded_terms}"
 
 
 def _candidate_rerank_text(candidate: Dict[str, Any]) -> str:
@@ -1440,8 +1458,12 @@ def _candidate_rerank_text(candidate: Dict[str, Any]) -> str:
         f"Candidate aliases: {aliases}",
         f"Candidate object tags: {objects}",
         f"Candidate normalized technical terms: {normalized_terms}",
+        f"Candidate query intent: {features.get('query_intent', '')}",
         f"Candidate match type: {features.get('match_type', '')}",
         f"Candidate domain match: {features.get('domain_match', '')}",
+        f"Candidate lexical score: {features.get('lexical_score', 0.0)}",
+        f"Candidate vector rank: {features.get('vector_rank', '')}",
+        f"Candidate exact identifier match: {features.get('is_exact_identifier', False)}",
         f"Candidate object overlap count: {features.get('object_overlap_count', 0)}",
         f"Content: {candidate.get('page_content', '')}",
     ]
@@ -1938,6 +1960,7 @@ def _render_result(candidate: Dict[str, Any]) -> str:
 
 
 def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED_RESULTS) -> Tuple[List[Dict[str, Any]], List[str]]:
+    intent = _query_intent(query, domain)
     direct = _direct_record_matches(query, domain)
     glossary = _glossary_strong_candidates(query, domain)
     domain_special = [
@@ -1949,12 +1972,36 @@ def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED
     ]
     exact = _exact_search_candidates(query, domain)
     rerank_pool_limit = max(limit * 4, MAX_RERANK_POOL)
-    seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
-    if direct and _looks_like_exact_identifier_query(query):
-        return _bge_rerank_candidates(query, domain, seeds, limit=limit), []
-    cross_spec = _expand_cross_spec_candidates(seeds, domain, query)
-    vector, errors = _vector_search_candidates(query, domain)
-    combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=rerank_pool_limit)
+    vector: List[Dict[str, Any]] = []
+    cross_spec: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    if intent == "exact_identifier":
+        seeds = _dedupe_candidates([*direct, *glossary, *exact], limit=rerank_pool_limit)
+        if len(seeds) < limit:
+            vector, errors = _vector_search_candidates(query, domain)
+        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+    elif intent == "glossary_term":
+        seeds = _dedupe_candidates([*glossary, *direct, *exact], limit=rerank_pool_limit)
+        vector, errors = _vector_search_candidates(query, domain)
+        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+    elif intent == "operation_lookup":
+        seeds = _dedupe_candidates([*domain_special, *direct, *exact], limit=rerank_pool_limit)
+        vector, errors = _vector_search_candidates(query, domain)
+        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+    elif intent == "clause_location":
+        seeds = _dedupe_candidates([*domain_special, *direct, *exact], limit=rerank_pool_limit)
+        vector, errors = _vector_search_candidates(query, domain)
+        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
+    elif intent == "schema_relation":
+        seeds = _dedupe_candidates([*domain_special, *direct, *exact, *glossary], limit=rerank_pool_limit)
+        cross_spec = _expand_cross_spec_candidates(seeds, domain, query)
+        vector, errors = _vector_search_candidates(query, domain)
+        combined = _dedupe_candidates([*seeds, *cross_spec, *vector], limit=rerank_pool_limit)
+    else:
+        seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
+        vector, errors = _vector_search_candidates(query, domain)
+        combined = _dedupe_candidates([*seeds, *vector], limit=rerank_pool_limit)
     return _bge_rerank_candidates(query, domain, combined, limit=limit), errors
 
 
@@ -2049,6 +2096,12 @@ def debug_search_semantic_knowledge_pipeline(
     _emit(f"stage=infer_policy_domain done duration_ms={timings_ms['infer_policy_domain']} domain={domain}")
 
     stage_start = time.perf_counter()
+    _emit("stage=query_intent start")
+    intent = _query_intent(normalized_query, domain)
+    timings_ms["query_intent"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+    _emit(f"stage=query_intent done duration_ms={timings_ms['query_intent']} intent={intent}")
+
+    stage_start = time.perf_counter()
     _emit("stage=direct_record_matches start")
     direct = _direct_record_matches(normalized_query, domain)
     counts["direct"] = len(direct)
@@ -2085,20 +2138,35 @@ def debug_search_semantic_knowledge_pipeline(
     rerank_pool_limit = max(sanitized_limit * 4, 20)
     stage_start = time.perf_counter()
     _emit("stage=seed_dedupe start")
-    seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
+    if intent == "exact_identifier":
+        seed_inputs = [*direct, *glossary, *exact]
+    elif intent == "glossary_term":
+        seed_inputs = [*glossary, *direct, *exact]
+    elif intent in {"operation_lookup", "clause_location"}:
+        seed_inputs = [*domain_special, *direct, *exact]
+    elif intent == "schema_relation":
+        seed_inputs = [*domain_special, *direct, *exact, *glossary]
+    else:
+        seed_inputs = [*direct, *glossary, *domain_special, *exact]
+    seeds = _dedupe_candidates(seed_inputs, limit=rerank_pool_limit)
     counts["seeds"] = len(seeds)
     timings_ms["seed_dedupe"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
     _emit(f"stage=seed_dedupe done duration_ms={timings_ms['seed_dedupe']} count={counts['seeds']}")
 
-    stage_start = time.perf_counter()
-    _emit("stage=expand_cross_spec_candidates start")
-    cross_spec = _run_with_timeout(
-        "expand_cross_spec_candidates",
-        lambda: _expand_cross_spec_candidates(seeds, domain, normalized_query, emit=_emit),
-    )
-    counts["cross_spec"] = len(cross_spec)
-    timings_ms["expand_cross_spec_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=expand_cross_spec_candidates done duration_ms={timings_ms['expand_cross_spec_candidates']} count={counts['cross_spec']}")
+    cross_spec: List[Dict[str, Any]] = []
+    if intent == "schema_relation":
+        stage_start = time.perf_counter()
+        _emit("stage=expand_cross_spec_candidates start")
+        cross_spec = _run_with_timeout(
+            "expand_cross_spec_candidates",
+            lambda: _expand_cross_spec_candidates(seeds, domain, normalized_query, emit=_emit),
+        )
+        counts["cross_spec"] = len(cross_spec)
+        timings_ms["expand_cross_spec_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
+        _emit(f"stage=expand_cross_spec_candidates done duration_ms={timings_ms['expand_cross_spec_candidates']} count={counts['cross_spec']}")
+    else:
+        counts["cross_spec"] = 0
+        timings_ms["expand_cross_spec_candidates"] = 0.0
 
     vector: List[Dict[str, Any]] = []
     vector_errors: List[str] = []

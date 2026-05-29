@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Stable import boundary for shared agent runtime primitives.
+
+The implementation lives in :mod:`agent_runtime`. Control-runtime agents import
+through this module so application code does not depend on the package layout of
+the lower-level runtime library.
+"""
+
 from importlib import import_module
 from typing import Any
 
@@ -16,6 +23,8 @@ __all__ = [
     "JsonlTraceWriter",
     "RuntimeCache",
     "StructuredToolLoop",
+    "TokenBudget",
+    "TokenCounter",
     "ToolLoopExecutionError",
     "TracedStructuredAgent",
     "build_run_tree_record",
@@ -39,6 +48,8 @@ def __getattr__(name: str) -> Any:
         "FileTaskQueue",
         "JsonlTraceWriter",
         "RuntimeCache",
+        "TokenBudget",
+        "TokenCounter",
         "TracedStructuredAgent",
     }:
         return getattr(import_module("agent_runtime"), name)

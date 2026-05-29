@@ -15,7 +15,7 @@ def project_root() -> Path:
 
 
 def runtime_root() -> Path:
-    return project_root() / "runtime"
+    return project_root() / "data" / "runtime"
 
 
 def runtime_agents_root() -> Path:
