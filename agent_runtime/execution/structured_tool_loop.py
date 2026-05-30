@@ -45,6 +45,7 @@ class StructuredToolLoop:
         max_iterations: int = 8,
         tool_error_mode: str = "raise",
         max_calls_per_tool: int | None = None,
+        tool_call_limits: dict[str, int] | None = None,
         forbid_duplicate_tool_calls: bool = False,
         max_tool_result_chars: int = 8000,
         tool_result_limits: dict[str, int] | None = None,
@@ -64,6 +65,9 @@ class StructuredToolLoop:
         self.max_calls_per_tool = max_calls_per_tool if max_calls_per_tool is None else int(max_calls_per_tool)
         if self.max_calls_per_tool is not None and self.max_calls_per_tool < 1:
             raise ValueError("max_calls_per_tool must be >= 1")
+        self._tool_call_limits = {str(name): int(limit) for name, limit in (tool_call_limits or {}).items()}
+        if any(limit < 1 for limit in self._tool_call_limits.values()):
+            raise ValueError("tool_call_limits values must be >= 1")
         self.forbid_duplicate_tool_calls = bool(forbid_duplicate_tool_calls)
         self.max_tool_result_chars = max(1000, int(max_tool_result_chars))
         self._tool_result_limits = dict(tool_result_limits or {})
@@ -87,6 +91,9 @@ class StructuredToolLoop:
                 raise ValueError(f"duplicate tool name: {name}")
             self.tools_by_name[name] = tool
         self.llm = llm.bind_tools(self.tools) if self.tools else llm
+
+    def _max_calls_for_tool(self, tool_name: str) -> int | None:
+        return self._tool_call_limits.get(tool_name, self.max_calls_per_tool)
 
     @staticmethod
     def _coerce_message(message: Any) -> BaseMessage:
@@ -184,6 +191,7 @@ class StructuredToolLoop:
         return [
             model_name,
             snake_name,
+            "structured_response",
             "intent_decision",
             "advisor_output",
             "response",
@@ -193,6 +201,20 @@ class StructuredToolLoop:
         ]
 
     def _validate_loaded_payload(self, payload: Any) -> BaseModel:
+        if isinstance(payload, list):
+            if not payload:
+                raise ValueError(
+                    f"Model returned an empty list, but {self.response_model.__name__} requires one JSON object"
+                )
+            if len(payload) == 1 and isinstance(payload[0], (dict, str)):
+                inner = payload[0]
+                if isinstance(inner, str):
+                    return self.response_model.model_validate_json(inner)
+                return self._validate_loaded_payload(inner)
+            raise ValueError(
+                f"Model returned a list with {len(payload)} items, but {self.response_model.__name__} requires one JSON object"
+            )
+
         try:
             return self.response_model.model_validate(payload)
         except Exception as direct_error:
@@ -218,10 +240,20 @@ class StructuredToolLoop:
             raise direct_error
 
     def _parse_structured_response(self, assistant_text: str) -> BaseModel:
-        candidates = [str(assistant_text or "").strip()]
-        stripped_fence = self._strip_code_fence(assistant_text)
+        raw = str(assistant_text or "").strip()
+        # Strip <think>...</think> blocks emitted by thinking-mode models (e.g. Qwen3).
+        # These blocks may contain '[' or '{' tokens that confuse the JSON scanner.
+        no_think = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
+        candidates = [raw]
+        if no_think and no_think not in candidates:
+            candidates.append(no_think)
+        stripped_fence = self._strip_code_fence(raw)
         if stripped_fence and stripped_fence not in candidates:
             candidates.append(stripped_fence)
+        if no_think:
+            stripped_fence_no_think = self._strip_code_fence(no_think)
+            if stripped_fence_no_think and stripped_fence_no_think not in candidates:
+                candidates.append(stripped_fence_no_think)
 
         decoder = json.JSONDecoder()
         last_error: Exception | None = None

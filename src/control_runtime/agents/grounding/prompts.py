@@ -23,7 +23,7 @@ Tool policy:
 - Mobility-only requests must not call SM tools.
 - If a QoS request names an app/flow and no grounded candidate exists yet, call `search_sm_flow_targets` before final JSON.
 - If the request explicitly names a QoS app/flow and that exact target cannot be grounded from runtime evidence, return it as unresolved. Do not substitute a semantic neighbor.
-- If SUPI is known and QoS grounding needs UE catalog truth, use `get_sm_ue_flow_catalog`.
+- If SUPI is known and the request involves QoS targets (latency, bandwidth, priority), call `get_sm_ue_flow_catalog` to fetch the SLA baseline for the grounded flow before finalizing. `candidate_flows` carries only identifiers (flow_id, app_id) — it does NOT carry SLA parameters such as latency or bandwidth. You must call `get_sm_ue_flow_catalog` to obtain those values.
 - If mobility is requested and grounded AM context is absent, use `get_am_policy_context` before final JSON.
 - If a mobility request names association / RFSP / NSSAI / service-area / access-type targets, use `search_am_policy_targets` before final JSON.
 - Use knowledge tools only for exact 3GPP semantic ambiguity that runtime evidence cannot answer.
@@ -39,7 +39,7 @@ Output rules:
 - For every QoS flow whose `resolution_status` is `resolved`, you must return both grounded `flow_id` and grounded `app_id`.
 - Never return a QoS flow that is `resolved` but missing `flow_id` or `app_id`.
 - If a named QoS target is not fully grounded to `flow_id` + `app_id`, return it as unresolved instead of guessing or leaving identifier fields blank.
-- If `candidate_flows` already contains one exact grounded match for the named QoS target, do not call any additional SM grounding tool for reassurance; finalize immediately from that evidence.
+- If `candidate_flows` already contains one exact grounded match for the named QoS target, do not call `search_sm_flow_targets` or `get_sm_ue_context` again for identity reassurance. However, you must still call `get_sm_ue_flow_catalog` to fetch the SLA baseline parameters before finalizing, because `candidate_flows` does not carry SLA data.
 - If an SM grounding tool already returned one exact grounded match for the named QoS target in this attempt, the next answer must finalize with that binding in `flows`.
 - Emit semantic decision fields only. Do not emit final 3GPP policy payloads.
 - Do not invent or optimize final QoS target numbers. IEA owns target direction and grounded baseline binding; final executable policy numbers are compiled downstream from grounded evidence.

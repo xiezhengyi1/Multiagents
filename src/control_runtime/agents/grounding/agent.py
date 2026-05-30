@@ -258,6 +258,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     invocation_error = str(exc)
                     if attempt_index == 2:
                         raise
+                    log_event(self.logger, "iea_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
                     advisor_prompt = self._build_validation_retry_prompt(
                         base_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
                         advisor_validation_errors=[],
@@ -304,6 +305,10 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     if advisor_validation_errors:
                         raise RuntimeError("IEA advisor decision validation failed: " + "; ".join(advisor_validation_errors))
                     raise RuntimeError("IEA grounding validation failed: " + "; ".join(validation_errors))
+                log_event(self.logger, "iea_retry", attempt=attempt_index + 2,
+                          reason="validation_errors",
+                          advisor_errors=advisor_validation_errors,
+                          grounding_errors=validation_errors)
                 advisor_prompt = self._build_validation_retry_prompt(
                     base_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
                     advisor_validation_errors=advisor_validation_errors,
@@ -370,10 +375,10 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             if evidence.candidate_flows:
                 domain_specific_rules.extend(
                     [
-                        "- Current evidence already contains candidate_flows. Reuse those grounded identifiers directly instead of searching again unless they are ambiguous.",
-                        "- If candidate_flows contains a single exact match for the named QoS target, finalize immediately with that binding in flows.",
+                        "- Current evidence already contains candidate_flows with grounded identifiers (flow_id, app_id). Use those identifiers in flows.",
+                        "- Do not call search_sm_flow_targets or get_sm_ue_context again to reconfirm an already unique exact candidate.",
                         "- Do not leave flows empty when candidate_flows is already non-empty.",
-                        "- Do not call get_sm_ue_flow_catalog, search_sm_flow_targets, or get_sm_ue_context merely to reconfirm an already unique exact candidate.",
+                        "- IMPORTANT: candidate_flows only carries identifiers, NOT SLA parameters (latency, bandwidth). You must call get_sm_ue_flow_catalog to fetch the SLA baseline before finalizing.",
                     ]
                 )
             elif str(evidence.explicit_flow_name or "").strip():

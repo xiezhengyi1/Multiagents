@@ -49,7 +49,7 @@
       "flow_count_range": "1 per app",
       "complexity": "low",
       "status": "ready",
-      "source": "experiments/scenarios_public/s1_basic_single_slice_public_datasets.yaml",
+      "source": "experiments/scenarios/s1_basic_single_slice.yaml",
       "notes": "S1 的公开数据集驱动变体。业务对象集合保持不变，流量统计参数由公开数据集代理特征映射生成，用于对比人工构造画像与公开数据集画像下的行为差异。"
     },
     {
@@ -62,7 +62,7 @@
       "flow_count_range": "multi-flow",
       "complexity": "medium",
       "status": "ready",
-      "source": "experiments/scenarios_public/s2_medium_complexity_public_datasets.yaml",
+      "source": "experiments/scenarios/s2_medium_complexity.yaml",
       "notes": "S2 的公开数据集驱动变体。对象拓扑与任务覆盖保持不变，带宽、包长、到达率及部分 QoS 目标替换为公开数据集统计特征。"
     },
     {
@@ -75,7 +75,7 @@
       "flow_count_range": "1-2 per app",
       "complexity": "high",
       "status": "ready",
-      "source": "experiments/scenarios_public/s3_high_complexity_public_datasets.yaml",
+      "source": "experiments/scenarios/s3_high_complexity.yaml",
       "notes": "S3 的公开数据集驱动变体。保持复杂拓扑与多对象竞争结构，同时引入公开数据集代理流量画像，用于复杂场景下的对照实验。"
     }
   ]

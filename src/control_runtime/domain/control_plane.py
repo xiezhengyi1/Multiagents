@@ -97,6 +97,7 @@ class StageTrigger(str, Enum):
     INITIAL = "initial"
     ON_PREVIOUS_FAILURE = "on_previous_failure"
     AFTER_PREVIOUS_STAGE = "after_previous_stage"
+    RETRY = "retry"
 
 
 class ControlSemanticMode(str, Enum):
@@ -120,6 +121,45 @@ class SemanticTarget(BaseModel):
     matched_app_ids: List[str] = Field(default_factory=list)
     resolution_status: str = Field(default="semantic")
 
+    @field_validator("target_type", mode="before")
+    @classmethod
+    def _normalize_target_type(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.lower()
+        return v
+
+    @field_validator("goal", mode="before")
+    @classmethod
+    def _normalize_goal(cls, v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        _GOAL_ALIASES: dict[str, str] = {
+            "improve": "protect",
+            "optimize": "protect",
+            "enhance": "protect",
+            "prioritize": "protect",
+            "boost": "protect",
+            "reduce": "protect",
+            "lower": "protect",
+            "minimize": "protect",
+            "maximize": "protect",
+            "maintain": "protect",
+            "ensure": "protect",
+            "guarantee": "protect",
+            "migrate": "protect",
+            "transfer": "protect",
+            "move": "protect",
+            "switch": "protect",
+            "reroute": "protect",
+            "redirect": "protect",
+            "reassign": "protect",
+            "offload": "protect",
+            "select": "protect",
+            "steer": "protect",
+        }
+        normalized = v.lower()
+        return _GOAL_ALIASES.get(normalized, normalized)
+
 
 class ControlStage(BaseModel):
     stage_index: int = Field(default=1, ge=1)
@@ -129,6 +169,22 @@ class ControlStage(BaseModel):
     targets: List[SemanticTarget] = Field(default_factory=list)
     active_flow_ids: List[str] = Field(default_factory=list)
     active_app_ids: List[str] = Field(default_factory=list)
+
+    @field_validator("trigger", mode="before")
+    @classmethod
+    def _normalize_trigger(cls, v: Any) -> Any:
+        if not isinstance(v, str):
+            return v
+        _TRIGGER_ALIASES: dict[str, str] = {
+            "on_retry": "retry",
+            "on_failure": "on_previous_failure",
+            "failure": "on_previous_failure",
+            "fallback": "on_previous_failure",
+            "after_previous": "after_previous_stage",
+            "sequential": "after_previous_stage",
+        }
+        normalized = v.lower()
+        return _TRIGGER_ALIASES.get(normalized, normalized)
 
 
 class ControlSemantics(BaseModel):
@@ -364,6 +420,13 @@ class GlobalControlIntent(BaseModel):
     snapshot_id: str = ""
     raw_input: str = ""
     supi: str = ""
+
+    @field_validator("supi", mode="before")
+    @classmethod
+    def _normalize_supi(cls, v: Any) -> Any:
+        if isinstance(v, str) and v.strip().isdigit():
+            return f"imsi-{v.strip()}"
+        return v
     round_strategy: MainRoundStrategy = Field(default=MainRoundStrategy.INITIAL_GROUNDING)
     next_agent: Literal["intent_encoding", "optimization_strategy"]
     requested_domains: List[ControlDomain] = Field(default_factory=list)

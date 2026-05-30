@@ -136,8 +136,9 @@ def _serialize_optimizer_result(result: Any) -> Dict[str, Any]:
     return payload
 
 
-def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
+def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], Dict[str, Any]]:
     from ...integrations.optimizer import run_joint_control_optimizer as run_optimizer
+    _results_cache: Dict[str, Any] = {}
 
     def _require_target_supi(candidate: Optional[str]) -> str:
         target = str(candidate or "").strip() or str(planning_request.operation_intent.supi or "").strip()
@@ -183,6 +184,7 @@ def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
         )
         result = run_optimizer(request)
         full_payload = _serialize_optimizer_result(result)
+        _results_cache["latest_optimizer_preview"] = full_payload
         return json.dumps(
             {"summary": _summarize_optimizer_result(full_payload)},
             ensure_ascii=False,
@@ -203,7 +205,7 @@ def build_request_tools(planning_request: PlanningRequest) -> List[Any]:
         trimmed = _require_ue_context(target)
         return json.dumps(_json_friendly(trimmed), ensure_ascii=False)
 
-    return [preview_qos_optimizer, fetch_qos_network_status, inspect_mobility_ue_policies]
+    return [preview_qos_optimizer, fetch_qos_network_status, inspect_mobility_ue_policies], _results_cache
 
 
 __all__ = ["build_request_tools", "_serialize_optimizer_result", "_summarize_optimizer_result"]

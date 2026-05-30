@@ -14,14 +14,22 @@ Return structured JSON only. Do not return markdown.
 
 Mandatory loop:
 1. First call list_existing_environment_specs before proposing the next env.
-2. Generate a candidate that is meaningfully different from existing specs.
-3. Call write_candidate_environment_yaml.
-4. Call validate_candidate_environment.
-5. Call simulate_candidate_environment to start the real simulator and verify
+2. Call initialize_environment_draft with metadata only.
+3. Populate slices, upfs, gnbs, ues, apps, flows, runtime_config, and
+   split_mode_overlay in order using replace_draft_section.
+4. Use patch_draft_entity for focused repairs to completed collection sections.
+5. Use inspect_draft_section only when the compact summary is insufficient.
+6. Call validate_environment_draft.
+7. After validation status is ok, call write_validated_environment_yaml.
+8. After YAML write succeeds, call simulate_candidate_environment to verify
    graph snapshot, policy gateway, and SLA initialization readiness.
-6. If validation or simulation fails, call record_validation_feedback, adjust the
+9. If validation or simulation fails, call record_validation_feedback, adjust the
    generation logic, and repeat until one environment succeeds or max attempts is
    reached.
+
+Do not submit a complete scenario mapping during initialization, replacement, or
+patch calls. Generate and repair only the bounded section needed for the current
+stage. Full YAML assembly is handled by the draft tools.
 
 ## Base Scenario YAML — Required Root Fields
 
@@ -61,6 +69,22 @@ Key reference values (copy real paths from the existing specs):
     n3_network_name: n3net
     n3_network_cidr: 10.201.1.0/29
 
+## Entity Field Contract
+
+Copy entity shapes from existing specs. Do not invent aliases:
+- Slice entries use `sst`, `sd`, `label`, `resource`, and `qos`.
+- Slice entries use `label`, never `slice_label`.
+- gNB entries use `name`, `slices`, and `backhaul_upf`.
+- UE entries use `name`, `supi`, `gnb`, `free5gc_policy`, and `sessions`.
+- App entries use `app_id`, `name`, `supi`, `ue_name`, and `flow_ids`.
+- Flow entries use `flow_id`, `app_id`, `supi`, `ue_name`, `slice_ref`,
+  `session_ref`, and `sla_target`.
+- gNBs reference slices through `slices`; UE sessions and flows use `slice_ref`.
+- `slice_ref` must equal one slice `label` exactly, for example
+  `slice_ref: slice-2-000001`. Never append an APN or any other suffix.
+- Only `session_ref` uses the four-part `<supi>:<app_id>:<slice_label>:<apn>`
+  format.
+
 ## session_ref Convention
 
 session_ref must follow the pattern:
@@ -69,21 +93,19 @@ Example: imsi-208930000000008:app-telemedicine:slice-2-000001:internet
 
 ## Final JSON Output Format
 
-After all tool calls succeed, output a single JSON object with EXACTLY these keys:
+After all tool calls succeed, output a compact JSON object with EXACTLY these keys:
 
   {
     "scenario_id": "<the scenario_id string>",
     "name": "<human readable name>",
-    "scenario": { <complete base scenario mapping as a dict, NOT a YAML string> },
-    "split_mode_overlay": { <overlay mapping or null> },
     "validation_status": "passed",
     "validation_feedback": [],
     "tool_loop_summary": ["step 1 ...", "step 2 ..."],
     "rationale": "<why this scenario was chosen>"
   }
 
-Do NOT wrap the scenario content as the top-level JSON — scenario must be nested
-inside the "scenario" key.
+Do NOT repeat the complete scenario mapping in the final JSON. The runtime loads
+the written validated YAML from write_validated_environment_yaml.
 """
 
 GENERATION_PROMPT_TEMPLATE = """Environment generation request:
@@ -107,14 +129,22 @@ Repository launch context:
   allocations that cover its guaranteed bandwidth.
 
 Task:
-First call list_existing_environment_specs, then generate one candidate
-environment that is not a near-duplicate of the returned specs.
-Produce one candidate environment with a complete base scenario mapping and,
-when needed, a split-mode overlay mapping. Keep all app, flow, UE, session,
-slice, gNB, and UPF references internally consistent.
+First call list_existing_environment_specs, then call
+initialize_environment_draft with metadata only. Populate slices, upfs, gnbs,
+ues, apps, flows, runtime_config, and split_mode_overlay in order using
+replace_draft_section. Use patch_draft_entity for focused repairs and
+inspect_draft_section only when a compact summary is insufficient.
+Do not submit a complete scenario mapping during initialization, replacement,
+or patch calls. Keep all app, flow, UE, session, slice, gNB, and UPF references
+internally consistent.
+Slice entries use `label`, never `slice_label`; gNBs reference labels through
+`slices`, while UE sessions and flows use `slice_ref`.
+`slice_ref` must equal one slice `label` exactly. Never append `:<apn>` to it.
+Call validate_environment_draft, then write_validated_environment_yaml, then
+simulate_candidate_environment. Do not skip these gates.
 
 IMPORTANT — final JSON keys:
-  scenario_id (str), name (str), scenario (dict), split_mode_overlay (dict|null),
-  validation_status (str), validation_feedback (list), tool_loop_summary (list), rationale (str).
-The 'scenario' value must be a dict (the parsed mapping), never a YAML string.
+  scenario_id (str), name (str), validation_status (str),
+  validation_feedback (list), tool_loop_summary (list), rationale (str).
+Do not repeat the complete scenario mapping in the final JSON.
 """

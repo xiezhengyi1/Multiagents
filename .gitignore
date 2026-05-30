@@ -32,6 +32,12 @@ training/projections
 training/single_control
 training/trajectories
 training/workflow
+training/knowledge_build
+training/knowledge_build/data
+training/knowledge_build/runtime
+training/environment_generation
+training/evals
+training/exports
 !src/shared/runtime
 # 知识库
 /data/

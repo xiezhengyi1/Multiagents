@@ -11,6 +11,7 @@ from shared.agents import BaseAgent, coerce_structured_response
 from shared.runtime import ArtifactWorkerMixin
 from ...domain.control_plane import (
     GlobalControlIntent,
+    MainRetryScope,
 )
 from shared.logging import log_event
 
@@ -205,6 +206,12 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             result = self.agent.invoke(payload, context=runtime_context)
         except Exception as exc:
             if isinstance(exc, ToolLoopExecutionError):
+                # Print the last AI message so we can see what the model actually output
+                for msg in reversed(exc.output_messages or []):
+                    content = getattr(msg, "content", None)
+                    if content and getattr(msg, "type", "") in ("ai", "AIMessage") or msg.__class__.__name__ == "AIMessage":
+                        print(f"[DEBUG] Main Agent last AI output:\n{content}")
+                        break
                 failed_tool_call = exc.failed_tool_call or {}
                 if failed_tool_call:
                     raise RuntimeError(
@@ -229,11 +236,16 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         if validation_errors:
             issues.extend(validation_errors)
 
-        import re
         cleaned = re.sub(
             r'\n\nRetry feedback \(attempt \d+\).*$',
             '',
             base_prompt,
+            flags=re.DOTALL,
+        )
+        cleaned = re.sub(
+            r'\n\nRetry feedback:.*$',
+            '',
+            cleaned,
             flags=re.DOTALL,
         )
         cleaned = re.sub(
@@ -242,15 +254,26 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             cleaned,
             flags=re.DOTALL,
         )
+        required_keys = (
+            "supi, round_strategy, next_agent, requested_domains, domain_evidence, "
+            "control_semantics, objective_profile, investigation_targets, uncertainty_flags, "
+            "retry_scope, required_evidence, forbidden_assumptions, intent_encoding_guidance, "
+            "routing_decision, routing_rationale, routing_confidence, reuse_contract, "
+            "handoff_expectations"
+        )
 
         return (
             f"{cleaned}\n\n"
             "Retry feedback:\n"
             "Correct the output now.\n"
-            "Return exactly one GlobalControlIntent JSON object.\n"
+            "Return exactly one MainControlInvocation raw_result-shaped JSON object.\n"
             "Top-level output must be an object, never a list.\n"
-            "Do not return markdown or explanation.\n"
-            "Return every routing field even when the value is an empty list or empty string.\n\n"
+            "Do not return markdown, prose, bullets, arrays, or partial sub-objects.\n"
+            "Put the full GlobalControlIntent object under structured_response.\n"
+            "Use messages=[] in the structure example; do not put routing fields under messages.\n"
+            f"Required structured_response keys: {required_keys}.\n"
+            "If a previous draft was a list, convert the intended route into structured_response.\n"
+            "If a previous draft only contained reuse_contract fields, keep those fields nested under structured_response.reuse_contract and add all missing structured_response routing fields.\n\n"
             "Validation errors:\n- " + "\n- ".join(issues)
         )
 
@@ -373,7 +396,8 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         if retry_scope not in allowed_retry_scopes:
             errors.append(f"retry_scope contains unsupported value: {retry_scope or '<empty>'}")
         if round_index <= 1 and retry_scope and retry_scope != "full_reground":
-            errors.append("round-1 main routing must not request retry scopes other than full_reground")
+            intent.retry_scope = MainRetryScope.FULL_REGROUND
+            retry_scope = "full_reground"
         next_agent = str(intent.next_agent or "").strip()
         if not str(intent.routing_decision or "").strip():
             errors.append("routing_decision must not be empty")

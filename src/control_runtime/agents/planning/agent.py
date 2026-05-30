@@ -145,13 +145,17 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     }
                     if attempt_index == 2:
                         raise
+                    log_event(self.logger, "osa_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
                     current_prompt = build_validation_retry_prompt(
                         base_prompt=base_prompt,
                         issues=[invocation_error],
                     )
                     continue
 
-                planning_tool_evidence = extract_planning_tool_evidence(advisor_result=advisor_result)
+                planning_tool_evidence = extract_planning_tool_evidence(
+                    advisor_result=advisor_result,
+                    tool_payload_cache=getattr(self, "_tools_cache", None),
+                )
                 grounding_tools = extract_grounding_tool_names(
                     advisor_result,
                     self.GROUNDING_TOOLS,
@@ -174,6 +178,8 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     break
                 if attempt_index == 2:
                     raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
+                log_event(self.logger, "osa_retry", attempt=attempt_index + 2,
+                          reason="contract_errors", errors=contract_errors)
                 current_prompt = build_validation_retry_prompt(
                     base_prompt=base_prompt,
                     issues=list(contract_errors),
@@ -265,10 +271,12 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             token_counter=token_counter,
             trace_metadata=trace_metadata,
         )
+        planning_tools, tools_cache = build_request_tools(planning_request)
+        self._tools_cache = tools_cache
         advisor_agent = self.create_json_agent(
             tools=[
                 *([] if not self.rag_enabled else self._RAG_TOOLS),
-                *build_request_tools(planning_request),
+                *planning_tools,
             ],
             system_prompt=OSA_SYSTEM_PROMPT,
             response_model=OsaAdvisorOutput,

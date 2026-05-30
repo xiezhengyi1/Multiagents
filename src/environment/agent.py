@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from experiments.scripts.common import resolve_python_executable
+
 from .compiler import EnvironmentAgentCompiler
 from .contracts import EnvironmentGenerationRequest, ScenarioCandidate
 from .prompts import ENVIRONMENT_AGENT_SYSTEM_PROMPT
@@ -29,10 +31,21 @@ def simulation_validation_succeeded(payloads: list[dict[str, Any]]) -> bool:
     return False
 
 
+def _resolve_environment_python_executables(project_root: Path, workspace_root: Path) -> tuple[Path, Path]:
+    return (
+        resolve_python_executable(project_root),
+        resolve_python_executable(workspace_root / "ns3-free5gc-integration"),
+    )
+
+
 def _extract_simulation_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
+    return _extract_tool_payloads(result, "simulate_candidate_environment")
+
+
+def _extract_tool_payloads(result: dict[str, Any], tool_name: str) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for tool_result in extract_tool_results(result.get("messages") or []):
-        if str(tool_result.get("name") or "").strip() != "simulate_candidate_environment":
+        if str(tool_result.get("name") or "").strip() != tool_name:
             continue
         try:
             payload = json.loads(str(tool_result.get("content") or ""))
@@ -43,11 +56,38 @@ def _extract_simulation_payloads(result: dict[str, Any]) -> list[dict[str, Any]]
     return payloads
 
 
+def _load_mapping(path: Path) -> dict[str, Any]:
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        import yaml
+
+        payload = yaml.safe_load(text)
+    except Exception:
+        payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise TypeError(f"{path} must contain a mapping")
+    return payload
+
+
+def _load_written_candidate(payload: dict[str, Any], *, fallback_name: str = "") -> ScenarioCandidate:
+    scenario_path = Path(str(payload.get("scenario_path") or "")).resolve()
+    if not scenario_path.is_file():
+        raise FileNotFoundError(f"written scenario YAML does not exist: {scenario_path}")
+    scenario = _load_mapping(scenario_path)
+    overlay_path = Path(str(payload.get("split_mode_overlay_path") or "")).resolve()
+    overlay = _load_mapping(overlay_path) if str(payload.get("split_mode_overlay_path") or "").strip() else None
+    return ScenarioCandidate(
+        scenario_id=str(payload.get("scenario_id") or scenario.get("scenario_id") or "").strip(),
+        name=str(scenario.get("name") or fallback_name or "").strip(),
+        scenario=scenario,
+        split_mode_overlay=overlay,
+        source_path=scenario_path,
+    )
+
+
 class EnvironmentAdvisorOutput(BaseModel):
     scenario_id: str = Field(description="Generated scenario id")
     name: str = Field(description="Human readable scenario name")
-    scenario: dict[str, Any] = Field(description="Complete base scenario YAML payload")
-    split_mode_overlay: dict[str, Any] | None = Field(default=None)
     validation_status: str = Field(default="unknown")
     validation_feedback: list[str] = Field(default_factory=list)
     tool_loop_summary: list[str] = Field(default_factory=list)
@@ -81,8 +121,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         if self.environment_tools is None:
             project_root = Path.cwd()
             workspace_root = project_root.parent
-            python_executable = project_root / ".venv" / "Scripts" / "python.exe"
-            stack_python = workspace_root / "ns3-free5gc-integration" / ".venv" / "Scripts" / "python.exe"
+            python_executable, stack_python = _resolve_environment_python_executables(project_root, workspace_root)
             from .launcher import EnvironmentLauncher
 
             self.environment_tools = build_environment_tools(
@@ -100,9 +139,14 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             tools=self.environment_tools,
             system_prompt=self.system_prompt,
             response_model=EnvironmentAdvisorOutput,
-            max_iterations=18,
+            max_iterations=32,
             tool_error_mode="return",
             max_calls_per_tool=5,
+            tool_call_limits={
+                "replace_draft_section": 12,
+                "patch_draft_entity": 12,
+                "inspect_draft_section": 8,
+            },
         )
 
     def expected_request_type(self) -> str:
@@ -145,14 +189,16 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             f"{prompt}\n\n"
             "Closed-loop requirement:\n"
             "- You must call list_existing_environment_specs before generating the candidate.\n"
-            "- Use write_candidate_environment_yaml, validate_candidate_environment, and simulate_candidate_environment.\n"
+            "- Initialize metadata with initialize_environment_draft.\n"
+            "- Populate ordered sections with replace_draft_section; use patch_draft_entity and inspect_draft_section only for focused repairs.\n"
+            "- Use validate_environment_draft, write_validated_environment_yaml, and simulate_candidate_environment in that order.\n"
             "- If validation or simulation reports a failure, call record_validation_feedback and produce a revised candidate.\n"
             "- Simulation succeeds only when the real launcher starts, the live graph snapshot exists, the policy gateway is healthy, and SLA initialization passes.\n"
-            "- Final JSON must describe the successfully validated environment candidate.\n"
+            "- Do not submit a complete scenario mapping during draft mutation or in the final JSON.\n"
+            "- Final JSON must summarize the successfully validated environment candidate.\n"
             "- CRITICAL: your final JSON output MUST contain these top-level keys:\n"
-            "    scenario_id (string), name (string), scenario (dict/object, NOT a yaml string),\n"
-            "    split_mode_overlay (dict or null), validation_status, validation_feedback, tool_loop_summary, rationale.\n"
-            "  Do NOT output the scenario content as the root JSON \u2014 it must be nested under the 'scenario' key.\n"
+            "    scenario_id (string), name (string), validation_status,\n"
+            "    validation_feedback, tool_loop_summary, rationale.\n"
         )
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
@@ -188,12 +234,10 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             EnvironmentAdvisorOutput,
             error_message="Environment advisor returned no structured_response",
         )
-        candidate = ScenarioCandidate(
-            scenario_id=output.scenario_id,
-            name=output.name,
-            scenario=output.scenario,
-            split_mode_overlay=output.split_mode_overlay,
-        )
+        written_payloads = _extract_tool_payloads(result, "write_validated_environment_yaml")
+        if not written_payloads:
+            raise RuntimeError("Environment advisor returned without validated YAML write evidence")
+        candidate = _load_written_candidate(written_payloads[-1], fallback_name=output.name)
         report = self.compiler.validate_candidate(candidate)
         if not report.ok:
             log_timing(

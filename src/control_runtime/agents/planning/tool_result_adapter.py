@@ -25,7 +25,11 @@ def _parse_json_object(content: Any) -> Dict[str, Any]:
     return payload
 
 
-def extract_planning_tool_evidence(*, advisor_result: Dict[str, Any]) -> Dict[str, Any]:
+def extract_planning_tool_evidence(
+    *,
+    advisor_result: Dict[str, Any],
+    tool_payload_cache: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     tool_calls = {
         str(call.get("id") or "").strip(): call
         for call in extract_tool_calls(advisor_result.get("messages") or [])
@@ -46,7 +50,13 @@ def extract_planning_tool_evidence(*, advisor_result: Dict[str, Any]) -> Dict[st
         try:
             payload = _parse_json_object(result.get("content"))
         except ValueError as exc:
-            raise ValueError(f"invalid planning tool result from {tool_name or '<unknown>'}: {exc}") from exc
+            # ToolMessage content may be truncated by context_policy.compact_tool_result.
+            # Fall back to tool_payload_cache if available; otherwise surface the error.
+            cached = (tool_payload_cache or {}).get("latest_optimizer_preview") if tool_name == "preview_qos_optimizer" else None
+            if cached is not None:
+                payload = dict(cached)
+            else:
+                raise ValueError(f"invalid planning tool result from {tool_name or '<unknown>'}: {exc}") from exc
         record = {
             "tool_name": tool_name,
             "call_args": dict(call_args),
@@ -59,9 +69,14 @@ def extract_planning_tool_evidence(*, advisor_result: Dict[str, Any]) -> Dict[st
         elif tool_name == "inspect_mobility_ue_policies":
             mobility_contexts.append(record)
 
+    # Prefer the full cached payload for optimizer results (avoids truncated-ToolMessage parse issues).
+    cached_optimizer = dict((tool_payload_cache or {}).get("latest_optimizer_preview") or {})
     return {
         "optimizer_previews": optimizer_previews,
-        "latest_optimizer_preview": dict((optimizer_previews[-1]["payload"] if optimizer_previews else {})),
+        "latest_optimizer_preview": (
+            cached_optimizer
+            or dict((optimizer_previews[-1]["payload"] if optimizer_previews else {}))
+        ),
         "network_statuses": network_statuses,
         "latest_network_status": dict((network_statuses[-1]["payload"] if network_statuses else {})),
         "mobility_contexts": mobility_contexts,

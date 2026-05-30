@@ -8,6 +8,32 @@ from typing import Any
 class ExistingScenarioSpecExplorer:
     """Create compact specs for existing scenario YAML files."""
 
+    REQUIRED_BASE_FIELDS = {
+        "name",
+        "scenario_id",
+        "tick_ms",
+        "seed",
+        "slices",
+        "upfs",
+        "gnbs",
+        "ues",
+        "apps",
+        "flows",
+        "free5gc",
+        "ns3",
+        "writer",
+        "topology",
+        "bridge",
+    }
+    REQUIRED_ENTITY_KEYS = {
+        "slices": {"label"},
+        "upfs": {"name"},
+        "gnbs": {"name"},
+        "ues": {"name", "supi"},
+        "apps": {"app_id"},
+        "flows": {"flow_id", "slice_ref"},
+    }
+
     def discover_specs(self, scenario_root: Path, *, limit: int = 50) -> list[dict[str, Any]]:
         root = Path(scenario_root)
         specs: list[dict[str, Any]] = []
@@ -18,8 +44,22 @@ class ExistingScenarioSpecExplorer:
             if "base_scenario" in payload and not {"slices", "flows"}.issubset(payload.keys()):
                 specs.append(self.summarize_overlay(payload, source=str(path)))
                 continue
+            if not self._looks_like_base_scenario(payload):
+                continue
             specs.append(self.summarize_mapping(payload, source=str(path)))
         return specs
+
+    @classmethod
+    def _looks_like_base_scenario(cls, payload: dict[str, Any]) -> bool:
+        if not cls.REQUIRED_BASE_FIELDS.issubset(payload):
+            return False
+        for collection_name, required_keys in cls.REQUIRED_ENTITY_KEYS.items():
+            items = payload.get(collection_name)
+            if not isinstance(items, list) or not items:
+                return False
+            if any(not isinstance(item, dict) or not required_keys.issubset(item) for item in items):
+                return False
+        return True
 
     def summarize_mapping(self, payload: dict[str, Any], *, source: str = "") -> dict[str, Any]:
         slices = [item for item in payload.get("slices") or [] if isinstance(item, dict)]
