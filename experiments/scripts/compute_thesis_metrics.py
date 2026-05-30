@@ -14,7 +14,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from experiments.scripts.common import RAW_RUN_ROOT, RESULTS_ROOT, SUMMARY_ROOT, load_json
+from experiments.scripts.common import RAW_RUN_ROOT, RESULTS_ROOT, SUMMARY_ROOT, load_json, write_json
 
 
 QOS_POLICY_TYPE = "SmPolicyDecision"
@@ -455,11 +455,6 @@ def _aggregate_runs(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     if not rows:
         raise ValueError("Cannot write CSV without rows")
@@ -521,7 +516,7 @@ def main() -> None:
         "runs": run_metrics,
         "overall": _aggregate_runs(run_metrics),
     }
-    _write_json(args.output_json, payload)
+    write_json(args.output_json, payload)
     _write_csv(args.output_csv, run_metrics)
 
     print(f"Computed thesis metrics for {len(run_metrics)} run summaries")

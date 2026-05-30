@@ -11,7 +11,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from experiments.paths import default_catalog_input_path, load_scenario_registry, scoped_catalog_input_path
-from experiments.scripts.common import CONFIG_ROOT, PROJECT_ROOT, TASK_ROOT, load_yaml_mapping
+from experiments.scripts.common import CONFIG_ROOT, PROJECT_ROOT, TASK_ROOT, load_yaml_mapping, write_json
 
 
 TASK_CATALOG_PATH = TASK_ROOT / "task_catalog.json"
@@ -252,8 +252,7 @@ def _build_task_catalog() -> Dict[str, Any]:
 
 
 def _write_task_catalog(path: Path, catalog: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(path, catalog)
 
 
 def _load_matrix(path: Path) -> Dict[str, Any]:
@@ -569,11 +568,10 @@ def main() -> None:
         experiment_id=str(args.experiment or "").strip(),
         scenario_id=str(args.scenario or "").strip(),
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(output_path, payload)
 
     default_output = default_catalog_input_path()
-    default_output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(default_output, payload)
     print(f"Wrote {len(records)} experiment records -> {output_path}")
     print(f"Canonical catalog size: {len(tasks)} tasks across {len(CATEGORY_ORDER)} categories")
     print(f"Updated default input file -> {default_output}")

@@ -31,7 +31,7 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def _task_map() -> Dict[str, Dict[str, Any]]:
-    payload = _load_json(TASK_CATALOG_PATH)
+    payload = load_json(TASK_CATALOG_PATH)
     return {
         str(item.get("task_id") or "").strip(): item
         for item in payload.get("tasks", [])

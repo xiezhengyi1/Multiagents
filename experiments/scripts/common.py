@@ -1,24 +1,29 @@
 from __future__ import annotations
 
+import csv
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Mapping, Sequence
 
 import yaml
 
+from experiments.paths import (
+    CONFIG_ROOT,
+    GENERATED_INPUT_ROOT,
+    LEDGER_ROOT,
+    PACKAGE_ROOT as EXPERIMENT_ROOT,
+    PROJECT_ROOT,
+    RAW_RUN_ROOT,
+    RESULTS_ROOT,
+    SCENARIO_ROOT,
+    SUMMARY_ROOT,
+    TASK_ROOT,
+    WORKSPACE_ROOT,
+)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-WORKSPACE_ROOT = PROJECT_ROOT.parent
-EXPERIMENT_ROOT = PROJECT_ROOT / "experiments"
-CONFIG_ROOT = EXPERIMENT_ROOT / "configs"
-SCENARIO_ROOT = EXPERIMENT_ROOT / "scenarios"
-TASK_ROOT = EXPERIMENT_ROOT / "tasks"
-GENERATED_INPUT_ROOT = EXPERIMENT_ROOT / "generated_inputs"
-RESULTS_ROOT = EXPERIMENT_ROOT / "results"
-LEDGER_ROOT = RESULTS_ROOT / "ledgers"
-RAW_RUN_ROOT = RESULTS_ROOT / "raw_runs"
-SUMMARY_ROOT = RESULTS_ROOT / "summaries"
 
 
 def resolve_python_executable(project_root: Path) -> Path:
@@ -47,6 +52,56 @@ def load_yaml_mapping(path: Path) -> Dict[str, Any]:
     return payload
 
 
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+
+
+def write_csv(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    fieldnames: Sequence[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def build_project_python_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    pythonpath = str(PROJECT_ROOT / "src")
+    existing = str(env.get("PYTHONPATH") or "").strip()
+    env["PYTHONPATH"] = pythonpath + ((os.pathsep + existing) if existing else "")
+    return env
+
+
+def run_project_python(script: Path, *args: str, cwd: Path = WORKSPACE_ROOT) -> None:
+    subprocess.run(
+        [str(resolve_python_executable(PROJECT_ROOT)), str(script), *args],
+        cwd=cwd,
+        env=build_project_python_env(),
+        check=True,
+    )
+
+
 __all__ = [
     "CONFIG_ROOT",
     "EXPERIMENT_ROOT",
@@ -59,7 +114,13 @@ __all__ = [
     "SUMMARY_ROOT",
     "TASK_ROOT",
     "WORKSPACE_ROOT",
+    "append_jsonl",
+    "build_project_python_env",
     "load_json",
     "load_yaml_mapping",
+    "read_jsonl",
     "resolve_python_executable",
+    "run_project_python",
+    "write_csv",
+    "write_json",
 ]

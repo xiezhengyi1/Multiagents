@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import subprocess
 import sys
 from datetime import datetime
@@ -21,6 +20,7 @@ from experiments.scripts.common import (
     RAW_RUN_ROOT,
     SUMMARY_ROOT,
     WORKSPACE_ROOT,
+    build_project_python_env,
     load_json,
     resolve_python_executable,
 )
@@ -34,16 +34,6 @@ RAW_RUN_DIR = RAW_RUN_ROOT
 SUMMARY_DIR = SUMMARY_ROOT
 LEDGER_PATH = LEDGER_ROOT / "run_ledger.csv"
 PYTHON_EXE = resolve_python_executable(PROJECT_ROOT)
-
-
-def _build_project_python_env() -> Dict[str, str]:
-    env = dict(os.environ)
-    pythonpath_entries = [str(PROJECT_ROOT / "src")]
-    existing_pythonpath = str(env.get("PYTHONPATH") or "").strip()
-    if existing_pythonpath:
-        pythonpath_entries.append(existing_pythonpath)
-    env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
-    return env
 
 
 def _load_methods() -> Dict[str, Dict[str, Any]]:
@@ -124,7 +114,7 @@ def _reset_scenario_for_run(scenario_id: str, *, snapshot_id: str) -> Path:
         "--graph-snapshot-id",
         normalized_snapshot_id,
     ]
-    subprocess.run(command, cwd=PROJECT_ROOT, check=True, env=_build_project_python_env())
+    subprocess.run(command, cwd=PROJECT_ROOT, check=True, env=build_project_python_env())
     return scenario_path
 
 

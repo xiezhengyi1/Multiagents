@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
@@ -17,21 +16,9 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
 from control_runtime.integrations.scenario.init_scenario import rebuild_ue_related_tables_from_graph_snapshot
 from control_runtime.orchestrators.single_agent_orchestrator import SingleAgentOrchestrator
 from experiments.paths import default_catalog_input_path, resolve_scenario_source_path
+from experiments.scripts.common import append_jsonl, write_json
 from training.collect_workflow_trajectories import load_user_input_records
 from training.common import processed_dir
-
-
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _write_jsonl_incremental(path: Path, record: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False))
-        handle.write("\n")
-        handle.flush()
 
 
 def summarize_run_results(results: List[Mapping[str, Any]], *, result_output: Path) -> Dict[str, Any]:
@@ -172,10 +159,10 @@ def main() -> None:
                 "round_traces": [],
             }
         results.append(result_record)
-        _write_jsonl_incremental(args.result_output, result_record)
+        append_jsonl(args.result_output, result_record)
 
     summary = summarize_run_results(results, result_output=args.result_output)
-    _write_json(args.summary_output, summary)
+    write_json(args.summary_output, summary)
     print(f"Ran {summary['total_cases']} single-agent cases")
     print(f"Completed cases: {summary['completed_case_count']}")
     print(f"Error cases: {summary['error_case_count']}")

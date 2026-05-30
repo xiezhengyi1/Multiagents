@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections import Counter
 from pathlib import Path
@@ -14,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from training.collect_workflow_trajectories import collect_workflow_trajectories, load_user_input_records
 from training.common import processed_dir
+from experiments.scripts.common import write_json
 
 
 def _normalize_dispatch_receipts(item: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -243,11 +243,6 @@ def summarize_run_results(
     }
 
 
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run workflow experiments in batch and summarize correct/error cases.",
@@ -343,7 +338,7 @@ def main() -> None:
     projection_summary = collection["projection_summary"]
     summary["artifacts"]["normalized_specs"] = str(args.spec_output)
     summary["artifacts"]["agent_trajectory_outputs"] = projection_summary.get("agent_outputs", {})
-    _write_json(args.summary_output, summary)
+    write_json(args.summary_output, summary)
 
     print(f"Ran {summary['total_cases']} experiment cases")
     print(f"Correct cases: {summary['correct_case_count']}")
