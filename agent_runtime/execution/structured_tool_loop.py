@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from agent_runtime.core.context import AgentRuntimeContext
+from agent_runtime.core.context_policy import ContextPolicy
 from agent_runtime.core.token_budget import TokenCounter, TokenBudget
 
 
@@ -51,6 +52,7 @@ class StructuredToolLoop:
         tool_result_token_limits: dict[str, int] | None = None,
         token_counter: Optional[TokenCounter] = None,
         token_budget: Optional[TokenBudget] = None,
+        context_policy: Optional[ContextPolicy] = None,
     ) -> None:
         self.system_prompt = str(system_prompt or "").strip()
         self.response_model = response_model
@@ -69,6 +71,12 @@ class StructuredToolLoop:
         self._tool_result_token_limits = dict(tool_result_token_limits or {})
         self._token_counter = token_counter
         self._token_budget = token_budget
+        self.context_policy = context_policy or ContextPolicy(
+            default_tool_result_chars=self.max_tool_result_chars,
+            default_tool_result_tokens=max_tool_result_tokens or 2000,
+            tool_result_char_limits=self._tool_result_limits,
+            tool_result_token_limits=self._tool_result_token_limits,
+        )
         self.tools = list(tools)
         self.tools_by_name: dict[str, Any] = {}
         for tool in self.tools:
@@ -242,28 +250,6 @@ class StructuredToolLoop:
             raise last_error
         raise RuntimeError("Model returned empty structured response")
 
-    def _max_tool_result_chars_for(self, tool_name: str) -> int:
-        return self._tool_result_limits.get(tool_name, self.max_tool_result_chars)
-
-    def _max_tool_result_tokens_for(self, tool_name: str) -> int:
-        per_tool = self._tool_result_token_limits.get(tool_name)
-        if per_tool is not None:
-            return per_tool
-        if self.max_tool_result_tokens is not None:
-            return self.max_tool_result_tokens
-        return 0
-
-    def _dynamic_token_limit(self, tool_name: str) -> int:
-        static_limit = self._max_tool_result_tokens_for(tool_name)
-        if static_limit <= 0 or self._token_budget is None:
-            return static_limit
-        pressure = self._token_budget.pressure()
-        if pressure < 0.5:
-            return static_limit
-        if pressure < 0.8:
-            return max(1000, int(static_limit * 0.75))
-        return max(1000, int(static_limit * 0.5))
-
     @staticmethod
     def _estimate_message_tokens(message: BaseMessage, counter: TokenCounter | None = None) -> int:
         if counter is not None:
@@ -293,25 +279,12 @@ class StructuredToolLoop:
         result = func(**kwargs)
         content = self._tool_result_to_content(result)
 
-        if self._token_counter is not None:
-            token_limit = self._max_tool_result_tokens_for(tool_name)
-            if token_limit <= 0:
-                token_limit = self._dynamic_token_limit(tool_name)
-            if token_limit > 0 and self._token_counter.count(content) > token_limit:
-                content = self._token_counter.truncate_to_tokens(
-                    content, token_limit, suffix="\n... [truncated]"
-                )
-        else:
-            limit = self._max_tool_result_chars_for(tool_name)
-            if len(content) > limit:
-                content = content[:limit] + "\n... [truncated]"
-
-        if self._token_budget is not None:
-            estimated = self._estimate_message_tokens(
-                ToolMessage(content=content, tool_call_id=str(tool_call_id or ""), name=tool_name),
-                self._token_counter,
-            )
-            self._token_budget.record_tokens("default", estimated)
+        content = self.context_policy.compact_tool_result(
+            tool_name,
+            content,
+            token_counter=self._token_counter,
+            token_budget=self._token_budget,
+        )
 
         return ToolMessage(
             content=content,
@@ -333,6 +306,51 @@ class StructuredToolLoop:
             tool_call_id=str(tool_call_id or ""),
             name=tool_name,
             status="error",
+        )
+    
+    @staticmethod
+    def _strip_thinking(text: str) -> str:
+        """Strip <think>...</think> reasoning blocks emitted by thinking-mode models."""
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    @staticmethod
+    def _sanitize_ai_message_for_history(message: AIMessage) -> AIMessage:
+        """Return ai_message with thinking tags stripped from tool call arguments in additional_kwargs.
+
+        Some thinking-mode models (e.g. Qwen3) embed <think>...</think> blocks inside
+        function.arguments, making the field invalid JSON.  If the polluted message is
+        appended verbatim to the conversation history and sent back to the API the next
+        iteration, the server rejects the entire request with a 400 error.
+        """
+        raw_tool_calls = (message.additional_kwargs or {}).get("tool_calls")
+        if not isinstance(raw_tool_calls, list):
+            return message
+        cleaned: list[Any] = []
+        changed = False
+        for tc in raw_tool_calls:
+            if not isinstance(tc, dict):
+                cleaned.append(tc)
+                continue
+            func = tc.get("function")
+            if not isinstance(func, dict):
+                cleaned.append(tc)
+                continue
+            raw_args = func.get("arguments", "")
+            if isinstance(raw_args, str) and "<think>" in raw_args.lower():
+                clean_args = re.sub(r"<think>.*?</think>", "", raw_args, flags=re.DOTALL | re.IGNORECASE).strip()
+                cleaned.append({**tc, "function": {**func, "arguments": clean_args}})
+                changed = True
+            else:
+                cleaned.append(tc)
+        if not changed:
+            return message
+        return AIMessage(
+            content=message.content,
+            additional_kwargs={**message.additional_kwargs, "tool_calls": cleaned},
+            tool_calls=message.tool_calls,
+            invalid_tool_calls=message.invalid_tool_calls,
+            response_metadata=message.response_metadata,
+            id=message.id,
         )
 
     @staticmethod
@@ -360,8 +378,12 @@ class StructuredToolLoop:
             if not isinstance(raw_args, str) or not raw_args.strip():
                 unrecovered.append(dict(raw_call))
                 continue
+            clean_args = re.sub(r"<think>.*?</think>", "", raw_args, flags=re.DOTALL | re.IGNORECASE).strip()
+            if not clean_args:
+                unrecovered.append(dict(raw_call))
+                continue
             try:
-                parsed_args = parse_partial_json(raw_args)
+                parsed_args = parse_partial_json(clean_args)
             except Exception:
                 unrecovered.append(dict(raw_call))
                 continue
@@ -406,6 +428,17 @@ class StructuredToolLoop:
 
         try:
             for _ in range(self.max_iterations):
+                conversation = self.context_policy.compact_tool_history(conversation)
+                if self._token_budget is not None:
+                    visible_tokens = (
+                        self._token_counter.count_messages(conversation)
+                        if self._token_counter is not None
+                        else sum(self._estimate_message_tokens(message) for message in conversation)
+                    )
+                    self._token_budget.record_tokens(
+                        str(getattr(context, "agent_name", "") or "default"),
+                        visible_tokens,
+                    )
                 ai_message = self.llm.invoke(conversation, **kwargs)
                 if not isinstance(ai_message, AIMessage):
                     raise TypeError(f"Expected AIMessage from model, got {type(ai_message).__name__}")

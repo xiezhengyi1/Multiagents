@@ -52,7 +52,7 @@ def build_environment_tools(
     compiler: EnvironmentAgentCompiler,
     launcher: EnvironmentLauncher,
     scenario_root: Path,
-    execute_simulator: bool = False,
+    execute_simulator: bool = True,
     explorer: ExistingScenarioSpecExplorer | None = None,
 ) -> list[Any]:
     explorer = explorer or ExistingScenarioSpecExplorer()
@@ -141,7 +141,7 @@ def build_environment_tools(
             live_graph_snapshot_id=live_graph_snapshot_id or "live-environment-agent",
             graph_db_url=graph_db_url,
         )
-        payload = {
+        payload: dict[str, Any] = {
             "status": "planned",
             "reason": reason,
             "execute_simulator": bool(execute_simulator),
@@ -157,8 +157,11 @@ def build_environment_tools(
             "live_graph_snapshot_id": plan.live_graph_snapshot_id,
         }
         if execute_simulator:
-            payload["status"] = "not_executed"
-            payload["error"] = "execute_simulator=True requires a process runner integration; current tool returns the verified launch contract."
+            payload = {
+                "reason": reason,
+                "execute_simulator": True,
+                **launcher.validate_simulator_startup(plan),
+            }
         return _json(payload)
 
     def record_validation_feedback(

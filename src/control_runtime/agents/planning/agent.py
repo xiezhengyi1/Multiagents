@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from shared.runtime import ArtifactEnvelope
+from shared.runtime import ContextPolicy
 from shared.agents import BaseAgent, coerce_structured_response, extract_grounding_tool_names
 from knowledge_runtime.retrieval.raw import get_knowledge_by_key, search_semantic_knowledge
 from shared.runtime import ToolLoopExecutionError
@@ -13,8 +14,8 @@ from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import PolicyPlanDraft
 from shared.logging import log_event, log_timing
 
+from ..common import project_collaboration_context_for_prompt, project_operation_intent_for_prompt
 from .compiler import OptimizationStrategyCompiler
-from .policy_normalizer import json_friendly as _json_friendly
 from .policy_normalizer import normalize_app_id as _normalize_app_id
 from .prompts import OSA_SYSTEM_PROMPT, build_advisor_user_prompt, build_validation_retry_prompt
 from .response_models import OsaAdvisorOutput
@@ -23,22 +24,7 @@ from .tools import build_request_tools
 
 
 def _build_lean_operation_intent(operation_intent: Any) -> dict:
-    """Build a lean version of OperationIntent for OSA prompt, removing numerical
-    fields that the optimizer tool provides (bw, gbr, latency, jitter, loss, five_tuple)."""
-    raw = _json_friendly(operation_intent.model_dump(mode="json"))
-    lean_flows = []
-    for f in raw.get("flows") or []:
-        if not isinstance(f, dict):
-            lean_flows.append(f)
-            continue
-        lean_flows.append({
-            k: v for k, v in f.items()
-            if k in ("flow_id", "app_id", "supi", "name", "flow_name",
-                     "service_type", "service_type_id", "priority",
-                     "resolution_status", "requested_domains", "dnn")
-        })
-    raw["flows"] = lean_flows
-    return raw
+    return project_operation_intent_for_prompt(operation_intent)
 
 
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
@@ -123,7 +109,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         operation_intent = effective_request.operation_intent
         normalized_user_intent = _build_lean_operation_intent(operation_intent)
         normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
-        coordination_context = _json_friendly(effective_request.context.model_dump(mode="json"))
+        coordination_context = project_collaboration_context_for_prompt(effective_request.context)
 
         total_start = time.perf_counter()
         log_event(self.logger, "osa_generate_start")
@@ -182,7 +168,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     "grounding_tools": list(grounding_tools or []),
                     "advisor_output": advisor_output.model_dump(mode="json"),
                     "contract_errors": list(contract_errors or []),
-                    "planning_tool_evidence": _json_friendly(planning_tool_evidence),
+                    "planning_tool_evidence": planning_tool_evidence,
                 }
                 if not contract_errors:
                     break
@@ -294,6 +280,18 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 "search_semantic_knowledge": 4000,
                 "get_knowledge_by_key": 4000,
             },
+            context_policy=ContextPolicy(
+                default_tool_result_chars=4000,
+                default_tool_result_tokens=1000,
+                tool_result_char_limits={
+                    "preview_qos_optimizer": 8000,
+                    "fetch_qos_network_status": 4000,
+                    "inspect_mobility_ue_policies": 4000,
+                    "search_semantic_knowledge": 4000,
+                    "get_knowledge_by_key": 4000,
+                },
+                recent_tool_results_per_tool=1,
+            ),
         )
         messages = [{"role": "user", "content": prompt}]
         invoke_payload = {

@@ -5,8 +5,6 @@ from typing import Any, Dict
 
 from ..prompt_skills.knowledge_search import OSA_KNOWLEDGE_SEARCH_SKILL
 
-from ..prompt_skills.knowledge_search import OSA_KNOWLEDGE_SEARCH_SKILL
-
 
 OSA_CORE_PROMPT = """
 You are the Optimization Strategy Advisor for a 5G PCF control system.
@@ -196,12 +194,6 @@ def build_advisor_user_prompt(
         "- Respect control_semantics.current_stage; optimize only the active stage flows.\n"
         "- Prefer optimizer sla values over telemetry values when filling final policy fields.\n\n"
         + _OUTPUT_FORMAT_RULES
-        + "\n\n"
-        + _QOS_EXAMPLE
-        + "\n\n"
-        + _MOBILITY_EXAMPLE
-        + "\n\n"
-        + _INFEASIBLE_EXAMPLE
         + "\n\n"
         "Return one OsaAdvisorOutput JSON object only."
     )

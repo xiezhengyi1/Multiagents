@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 from knowledge_runtime.retrieval.raw import warmup_knowledge_tool_models
 from shared.memory import MemoryManager
 from agent_runtime.core.token_budget import TokenCounter, TokenBudget
+from agent_runtime.core.context_policy import ContextPolicy
+from ..agents.common import project_global_intent_for_prompt, project_memory_payload
 
 from ..agents.dispatch import PolicyDispatchAgent
 from ..agents.grounding import IntentEncodingAgent
@@ -73,6 +75,7 @@ class MainControlOrchestrator:
         self.max_rounds = max_rounds
         self.rag_enabled = rag_enabled
         self._token_counter = TokenCounter()
+        self._context_policy = ContextPolicy()
         self.preloaded_models: Dict[str, Any] = {}
         if preload_models:
             self.preloaded_models = self._preload_runtime_models()
@@ -122,10 +125,8 @@ class MainControlOrchestrator:
     def _remember(self, role: str, payload: Any) -> None:
         if isinstance(payload, str):
             content = payload
-        elif hasattr(payload, "model_dump"):
-            content = json.dumps(payload.model_dump(mode="json"), ensure_ascii=False)
         else:
-            content = json.dumps(payload, ensure_ascii=False)
+            content = json.dumps(project_memory_payload(role, payload), ensure_ascii=False)
         if role == "IEA":
             try:
                 parsed = json.loads(content)
@@ -148,7 +149,15 @@ class MainControlOrchestrator:
             blocks.append("[Memory][Short-Term]\n" + "\n".join(f"{item.get('role', 'unknown')}: {item.get('content', '')}" for item in short_term if isinstance(item, dict)))
         if long_term:
             blocks.append("[Memory][Long-Term]\n" + "\n".join(str(item) for item in long_term))
-        return "\n\n".join(block for block in blocks if block.strip())
+        rendered = "\n\n".join(block for block in blocks if block.strip())
+        policy = getattr(self, "_context_policy", None) or ContextPolicy()
+        counter = getattr(self, "_token_counter", None)
+        return policy.compact_text(
+            rendered,
+            max_chars=6000,
+            max_tokens=1500,
+            token_counter=counter,
+        )
 
     @staticmethod
     def _rerank_by_hint(items: List[Any], diagnosis_hint: str = "", routing_hint: str = "") -> List[Any]:
@@ -187,6 +196,7 @@ class MainControlOrchestrator:
         feedback_context: str,
     ) -> str:
         snapshot = get_snapshot_data_by_id(snapshot_id) or {}
+        projected_global_intent = project_global_intent_for_prompt(global_intent)
         return (
             "## Guidance\n"
             f"- round_index: {round_index}\n"
@@ -195,10 +205,9 @@ class MainControlOrchestrator:
             f"- routing_decision: {global_intent.get('routing_decision') or 'N/A'}\n"
             f"- routing_rationale: {global_intent.get('routing_rationale') or 'N/A'}\n\n"
             "## Evidence\n"
-            f"- main_intent: {json.dumps(global_intent, ensure_ascii=False)}\n"
+            f"- main_intent: {json.dumps(projected_global_intent, ensure_ascii=False)}\n"
             f"- snapshot_summary: {json.dumps(_build_snapshot_summary(snapshot) if snapshot else {}, ensure_ascii=False)}\n"
-            f"- reuse_contract: {json.dumps(global_intent.get('reuse_contract') or {}, ensure_ascii=False)}\n"
-            f"- handoff_expectations: {json.dumps(global_intent.get('handoff_expectations') or [], ensure_ascii=False)}\n\n"
+            "\n"
             "## Previous Diagnosis\n"
             f"{json.dumps(diagnosis or {}, ensure_ascii=False)}\n\n"
             "## Feedback\n"

@@ -11,10 +11,36 @@ from .compiler import EnvironmentAgentCompiler
 from .contracts import EnvironmentGenerationRequest, ScenarioCandidate
 from .prompts import ENVIRONMENT_AGENT_SYSTEM_PROMPT
 from .tools import build_environment_tools
-
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.logging import log_event, log_timing
-from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, ToolLoopExecutionError
+from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, ToolLoopExecutionError, extract_tool_results
+
+
+def simulation_validation_succeeded(payloads: list[dict[str, Any]]) -> bool:
+    for payload in payloads:
+        if (
+            payload.get("status") == "ok"
+            and payload.get("simulator_started") is True
+            and (payload.get("graph_snapshot") or {}).get("ok") is True
+            and (payload.get("gateway_health") or {}).get("ok") is True
+            and (payload.get("sla_initialization") or {}).get("ok") is True
+        ):
+            return True
+    return False
+
+
+def _extract_simulation_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for tool_result in extract_tool_results(result.get("messages") or []):
+        if str(tool_result.get("name") or "").strip() != "simulate_candidate_environment":
+            continue
+        try:
+            payload = json.loads(str(tool_result.get("content") or ""))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
 
 
 class EnvironmentAdvisorOutput(BaseModel):
@@ -68,7 +94,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                     stack_python_executable=stack_python,
                 ),
                 scenario_root=scenario_root or (project_root / "experiments" / "scenarios"),
-                execute_simulator=False,
+                execute_simulator=True,
             )
         self.agent = self.create_json_agent(
             tools=self.environment_tools,
@@ -121,6 +147,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             "- You must call list_existing_environment_specs before generating the candidate.\n"
             "- Use write_candidate_environment_yaml, validate_candidate_environment, and simulate_candidate_environment.\n"
             "- If validation or simulation reports a failure, call record_validation_feedback and produce a revised candidate.\n"
+            "- Simulation succeeds only when the real launcher starts, the live graph snapshot exists, the policy gateway is healthy, and SLA initialization passes.\n"
             "- Final JSON must describe the successfully validated environment candidate.\n"
             "- CRITICAL: your final JSON output MUST contain these top-level keys:\n"
             "    scenario_id (string), name (string), scenario (dict/object, NOT a yaml string),\n"
@@ -153,6 +180,9 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             if isinstance(exc, ToolLoopExecutionError):
                 raise RuntimeError(f"Environment generation advisor failed: {exc}") from exc
             raise
+        simulation_payloads = _extract_simulation_payloads(result)
+        if not simulation_validation_succeeded(simulation_payloads):
+            raise RuntimeError("Environment advisor returned without successful real simulator validation evidence")
         output = coerce_structured_response(
             result,
             EnvironmentAdvisorOutput,
@@ -187,4 +217,4 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         return candidate
 
 
-__all__ = ["EnvironmentAdvisorOutput", "EnvironmentGenerationAgent"]
+__all__ = ["EnvironmentAdvisorOutput", "EnvironmentGenerationAgent", "simulation_validation_succeeded"]

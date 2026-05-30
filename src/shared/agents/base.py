@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from shared.runtime import ContextPolicy
 from shared.runtime import RuntimeCache
 from shared.runtime import AgentRuntimeContext
 from shared.runtime import StructuredToolLoop
@@ -258,6 +259,7 @@ class BaseAgent:
         tool_result_limits: dict[str, int] | None = None,
         max_tool_result_tokens: int | None = None,
         tool_result_token_limits: dict[str, int] | None = None,
+        context_policy: ContextPolicy | None = None,
         token_counter: Any = None,
         token_budget: Any = None,
     ) -> TracedStructuredAgent:
@@ -277,6 +279,7 @@ class BaseAgent:
             tool_result_token_limits=tool_result_token_limits,
             token_counter=token_counter,
             token_budget=token_budget,
+            context_policy=context_policy,
         )
         agent_name = str(getattr(self, "agent_name", "") or "").strip()
         if not agent_name:

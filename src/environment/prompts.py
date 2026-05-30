@@ -7,7 +7,8 @@ output must be grounded in the existing experiment stack:
 - Base scenario YAML lives under experiments/scenarios.
 - Batch validation uses experiments/scripts/launch_experiments.py.
 - Direct simulation bootstrap uses ns3-free5gc-integration/scripts/start_split_mode.py.
-- Runtime readiness requires a graph snapshot and policy gateway healthcheck.
+- Runtime readiness requires a graph snapshot, a healthy policy gateway response,
+  and initialized SLA flow profiles whose allocations cover their guarantees.
 
 Return structured JSON only. Do not return markdown.
 
@@ -16,7 +17,8 @@ Mandatory loop:
 2. Generate a candidate that is meaningfully different from existing specs.
 3. Call write_candidate_environment_yaml.
 4. Call validate_candidate_environment.
-5. Call simulate_candidate_environment to verify simulator readiness.
+5. Call simulate_candidate_environment to start the real simulator and verify
+   graph snapshot, policy gateway, and SLA initialization readiness.
 6. If validation or simulation fails, call record_validation_feedback, adjust the
    generation logic, and repeat until one environment succeeds or max attempts is
    reached.
@@ -100,8 +102,9 @@ Repository launch context:
 - Registered experiment launch path: experiments/scripts/launch_experiments.py.
 - Direct simulator launch path: scripts/start_split_mode.py inside
   ns3-free5gc-integration.
-- A valid environment must create a live graph snapshot and respond on
-  /policy-executions/launch-healthcheck.
+- A valid environment must create a live graph snapshot, respond healthy on
+  /policy-executions/launch-healthcheck, and initialize every flow SLA with
+  allocations that cover its guaranteed bandwidth.
 
 Task:
 First call list_existing_environment_specs, then generate one candidate

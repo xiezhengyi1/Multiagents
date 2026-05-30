@@ -9,14 +9,14 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import AIMessage
 
 from shared.agents import BaseAgent, coerce_structured_response, extract_grounding_tool_names
-from shared.runtime import ArtifactWorkerMixin, ToolLoopExecutionError
+from shared.runtime import ArtifactWorkerMixin, ContextPolicy, ToolLoopExecutionError
 from shared.logging import log_event, log_timing
 
 from ...domain.collaboration import PlanningContext, PlanningRequest
 from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
 from ...domain.policy_plan import OperationIntent, PlanningRationale, PolicyDraft, PolicyPlanDraft
 from ...integrations.storage import get_latest_snapshot_metadata
-from ..common import validate_and_compile_intent
+from ..common import project_intent_evidence_for_prompt, validate_and_compile_intent
 from ..grounding.compiler import IntentCompiler
 from ..grounding.contracts import IntentAdvisorDecision
 from ..planning.policy_normalizer import normalize_policy_plan_draft
@@ -223,6 +223,25 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 "search_semantic_knowledge": 4000,
                 "get_knowledge_by_key": 4000,
             },
+            context_policy=ContextPolicy(
+                default_tool_result_chars=4000,
+                default_tool_result_tokens=1000,
+                tool_result_char_limits={
+                    "preview_qos_optimizer": 8000,
+                    "get_sm_ue_context": 4000,
+                    "get_sm_ue_flow_catalog": 8000,
+                    "get_am_policy_context": 4000,
+                    "fetch_qos_network_status": 4000,
+                    "inspect_mobility_ue_policies": 4000,
+                    "search_semantic_knowledge": 4000,
+                    "get_knowledge_by_key": 4000,
+                },
+                recent_tool_results_per_tool=1,
+                tool_history_keep_limits={
+                    "search_sm_flow_targets": 2,
+                    "search_am_policy_targets": 2,
+                },
+            ),
         )
         prompt = self._build_round_prompt(
             user_input=user_input,
@@ -329,15 +348,20 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _build_round_prompt(*, user_input: str, evidence: Dict[str, Any], context: str, feedback_context: str) -> str:
+        feedback_block = ""
+        if feedback_context and feedback_context not in context:
+            feedback_block = (
+                "Feedback context:\n"
+                f"{feedback_context}\n\n"
+            )
         return (
             "User request:\n"
             f"{user_input}\n\n"
             "Structured evidence:\n"
-            f"{json.dumps(evidence, ensure_ascii=False)}\n\n"
+            f"{json.dumps(project_intent_evidence_for_prompt(evidence), ensure_ascii=False)}\n\n"
             "Round context:\n"
             f"{context or 'N/A'}\n\n"
-            "Feedback context:\n"
-            f"{feedback_context or 'N/A'}\n\n"
+            f"{feedback_block}"
             "Task:\n"
             "- Stage 1: infer requested_domains and ground the required identifiers.\n"
             "- Stage 2: use planning tools in the same loop and return executable policy payloads.\n"
@@ -643,7 +667,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 snapshot_id=snapshot_id,
                 snapshot_metadata=get_latest_snapshot_metadata() or {},
                 feedback_context=feedback_context,
-                handoff_history=round_traces,
+                handoff_history=round_traces[-2:],
                 active_domains=[item.value for item in global_intent.requested_domains],
                 main_round_strategy=global_intent.round_strategy.value,
                 objective_profile=global_intent.objective_profile.model_dump(mode="json"),

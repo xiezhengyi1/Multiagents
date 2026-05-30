@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from shared.runtime import ArtifactEnvelope
+from shared.runtime import ContextPolicy
 from shared.runtime import ToolLoopExecutionError
 from shared.agents import BaseAgent, coerce_structured_response, extract_grounding_tool_names
 from shared.runtime import ArtifactWorkerMixin
@@ -19,7 +20,7 @@ from ...integrations.pcf import (
     search_sm_flow_targets,
 )
 from ...domain.policy_plan import OperationIntent
-from ..common import validate_and_compile_intent
+from ..common import project_intent_evidence_for_prompt, validate_and_compile_intent
 from shared.logging import log_event, log_timing
 
 from .compiler import IntentCompiler
@@ -99,6 +100,24 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 "search_semantic_knowledge": 4000,
                 "get_knowledge_by_key": 4000,
             },
+            context_policy=ContextPolicy(
+                default_tool_result_chars=4000,
+                default_tool_result_tokens=1000,
+                tool_result_char_limits={
+                    "get_sm_ue_flow_catalog": 8000,
+                    "get_sm_ue_context": 4000,
+                    "search_sm_flow_targets": 4000,
+                    "get_am_policy_context": 4000,
+                    "search_am_policy_targets": 4000,
+                    "search_semantic_knowledge": 4000,
+                    "get_knowledge_by_key": 4000,
+                },
+                recent_tool_results_per_tool=1,
+                tool_history_keep_limits={
+                    "search_sm_flow_targets": 2,
+                    "search_am_policy_targets": 2,
+                },
+            ),
         )
         self.last_failure_debug: Dict[str, Any] = {}
 
@@ -411,7 +430,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             "User request:\n"
             f"{evidence.user_input}\n\n"
             "Structured evidence:\n"
-            f"{json.dumps(evidence.model_dump(mode='json'), ensure_ascii=False)}\n\n"
+            f"{json.dumps(project_intent_evidence_for_prompt(evidence), ensure_ascii=False)}\n\n"
             "Coordinator context:\n"
             f"{context or 'N/A'}\n\n"
             f"{IEA_DYNAMIC_RULES.strip()}\n\n"
