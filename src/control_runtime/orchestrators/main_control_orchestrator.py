@@ -818,6 +818,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Optional trace scenario tag. Repeat to provide multiple tags.",
     )
     parser.add_argument(
+        "--snapshot-id",
+        dest="snapshot_id",
+        default="",
+        help="Existing live network graph snapshot id to bind this run.",
+    )
+    parser.add_argument(
         "--max-rounds",
         dest="max_rounds",
         type=int,
@@ -834,6 +840,32 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         dest="use_deepseek",
         help="Use deepseek-v4-flash for all agents instead of the default models.",
+    )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run the autonomous guard loop instead of a single request.",
+    )
+    parser.add_argument(
+        "--watch-interval",
+        dest="watch_interval",
+        type=float,
+        default=1.0,
+        help="Seconds between autonomous guard-loop ticks.",
+    )
+    parser.add_argument(
+        "--watch-iterations",
+        dest="watch_iterations",
+        type=int,
+        default=0,
+        help="Maximum guard-loop ticks. Use 0 for continuous guarding.",
+    )
+    parser.add_argument(
+        "--monitor-context-chars",
+        dest="monitor_context_chars",
+        type=int,
+        default=4000,
+        help="Maximum previous-control context characters passed to monitor reentry.",
     )
     return parser.parse_args(argv)
 
@@ -852,12 +884,43 @@ def _resolve_user_input(cli_value: Optional[str]) -> str:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     try:
-        user_input = _resolve_user_input(args.user_input)
         orchestrator = MainControlOrchestrator(max_rounds=args.max_rounds, use_local_model=True, use_deepseek=args.use_deepseek)
+        if args.watch:
+            from control_runtime.monitoring import ConsoleUserInputSource, build_default_autonomous_watch_loop
+
+            console_source = ConsoleUserInputSource(prompt="control> ")
+            initial_user_input = str(args.user_input or "").strip()
+
+            def user_input_source() -> str:
+                nonlocal initial_user_input
+                if initial_user_input:
+                    text = initial_user_input
+                    initial_user_input = ""
+                    return text
+                return console_source()
+
+            watch_loop = build_default_autonomous_watch_loop(
+                orchestrator=orchestrator,
+                user_input_source=user_input_source,
+                previous_context_max_chars=args.monitor_context_chars,
+                poll_interval_seconds=args.watch_interval,
+            )
+            results = watch_loop.run_forever(
+                max_iterations=args.watch_iterations if args.watch_iterations > 0 else None,
+                snapshot_id=args.snapshot_id,
+                scenario_id=args.scenario_id,
+                scenario_tags=args.scenario_tags,
+            )
+            payload = [result.to_dict() for result in results]
+            print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
+            return 0
+
+        user_input = _resolve_user_input(args.user_input)
         result = orchestrator.run(
             user_input,
             scenario_id=args.scenario_id,
             scenario_tags=args.scenario_tags,
+            snapshot_id=args.snapshot_id,
         )
         payload = result.__dict__
         print(json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None))
