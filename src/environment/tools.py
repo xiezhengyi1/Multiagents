@@ -23,11 +23,14 @@ class SimpleEnvironmentTool:
 
 def _make_tool(name: str, description: str, func: Callable[..., str]) -> Any:
     try:
-        from langchain.tools import StructuredTool
+        from langchain_core.tools import StructuredTool
+    except ImportError:
+        try:
+            from langchain.tools import StructuredTool
+        except ImportError:
+            return SimpleEnvironmentTool(name=name, description=description, func=func)
 
-        return StructuredTool.from_function(func=func, name=name, description=description)
-    except Exception:
-        return SimpleEnvironmentTool(name=name, description=description, func=func)
+    return StructuredTool.from_function(func=func, name=name, description=description)
 
 
 def _json(data: Any) -> str:

@@ -1,0 +1,6 @@
+base_scenario: ../s2_medium_complexity.yaml
+ns3_scratch: nr_ulcl_stress_contention_split
+scheduler_type: pf
+split_mode: dynamic
+control_plane_delay_ms: 5
+user_plane_delay_ms: 10
