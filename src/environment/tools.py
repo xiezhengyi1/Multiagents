@@ -65,20 +65,26 @@ def build_environment_tools(
         scenario_id: str = "",
         scenario: dict[str, Any] | None = None,
         split_mode_overlay: dict[str, Any] | None = None,
-        output_dir: str = "generated",
+        output_dir: str = "",
     ) -> str:
-        """Write candidate base and optional split-mode YAML under the scenario root."""
+        """Write candidate base and optional split-mode YAML under the scenario root.
+
+        Base scenario is written to <scenario_root>/<filename>.yaml (or
+        <scenario_root>/<output_dir>/<filename>.yaml when output_dir is given).
+        Split-mode overlay is always written to <scenario_root>/split_mode/<filename>.yaml.
+        """
         normalized_id = str(scenario_id or (scenario or {}).get("scenario_id") or "").strip()
         if not normalized_id:
             raise ValueError("scenario_id is required")
         if not isinstance(scenario, dict):
             raise TypeError("scenario must be a mapping")
         filename = normalized_id.lower().replace("-", "_") + ".yaml"
-        base_path = Path(scenario_root) / output_dir / filename
+        base_dir = Path(scenario_root) / output_dir if output_dir else Path(scenario_root)
+        base_path = base_dir / filename
         _dump_mapping(base_path, scenario)
         overlay_path = ""
         if split_mode_overlay is not None:
-            overlay_target = Path(scenario_root) / "split_mode" / output_dir / filename
+            overlay_target = Path(scenario_root) / "split_mode" / filename
             _dump_mapping(overlay_target, split_mode_overlay)
             overlay_path = str(overlay_target)
         return _json(

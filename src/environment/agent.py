@@ -113,6 +113,10 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             "- Use write_candidate_environment_yaml, validate_candidate_environment, and simulate_candidate_environment.\n"
             "- If validation or simulation reports a failure, call record_validation_feedback and produce a revised candidate.\n"
             "- Final JSON must describe the successfully validated environment candidate.\n"
+            "- CRITICAL: your final JSON output MUST contain these top-level keys:\n"
+            "    scenario_id (string), name (string), scenario (dict/object, NOT a yaml string),\n"
+            "    split_mode_overlay (dict or null), validation_status, validation_feedback, tool_loop_summary, rationale.\n"
+            "  Do NOT output the scenario content as the root JSON \u2014 it must be nested under the 'scenario' key.\n"
         )
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,

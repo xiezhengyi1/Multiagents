@@ -20,6 +20,68 @@ Mandatory loop:
 6. If validation or simulation fails, call record_validation_feedback, adjust the
    generation logic, and repeat until one environment succeeds or max attempts is
    reached.
+
+## Base Scenario YAML — Required Root Fields
+
+Every base scenario MUST contain ALL of the following top-level keys:
+  name, scenario_id, tick_ms, seed,
+  slices, upfs, gnbs, ues, apps, flows,
+  free5gc, ns3, writer, topology, bridge
+
+Key reference values (copy real paths from the existing specs):
+
+  free5gc:
+    compose_file: /home/yyx/6gcore/free5gc-compose/docker-compose.yaml
+    config_root: /home/yyx/6gcore/free5gc-compose/config
+    mode: single_upf          # or ulcl
+    bridge_name: br-free5gc
+    project_name: nrint-<scenario_id>
+
+  ns3:
+    ns3_root: /home/yyx/6gcore/ns-allinone-3.46.1/ns-3.46.1
+    scratch_name: nr_single_slice   # or nr_multignb_multiupf_split
+    output_subdir: ns3
+    simulator: RealtimeSimulatorImpl
+    sim_time_ms: 300000
+    bridge_mode: l2_inline
+    slice_isolation: true
+
+  writer:
+    archive_dir: archive
+    state_db: state/writer.db
+    graph_db_url: postgresql://postgres:123456@localhost:5432/multiagents_db
+
+  topology:
+    graph_file: graphs/<scenario_id>.yaml
+
+  bridge:
+    enable_inline_harness: true
+    n3_network_name: n3net
+    n3_network_cidr: 10.201.1.0/29
+
+## session_ref Convention
+
+session_ref must follow the pattern:
+  <supi>:<app_id>:<slice_label>:<apn>
+Example: imsi-208930000000008:app-telemedicine:slice-2-000001:internet
+
+## Final JSON Output Format
+
+After all tool calls succeed, output a single JSON object with EXACTLY these keys:
+
+  {
+    "scenario_id": "<the scenario_id string>",
+    "name": "<human readable name>",
+    "scenario": { <complete base scenario mapping as a dict, NOT a YAML string> },
+    "split_mode_overlay": { <overlay mapping or null> },
+    "validation_status": "passed",
+    "validation_feedback": [],
+    "tool_loop_summary": ["step 1 ...", "step 2 ..."],
+    "rationale": "<why this scenario was chosen>"
+  }
+
+Do NOT wrap the scenario content as the top-level JSON — scenario must be nested
+inside the "scenario" key.
 """
 
 GENERATION_PROMPT_TEMPLATE = """Environment generation request:
@@ -47,4 +109,9 @@ environment that is not a near-duplicate of the returned specs.
 Produce one candidate environment with a complete base scenario mapping and,
 when needed, a split-mode overlay mapping. Keep all app, flow, UE, session,
 slice, gNB, and UPF references internally consistent.
+
+IMPORTANT — final JSON keys:
+  scenario_id (str), name (str), scenario (dict), split_mode_overlay (dict|null),
+  validation_status (str), validation_feedback (list), tool_loop_summary (list), rationale (str).
+The 'scenario' value must be a dict (the parsed mapping), never a YAML string.
 """
