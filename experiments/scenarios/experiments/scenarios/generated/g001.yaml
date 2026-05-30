@@ -1,0 +1,243 @@
+name: urlcc-stress-slice-contention
+description: URLLC stress test with slice resource contention in ULCL topology.
+topology_mode: ulcl
+stress_mode: slice_resource_contention
+target_flow_count: 8
+slice_count: 4
+gnb_count: 3
+upf_count: 2
+ue_count: 12
+app_count: 8
+flow_count: 8
+slice_profiles:
+- id: slice-urllc-1
+  type: URLLC
+  priority: high
+  latency_budget_ms: 10
+  reliability: 99.999%
+  bandwidth_mbps: 50
+- id: slice-urllc-2
+  type: URLLC
+  priority: high
+  latency_budget_ms: 15
+  reliability: 99.99%
+  bandwidth_mbps: 40
+- id: slice-mmtc-1
+  type: mMTC
+  priority: low
+  latency_budget_ms: 1000
+  reliability: 99.0%
+  bandwidth_mbps: 10
+- id: slice-embb-1
+  type: eMBB
+  priority: medium
+  latency_budget_ms: 50
+  reliability: 99.5%
+  bandwidth_mbps: 100
+service_types:
+- URLLC
+- mMTC
+- eMBB
+app_families:
+- URLLC-RealTimeControl
+- mMTC-SensorStream
+- eMBB-VideoStream
+free5gc_mode: split
+ns3_scratch: scratch/5g-urllc-contention.cc
+gNBs:
+- id: gnb-1
+  location: edge
+  slice_ids:
+  - slice-urllc-1
+  - slice-urllc-2
+- id: gnb-2
+  location: edge
+  slice_ids:
+  - slice-urllc-1
+  - slice-mmtc-1
+- id: gnb-3
+  location: core
+  slice_ids:
+  - slice-embb-1
+  - slice-urllc-2
+UPFs:
+- id: upf-1
+  location: edge
+  slice_ids:
+  - slice-urllc-1
+  - slice-mmtc-1
+- id: upf-2
+  location: core
+  slice_ids:
+  - slice-urllc-2
+  - slice-embb-1
+UEs:
+- id: ue-1
+  slice_id: slice-urllc-1
+  app_family: URLLC-RealTimeControl
+  flow_ids:
+  - flow-1
+- id: ue-2
+  slice_id: slice-urllc-1
+  app_family: URLLC-RealTimeControl
+  flow_ids:
+  - flow-2
+- id: ue-3
+  slice_id: slice-urllc-2
+  app_family: URLLC-RealTimeControl
+  flow_ids:
+  - flow-3
+- id: ue-4
+  slice_id: slice-urllc-2
+  app_family: URLLC-RealTimeControl
+  flow_ids:
+  - flow-4
+- id: ue-5
+  slice_id: slice-mmtc-1
+  app_family: mMTC-SensorStream
+  flow_ids:
+  - flow-5
+- id: ue-6
+  slice_id: slice-mmtc-1
+  app_family: mMTC-SensorStream
+  flow_ids:
+  - flow-6
+- id: ue-7
+  slice_id: slice-embb-1
+  app_family: eMBB-VideoStream
+  flow_ids:
+  - flow-7
+- id: ue-8
+  slice_id: slice-embb-1
+  app_family: eMBB-VideoStream
+  flow_ids:
+  - flow-8
+- id: ue-9
+  slice_id: slice-urllc-1
+  app_family: URLLC-RealTimeControl
+  flow_ids:
+  - flow-1
+- id: ue-10
+  slice_id: slice-urllc-2
+  app_family: URLLC-RealTimeControl
+  flow_ids:
+  - flow-3
+- id: ue-11
+  slice_id: slice-mmtc-1
+  app_family: mMTC-SensorStream
+  flow_ids:
+  - flow-5
+- id: ue-12
+  slice_id: slice-embb-1
+  app_family: eMBB-VideoStream
+  flow_ids:
+  - flow-7
+Apps:
+- id: app-1
+  family: URLLC-RealTimeControl
+  traffic_model: constant_bitrate
+  bitrate_kbps: 50000
+  packet_size_bytes: 100
+- id: app-2
+  family: URLLC-RealTimeControl
+  traffic_model: constant_bitrate
+  bitrate_kbps: 50000
+  packet_size_bytes: 100
+- id: app-3
+  family: URLLC-RealTimeControl
+  traffic_model: constant_bitrate
+  bitrate_kbps: 50000
+  packet_size_bytes: 100
+- id: app-4
+  family: URLLC-RealTimeControl
+  traffic_model: constant_bitrate
+  bitrate_kbps: 50000
+  packet_size_bytes: 100
+- id: app-5
+  family: mMTC-SensorStream
+  traffic_model: bursty
+  bitrate_kbps: 1000
+  packet_size_bytes: 50
+- id: app-6
+  family: mMTC-SensorStream
+  traffic_model: bursty
+  bitrate_kbps: 1000
+  packet_size_bytes: 50
+- id: app-7
+  family: eMBB-VideoStream
+  traffic_model: variable_bitrate
+  bitrate_kbps: 100000
+  packet_size_bytes: 1500
+- id: app-8
+  family: eMBB-VideoStream
+  traffic_model: variable_bitrate
+  bitrate_kbps: 100000
+  packet_size_bytes: 1500
+Flows:
+- id: flow-1
+  source_ue_id: ue-1
+  dest_upf_id: upf-1
+  app_id: app-1
+  slice_id: slice-urllc-1
+  priority: high
+  expected_latency_ms: 8
+  expected_reliability: 99.999%
+- id: flow-2
+  source_ue_id: ue-2
+  dest_upf_id: upf-1
+  app_id: app-2
+  slice_id: slice-urllc-1
+  priority: high
+  expected_latency_ms: 8
+  expected_reliability: 99.999%
+- id: flow-3
+  source_ue_id: ue-3
+  dest_upf_id: upf-2
+  app_id: app-3
+  slice_id: slice-urllc-2
+  priority: high
+  expected_latency_ms: 12
+  expected_reliability: 99.99%
+- id: flow-4
+  source_ue_id: ue-4
+  dest_upf_id: upf-2
+  app_id: app-4
+  slice_id: slice-urllc-2
+  priority: high
+  expected_latency_ms: 12
+  expected_reliability: 99.99%
+- id: flow-5
+  source_ue_id: ue-5
+  dest_upf_id: upf-1
+  app_id: app-5
+  slice_id: slice-mmtc-1
+  priority: low
+  expected_latency_ms: 900
+  expected_reliability: 99.0%
+- id: flow-6
+  source_ue_id: ue-6
+  dest_upf_id: upf-1
+  app_id: app-6
+  slice_id: slice-mmtc-1
+  priority: low
+  expected_latency_ms: 900
+  expected_reliability: 99.0%
+- id: flow-7
+  source_ue_id: ue-7
+  dest_upf_id: upf-2
+  app_id: app-7
+  slice_id: slice-embb-1
+  priority: medium
+  expected_latency_ms: 45
+  expected_reliability: 99.5%
+- id: flow-8
+  source_ue_id: ue-8
+  dest_upf_id: upf-2
+  app_id: app-8
+  slice_id: slice-embb-1
+  priority: medium
+  expected_latency_ms: 45
+  expected_reliability: 99.5%
+policy_gateway:
+  healthcheck_url: /policy-executions/launch-healthcheck
+  timeout_seconds: 30

@@ -8,6 +8,7 @@ import re
 from typing import Any, Iterable, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.utils.json import parse_partial_json
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -334,6 +335,48 @@ class StructuredToolLoop:
             status="error",
         )
 
+    @staticmethod
+    def _recover_invalid_tool_calls(invalid_tool_calls: Iterable[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        recovered: list[dict[str, Any]] = []
+        unrecovered: list[dict[str, Any]] = []
+        for raw_call in invalid_tool_calls:
+            if not isinstance(raw_call, dict):
+                unrecovered.append({"raw": raw_call, "error": "invalid tool call payload must be a dict"})
+                continue
+            tool_name = str(raw_call.get("name") or "").strip()
+            raw_args = raw_call.get("args")
+            if not tool_name:
+                unrecovered.append(dict(raw_call))
+                continue
+            if isinstance(raw_args, dict):
+                recovered.append(
+                    {
+                        "id": raw_call.get("id"),
+                        "name": tool_name,
+                        "args": raw_args,
+                    }
+                )
+                continue
+            if not isinstance(raw_args, str) or not raw_args.strip():
+                unrecovered.append(dict(raw_call))
+                continue
+            try:
+                parsed_args = parse_partial_json(raw_args)
+            except Exception:
+                unrecovered.append(dict(raw_call))
+                continue
+            if not isinstance(parsed_args, dict):
+                unrecovered.append(dict(raw_call))
+                continue
+            recovered.append(
+                {
+                    "id": raw_call.get("id"),
+                    "name": tool_name,
+                    "args": parsed_args,
+                }
+            )
+        return recovered, unrecovered
+
     def invoke(
         self,
         payload: dict[str, Any],
@@ -368,10 +411,14 @@ class StructuredToolLoop:
                     raise TypeError(f"Expected AIMessage from model, got {type(ai_message).__name__}")
                 output_messages.append(ai_message)
                 conversation.append(ai_message)
+                tool_calls = list(getattr(ai_message, "tool_calls", None) or [])
                 if ai_message.invalid_tool_calls:
-                    raise RuntimeError(f"Model produced invalid tool calls: {ai_message.invalid_tool_calls}")
-
-                tool_calls = getattr(ai_message, "tool_calls", None) or []
+                    recovered_tool_calls, unrecovered_tool_calls = self._recover_invalid_tool_calls(
+                        ai_message.invalid_tool_calls
+                    )
+                    tool_calls.extend(recovered_tool_calls)
+                    if unrecovered_tool_calls:
+                        raise RuntimeError(f"Model produced invalid tool calls: {unrecovered_tool_calls}")
                 if tool_calls:
                     for tool_call in tool_calls:
                         if not isinstance(tool_call, dict):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from .prompts import ENVIRONMENT_AGENT_SYSTEM_PROMPT
 from .tools import build_environment_tools
 
 from shared.agents import BaseAgent, coerce_structured_response
+from shared.logging import log_event, log_timing
 from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, ToolLoopExecutionError
 
 
@@ -105,6 +107,13 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         snapshot_id: str = "",
     ) -> ScenarioCandidate:
         self.ensure_worker_runtime_initialized()
+        total_start = time.perf_counter()
+        log_event(
+            self.logger,
+            "environment_generate_start",
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+        )
         prompt = self.compiler.build_generation_prompt(request)
         prompt = (
             f"{prompt}\n\n"
@@ -132,6 +141,15 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         try:
             result = self.agent.invoke(payload, context=runtime_context)
         except Exception as exc:
+            self.logger.exception(f"Failed to generate environment candidate: {exc}")
+            log_timing(
+                self.logger,
+                "environment_total",
+                time.perf_counter() - total_start,
+                status="error",
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+            )
             if isinstance(exc, ToolLoopExecutionError):
                 raise RuntimeError(f"Environment generation advisor failed: {exc}") from exc
             raise
@@ -148,7 +166,24 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         )
         report = self.compiler.validate_candidate(candidate)
         if not report.ok:
+            log_timing(
+                self.logger,
+                "environment_total",
+                time.perf_counter() - total_start,
+                status="error",
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+            )
             raise RuntimeError("Environment advisor returned invalid scenario: " + json.dumps(report.errors, ensure_ascii=False))
+        log_timing(
+            self.logger,
+            "environment_total",
+            time.perf_counter() - total_start,
+            status="success",
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            scenario_id=candidate.scenario_id,
+        )
         return candidate
 
 

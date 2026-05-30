@@ -5,6 +5,8 @@ from typing import Any, Dict
 
 from ..prompt_skills.knowledge_search import OSA_KNOWLEDGE_SEARCH_SKILL
 
+from ..prompt_skills.knowledge_search import OSA_KNOWLEDGE_SEARCH_SKILL
+
 
 OSA_CORE_PROMPT = """
 You are the Optimization Strategy Advisor for a 5G PCF control system.
