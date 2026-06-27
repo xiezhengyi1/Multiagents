@@ -217,6 +217,12 @@ def parse_args() -> argparse.Namespace:
         dest="use_deepseek",
         help="Use deepseek-v4-flash for all agents (Ours variants only).",
     )
+    parser.add_argument(
+        "--qwen",
+        action="store_true",
+        dest="use_qwen",
+        help="Use qwen3-30b-a3b-instruct for single-agent methods.",
+    )
     return parser.parse_args()
 
 
@@ -382,6 +388,8 @@ def main() -> None:
                             ]
                         if args.use_deepseek:
                             run_method_cmd.append("--deepseek")
+                        if args.use_qwen:
+                            run_method_cmd.append("--qwen")
                         stdout = _run_command(
                             run_method_cmd,
                             label=f"run {experiment_id}/{scenario_id}/{method_id}",

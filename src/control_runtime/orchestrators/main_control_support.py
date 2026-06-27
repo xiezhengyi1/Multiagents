@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent_runtime.core.context_policy import ContextPolicy
+from shared.runtime import ContextPolicy
 
 from ..agents.dispatch.contracts import FeedbackReport
 from ..domain.collaboration import DomainNegotiationRequest, ExecutionReentryRequest, PlanningBlockerReport, PlanningContext

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
@@ -334,6 +335,7 @@ def collect_workflow_trajectories(
         preview = str(record["user_input"]).replace("\n", " ")[:120]
         print(f"[{record['record_index']}/{total}] workflow start: {preview}", flush=True)
 
+        run_started_at = time.perf_counter()
         try:
             run_result = orchestrator.run(
                 str(record["user_input"]),
@@ -401,6 +403,7 @@ def collect_workflow_trajectories(
                 flush=True,
             )
 
+        result_record["elapsed_ms"] = round((time.perf_counter() - run_started_at) * 1000, 3)
         results.append(result_record)
         _write_jsonl_incremental(result_output, result_record)
 

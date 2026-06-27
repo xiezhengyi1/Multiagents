@@ -156,21 +156,20 @@ def stringify_message_content(value: Any) -> str:
 # ── Tool Spec & Extraction ─────────────────────────────────────
 
 
-_TOOL_CAPABILITY_ALIASES: Dict[str, List[str]] = {
-    "get_sm_ue_context": ["sm_ue_context"],
-    "get_sm_ue_flow_catalog": ["sm_flow_catalog"],
-    "get_ue_flow_catalog": ["sm_flow_catalog"],
-    "search_sm_flow_targets": ["sm_flow_target_resolution"],
-    "search_flow_targets_by_name": ["sm_flow_target_resolution"],
-    "get_am_policy_context": ["am_policy_context"],
-    "search_am_policy_targets": ["am_policy_target_resolution"],
-    "preview_qos_optimizer": ["optimizer_counterfactual", "qos_runtime_evidence"],
-    "preview_optimizer": ["optimizer_counterfactual", "qos_runtime_evidence"],
-    "fetch_qos_network_status": ["qos_runtime_evidence"],
-    "fetch_network_status": ["qos_runtime_evidence"],
-    "inspect_mobility_ue_policies": ["ue_policy_context", "mobility_policy_context"],
-    "inspect_ue_policies": ["ue_policy_context", "mobility_policy_context"],
-}
+# Empty by default — application-layer 6G-specific tool names are injected via
+# control_runtime at startup. Keeping the map here preserves backward compat
+# during migration; new code should pass capability_aliases explicitly.
+_TOOL_CAPABILITY_ALIASES: Dict[str, List[str]] = {}
+
+
+def register_capability_aliases(aliases: Dict[str, List[str]]) -> None:
+    """Register application-layer tool capability aliases at startup.
+
+    Called once by the control-runtime layer to inject 6G-specific tool names
+    without hardcoding them in the generic runtime library.
+    """
+    _TOOL_CAPABILITY_ALIASES.clear()
+    _TOOL_CAPABILITY_ALIASES.update(aliases)
 
 
 def resolve_tool_capabilities(tool_name: str) -> List[str]:
@@ -248,3 +247,19 @@ def extract_tool_results(messages: Iterable[Any]) -> List[Dict[str, Any]]:
             }
         )
     return results
+
+
+__all__ = [
+    "build_tool_specs",
+    "extract_tool_calls",
+    "extract_tool_results",
+    "format_tool_call",
+    "format_tool_result",
+    "json_friendly",
+    "normalize_message_role",
+    "register_capability_aliases",
+    "resolve_tool_capabilities",
+    "serialize_base_model_schema",
+    "serialize_message",
+    "stringify_message_content",
+]

@@ -1,3 +1,10 @@
+"""Project agent runtime traces into training-specific data formats.
+
+Moved from ``agent_runtime/trace/projectors.py`` because this module depends on
+``training.schemas`` (application layer), creating a reverse dependency from the
+generic runtime library.  It belongs in the training layer.
+"""
+
 from __future__ import annotations
 
 import json

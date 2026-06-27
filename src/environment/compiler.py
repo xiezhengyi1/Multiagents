@@ -54,6 +54,7 @@ class EnvironmentAgentCompiler:
         errors.extend(self._validate_root_fields(scenario))
         if errors:
             return EnvironmentValidationReport(candidate.scenario_id, ok=False, errors=tuple(errors))
+        self._validate_loader_contract(scenario, errors)
 
         slice_labels = self._collect_unique_strings(scenario.get("slices"), "label", errors, "slice")
         upf_names = self._collect_unique_strings(scenario.get("upfs"), "name", errors, "upf")
@@ -63,8 +64,15 @@ class EnvironmentAgentCompiler:
         app_ids = self._collect_unique_strings(scenario.get("apps"), "app_id", errors, "app")
         flow_ids = self._collect_unique_strings(scenario.get("flows"), "flow_id", errors, "flow")
 
+        gnb_slice_map: dict[str, set[str]] = {}
+        for gnb in scenario.get("gnbs") or []:
+            if isinstance(gnb, dict):
+                name = str(gnb.get("name") or "").strip()
+                if name:
+                    gnb_slice_map[name] = {str(s) for s in (gnb.get("slices") or []) if str(s).strip()}
+
         self._validate_gnbs(scenario.get("gnbs") or [], slice_labels, upf_names, errors)
-        self._validate_ues(scenario.get("ues") or [], slice_labels, gnb_names, app_ids, errors)
+        self._validate_ues(scenario.get("ues") or [], slice_labels, gnb_names, gnb_slice_map, app_ids, errors)
         self._validate_apps(scenario.get("apps") or [], ue_names, ue_supis, flow_ids, errors)
         self._validate_flows(scenario.get("flows") or [], slice_labels, ue_names, ue_supis, app_ids, errors)
         self._validate_capacity(scenario, errors, warnings)
@@ -86,6 +94,74 @@ class EnvironmentAgentCompiler:
             if field in scenario and not isinstance(scenario.get(field), list):
                 errors.append(f"root field {field} must be a list")
         return errors
+
+    @staticmethod
+    def _validate_loader_contract(scenario: dict[str, Any], errors: list[str]) -> None:
+        for item in scenario.get("slices") or []:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "<unknown>").strip()
+            try:
+                if isinstance(item.get("sst"), bool):
+                    raise ValueError
+                sst = int(item["sst"])
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"slice {label} field sst must be an integer")
+                sst = None
+            sd = str(item.get("sd") or "").strip()
+            if not sd:
+                errors.append(f"slice {label} missing field sd")
+            if sst is not None and sd:
+                derived_identifier = f"slice-{sst}-{sd.lower()}"
+                if label != derived_identifier:
+                    errors.append(
+                        f"slice label {label} must equal derived identifier {derived_identifier}"
+                    )
+            resource = item.get("resource")
+            if not isinstance(resource, dict):
+                errors.append(f"slice {label} resource must be a mapping")
+            else:
+                for field in (
+                    "capacity_dl_mbps",
+                    "capacity_ul_mbps",
+                    "guaranteed_dl_mbps",
+                    "guaranteed_ul_mbps",
+                ):
+                    if field not in resource:
+                        errors.append(f"slice {label} resource missing field {field}")
+
+        for item in scenario.get("ues") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "<unknown>").strip()
+            for field in ("key", "op"):
+                if not str(item.get(field) or "").strip():
+                    errors.append(f"UE {name} missing field {field}")
+            if not isinstance(item.get("free5gc_policy"), dict):
+                errors.append(f"UE {name} free5gc_policy must be a mapping")
+            sessions = item.get("sessions")
+            if not isinstance(sessions, list) or not sessions:
+                errors.append(f"UE {name} sessions must be a non-empty list")
+                continue
+            for session in sessions:
+                if not isinstance(session, dict):
+                    errors.append(f"UE {name} session must be a mapping")
+                    continue
+                for field in ("slice_ref", "app_id"):
+                    if not str(session.get(field) or "").strip():
+                        errors.append(f"UE {name} session missing field {field}")
+
+        for section, fields in (
+            ("free5gc", ("compose_file", "config_root")),
+            ("ns3", ("ns3_root",)),
+        ):
+            payload = scenario.get(section)
+            if not isinstance(payload, dict):
+                errors.append(f"{section} must be a mapping")
+                continue
+            for field in fields:
+                if not str(payload.get(field) or "").strip():
+                    errors.append(f"{section} missing field {field}")
 
     @staticmethod
     def _collect_unique_strings(
@@ -130,6 +206,7 @@ class EnvironmentAgentCompiler:
         ues: Iterable[dict[str, Any]],
         slice_labels: set[str],
         gnb_names: set[str],
+        gnb_slice_map: dict[str, set[str]],
         app_ids: set[str],
         errors: list[str],
     ) -> None:
@@ -152,6 +229,15 @@ class EnvironmentAgentCompiler:
                     errors.append(f"UE {name} session references missing slice_ref {slice_ref}")
                 if app_id and app_id not in app_ids:
                     errors.append(f"UE {name} session references missing app_id {app_id}")
+            # Cross-reference: UE's attached gNB must serve the slices in the UE's sessions
+            if gnb in gnb_slice_map:
+                for session in ue.get("sessions") or []:
+                    session_slice = str(session.get("slice_ref") or "").strip()
+                    if session_slice and session_slice not in gnb_slice_map[gnb]:
+                        errors.append(
+                            f"UE {name} attached to gNB {gnb} uses session slice {session_slice} "
+                            "not advertised by that gNB"
+                        )
 
     @staticmethod
     def _validate_apps(
@@ -236,3 +322,6 @@ class EnvironmentAgentCompiler:
         for field in self.REQUIRED_OVERLAY_FIELDS:
             if field not in overlay:
                 errors.append(f"split_mode_overlay missing field {field}")
+        for section in ("ns3", "runtime", "radio"):
+            if section in overlay and not isinstance(overlay.get(section), dict):
+                errors.append(f"split_mode_overlay {section} must be a mapping")

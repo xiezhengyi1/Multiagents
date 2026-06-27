@@ -5,16 +5,23 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 from agent_runtime.trace.models import RunTreeTraceRecord
-from agent_runtime.trace.projectors import project_trace_to_training_trace
+from training.trace_projectors import project_trace_to_training_trace
 from training.common import load_trace_records
 from training.schemas import ChatmlSftRecord, DatasetMessage, ProjectedTraceRecord, WorkflowTrajectoryRecord
 
 COLLABORATION_AGENT_NAMES: tuple[str, ...] = (
+    "autonomous_requirement_agent",
     "intent_encoding",
     "optimization_strategy",
     "policy_dispatch",
 )
-WORKFLOW_AGENT_NAMES: tuple[str, ...] = ("main_control", *COLLABORATION_AGENT_NAMES)
+WORKFLOW_AGENT_NAMES: tuple[str, ...] = (
+    "autonomous_requirement_agent",
+    "main_control",
+    "intent_encoding",
+    "optimization_strategy",
+    "policy_dispatch",
+)
 
 
 def read_jsonl_objects(path: Path) -> List[Dict[str, Any]]:

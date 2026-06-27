@@ -93,7 +93,7 @@ class ScenarioDraftStore:
             "status": "ok",
             "section": section,
             "payload": deepcopy(self.sections.get(section)),
-            "draft": self.summary(),
+            "draft": self.summary(compact=True),
         }
 
     def assemble_candidate(self) -> ScenarioCandidate:
@@ -125,8 +125,8 @@ class ScenarioDraftStore:
             str(Path(split_mode_overlay_path).resolve()) if split_mode_overlay_path else ""
         )
 
-    def summary(self) -> dict[str, Any]:
-        return {
+    def summary(self, compact: bool = False) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "scenario_id": str((self.sections.get("metadata") or {}).get("scenario_id") or ""),
             "completed_sections": list(self.completed_sections),
             "next_section": self.next_section(),
@@ -135,10 +135,23 @@ class ScenarioDraftStore:
                 for section, payload in self.sections.items()
                 if isinstance(payload, list)
             },
-            "reference_ids": self._reference_ids(),
             "validation_passed": self.validation_passed,
             "scenario_path": self.scenario_path,
         }
+        if compact:
+            completed = [s for s in self.completed_sections if s in COLLECTION_ID_KEYS]
+            if completed:
+                last = completed[-1]
+                id_key = COLLECTION_ID_KEYS[last]
+                ids = [
+                    str(item.get(id_key) or "")
+                    for item in self.sections.get(last, [])
+                    if isinstance(item, dict) and str(item.get(id_key) or "")
+                ]
+                result["last_added_ids"] = {last: ids}
+            return result
+        result["reference_ids"] = self._reference_ids()
+        return result
 
     def _reference_ids(self) -> dict[str, list[str]]:
         labels = {

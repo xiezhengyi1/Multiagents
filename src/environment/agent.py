@@ -99,7 +99,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
 
     def __init__(
         self,
-        model_name: str = "qwen3-30b-a3b-instruct-2507",
+        model_name: str = "qwen3.6-flash",
         use_local_model: bool = False,
         *,
         initialize_runtime: bool = True,
@@ -134,6 +134,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                 ),
                 scenario_root=scenario_root or (project_root / "experiments" / "scenarios"),
                 execute_simulator=True,
+                logger=self.logger,
             )
         self.agent = self.create_json_agent(
             tools=self.environment_tools,
@@ -141,11 +142,20 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             response_model=EnvironmentAdvisorOutput,
             max_iterations=32,
             tool_error_mode="return",
-            max_calls_per_tool=5,
+            max_calls_per_tool=8,
             tool_call_limits={
-                "replace_draft_section": 12,
-                "patch_draft_entity": 12,
-                "inspect_draft_section": 8,
+                "replace_draft_section": 20,
+                "patch_draft_entity": 16,
+                "inspect_draft_section": 12,
+                "validate_environment_draft": 10,
+                "write_validated_environment_yaml": 5,
+                "simulate_candidate_environment": 5,
+            },
+            tool_result_limits={
+                "replace_draft_section": 1200,
+                "patch_draft_entity": 1200,
+                "inspect_draft_section": 3000,
+                "validate_environment_draft": 4000,
             },
         )
 
@@ -192,6 +202,9 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             "- Initialize metadata with initialize_environment_draft.\n"
             "- Populate ordered sections with replace_draft_section; use patch_draft_entity and inspect_draft_section only for focused repairs.\n"
             "- Use validate_environment_draft, write_validated_environment_yaml, and simulate_candidate_environment in that order.\n"
+            "- Obey validate_environment_draft repair_plan actions exactly. If a section action is replace_draft_section, replace that complete section in one call instead of patching entities one by one.\n"
+            "- When simulation fails and returns failure_analysis, follow its suggested_section and guidance. Do NOT retry the same data unchanged.\n"
+            "- If simulation fails but the draft appears correct in-memory, use read_back_written_yaml to compare the draft against the file on disk. Look for missing keys, type mismatches, or serialization gaps.\n"
             "- If validation or simulation reports a failure, call record_validation_feedback and produce a revised candidate.\n"
             "- Simulation succeeds only when the real launcher starts, the live graph snapshot exists, the policy gateway is healthy, and SLA initialization passes.\n"
             "- Do not submit a complete scenario mapping during draft mutation or in the final JSON.\n"

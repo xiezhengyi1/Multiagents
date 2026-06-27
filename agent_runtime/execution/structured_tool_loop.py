@@ -265,9 +265,15 @@ class StructuredToolLoop:
             except Exception as exc:
                 last_error = exc
             try:
-                return self._validate_loaded_payload(json.loads(candidate))
+                payload = json.loads(candidate)
             except Exception as exc:
                 last_error = exc
+            else:
+                try:
+                    return self._validate_loaded_payload(payload)
+                except Exception as exc:
+                    last_error = exc
+                    continue
             for index, ch in enumerate(candidate):
                 if ch not in "[{":
                     continue
@@ -499,10 +505,11 @@ class StructuredToolLoop:
                         if self.forbid_duplicate_tool_calls and call_signature in seen_tool_calls:
                             raise RuntimeError(f"Duplicate tool call forbidden: {tool_name}({normalized_args})")
                         next_count = tool_call_counts.get(tool_name, 0) + 1
-                        if self.max_calls_per_tool is not None and next_count > self.max_calls_per_tool:
-                            raise RuntimeError(
-                                f"Tool {tool_name} exceeded max_calls_per_tool={self.max_calls_per_tool}"
-                            )
+                    max_calls_for_tool = self._max_calls_for_tool(tool_name)
+                    if max_calls_for_tool is not None and next_count > max_calls_for_tool:
+                        raise RuntimeError(
+                            f"Tool {tool_name} exceeded max_calls_per_tool={max_calls_for_tool}"
+                        )
                         try:
                             tool_message = self._invoke_tool(
                                 tool_name,

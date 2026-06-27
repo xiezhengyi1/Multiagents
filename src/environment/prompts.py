@@ -26,10 +26,21 @@ Mandatory loop:
 9. If validation or simulation fails, call record_validation_feedback, adjust the
    generation logic, and repeat until one environment succeeds or max attempts is
    reached.
+10. When validate_environment_draft returns repair_plan, obey its action exactly.
+    If a section action is replace_draft_section, replace that complete section in
+    one call. Do not patch its entities one by one.
+11. When simulate_candidate_environment returns failure_analysis, use its
+    suggested_section and guidance to target your repair. Do NOT retry the same
+    data — if the draft already has the expected fields, the issue may be a YAML
+    serialization mismatch. In that case, call read_back_written_yaml to compare
+    the draft against the file the simulator actually reads, then reorder keys
+    or adjust field nesting to match the serialization format.
 
 Do not submit a complete scenario mapping during initialization, replacement, or
 patch calls. Generate and repair only the bounded section needed for the current
 stage. Full YAML assembly is handled by the draft tools.
+Metadata contains only name, scenario_id, tick_ms, and seed. Put free5gc, ns3,
+writer, topology, and bridge under runtime_config.
 
 ## Base Scenario YAML — Required Root Fields
 
@@ -63,6 +74,8 @@ Key reference values (copy real paths from the existing specs):
 
   topology:
     graph_file: graphs/<scenario_id>.yaml
+    # The YAML writer materializes this derived graph file from slices, UPFs,
+    # gNBs, and UEs. Do not retry simulation with the same missing graph path.
 
   bridge:
     enable_inline_harness: true
@@ -73,13 +86,28 @@ Key reference values (copy real paths from the existing specs):
 
 Copy entity shapes from existing specs. Do not invent aliases:
 - Slice entries use `sst`, `sd`, `label`, `resource`, and `qos`.
+- Slice `sst` is an integer. Slice `resource` contains capacity_dl_mbps,
+  capacity_ul_mbps, guaranteed_dl_mbps, and guaranteed_ul_mbps.
 - Slice entries use `label`, never `slice_label`.
+- Slice `label` must equal `slice-<sst>-<sd>` exactly. For example, `sst: 2`
+  and `sd: "000001"` require `label: slice-2-000001`.
 - gNB entries use `name`, `slices`, and `backhaul_upf`.
-- UE entries use `name`, `supi`, `gnb`, `free5gc_policy`, and `sessions`.
+- UE entries use `name`, `supi`, `gnb`, `key`, `op`, `free5gc_policy`, and
+  `sessions`. `free5gc_policy` is a mapping, and each session contains
+  `slice_ref`, `session_ref`, `apn`, and `app_id`.
+- Copy UE `key`, `op`, `op_type`, and `amf` values from an existing scenario.
+  Never use a SUPI as `key`, and never use values such as `add` as `op`.
+- `free5gc_policy` contains `target_gnb` and `preferred_gnbs`; do not invent
+  policy-name keys such as `urlc_policy`.
 - App entries use `app_id`, `name`, `supi`, `ue_name`, and `flow_ids`.
+  **CRITICAL: Every app_id MUST be unique across all apps.** When multiple
+  apps share the same service type (e.g., three Telemedicine apps), append
+  distinct suffixes: app-telemedicine-1, app-telemedicine-2, etc.
 - Flow entries use `flow_id`, `app_id`, `supi`, `ue_name`, `slice_ref`,
   `session_ref`, and `sla_target`.
+  **CRITICAL: Every flow_id MUST be unique across all flows.**
 - gNBs reference slices through `slices`; UE sessions and flows use `slice_ref`.
+- Every UE session `slice_ref` must be advertised by the UE's attached `gnb`.
 - `slice_ref` must equal one slice `label` exactly, for example
   `slice_ref: slice-2-000001`. Never append an APN or any other suffix.
 - Only `session_ref` uses the four-part `<supi>:<app_id>:<slice_label>:<apn>`
@@ -90,6 +118,25 @@ Copy entity shapes from existing specs. Do not invent aliases:
 session_ref must follow the pattern:
   <supi>:<app_id>:<slice_label>:<apn>
 Example: imsi-208930000000008:app-telemedicine:slice-2-000001:internet
+
+## split_mode_overlay Shape
+
+Copy this bounded shape from an existing overlay. The writer rewrites
+base_scenario to the newly generated base YAML:
+  name: <scenario_id>-split
+  scenario_id: <scenario_id>-split
+  base_scenario: ../<generated-base>.yaml
+  ns3:
+    output_subdir: ns3-split
+    scratch_name: nr_multignb_multiupf_split
+    policy_reload_ms: 100
+    activation_poll_ms: 200
+  runtime:
+    startup_timeout_seconds: 180
+    state_poll_ms: 200
+  radio:
+    scheduler_type: pf
+    tdd_pattern: ul_friendly
 
 ## Final JSON Output Format
 
@@ -134,11 +181,21 @@ initialize_environment_draft with metadata only. Populate slices, upfs, gnbs,
 ues, apps, flows, runtime_config, and split_mode_overlay in order using
 replace_draft_section. Use patch_draft_entity for focused repairs and
 inspect_draft_section only when a compact summary is insufficient.
+When validate_environment_draft returns repair_plan, obey its action exactly.
+If a section action is replace_draft_section, replace that complete section in
+one call. Do not patch its entities one by one.
 Do not submit a complete scenario mapping during initialization, replacement,
 or patch calls. Keep all app, flow, UE, session, slice, gNB, and UPF references
 internally consistent.
+**CASCADE RULE: When you change an app_id, you MUST also replace ues and flows
+in the same response because their session_ref / app_id references must match.**
+Metadata contains only name, scenario_id, tick_ms, and seed. Put free5gc, ns3,
+writer, topology, and bridge under runtime_config. Copy the complete
+runtime_config shapes from an existing base scenario.
 Slice entries use `label`, never `slice_label`; gNBs reference labels through
 `slices`, while UE sessions and flows use `slice_ref`.
+Slice `label` must equal `slice-<sst>-<sd>` exactly.
+Every UE session `slice_ref` must be advertised by the UE's attached `gnb`.
 `slice_ref` must equal one slice `label` exactly. Never append `:<apn>` to it.
 Call validate_environment_draft, then write_validated_environment_yaml, then
 simulate_candidate_environment. Do not skip these gates.

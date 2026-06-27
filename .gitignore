@@ -22,6 +22,8 @@ wheels/
 # 运行存储
 experiments/results
 runtime
+docs/
+tmp/
 tests
 training/intent_encoding
 training/main_control

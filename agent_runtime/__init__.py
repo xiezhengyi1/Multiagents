@@ -25,8 +25,6 @@ __all__ = [
     "format_tool_result",
     "json_friendly",
     "normalize_message_role",
-    "project_trace_to_chatml_messages",
-    "project_trace_to_training_trace",
     "runtime_root",
     "serialize_message",
     "stringify_message_content",
@@ -42,9 +40,6 @@ def __getattr__(name: str) -> Any:
         "build_tool_specs",
         "extract_tool_calls",
         "extract_tool_results",
-    }:
-        return getattr(import_module(".tooling", __name__), name)
-    if name in {
         "format_tool_call",
         "format_tool_result",
         "json_friendly",
@@ -57,6 +52,4 @@ def __getattr__(name: str) -> Any:
         return getattr(import_module(".storage", __name__), name)
     if name in {"JsonlTraceWriter", "RunTreeEvent", "RunTreeTraceRecord", "TracedStructuredAgent"}:
         return getattr(import_module(".trace", __name__), name)
-    if name in {"project_trace_to_chatml_messages", "project_trace_to_training_trace"}:
-        return getattr(import_module(".trace.projectors", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

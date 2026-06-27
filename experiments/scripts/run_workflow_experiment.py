@@ -16,6 +16,21 @@ from training.common import processed_dir
 from experiments.scripts.common import write_json
 
 
+def _average_elapsed_ms(results: List[Mapping[str, Any]]) -> float:
+    values: List[float] = []
+    for item in results:
+        value = item.get("elapsed_ms")
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+            continue
+        if isinstance(value, str) and value.strip():
+            try:
+                values.append(float(value))
+            except ValueError:
+                continue
+    return round(sum(values) / len(values), 4) if values else 0.0
+
+
 def _normalize_dispatch_receipts(item: Mapping[str, Any]) -> List[Dict[str, Any]]:
     receipts: List[Dict[str, Any]] = []
     for feedback_name in ("qos_feedback", "mobility_feedback"):
@@ -234,6 +249,7 @@ def summarize_run_results(
         "main_judgement_wrong_cases": main_judgement_wrong_cases,
         "round_count_histogram": dict(sorted(round_histogram.items())),
         "retry_count_histogram": dict(sorted(retry_histogram.items())),
+        "avg_elapsed_ms": _average_elapsed_ms(results),
         "correct_cases": correct_cases,
         "error_cases": error_cases,
         "artifacts": {

@@ -76,6 +76,18 @@ def _extract_failure_type(item: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_elapsed_ms(item: Dict[str, Any]) -> float | str:
+    value = item.get("elapsed_ms")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value)
+        except ValueError:
+            return ""
+    return ""
+
+
 def _append_csv_rows(path: Path, fieldnames: Iterable[str], rows: List[Dict[str, Any]]) -> None:
     with path.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
@@ -121,7 +133,7 @@ def main() -> None:
             "ssi": "",
             "round_count": item.get("round_count", ""),
             "retry_count": item.get("retry_count", ""),
-            "avg_latency_ms": "",
+            "avg_latency_ms": _extract_elapsed_ms(item),
             "execution_status": (
                 (item.get("qos_feedback") or {}).get("execution_status")
                 if isinstance(item.get("qos_feedback"), dict)

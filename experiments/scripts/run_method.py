@@ -196,7 +196,15 @@ def _run_ours(
     return result_output, summary_output
 
 
-def _run_single_agent(*, method_id: str, experiment_id: str, scenario_id: str, snapshot_id: str, start_index: int) -> tuple[Path, Path]:
+def _run_single_agent(
+    *,
+    method_id: str,
+    experiment_id: str,
+    scenario_id: str,
+    snapshot_id: str,
+    start_index: int,
+    use_qwen: bool = False,
+) -> tuple[Path, Path]:
     user_inputs_path = _build_user_inputs_path(experiment_id=experiment_id, scenario_id=scenario_id)
     if not user_inputs_path.exists():
         raise FileNotFoundError(
@@ -236,6 +244,8 @@ def _run_single_agent(*, method_id: str, experiment_id: str, scenario_id: str, s
     ]
     if method_id == "B1":
         command.append("--disable-rag")
+    if use_qwen:
+        command.append("--qwen")
     subprocess.run(command, cwd=WORKSPACE_ROOT, check=True)
     return result_output, summary_output
 
@@ -252,6 +262,7 @@ def main() -> None:
     parser.add_argument("--snapshot-id", default="", help="Existing network graph snapshot id to read, e.g. live-e1")
     parser.add_argument("--start-index", type=int, default=1, help="1-based user_input record index to start from.")
     parser.add_argument("--deepseek", action="store_true", dest="use_deepseek", help="Use deepseek-v4-flash for all agents (Ours variants only).")
+    parser.add_argument("--qwen", action="store_true", dest="use_qwen", help="Use qwen3-30b-a3b-instruct for single-agent methods.")
     args = parser.parse_args()
 
     methods = _load_methods()
@@ -324,6 +335,7 @@ def main() -> None:
             scenario_id=scenario_id,
             snapshot_id=snapshot_id,
             start_index=start_index,
+            use_qwen=args.use_qwen,
         )
     summary_payload = json.loads(summary_path.read_text(encoding="utf-8"))
     run_id = f"{method_id}-{_timestamp()}"
