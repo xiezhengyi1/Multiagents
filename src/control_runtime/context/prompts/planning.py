@@ -3,63 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
+from .engine import PromptEngine
 from .knowledge_search import OSA_KNOWLEDGE_SEARCH_SKILL
-
-
-OSA_CORE_PROMPT = """
-You are the Optimization Strategy Advisor for a 5G PCF control system.
-
-IEA already resolved semantic entities. Treat the incoming OperationIntent as authoritative.
-Your job:
-1. use tools to gather the runtime and optimizer evidence needed for execution,
-2. choose the final executable policy values consistent with that evidence,
-3. output one complete OsaAdvisorOutput JSON object.
-
-Possible request-scoped tools. The actual callable subset for this round is
-listed in the user prompt under "Callable tools in this round"; never call a
-tool that is absent from that callable list.
-- `preview_qos_optimizer`: rerun the optimizer to collect QoS-domain planning evidence.
-- `fetch_qos_network_status`: inspect current QoS-domain slice utilization and capacity.
-- `inspect_mobility_ue_policies`: inspect current UE mobility policy context.
-- `search_semantic_knowledge`: search 3GPP semantics.
-- `get_knowledge_by_key`: fetch exact 3GPP objects.
-
-Domain rules:
-- If QoS is requested, output `sm_policies`.
-- If mobility is requested, output `am_policy`.
-- If both are requested, output both and keep them consistent.
-- QoS-only requests must not call mobility tools or output `am_policy`.
-- Mobility-only requests must not call QoS tools or output `sm_policies`.
-
-Grounding rules:
-- Every final policy value must be supported by tool or runtime evidence.
-- For QoS output, call `preview_qos_optimizer` in this round.
-- For mobility output, call `inspect_mobility_ue_policies` before returning.
-- `fetch_qos_network_status` is supplementary; it does not replace `preview_qos_optimizer`.
-- When `preview_qos_optimizer` returns `objective_breakdown`, prefer `session_cost`, `mobility_cost`, `coupling_cost`.
-- Use optimizer `sla` values over `telemetry` values when filling final policy fields.
-
-Hard rules:
-- Do not invent app_id, flow_id, S-NSSAI, RFSP, or trigger values.
-- Do not fill missing required fields with guesses.
-- Never call a tool that is not listed under "Callable tools in this round".
-- Each tool may be called at most twice per round.
-- Never call the same tool twice with the same arguments in one round.
-- Only the latest visible result for each tool may be retained in context; do not call the tool again to recover earlier evidence.
-- If a tool result adds no new evidence, stop calling tools and finalize from current evidence.
-- Do not rerun `preview_qos_optimizer` or `fetch_qos_network_status` just to reconfirm.
-- An approved optimizer preview with grounded assignments is sufficient evidence to finalize the QoS plan.
-- Rejected optimizer preview is sufficient evidence to stop and return partial_plan or needs_upstream_reground.
-- If the optimizer preview is infeasible, incomplete, or missing grounded assignments, do NOT return `planning_status=\"executable_plan\"`. Return `partial_plan` or `needs_upstream_reground` with blocking reasons.
-- Prefer the smallest executable policy set that satisfies the request.
-- Treat `main_retry_scope`, `revision_requests`, and `unified_constraints` as binding control guidance.
-- Do not suggest `PRA_CH` when the inspected mobility context lacks `presenceAreas`.
-- Treat OperationIntent.flows and qos_target_envelopes as authoritative grounded IEA evidence. If baseline GBR/maxBR/latency values are present there, do not claim they are missing or ask IEA to reground them.
-- If the optimizer preview is infeasible but the target binding and QoS envelope are present, return partial_plan with blocked_targets/planner_conflicts instead of needs_upstream_reground.
-- Do not call knowledge tools to validate local runtime schema fields, local slice labels, or optimizer-selected S-NSSAI assignments. Optimizer/runtime evidence is authoritative for local assignments.
-
-Never return bare policy objects or bare arrays. Always wrap policy items inside the top-level OsaAdvisorOutput object.
-"""
 
 
 OSA_DYNAMIC_RULES = """
@@ -70,7 +15,15 @@ Dynamic planning rules for this round:
 """
 
 
-OSA_SYSTEM_PROMPT = OSA_CORE_PROMPT + OSA_KNOWLEDGE_SEARCH_SKILL
+def _render_system_prompt() -> str:
+    return PromptEngine().render(
+        "planning/system.j2",
+        osa_knowledge_search_skill=OSA_KNOWLEDGE_SEARCH_SKILL,
+    )
+
+
+OSA_SYSTEM_PROMPT = _render_system_prompt()
+OSA_CORE_PROMPT = OSA_SYSTEM_PROMPT
 
 
 _QOS_EXAMPLE = """
@@ -197,25 +150,14 @@ def build_advisor_user_prompt(
     planning_evidence: Dict[str, Any],
     available_tool_names: list[str] | None = None,
 ) -> str:
-    tool_policy = _render_round_tool_policy(available_tool_names)
-    return (
-        "Structured operation intent:\n"
-        f"{json.dumps(normalized_user_intent, ensure_ascii=False)}\n\n"
-        "Planning context:\n"
-        f"{json.dumps(coordination_context, ensure_ascii=False)}\n\n"
-        "Planning evidence:\n"
-        f"{json.dumps(planning_evidence, ensure_ascii=False)}\n\n"
-        f"{tool_policy}\n\n"
-        f"{OSA_DYNAMIC_RULES.strip()}\n\n"
-        "Task:\n"
-        "- Inspect the evidence and return one complete grounded OsaAdvisorOutput.\n"
-        "- If evidence is sufficient, return planning_status=\"executable_plan\" with all required fields grounded.\n"
-        "- If evidence is insufficient or optimizer is infeasible/incomplete, return partial_plan or needs_upstream_reground.\n"
-        "- Respect control_semantics.current_stage; optimize only the active stage flows.\n"
-        "- Prefer optimizer sla values over telemetry values when filling final policy fields.\n\n"
-        + _OUTPUT_FORMAT_RULES
-        + "\n\n"
-        "Return one OsaAdvisorOutput JSON object only."
+    return PromptEngine().render(
+        "planning/user.j2",
+        normalized_user_intent=normalized_user_intent,
+        coordination_context=coordination_context,
+        planning_evidence=planning_evidence,
+        tool_policy=_render_round_tool_policy(available_tool_names),
+        dynamic_rules=OSA_DYNAMIC_RULES.strip(),
+        output_format_rules=_OUTPUT_FORMAT_RULES.strip(),
     )
 
 
@@ -351,3 +293,4 @@ __all__ = [
     "build_advisor_user_prompt",
     "build_validation_retry_prompt",
 ]
+

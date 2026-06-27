@@ -13,7 +13,7 @@ from ...domain.collaboration import PlanningRequest
 from ...integrations.scenario.network_status import get_network_status_summary
 from ...integrations.storage import get_ue_context_by_supi
 
-from .policy_normalizer import json_friendly as _json_friendly
+from .planning_validation import json_friendly as _json_friendly
 
 
 def _pick_first(payload: Dict[str, Any], keys: Iterable[str]) -> Any:

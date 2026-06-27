@@ -18,7 +18,7 @@ from ...domain.collaboration import PlanningContext, PlanningRequest
 from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
 from ...domain.policy_plan import FlowSelector, OperationIntent, PlanningRationale, PolicyDraft, PolicyPlanDraft
 from ...integrations.storage import get_latest_snapshot_metadata
-from ..planning.policy_normalizer import normalize_policy_plan_draft
+from ..planning.planning_validation import normalize_policy_plan_draft
 from ..planning.compiler import OptimizationStrategyCompiler
 from ..planning.tool_result_adapter import extract_planning_tool_evidence
 from .contracts import SingleAgentRoundDecision

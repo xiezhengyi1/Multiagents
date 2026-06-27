@@ -5,6 +5,4 @@ from .base import PromptBuilder
 
 class SinglePromptBuilder(PromptBuilder):
     def system_prompt(self) -> str:
-        from ..single import SINGLE_AGENT_ROUND_PROMPT
-
-        return SINGLE_AGENT_ROUND_PROMPT
+        return self.render_template("single/system.j2")

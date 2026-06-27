@@ -1,0 +1,6 @@
+{% macro no_duplicate_tool_calls() -%}
+Tool discipline:
+- Never call a tool that is absent from the current runtime.
+- Never call the same tool twice with the same effective arguments in one round.
+- Stop tool use once current evidence is sufficient for a valid final JSON object.
+{%- endmacro %}

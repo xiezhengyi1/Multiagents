@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from jinja2 import UndefinedError
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -22,6 +23,15 @@ from control_runtime.context import (
     field,
     project_operation_intent_for_prompt,
 )
+from control_runtime.context.prompts import (
+    GroundingPromptBuilder,
+    MAIN_CONTROL_SYSTEM_PROMPT,
+    OSA_SYSTEM_PROMPT,
+    PlanningPromptBuilder,
+    SINGLE_AGENT_ROUND_PROMPT,
+    SinglePromptBuilder,
+)
+from control_runtime.context.prompts.engine import PromptEngine
 from control_runtime.context.projectors.base import BaseProjector
 from control_runtime.domain.collaboration import PlanningContext, PlanningRequest
 from control_runtime.domain.policy_plan import FlowSelector, OperationIntent, QosTargetEnvelope
@@ -39,6 +49,12 @@ LEGACY_CONTEXT_ENGINEERING_FILES = [
     "src/control_runtime/agents/prompt_skills/knowledge_search.py",
 ]
 
+CONSOLIDATED_AGENT_HELPER_FILES = [
+    "src/control_runtime/agents/grounding/directives.py",
+    "src/control_runtime/agents/grounding/qos_envelope_builder.py",
+    "src/control_runtime/agents/planning/policy_normalizer.py",
+]
+
 LEGACY_IMPORT_PATTERNS = [
     "agents.common.context_projection",
     "agents.grounding.evidence_builder",
@@ -49,12 +65,15 @@ LEGACY_IMPORT_PATTERNS = [
     "agents.main.prompts",
     "agents.single.prompts",
     "agents.prompt_skills.knowledge_search",
+    "agents.grounding.directives",
+    "agents.grounding.qos_envelope_builder",
+    "agents.planning.policy_normalizer",
     "from ..common import project_",
 ]
 
 
 def test_legacy_context_engineering_entrypoints_are_removed() -> None:
-    for legacy_path in LEGACY_CONTEXT_ENGINEERING_FILES:
+    for legacy_path in [*LEGACY_CONTEXT_ENGINEERING_FILES, *CONSOLIDATED_AGENT_HELPER_FILES]:
         assert not (ROOT / legacy_path).exists(), legacy_path
 
     scanned_files = [
@@ -190,8 +209,6 @@ def test_evidence_formatter_matches_planning_evidence_shape() -> None:
 
 
 def test_main_prompt_builder_and_retry_builder_keep_compatibility_contracts() -> None:
-    from control_runtime.context.prompts import MAIN_CONTROL_SYSTEM_PROMPT
-
     assert MainPromptBuilder().system_prompt() == MAIN_CONTROL_SYSTEM_PROMPT
 
     retry_prompt = RetryPromptBuilder().build_main(
@@ -203,3 +220,53 @@ def test_main_prompt_builder_and_retry_builder_keep_compatibility_contracts() ->
     assert "Return exactly one GlobalControlIntent JSON object." in retry_prompt
     assert "Top-level output must be an object, never a list." in retry_prompt
     assert "Required GlobalControlIntent keys" in retry_prompt
+
+
+def test_prompt_engine_raises_for_missing_template_variables() -> None:
+    with pytest.raises(UndefinedError):
+        PromptEngine().render("grounding/system.j2")
+
+
+def test_prompt_builders_render_jinja_templates_as_compatibility_constants() -> None:
+    from control_runtime.context.prompts import IEA_SYSTEM_PROMPT
+
+    assert MainPromptBuilder().system_prompt() == MAIN_CONTROL_SYSTEM_PROMPT
+    assert GroundingPromptBuilder().system_prompt() == IEA_SYSTEM_PROMPT
+    assert PlanningPromptBuilder().system_prompt() == OSA_SYSTEM_PROMPT
+    assert SinglePromptBuilder().system_prompt() == SINGLE_AGENT_ROUND_PROMPT
+
+    for rendered in (
+        MainPromptBuilder().system_prompt(),
+        GroundingPromptBuilder().system_prompt(),
+        PlanningPromptBuilder().system_prompt(),
+        SinglePromptBuilder().system_prompt(),
+    ):
+        assert "Return raw JSON only" in rendered or "Return JSON only" in rendered
+        assert "{% block" not in rendered
+        assert "{% include" not in rendered
+
+
+def test_planning_user_prompt_is_rendered_from_jinja_template() -> None:
+    from control_runtime.context.prompts import OSA_DYNAMIC_RULES
+    from control_runtime.context.prompts.planning import _OUTPUT_FORMAT_RULES, _render_round_tool_policy
+
+    prompt = PlanningPromptBuilder().advisor_user_prompt(
+        normalized_user_intent={"session_id": "s1", "app_id": "app_1"},
+        coordination_context={"active_domains": ["qos"]},
+        planning_evidence={"flows": [{"flow_id": "flow-1"}]},
+        available_tool_names=["preview_qos_optimizer"],
+    )
+
+    engine_rendered = PromptEngine().render(
+        "planning/user.j2",
+        normalized_user_intent={"session_id": "s1", "app_id": "app_1"},
+        coordination_context={"active_domains": ["qos"]},
+        planning_evidence={"flows": [{"flow_id": "flow-1"}]},
+        tool_policy=_render_round_tool_policy(["preview_qos_optimizer"]),
+        dynamic_rules=OSA_DYNAMIC_RULES.strip(),
+        output_format_rules=_OUTPUT_FORMAT_RULES.strip(),
+    )
+
+    assert prompt == engine_rendered
+    assert '"session_id": "s1"' in prompt
+    assert "Callable tools in this round:" in prompt

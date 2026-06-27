@@ -5,9 +5,12 @@ from .base import PromptBuilder
 
 class GroundingPromptBuilder(PromptBuilder):
     def system_prompt(self) -> str:
-        from ..grounding import IEA_SYSTEM_PROMPT
+        from ..knowledge_search import IEA_KNOWLEDGE_SEARCH_SKILL
 
-        return IEA_SYSTEM_PROMPT
+        return self.render_template(
+            "grounding/system.j2",
+            iea_knowledge_search_skill=IEA_KNOWLEDGE_SEARCH_SKILL,
+        )
 
     def dynamic_rules(self) -> str:
         from ..grounding import IEA_DYNAMIC_RULES

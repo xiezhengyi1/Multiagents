@@ -17,7 +17,7 @@ from ...context.prompts import PlanningPromptBuilder, RetryPromptBuilder
 from shared.logging import log_event, log_timing
 
 from .compiler import OptimizationStrategyCompiler
-from .policy_normalizer import normalize_app_id as _normalize_app_id
+from .planning_validation import normalize_app_id as _normalize_app_id
 from .response_models import OsaAdvisorOutput
 from .tool_result_adapter import extract_planning_tool_evidence
 from .tools import build_request_tools

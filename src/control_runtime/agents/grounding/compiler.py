@@ -5,9 +5,15 @@ from typing import Dict, List, Optional
 from ...context.evidence import EvidenceFormatter
 from ...domain.policy_plan import OperationIntent
 from .artifact_compiler import OperationIntentCompiler
-from .common import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS, uses_am_grounding, uses_sm_grounding
+from .common import (
+    AM_GROUNDING_TOOLS,
+    SM_GROUNDING_TOOLS,
+    VALID_DOMAINS,
+    MainDirectiveExtractor,
+    uses_am_grounding,
+    uses_sm_grounding,
+)
 from .contracts import IntentAdvisorDecision, IntentEvidence
-from .directives import MainDirectiveExtractor
 from .validator import IntentGroundingValidator
 
 

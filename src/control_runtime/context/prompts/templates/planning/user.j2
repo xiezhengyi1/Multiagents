@@ -1,0 +1,23 @@
+Structured operation intent:
+{{ normalized_user_intent | json_dumps }}
+
+Planning context:
+{{ coordination_context | json_dumps }}
+
+Planning evidence:
+{{ planning_evidence | json_dumps }}
+
+{{ tool_policy }}
+
+{{ dynamic_rules }}
+
+Task:
+- Inspect the evidence and return one complete grounded OsaAdvisorOutput.
+- If evidence is sufficient, return planning_status="executable_plan" with all required fields grounded.
+- If evidence is insufficient or optimizer is infeasible/incomplete, return partial_plan or needs_upstream_reground.
+- Respect control_semantics.current_stage; optimize only the active stage flows.
+- Prefer optimizer sla values over telemetry values when filling final policy fields.
+
+{{ output_format_rules }}
+
+Return one OsaAdvisorOutput JSON object only.

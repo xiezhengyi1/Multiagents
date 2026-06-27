@@ -1,0 +1,6 @@
+{% macro raw_json_contract(schema_name) -%}
+Output contract:
+- Return raw JSON only.
+- Return exactly one {{ schema_name }} JSON object.
+- Do not wrap the answer in markdown fences or prose.
+{%- endmacro %}

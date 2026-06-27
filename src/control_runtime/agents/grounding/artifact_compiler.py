@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from ...domain.policy_plan import FlowSelector, GroundingEvidenceBundle, OperationIntent
 from .common import (
+    QosEnvelopeBuilder,
     classify_domain_resolution,
     flow_id_is_grounded,
     normalize_domain_evidence,
@@ -13,7 +14,6 @@ from .common import (
 )
 from .control_semantics_grounder import ControlSemanticsGrounder
 from .contracts import FlowCandidateEvidence, IntentAdvisorDecision, IntentEvidence
-from .qos_envelope_builder import QosEnvelopeBuilder
 
 
 class OperationIntentCompiler:

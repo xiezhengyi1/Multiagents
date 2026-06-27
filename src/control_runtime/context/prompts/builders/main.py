@@ -5,9 +5,7 @@ from .base import PromptBuilder
 
 class MainPromptBuilder(PromptBuilder):
     def system_prompt(self) -> str:
-        from ..main import MAIN_CONTROL_SYSTEM_PROMPT
-
-        return MAIN_CONTROL_SYSTEM_PROMPT
+        return self.render_template("main/system.j2")
 
     def dynamic_rules(self) -> str:
         from ..main import MAIN_CONTROL_DYNAMIC_RULES

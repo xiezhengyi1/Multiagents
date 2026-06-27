@@ -7,9 +7,12 @@ from .base import PromptBuilder
 
 class PlanningPromptBuilder(PromptBuilder):
     def system_prompt(self) -> str:
-        from ..planning import OSA_SYSTEM_PROMPT
+        from ..knowledge_search import OSA_KNOWLEDGE_SEARCH_SKILL
 
-        return OSA_SYSTEM_PROMPT
+        return self.render_template(
+            "planning/system.j2",
+            osa_knowledge_search_skill=OSA_KNOWLEDGE_SEARCH_SKILL,
+        )
 
     def advisor_user_prompt(
         self,
@@ -19,11 +22,14 @@ class PlanningPromptBuilder(PromptBuilder):
         planning_evidence: Dict[str, Any],
         available_tool_names: list[str] | None = None,
     ) -> str:
-        from ..planning import build_advisor_user_prompt
+        from ..planning import OSA_DYNAMIC_RULES, _OUTPUT_FORMAT_RULES, _render_round_tool_policy
 
-        return build_advisor_user_prompt(
+        return self.render_template(
+            "planning/user.j2",
             normalized_user_intent=normalized_user_intent,
             coordination_context=coordination_context,
             planning_evidence=planning_evidence,
-            available_tool_names=available_tool_names,
+            tool_policy=_render_round_tool_policy(available_tool_names),
+            dynamic_rules=OSA_DYNAMIC_RULES.strip(),
+            output_format_rules=_OUTPUT_FORMAT_RULES.strip(),
         )
