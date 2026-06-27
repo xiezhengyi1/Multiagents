@@ -46,6 +46,7 @@ class AutonomousMonitorReentryLoop:
             scenario_id=scenario_id,
             scenario_tags=list(scenario_tags or []),
             snapshot_id=snapshot_id,
+            routing_hint=requirement.routing_hint,
         )
         return ReentryLoopResult(
             snapshot_id=snapshot_id,

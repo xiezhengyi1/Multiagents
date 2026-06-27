@@ -7,10 +7,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
 from .control_plane import (
-    AgentConflict,
-    AgentContribution,
     ControlSemantics,
-    HandoffRecord,
     OpenQuestion,
 )
 
@@ -53,7 +50,6 @@ class FlowSelector(BaseModel):
     current_bw_ul: Optional[float] = Field(default=None, description="Current uplink bandwidth in Mbps")
     current_bw_dl: Optional[float] = Field(default=None, description="Current downlink bandwidth in Mbps")
     resolution_status: str = Field(default="resolved", description="Resolution status")
-    resolution_candidates: List[str] = Field(default_factory=list, description="Resolution candidates")
 
 
 class GroundingEvidenceBundle(BaseModel):
@@ -93,8 +89,6 @@ class OperationIntent(BaseModel):
     supi: str = Field(default="", description="UE identifier")
     app_id: Optional[str] = Field(default="", description="Application identifier")
     app_name: Optional[str] = Field(default=None, description="Application name")
-    operation_type: str = Field(default="modify", description="Requested operation type")
-    urgency: str = Field(default="Normal", description="Requested urgency")
     raw_input: str = Field(default="", description="Original user input")
     resolution_status: str = Field(default="", description="Top-level resolution status")
     requested_domains: List[str] = Field(default_factory=list, description="Requested control domains inferred from intent")
@@ -109,9 +103,6 @@ class OperationIntent(BaseModel):
     grounding_evidence: GroundingEvidenceBundle = Field(default_factory=GroundingEvidenceBundle, description="Structured grounding evidence carried forward for traceability")
     flows: List[FlowSelector] = Field(default_factory=list, description="Resolved flow selectors")
     qos_target_envelopes: List[QosTargetEnvelope] = Field(default_factory=list, description="IEA-owned QoS target envelopes derived from grounded baselines")
-    agent_contributions: List[AgentContribution] = Field(default_factory=list, description="Structured multi-agent contribution trace")
-    agent_conflicts: List[AgentConflict] = Field(default_factory=list, description="Structured multi-agent conflict trace")
-    handoff_records: List[HandoffRecord] = Field(default_factory=list, description="Structured handoff trace")
     open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
     @field_validator("domain_evidence", mode="before")
@@ -173,10 +164,7 @@ class PolicyPlanDraft(BaseModel):
     session_id: str = Field(default="", description="Session identifier for deterministic execution")
     snapshot_id: str = Field(default="", description="Snapshot identifier for deterministic execution")
     planning_status: str = Field(default="executable_plan", description="executable_plan, partial_plan, or needs_upstream_reground")
-    planning_basis: Dict[str, Any] = Field(default_factory=dict, description="Structured planning basis and planner-owned reasoning inputs")
-    constraint_sources: Dict[str, Any] = Field(default_factory=dict, description="Structured constraint sources inherited from Main and Mediator")
     optimizer_result: Dict[str, Any] = Field(default_factory=dict, description="Structured optimizer output and cross-domain verdicts")
-    execution_writeback: Dict[str, Any] = Field(default_factory=dict, description="Structured execution writeback patch information")
     planning_rationale: PlanningRationale = Field(default_factory=PlanningRationale, description="Structured rationale for the selected plan")
     all_policies: List[PolicyDraft] = Field(default_factory=list, description="All generated policy drafts")
     partial_policies: List[PolicyDraft] = Field(default_factory=list, description="Partially grounded policy drafts that are not yet executable")
@@ -184,9 +172,6 @@ class PolicyPlanDraft(BaseModel):
     blocked_targets: List[str] = Field(default_factory=list, description="Targets blocked by missing evidence or conflicts")
     upstream_requests: List[str] = Field(default_factory=list, description="Structured requests that must be sent upstream")
     planner_conflicts: List[str] = Field(default_factory=list, description="Planner-side conflicts or infeasibility notes")
-    agent_contributions: List[AgentContribution] = Field(default_factory=list, description="Structured multi-agent contribution trace")
-    agent_conflicts: List[AgentConflict] = Field(default_factory=list, description="Structured multi-agent conflict trace")
-    handoff_records: List[HandoffRecord] = Field(default_factory=list, description="Structured handoff trace")
     open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
 

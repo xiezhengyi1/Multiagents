@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Any, List
 
 from .common import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS, flow_id_is_grounded, mobility_request_mentions_specific_targets
 from .contracts import IntentAdvisorDecision, IntentEvidence
@@ -12,6 +12,7 @@ class IntentGroundingValidator:
         *,
         evidence: IntentEvidence,
         grounding_tools: List[str],
+        decision: IntentAdvisorDecision | None = None,
     ) -> List[str]:
         errors: List[str] = []
         requested_domains = {str(item or "").strip().lower() for item in (evidence.requested_domains or []) if str(item or "").strip()}
@@ -21,10 +22,11 @@ class IntentGroundingValidator:
         if requested_domains == {"qos"} and (used_grounding_tools & AM_GROUNDING_TOOLS):
             errors.append("QoS-only intent must not call AM grounding tools")
         if list(evidence.requested_domains or []) == ["mobility"]:
-            if not evidence.am_context_summary:
+            decision_has_am_context = self._decision_has_grounded_am_policy(decision)
+            if not evidence.am_context_summary and not decision_has_am_context:
                 errors.append("mobility-only intent requires grounded AM policy context before returning final intent")
             if mobility_request_mentions_specific_targets(evidence.user_input):
-                if not evidence.am_policy_candidates:
+                if not evidence.am_policy_candidates and not decision_has_am_context:
                     errors.append(
                         "mobility intent that names association/RFSP/NSSAI/service-area/access targets requires search_am_policy_targets evidence"
                     )
@@ -45,6 +47,22 @@ class IntentGroundingValidator:
         if "qos" in requested_domains and not evidence.candidate_flows and not grounding_tools:
             errors.append("unresolved QoS intent requires at least one grounding tool call")
         return errors
+
+    @staticmethod
+    def _decision_has_grounded_am_policy(decision: IntentAdvisorDecision | None) -> bool:
+        if decision is None:
+            return False
+        mobility_intent: Any = decision.mobility_intent or {}
+        if not isinstance(mobility_intent, dict):
+            return False
+        association_id = str(
+            mobility_intent.get("association_id")
+            or mobility_intent.get("current_association_id")
+            or ""
+        ).strip()
+        rfsp = mobility_intent.get("current_rfsp", mobility_intent.get("rfsp"))
+        allowed_snssais = mobility_intent.get("current_allowed_snssais", mobility_intent.get("allowed_snssais"))
+        return bool(association_id and rfsp is not None and allowed_snssais)
 
     def validate_advisor_decision(
         self,

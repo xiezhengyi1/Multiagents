@@ -23,6 +23,7 @@ def validate_and_compile_intent(
     grounding_errors = compiler.validate_intent_grounding(
         evidence=evidence,
         grounding_tools=grounding_tools,
+        decision=decision,
     )
     if advisor_errors or grounding_errors:
         return list(advisor_errors), list(grounding_errors), None

@@ -57,6 +57,17 @@ def _flow_property_id(properties: Dict[str, Any]) -> str:
     return str(properties.get("flow_id") or properties.get("id") or "").strip()
 
 
+def _binding_from_node_key(node_key: str) -> Dict[str, str]:
+    parts = str(node_key or "").strip().split(":")
+    if len(parts) < 4 or parts[0] != "flow":
+        return {}
+    return {
+        "supi": parts[1].strip(),
+        "app_id": parts[2].strip(),
+        "flow_id": parts[3].strip(),
+    }
+
+
 def _severity(max_ratio: float, violation_count: int) -> str:
     if max_ratio >= 0.50 or violation_count >= 2:
         return "critical"
@@ -192,10 +203,11 @@ class FlowTelemetryMonitor:
         if not violated:
             return None
 
-        flow_id = _flow_property_id(properties)
+        binding_from_key = _binding_from_node_key(node_key)
+        flow_id = _flow_property_id(properties) or binding_from_key.get("flow_id", "")
         flow_name = str(properties.get("flow_name") or properties.get("name") or label or flow_id).strip()
-        supi = str(properties.get("supi") or "").strip()
-        app_id = str(properties.get("app_id") or "").strip()
+        supi = str(properties.get("supi") or binding_from_key.get("supi") or "").strip()
+        app_id = str(properties.get("app_id") or binding_from_key.get("app_id") or "").strip()
         app_name = str(properties.get("app_name") or "").strip()
         alert_id = hashlib.sha1(f"{snapshot_id}|{node_key}|{','.join(sorted(violated))}".encode("utf-8")).hexdigest()[:16]
         severity = _severity(max_ratio, len(violated))

@@ -56,7 +56,6 @@ class MainDirectiveExtractor:
             "routing_decision": str(main_intent.get("routing_decision") or "").strip(),
             "routing_rationale": str(main_intent.get("routing_rationale") or "").strip(),
             "reuse_contract": main_intent.get("reuse_contract") if isinstance(main_intent.get("reuse_contract"), dict) else {},
-            "handoff_expectations": list(main_intent.get("handoff_expectations") or []),
             "intent_encoding_guidance": str(main_intent.get("intent_encoding_guidance") or "").strip(),
             "candidate_flows": candidate_flows,
         }

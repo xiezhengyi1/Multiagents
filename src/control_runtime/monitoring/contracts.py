@@ -102,6 +102,7 @@ class WatchLoopTriggerRecord:
     source_alert_id: str = ""
     previous_context: str = ""
     context_truncated: bool = False
+    routing_hint: Dict[str, Any] = field(default_factory=dict)
     control_result: Any = None
     data_flywheel: Dict[str, Any] = field(default_factory=dict)
 
@@ -113,6 +114,7 @@ class WatchLoopTriggerRecord:
             "source_alert_id": self.source_alert_id,
             "previous_context": self.previous_context,
             "context_truncated": self.context_truncated,
+            "routing_hint": dict(self.routing_hint),
             "control_result": self.control_result,
             "data_flywheel": dict(self.data_flywheel),
         }
@@ -124,6 +126,11 @@ class WatchLoopIterationResult:
     monitor_result: Optional[MonitorResult] = None
     records: List[WatchLoopTriggerRecord] = field(default_factory=list)
     user_input_seen: bool = False
+    pending_monitor_alerts: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def pending_monitor_alert_count(self) -> int:
+        return len(self.pending_monitor_alerts)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -131,4 +138,6 @@ class WatchLoopIterationResult:
             "monitor_result": self.monitor_result.to_dict() if self.monitor_result is not None else None,
             "records": [record.to_dict() for record in self.records],
             "user_input_seen": self.user_input_seen,
+            "pending_monitor_alert_count": self.pending_monitor_alert_count,
+            "pending_monitor_alerts": [dict(alert) for alert in self.pending_monitor_alerts],
         }

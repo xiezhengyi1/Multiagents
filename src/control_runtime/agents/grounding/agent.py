@@ -19,14 +19,16 @@ from ...integrations.pcf import (
     search_am_policy_targets,
     search_sm_flow_targets,
 )
+from ...context.projectors import project_intent_evidence_for_prompt
 from ...domain.policy_plan import OperationIntent
-from ..common import project_intent_evidence_for_prompt, validate_and_compile_intent
+from ...context.prompts import GroundingPromptBuilder, RetryPromptBuilder
+from ..common import validate_and_compile_intent
 from shared.logging import log_event, log_timing
 
 from .compiler import IntentCompiler
 from .common import extract_requested_supis, merge_candidate_dicts, merge_catalog_payloads
 from .contracts import IntentAdvisorDecision, IntentEvidence
-from .prompts import IEA_DYNAMIC_RULES, IEA_SYSTEM_PROMPT
+from ...context.prompts import IEA_DYNAMIC_RULES
 from .tool_result_adapter import extract_grounding_tool_payloads
 
 
@@ -86,9 +88,13 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         ]
         if self.rag_enabled:
             self.tools.extend([search_semantic_knowledge, get_knowledge_by_key])
-        self.advisor_agent = self.create_json_agent(
-            tools=self.tools,
-            system_prompt=IEA_SYSTEM_PROMPT,
+        self.advisor_agent = self._create_advisor_agent(self.tools)
+        self.last_failure_debug: Dict[str, Any] = {}
+
+    def _create_advisor_agent(self, tools: List[Any]) -> Any:
+        return self.create_json_agent(
+            tools=tools,
+            system_prompt=GroundingPromptBuilder().system_prompt(),
             response_model=IntentAdvisorDecision,
             max_iterations=14,
             tool_result_limits={
@@ -114,12 +120,35 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 },
                 recent_tool_results_per_tool=1,
                 tool_history_keep_limits={
+                    "get_sm_ue_flow_catalog": 2,
+                    "get_sm_ue_context": 2,
                     "search_sm_flow_targets": 2,
+                    "get_am_policy_context": 2,
                     "search_am_policy_targets": 2,
+                    "search_semantic_knowledge": 2,
+                    "get_knowledge_by_key": 2,
                 },
             ),
         )
-        self.last_failure_debug: Dict[str, Any] = {}
+
+    @classmethod
+    def _filter_tools_for_domains(cls, tools: List[Any], requested_domains: List[str] | None) -> List[Any]:
+        domains = {
+            str(item.value if hasattr(item, "value") else item or "").strip().lower()
+            for item in (requested_domains or [])
+            if str(item.value if hasattr(item, "value") else item or "").strip()
+        }
+        if not domains:
+            return list(tools)
+        filtered: List[Any] = []
+        for tool in tools:
+            name = str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
+            if name in cls.SM_GROUNDING_TOOLS and "qos" not in domains:
+                continue
+            if name in cls.AM_GROUNDING_TOOLS and "mobility" not in domains:
+                continue
+            filtered.append(tool)
+        return filtered
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> OperationIntent:
         payload = envelope.payload or {}
@@ -242,6 +271,9 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 token_counter=token_counter,
                 trace_metadata=trace_metadata,
             )
+            request_advisor_agent = self._create_advisor_agent(
+                self._filter_tools_for_domains(self.tools, evidence.requested_domains)
+            )
             advisor_prompt = self._build_advisor_prompt(evidence=evidence, context=context)
             advisor_decision = None
             grounding_tools: List[str] = []
@@ -253,6 +285,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     advisor_invocation = self._invoke_intent_advisor(
                         prompt=advisor_prompt,
                         runtime_context=runtime_context,
+                        advisor_agent=request_advisor_agent,
                     )
                 except RuntimeError as exc:
                     invocation_error = str(exc)
@@ -369,7 +402,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     "- This request includes QoS grounding. Final JSON must contain a non-empty flows array.",
                     "- Every resolved QoS flow must include grounded app_id and grounded flow_id.",
                     "- If the current evidence does not already ground the QoS target, keep using SM grounding tools until flows is populated or the target is explicitly unresolved.",
-                    "- Do not stop at selected_app_id / selected_flow_id alone; the grounded binding must appear inside flows.",
+                    "- The grounded binding must appear inside flows.",
                 ]
             )
             if evidence.candidate_flows:
@@ -459,82 +492,11 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         grounding_validation_errors: List[str],
         invocation_error: str,
     ) -> str:
-        issues: List[str] = []
-        if invocation_error:
-            issues.append(invocation_error)
-        if advisor_validation_errors:
-            issues.extend(advisor_validation_errors)
-        if grounding_validation_errors:
-            issues.extend(grounding_validation_errors)
-        repair_rules: List[str] = [
-            "Return one corrected IntentAdvisorDecision JSON object only.",
-            "Do not guess missing identifiers, and do not rely on downstream compilation to fill them.",
-            "Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
-            "`domain_resolution` must be a scalar string, not an object.",
-        ]
-        joined = " | ".join(issues)
-        if "QoS advisor decision must include grounded target flows." in joined:
-            repair_rules.extend([
-                "This retry is specifically failing because your previous JSON omitted flows.",
-                "For the next answer, flows must be non-empty.",
-                "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
-                "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
-                "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return either a resolved or explicitly unresolved flow entry.",
-                "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
-            ])
-        if "domain_resolution must be confirmed, narrowed, widened, or cannot_confirm" in joined:
-            repair_rules.extend([
-                "Set `domain_resolution` to exactly one of: confirmed, narrowed, widened, cannot_confirm.",
-                "Do not output a nested object under `domain_resolution`.",
-            ])
-        if "cannot_confirm domain resolution requires domain_revision_rationale" in joined:
-            repair_rules.extend([
-                "If you set `domain_resolution` to `cannot_confirm`, you must include a non-empty `domain_revision_rationale`.",
-                "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
-            ])
-        if (
-            "explicitly named QoS flow '" in joined
-            and (
-                "was not grounded by catalog/search evidence" in joined
-                or "must appear in advisor decision flows as resolved or unresolved" in joined
-            )
-        ):
-            repair_rules.extend([
-                "For each explicitly named QoS flow, either ground it via catalog/search evidence or leave it unresolved.",
-                "When a flow is resolved, set `flows[].name` to the explicit flow name that the resolved binding satisfies.",
-                "Do not return a resolved flow binding for any name that is missing from catalog/search evidence.",
-            ])
-        if "mobility-only intent must not call SM grounding tools" in joined:
-            repair_rules.extend([
-                "This retry is mobility-only.",
-                "Do not call search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
-            ])
-        if "QoS-only intent must not call AM grounding tools" in joined:
-            repair_rules.extend([
-                "This retry is QoS-only.",
-                "Do not call get_am_policy_context or search_am_policy_targets.",
-            ])
-
-        import re
-        cleaned = re.sub(
-            r'\n\nRetry feedback \(attempt \d+\).*$',
-            '',
-            base_prompt,
-            flags=re.DOTALL,
-        )
-        cleaned = re.sub(
-            r'\n\nYour previous attempt failed validation.*$',
-            '',
-            cleaned,
-            flags=re.DOTALL,
-        )
-
-        return (
-            f"{cleaned}\n\n"
-            "Retry feedback:\n"
-            + "\n".join(f"- {rule}" for rule in repair_rules)
-            + "\n\nValidation errors:\n- "
-            + "\n- ".join(issues)
+        return RetryPromptBuilder().build_grounding(
+            base_prompt=base_prompt,
+            advisor_validation_errors=advisor_validation_errors,
+            grounding_validation_errors=grounding_validation_errors,
+            invocation_error=invocation_error,
         )
 
     def _invoke_intent_advisor(
@@ -542,6 +504,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         *,
         prompt: str,
         runtime_context: Any,
+        advisor_agent: Any | None = None,
     ) -> IntentAdvisorInvocation:
         self._pending_invoke_messages = [{"role": "user", "content": prompt}]
         base_trace_metadata = dict(getattr(runtime_context, "trace_metadata", {}) or {})
@@ -554,7 +517,8 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             },
         }
         try:
-            result = self.advisor_agent.invoke(invoke_payload, context=runtime_context)
+            active_advisor_agent = advisor_agent or self.advisor_agent
+            result = active_advisor_agent.invoke(invoke_payload, context=runtime_context)
         except Exception as exc:
             if isinstance(exc, ToolLoopExecutionError):
                 failed_tool_call = exc.failed_tool_call or {}
@@ -568,7 +532,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             raise RuntimeError(f"IEA advisor invocation failed before structured output validation: {exc}") from exc
         return IntentAdvisorInvocation(
             advisor_result=result,
-            trace_agent=self.advisor_agent,
+            trace_agent=active_advisor_agent,
             trace_payload=invoke_payload,
             runtime_context=runtime_context,
         )
@@ -603,10 +567,10 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         main_directives: Dict[str, Any],
         snapshot_id: str,
     ) -> IntentEvidence:
-        semantic_candidates: List[Dict[str, Any]] = []
-        catalog_payload: Dict[str, Any] = {}
-        am_context_payload: Dict[str, Any] = {}
-        am_policy_candidates: List[Dict[str, Any]] = []
+        semantic_candidates: List[Dict[str, Any]] = list(evidence.semantic_candidates or [])
+        catalog_payload: Dict[str, Any] = dict(evidence.catalog_payload or {})
+        am_context_payload: Dict[str, Any] = dict(evidence.am_context_payload or {})
+        am_policy_candidates: List[Dict[str, Any]] = list(evidence.am_policy_candidates or [])
         requested_domains = list(evidence.requested_domains or [])
         requested_supis = set(extract_requested_supis(evidence.supi, evidence.user_input))
 
@@ -623,7 +587,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             elif tool_name == "get_am_policy_context" and self.compiler.uses_am_grounding(requested_domains):
                 payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
                 if not requested_supis or payload_supi in requested_supis:
-                    am_context_payload = dict(payload)
+                    am_context_payload = {**am_context_payload, **dict(payload)}
             elif tool_name == "search_am_policy_targets" and self.compiler.uses_am_grounding(requested_domains):
                 am_policy_candidates = merge_candidate_dicts(am_policy_candidates, list(payload.get("candidates") or []))
 

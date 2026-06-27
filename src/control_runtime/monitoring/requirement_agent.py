@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Dict
 
@@ -78,22 +79,12 @@ class AutonomousRequirementAgent(BaseAgent):
         user_input = self._normalize_natural_language_response(response)
         if not user_input:
             return None
-        routing_hint = {
-            "source": self.agent_name,
-            "source_alert_id": alert.alert_id,
-            "requested_domains": list(alert.suggested_domains or ["qos"]),
-            "reuse_binding": alert.reuse_binding,
-            "severity": alert.severity,
-            "fuzzy_semantics": self._infer_fuzzy_semantics(alert, user_input),
-            "extra_context": dict(extra_context or {}),
-            "llm_rewritten": True,
-            "llm_output_contract": "natural_language",
-            "data_flywheel": {
-                "trace_type": "monitor_alert_to_synthetic_user_requirement",
-                "source_observation": "network_graph_flow_telemetry",
-                "training_signal": "autonomous_reentry",
-            },
-        }
+        routing_hint = self._build_routing_hint(
+            alert,
+            user_input=user_input,
+            extra_context=extra_context,
+            llm_rewritten=True,
+        )
         return RequirementDraft(
             source_alert_id=alert.alert_id,
             snapshot_id=alert.snapshot_id,
@@ -105,10 +96,33 @@ class AutonomousRequirementAgent(BaseAgent):
     def _normalize_natural_language_response(response: Any) -> str:
         text = str(getattr(response, "content", response) or "").strip()
         if text.startswith("```"):
-            text = text.strip("`")
-            if "\n" in text:
-                text = text.split("\n", 1)[1].strip()
+            lines = text.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        parsed = AutonomousRequirementAgent._extract_user_input_from_json(text)
+        if parsed:
+            return parsed
+        for prefix in ("user_input:", "requirement:", "request:", "需求：", "需求:"):
+            if text.lower().startswith(prefix.lower()):
+                return text[len(prefix) :].strip()
         return text.strip()
+
+    @staticmethod
+    def _extract_user_input_from_json(text: str) -> str:
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("user_input", "requirement", "request", "natural_language_request"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
 
     @staticmethod
     def _infer_fuzzy_semantics(alert: MonitorAlert, user_input: str) -> list[str]:
@@ -124,6 +138,58 @@ class AutonomousRequirementAgent(BaseAgent):
             semantics.append("紧急纠偏")
         return list(dict.fromkeys(semantics))
 
+    def _build_routing_hint(
+        self,
+        alert: MonitorAlert,
+        *,
+        user_input: str,
+        extra_context: Dict[str, Any] | None,
+        llm_rewritten: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "source": self.agent_name,
+            "source_alert_id": alert.alert_id,
+            "requested_domains": list(alert.suggested_domains or ["qos"]),
+            "reuse_binding": alert.reuse_binding,
+            "severity": alert.severity,
+            "monitor_binding": {
+                "supi": alert.supi,
+                "app_id": alert.app_id,
+                "app_name": alert.app_name,
+                "flow_id": alert.flow_id,
+                "flow_name": alert.flow_name,
+            },
+            "violated_metrics": list(alert.violated_metrics),
+            "metric_deltas": dict(alert.metric_deltas),
+            "context_policy": [
+                "preserve_monitor_binding_when_reuse_binding_is_true",
+                "treat_metric_deltas_as_runtime_evidence_not_user_claim",
+                "prefer_qos_parameter_revision_before_regrounding_when_binding_is_stable",
+            ],
+            "fuzzy_semantics": self._infer_fuzzy_semantics(alert, user_input),
+            "extra_context": self._compact_extra_context(extra_context or {}),
+            "llm_rewritten": llm_rewritten,
+            "llm_output_contract": "natural_language",
+            "data_flywheel": {
+                "trace_type": "monitor_alert_to_synthetic_user_requirement",
+                "source_observation": "network_graph_flow_telemetry",
+                "training_signal": "autonomous_reentry",
+            },
+        }
+
+    @staticmethod
+    def _compact_extra_context(extra_context: Dict[str, Any]) -> Dict[str, Any]:
+        compacted: Dict[str, Any] = {}
+        for key, value in extra_context.items():
+            if key == "previous_control_context":
+                text = str(value or "")
+                if text:
+                    compacted["previous_control_context_chars"] = len(text)
+                    compacted["previous_control_context_sha1"] = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+                continue
+            compacted[key] = value
+        return compacted
+
     def _build_prompt(
         self,
         alert: MonitorAlert,
@@ -136,6 +202,8 @@ class AutonomousRequirementAgent(BaseAgent):
             "Rewrite the monitor observation into a natural-language user request in Chinese.\n"
             "The request must sound like a user correcting or refining intent, not like a database record.\n"
             "Preserve explicit SUPI, flow/app names, and the monitor evidence. Do not invent identifiers.\n"
+            "If reuse_binding is true, phrase the request so downstream agents preserve the monitored SUPI/app/flow binding unless runtime evidence proves it stale.\n"
+            "Mention the violated user-facing experience or SLA metric, but keep raw metric tables out of the user sentence.\n"
             "Use fuzzy user-facing semantics when appropriate, such as experience degradation, unstable service, or restore SLA.\n"
             "This agent works with the original multi-agent control system to create a 数据飞轮/data flywheel: monitor alert -> synthetic user requirement -> autonomous reentry trace.\n"
             "不要输出 JSON，不要输出字段名，不要输出解释。只输出一段用户会说的自然语言需求。\n\n"
@@ -163,26 +231,12 @@ class AutonomousRequirementAgent(BaseAgent):
             "重新生成能让该业务流恢复 SLA 的自然语言控制需求；如果只是参数不合适，请优先重调 QoS，"
             "如果证据显示绑定已失效，再回到意图解析重新确认目标。"
         )
-        routing_hint = {
-            "source": self.agent_name,
-            "source_alert_id": alert.alert_id,
-            "requested_domains": list(alert.suggested_domains or ["qos"]),
-            "reuse_binding": alert.reuse_binding,
-            "severity": alert.severity,
-            "fuzzy_semantics": [
-                "用户体验明显变差",
-                "恢复 SLA",
-                "修正上一轮意图",
-            ],
-            "extra_context": dict(extra_context or {}),
-            "llm_rewritten": False,
-            "llm_output_contract": "natural_language",
-            "data_flywheel": {
-                "trace_type": "monitor_alert_to_synthetic_user_requirement",
-                "source_observation": "network_graph_flow_telemetry",
-                "training_signal": "autonomous_reentry",
-            },
-        }
+        routing_hint = self._build_routing_hint(
+            alert,
+            user_input=user_input,
+            extra_context=extra_context,
+            llm_rewritten=False,
+        )
         return RequirementDraft(
             source_alert_id=alert.alert_id,
             snapshot_id=alert.snapshot_id,

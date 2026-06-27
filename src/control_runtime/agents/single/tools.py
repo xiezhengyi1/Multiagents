@@ -8,11 +8,11 @@ from langchain.tools import ToolRuntime
 from shared.runtime import AgentRuntimeContext
 from shared.tools.wrapper_think import tool_with_reason
 
+from ...context.evidence import EvidenceFormatter
 from ...domain.collaboration import PlanningContext, PlanningRequest
 from ...domain.policy_plan import FlowSelector, OperationIntent, QosTargetEnvelope
 from ...integrations.scenario.network_status import get_network_status_summary
 from ...integrations.storage import get_ue_context_by_supi, get_ue_flow_catalog_by_supi
-from ..planning.request_builder import build_joint_optimizer_request
 from ..planning.tools import _serialize_optimizer_result, _summarize_optimizer_result
 
 
@@ -205,13 +205,10 @@ def _build_runtime_planning_request(
         snapshot_id=snapshot_id,
         supi=normalized_supi,
         app_id=str(flows[0].app_id or "").strip() if flows else "",
-        operation_type="modify",
         raw_input="",
-        raw_intent_summary="",
         resolution_status="resolved",
         requested_domains=normalized_domains,
         domain_evidence={},
-        objective_profile_hint=normalized_profile,
         flows=flows,
         qos_target_envelopes=_build_qos_target_envelopes(flows, normalized_profile),
     )
@@ -264,7 +261,7 @@ def build_single_agent_tools(
             snapshot_id=_runtime_snapshot_id(runtime),
         )
         result = run_optimizer(
-            build_joint_optimizer_request(
+            EvidenceFormatter.for_optimizer(
                 planning_request,
                 profile_name=str(objective_profile or "").strip().lower(),
                 template_name="joint_balanced",

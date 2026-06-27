@@ -10,7 +10,7 @@ from knowledge_runtime.retrieval.raw import warmup_knowledge_tool_models
 from shared.memory import MemoryManager
 from agent_runtime.core.token_budget import TokenCounter, TokenBudget
 from agent_runtime.core.context_policy import ContextPolicy
-from ..agents.common import project_global_intent_for_prompt, project_memory_payload
+from ..context.projectors import project_global_intent_for_prompt, project_memory_payload
 
 from ..agents.dispatch import PolicyDispatchAgent
 from ..agents.grounding import IntentEncodingAgent
@@ -274,6 +274,16 @@ class MainControlOrchestrator:
         return report_payload, diagnosis
 
     @staticmethod
+    def _has_supi_scope(global_intent: GlobalControlIntent) -> bool:
+        if str(global_intent.supi or "").strip():
+            return True
+        for stage in global_intent.control_semantics.stages or []:
+            for target in stage.targets or []:
+                if str(target.supi or "").strip():
+                    return True
+        return False
+
+    @staticmethod
     def _build_negotiation_request(operation_intent: OperationIntent, *, round_index: int) -> DomainNegotiationRequest:
         issues = []
         for question in operation_intent.open_questions:
@@ -389,6 +399,7 @@ class MainControlOrchestrator:
         round_index: int,
         scenario_id: str,
         scenario_tags: Optional[List[str]],
+        routing_hint: Optional[Dict[str, Any]],
         memory_context: str,
         feedback_context: str,
         previous_diagnosis: Dict[str, Any],
@@ -420,13 +431,14 @@ class MainControlOrchestrator:
                 previous_negotiation_request=previous_negotiation_request,
                 previous_planning_blocker=previous_planning_blocker,
                 previous_execution_reentry=previous_execution_reentry,
+                external_routing_hint=routing_hint,
             ),
             trace_metadata=trace_metadata,
         )
         if not global_intent.requested_domains:
             raise RuntimeError("Main Agent returned no requested_domains; refusing to infer domains outside the agent.")
-        if not str(global_intent.supi or "").strip():
-            raise RuntimeError("Main Agent returned no SUPI; refusing to patch identifiers outside the agent.")
+        if not self._has_supi_scope(global_intent):
+            raise RuntimeError("Main Agent returned no SUPI scope; refusing to patch identifiers outside the agent.")
         self._remember("MAIN", global_intent)
 
         selected_next_agent = str(global_intent.next_agent or "").strip().lower()
@@ -520,6 +532,7 @@ class MainControlOrchestrator:
         scenario_id: str = "",
         scenario_tags: Optional[List[str]] = None,
         snapshot_id: str = "",
+        routing_hint: Optional[Dict[str, Any]] = None,
     ) -> ControlRoundResult:
         session_id, snapshot_id = start_control_session(step_name="main_control", user_input=user_input, snapshot_id=snapshot_id)
         self.memory_manager.bind_thread(session_id)
@@ -540,7 +553,11 @@ class MainControlOrchestrator:
             memory_context = self._build_memory_context(
                 user_input,
                 diagnosis_hint=str(state.previous_diagnosis.get("root_cause_category") or ""),
-                routing_hint=str((state.previous_mediator_decision or {}).get("status") or ""),
+                routing_hint=(
+                    json.dumps(routing_hint, ensure_ascii=False)
+                    if isinstance(routing_hint, dict) and routing_hint
+                    else str((state.previous_mediator_decision or {}).get("status") or "")
+                ),
             )
             feedback_context = build_feedback_context_from_snapshots(
                 state.rounds,
@@ -556,6 +573,7 @@ class MainControlOrchestrator:
                     round_index=round_index,
                     scenario_id=scenario_id,
                     scenario_tags=scenario_tags,
+                    routing_hint=routing_hint,
                     memory_context=memory_context,
                     feedback_context=feedback_context,
                     previous_diagnosis=state.previous_diagnosis,
@@ -876,6 +894,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=4000,
         help="Maximum previous-control context characters passed to monitor reentry.",
     )
+    parser.add_argument(
+        "--monitor-max-reentries",
+        dest="monitor_max_reentries",
+        type=int,
+        default=1,
+        help="Maximum monitor-triggered autonomous reentries per watch-loop tick.",
+    )
     return parser.parse_args(argv)
 
 
@@ -913,6 +938,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 user_input_source=user_input_source,
                 previous_context_max_chars=args.monitor_context_chars,
                 poll_interval_seconds=args.watch_interval,
+                max_monitor_reentries_per_iteration=args.monitor_max_reentries,
             )
             results = watch_loop.run_forever(
                 max_iterations=args.watch_iterations if args.watch_iterations > 0 else None,

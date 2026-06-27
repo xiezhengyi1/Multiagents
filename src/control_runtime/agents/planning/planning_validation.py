@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 from ...domain.collaboration import PlanningRequest
 from ...domain.control_plane import ControlDomain, DomainStatus
 from ...domain.policy_plan import PolicyPlanDraft
-from .planning_evidence import build_slice_snssai
+from ...context.evidence import build_slice_snssai
 from .policy_normalizer import normalize_app_id as _normalize_app_id
 from .response_models import OsaAdvisorOutput
 
@@ -44,8 +44,22 @@ class PlanningAdvisorValidator:
             errors.append("qos-active planning requires sm_policies")
         if planning_status == "executable_plan" and "mobility" in domains and not has_am:
             errors.append("mobility-active planning requires am_policy")
+        if has_sm:
+            errors.extend(self._validate_sm_policy_qos_bounds(advisor_output.sm_policies))
         optimizer_preview = self._latest_optimizer_preview(normalized_tool_evidence)
         mobility_context = self._latest_mobility_context(normalized_tool_evidence)
+        if (
+            "qos" in domains
+            and planning_status != "executable_plan"
+            and self._optimizer_preview_has_grounded_qos_assignments(
+                optimizer_preview,
+                flow_ids=preserved_flow_ids,
+            )
+        ):
+            errors.append(
+                "approved optimizer preview with grounded QoS assignments must return executable_plan "
+                "with sm_policies; do not request upstream SNSSAI or RAG validation"
+            )
         if has_sm and not optimizer_preview:
             errors.append("sm_policies require a parseable optimizer preview payload")
         elif has_sm:
@@ -85,6 +99,9 @@ class PlanningAdvisorValidator:
         result = payload.get("result")
         if isinstance(result, dict):
             return dict(result)
+        summary = payload.get("summary")
+        if isinstance(summary, dict):
+            return dict(summary)
         if isinstance(payload, dict) and payload.get("status") is not None:
             return payload
         return {}
@@ -94,6 +111,26 @@ class PlanningAdvisorValidator:
         return dict(planning_tool_evidence.get("latest_mobility_context") or {})
 
     @staticmethod
+    def _validate_sm_policy_qos_bounds(sm_policies: List[Any]) -> List[str]:
+        errors: List[str] = []
+        for index, spec in enumerate(sm_policies or []):
+            max_ul = float(getattr(spec, "max_br_ul_mbps", 0.0) or 0.0)
+            max_dl = float(getattr(spec, "max_br_dl_mbps", 0.0) or 0.0)
+            gbr_ul = getattr(spec, "gbr_ul_mbps", None)
+            gbr_dl = getattr(spec, "gbr_dl_mbps", None)
+            if gbr_ul is not None and float(gbr_ul) > max_ul + 1e-9:
+                errors.append(
+                    f"sm_policies[{index}].gbr_ul_mbps must not exceed max_br_ul_mbps "
+                    f"({float(gbr_ul)} > {max_ul})"
+                )
+            if gbr_dl is not None and float(gbr_dl) > max_dl + 1e-9:
+                errors.append(
+                    f"sm_policies[{index}].gbr_dl_mbps must not exceed max_br_dl_mbps "
+                    f"({float(gbr_dl)} > {max_dl})"
+                )
+        return errors
+
+    @staticmethod
     def _validate_optimizer_preview(optimizer_preview: Any) -> None:
         if not isinstance(optimizer_preview, dict) or not optimizer_preview:
             raise ValueError("missing grounded optimizer preview")
@@ -101,7 +138,7 @@ class PlanningAdvisorValidator:
         infeasible_reasons = list(optimizer_preview.get("infeasible_reasons", []) or [])
         qos_plan = optimizer_preview.get("qos_plan") if isinstance(optimizer_preview, dict) else {}
         qos_meta = qos_plan.get("meta") if isinstance(qos_plan, dict) else {}
-        qos_meta_status = str((qos_meta or {}).get("status") or "").strip()
+        qos_meta_status = str(optimizer_preview.get("qos_meta_status") or (qos_meta or {}).get("status") or "").strip()
         if result_status == DomainStatus.INCOMPLETE_CONTEXT.value:
             reason_text = "; ".join(str(item) for item in infeasible_reasons) or "missing required planning context"
             raise ValueError(f"incomplete_context: {reason_text}")
@@ -116,6 +153,20 @@ class PlanningAdvisorValidator:
         except Exception as exc:
             return [str(exc)]
         return []
+
+    def _optimizer_preview_has_grounded_qos_assignments(self, optimizer_preview: Dict[str, Any], *, flow_ids: set[str]) -> bool:
+        if not flow_ids or not optimizer_preview:
+            return False
+        result_status = str(optimizer_preview.get("status") or "").strip().lower()
+        if result_status in {
+            DomainStatus.REJECTED.value,
+            DomainStatus.INCOMPLETE_CONTEXT.value,
+            DomainStatus.FAILED.value,
+        }:
+            return False
+        if self._validate_optimizer_preview_payload(optimizer_preview):
+            return False
+        return all(self._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id) for flow_id in flow_ids)
 
     def _extract_qos_resource_keys(self, joint_result: Any, *, flow_id: str) -> List[str]:
         qos_plan = joint_result.get("qos_plan", {}) if isinstance(joint_result, dict) else {}
@@ -144,6 +195,24 @@ class PlanningAdvisorValidator:
                     continue
                 allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
                 selected_slice = str(allocation.get("current_slice_snssai") or "").strip()
+                if selected_slice:
+                    keys.append(f"slice:{selected_slice}")
+                    snssai = build_slice_snssai(selected_slice)
+                    if snssai is not None:
+                        keys.append(f"snssai:{json.dumps(snssai, sort_keys=True, ensure_ascii=False)}")
+        summary_assignments = joint_result.get("qos_flow_assignments") if isinstance(joint_result, dict) else []
+        if isinstance(summary_assignments, list):
+            for item in summary_assignments:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("flow_id") or item.get("id") or "").strip() != flow_id:
+                    continue
+                selected_slice = str(
+                    item.get("new_slice")
+                    or item.get("current_slice_snssai")
+                    or item.get("slice_snssai")
+                    or ""
+                ).strip()
                 if selected_slice:
                     keys.append(f"slice:{selected_slice}")
                     snssai = build_slice_snssai(selected_slice)

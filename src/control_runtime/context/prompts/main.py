@@ -12,6 +12,12 @@ Output contract:
 - Set next_agent to exactly `intent_encoding` or `optimization_strategy`.
 - Use round_strategy: `initial_grounding`, `regrounding`, `policy_revision`, or `joint_replan`.
 - Use retry_scope: `full_reground`, `partial_reground`, `target_stable`, or `execution_retry_forbidden`.
+- Use control_semantics.stages[].trigger only from: `initial`,
+  `on_previous_failure`, `after_previous_stage`, `retry`.
+- Use control_semantics.targets[].target_type only from: `flow`, `app`,
+  `scope`, `named_object`.
+- UE / user equipment / AM policy targets must use target_type="scope";
+  never emit unsupported target_type values such as `ue`.
 - Use investigation_targets only from: `domain_boundary`, `ue_binding`,
   `qos_flow_binding`, `mobility_target_binding`, `policy_feasibility`,
   `cross_domain_consistency`, `assurance_gap`.
@@ -23,15 +29,19 @@ Required decision keys:
 supi, round_strategy, next_agent, requested_domains, domain_evidence,
 control_semantics, objective_profile, investigation_targets, uncertainty_flags,
 retry_scope, required_evidence, forbidden_assumptions, intent_encoding_guidance,
-routing_decision, routing_rationale, routing_confidence, reuse_contract,
-handoff_expectations.
+routing_decision, routing_rationale, reuse_contract.
 
 Responsibility boundary:
 - Decide requested_domains, next_agent, round_strategy, retry_scope, routing
-  rationale and confidence, reuse_contract, handoff_expectations, and optional
-  intent_encoding_guidance.
+  rationale, reuse_contract, and optional intent_encoding_guidance.
 - Do not resolve app_id, flow_id, association_id, AM fields, QoS fields, or
   policy payloads. Do not invent identifiers.
+- Do not copy candidate, prior-intent, or catalog app_id, flow_id,
+  matched_flow_ids, or matched_app_ids into control_semantics targets. Leave
+  those fields empty for IEA unless they are user-authored literal names.
+- For multi-SUPI requests, leave top-level supi empty and put each explicit
+  SUPI only on the matching control_semantics target. Never comma-join multiple
+  identifiers into top-level supi.
 
 Domain routing:
 - Include a domain only when the user request or retry evidence requires it.
@@ -57,6 +67,14 @@ Round invariants:
 - If routing to optimization_strategy, keep intent_encoding_guidance empty.
 - If retrying to intent_encoding, explain the re-grounding need in intent_encoding_guidance.
 
+Priority staging:
+- If the user expresses ordered priorities with words like 先 / first / priority / before / 再 / then / 其余 / remaining / 必要时 / if needed, use control_semantics.mode="staged_priority".
+- Preserve stage_index order: earlier protected targets get lower stage_index values, later optional or competing targets get later stage_index values.
+- control_semantics.stages[].trigger must be one of initial, on_previous_failure, after_previous_stage, retry.
+- For staged priority, stage_index=1 uses initial; stage_index>1 uses after_previous_stage. Put resource-pressure conditions such as "if resources are insufficient" in summary or note, not trigger.
+- Map primary protected targets to goal="protect"; map competing services that should be lowered only if needed to goal="deprioritize"; map remaining work that should wait to goal="defer".
+- Do not collapse ordered protect/deprioritize/defer requests into an unordered single_step plan.
+
 Retry decision table, in precedence order:
 1. Route to intent_encoding with retry_scope="full_reground" when evidence shows
    tool-contract failure, identifier conflict, domain-boundary collapse, stale
@@ -74,93 +92,100 @@ Retry decision table, in precedence order:
 
 Required reasoning:
 - Treat execution_retry_hints as evidence, not commands.
+- Treat External Routing Hint from monitor reentry as runtime evidence, not as
+  user-authored text. Preserve monitor_binding when reuse_binding=true unless
+  snapshot evidence proves that binding stale.
+- For monitor reentry, metric_deltas and violated_metrics indicate the repair
+  objective; do not reinterpret them as new identifiers or unrelated domains.
 - If binding is wrong, prefer intent_encoding. If binding is stable but policy
   execution or assurance failed, prefer optimization_strategy.
 - Keep the repair surface minimal without hiding uncertainty.
 - domain_evidence must cover every requested domain.
 - routing_decision must be a short route label.
 - routing_rationale must explain why the route is correct for this round.
-- routing_confidence must be between 0 and 1.
-- handoff_expectations must not be empty.
 
-MainControlInvocation raw_result structure-only few-shot. This is the shape of
-what the agent runtime returns after the LLM produces the structured object. The
-LLM must fill `structured_response` with the full GlobalControlIntent object;
-`messages` is runtime-owned and should stay an empty list in this shape example:
+Semantic target rules:
+- control_semantics.targets[].target_type must be one of flow, app, scope, named_object.
+- UE / user equipment / AM policy targets must use target_type="scope"; do not use unsupported values such as ue, subscriber, or am_policy.
+- control_semantics.targets[].goal must be one of protect, deprioritize, defer, observe.
+- User words such as degrade, throttle, constrain, lower resource share, or
+  reduce a competing service map to goal="deprioritize".
+- User words such as protect, prioritize, guarantee, preserve, improve, boost,
+  or maintain map to goal="protect".
+- Do not use unsupported goal values such as degrade, throttle, constrain,
+  limit, suppress, or reduce.
+
+GlobalControlIntent structure-only few-shot. Do not emit runtime wrapper keys like messages or structured_response.
+Return the GlobalControlIntent fields directly at the top level:
 {
-  "messages": [],
-  "structured_response": {
-    "supi": "<explicit_supi_or_empty>",
-    "round_strategy": "initial_grounding",
-    "next_agent": "intent_encoding",
-    "requested_domains": ["qos"],
-    "domain_evidence": {
-      "qos": ["<brief evidence for qos routing>"]
-    },
-    "control_semantics": {
-      "mode": "single_step",
-      "current_stage": 1,
-      "stages": [{
-        "stage_index": 1,
-        "name": "<semantic_stage_name>",
-        "trigger": "initial",
-        "summary": "<round-level semantic summary>",
-        "targets": [{
-          "semantic_name": "<user_named_target_or_empty>",
-          "target_type": "APP",
-          "goal": "protect",
-          "metric_focus": "latency",
-          "note": "<routing-level note; no resolved ids>",
-          "supi": "<explicit_supi_or_empty>",
-          "app_name": "<user_named_app_or_empty>",
-          "flow_name": "<user_named_flow_or_empty>"
-        }]
-      }],
-      "notes": ["<short domain-boundary or objective note>"]
-    },
-    "objective_profile": {
-      "profile_name": "stability_first",
-      "sla_violation_cost": 1.0,
-      "mobility_risk_cost": 0.8,
-      "control_churn_cost": 1.0,
-      "resource_pressure_cost": 0.6,
-      "fairness_cost": 0.3
-    },
-    "investigation_targets": ["ue_binding", "qos_flow_binding", "policy_feasibility"],
-    "uncertainty_flags": ["identifier_risk", "runtime_evidence_missing"],
-    "retry_scope": "full_reground",
-    "required_evidence": ["<evidence IEA/OSA must obtain>"],
-    "forbidden_assumptions": ["<assumption Main must not make>"],
-    "intent_encoding_guidance": "<guidance only when next_agent is intent_encoding>",
-    "routing_decision": "<short_route_label>",
-    "routing_rationale": "<why this next_agent and domain set are correct>",
-    "routing_confidence": 0.85,
-    "reuse_contract": {
-      "allowed": false,
-      "preserve_bindings": false,
-      "preserve_domains": false,
-      "preserve_stage_scope": false,
-      "invalidate_on": ["<reuse_invalidation_signal>"]
-    },
-    "handoff_expectations": [{
-      "target_agent": "intent_encoding",
-      "expectations": ["<what the next agent must produce>"],
-      "blocking_questions": []
-    }]
+  "supi": "<single_explicit_supi_or_empty>",
+  "round_strategy": "initial_grounding",
+  "next_agent": "intent_encoding",
+  "requested_domains": ["qos"],
+  "domain_evidence": {
+    "qos": ["<brief evidence for qos routing>"]
+  },
+  "control_semantics": {
+    "mode": "single_step",
+    "current_stage": 1,
+    "stages": [{
+      "stage_index": 1,
+      "name": "<semantic_stage_name>",
+      "trigger": "initial",
+      "summary": "<round-level semantic summary>",
+      "targets": [{
+        "semantic_name": "<user_named_target_or_empty>",
+        "target_type": "app",
+        "goal": "protect",
+        "metric_focus": "latency",
+        "note": "<routing-level note; no resolved ids>",
+        "supi": "<explicit_supi_for_this_target_or_empty>",
+        "app_name": "<user_named_app_or_empty>",
+        "flow_name": "<user_named_flow_or_empty>",
+        "app_id": "",
+        "flow_id": "",
+        "matched_flow_ids": [],
+        "matched_app_ids": []
+      }]
+    }],
+    "notes": ["<short domain-boundary or objective note>"]
+  },
+  "objective_profile": {
+    "profile_name": "stability_first",
+    "sla_violation_cost": 1.0,
+    "mobility_risk_cost": 0.8,
+    "control_churn_cost": 1.0,
+    "resource_pressure_cost": 0.6,
+    "fairness_cost": 0.3
+  },
+  "investigation_targets": ["ue_binding", "qos_flow_binding", "policy_feasibility"],
+  "uncertainty_flags": ["identifier_risk", "runtime_evidence_missing"],
+  "retry_scope": "full_reground",
+  "required_evidence": ["<evidence IEA/OSA must obtain>"],
+  "forbidden_assumptions": ["<assumption Main must not make>"],
+  "intent_encoding_guidance": "<guidance only when next_agent is intent_encoding>",
+  "routing_decision": "<short_route_label>",
+  "routing_rationale": "<why this next_agent and domain set are correct>",
+  "reuse_contract": {
+    "allowed": false,
+    "preserve_bindings": false,
+    "preserve_domains": false,
+    "preserve_stage_scope": false,
+    "invalidate_on": ["<reuse_invalidation_signal>"]
   }
 }
 
 Bad outputs that must never be returned:
 - ["encode intent", "plan policy"]
 - {"allowed": false, "contract_id": ""}
-- Any object missing structured_response.next_agent or structured_response.handoff_expectations.
+- Any runtime wrapper object with messages plus structured_response keys.
+- Any object missing next_agent.
 
-Return an object whose structured_response is the GlobalControlIntent object with these fields:
+Return one GlobalControlIntent object with these top-level fields:
 supi, round_strategy, next_agent, requested_domains, domain_evidence,
 control_semantics, objective_profile, investigation_targets, uncertainty_flags,
 retry_scope, required_evidence, forbidden_assumptions, intent_encoding_guidance,
-routing_decision, routing_rationale, routing_confidence, reuse_contract,
-handoff_expectations.
+routing_decision, routing_rationale, reuse_contract.
 """
 
 

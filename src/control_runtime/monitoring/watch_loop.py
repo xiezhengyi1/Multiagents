@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Optional
 
 from .contracts import MonitorResult, WatchLoopIterationResult, WatchLoopTriggerRecord
+from .contracts import MonitorAlert
 from .flow_monitor import FlowTelemetryMonitor
 from .requirement_agent import AutonomousRequirementAgent
 
@@ -101,6 +102,7 @@ class AutonomousWatchLoop:
         snapshot_id_source: Optional[Callable[[], str]] = None,
         previous_context_builder: Optional[PreviousContextBuilder] = None,
         poll_interval_seconds: float = 1.0,
+        max_monitor_reentries_per_iteration: int = 1,
     ) -> None:
         self.monitor = monitor
         self.orchestrator = orchestrator
@@ -109,6 +111,9 @@ class AutonomousWatchLoop:
         self.snapshot_id_source = snapshot_id_source or self._default_snapshot_id_source
         self.previous_context_builder = previous_context_builder or PreviousContextBuilder()
         self.poll_interval_seconds = max(0.0, float(poll_interval_seconds))
+        self.max_monitor_reentries_per_iteration = max(1, int(max_monitor_reentries_per_iteration))
+        self._handled_monitor_alert_keys: set[str] = set()
+        self._pending_monitor_alerts: dict[str, dict[str, Any]] = {}
 
     def run_once(
         self,
@@ -168,6 +173,7 @@ class AutonomousWatchLoop:
             monitor_result=monitor_result,
             records=records,
             user_input_seen=bool(raw_user_input),
+            pending_monitor_alerts=list(self._pending_monitor_alerts.values()),
         )
 
     def run_forever(
@@ -209,7 +215,49 @@ class AutonomousWatchLoop:
             prior_context=prior_context,
         )
         records: list[WatchLoopTriggerRecord] = []
+        reentry_count = 0
         for alert in monitor_result.alerts:
+            alert_key = self._alert_lifecycle_key(alert)
+            if alert_key in self._handled_monitor_alert_keys:
+                self._pending_monitor_alerts.pop(alert_key, None)
+                records.append(
+                    WatchLoopTriggerRecord(
+                        trigger_type="monitor_suppressed",
+                        snapshot_id=snapshot_id,
+                        user_input="",
+                        source_alert_id=alert.alert_id,
+                        data_flywheel={
+                            "stage": "monitor_alert_suppressed",
+                            "alert_id": alert.alert_id,
+                            "flow_id": alert.flow_id,
+                            "suppression_reason": "already_reentered",
+                            "alert_lifecycle_key": alert_key,
+                        },
+                    )
+                )
+                continue
+            if reentry_count >= self.max_monitor_reentries_per_iteration:
+                self._pending_monitor_alerts[alert_key] = self._pending_alert_payload(
+                    alert,
+                    alert_lifecycle_key=alert_key,
+                    defer_reason="per_iteration_reentry_limit",
+                )
+                records.append(
+                    WatchLoopTriggerRecord(
+                        trigger_type="monitor_deferred",
+                        snapshot_id=snapshot_id,
+                        user_input="",
+                        source_alert_id=alert.alert_id,
+                        data_flywheel={
+                            "stage": "monitor_alert_deferred",
+                            "alert_id": alert.alert_id,
+                            "flow_id": alert.flow_id,
+                            "suppression_reason": "per_iteration_reentry_limit",
+                            "alert_lifecycle_key": alert_key,
+                        },
+                    )
+                )
+                continue
             requirement = self.requirement_agent.generate_requirement(
                 alert,
                 previous_user_intent=previous_user_intent,
@@ -225,7 +273,11 @@ class AutonomousWatchLoop:
                 scenario_id=scenario_id,
                 scenario_tags=self._merge_tags(scenario_tags, ["monitor_reentry", "data_flywheel"]),
                 snapshot_id=snapshot_id,
+                routing_hint=requirement.routing_hint,
             )
+            self._handled_monitor_alert_keys.add(alert_key)
+            self._pending_monitor_alerts.pop(alert_key, None)
+            reentry_count += 1
             records.append(
                 WatchLoopTriggerRecord(
                     trigger_type="monitor",
@@ -234,17 +286,49 @@ class AutonomousWatchLoop:
                     source_alert_id=alert.alert_id,
                     previous_context=previous_context,
                     context_truncated=context_truncated,
+                    routing_hint=requirement.routing_hint,
                     control_result=control_result,
                     data_flywheel={
                         "stage": "monitor_alert_to_orchestrator_reentry",
                         "alert_id": alert.alert_id,
                         "flow_id": alert.flow_id,
+                        "alert_lifecycle_key": alert_key,
                         "synthetic_requirement": True,
                         "llm_output_contract": "natural_language",
                     },
                 )
             )
         return records
+
+    @staticmethod
+    def _alert_lifecycle_key(alert: MonitorAlert) -> str:
+        binding = [
+            str(alert.supi or "").strip(),
+            str(alert.app_id or "").strip(),
+            str(alert.flow_id or "").strip(),
+        ]
+        metrics = sorted(str(item or "").strip() for item in (alert.violated_metrics or []) if str(item or "").strip())
+        return "|".join([*binding, ",".join(metrics)])
+
+    @staticmethod
+    def _pending_alert_payload(
+        alert: MonitorAlert,
+        *,
+        alert_lifecycle_key: str,
+        defer_reason: str,
+    ) -> dict[str, Any]:
+        return {
+            "alert_id": alert.alert_id,
+            "snapshot_id": alert.snapshot_id,
+            "supi": alert.supi,
+            "app_id": alert.app_id,
+            "flow_id": alert.flow_id,
+            "flow_name": alert.flow_name,
+            "severity": alert.severity,
+            "violated_metrics": list(alert.violated_metrics),
+            "alert_lifecycle_key": alert_lifecycle_key,
+            "defer_reason": defer_reason,
+        }
 
     @staticmethod
     def _merge_tags(base: list[str], additions: list[str]) -> list[str]:
@@ -274,6 +358,7 @@ def build_default_autonomous_watch_loop(
     max_alerts: int = 20,
     previous_context_max_chars: int = 4000,
     poll_interval_seconds: float = 1.0,
+    max_monitor_reentries_per_iteration: int = 1,
 ) -> AutonomousWatchLoop:
     if snapshot_loader is None:
         from ..integrations.storage import get_snapshot_data_by_id
@@ -295,6 +380,7 @@ def build_default_autonomous_watch_loop(
         snapshot_id_source=snapshot_id_source,
         previous_context_builder=PreviousContextBuilder(max_chars=previous_context_max_chars),
         poll_interval_seconds=poll_interval_seconds,
+        max_monitor_reentries_per_iteration=max_monitor_reentries_per_iteration,
     )
 
 

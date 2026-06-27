@@ -1,4 +1,4 @@
-from ..prompt_skills.knowledge_search import IEA_KNOWLEDGE_SEARCH_SKILL
+from .knowledge_search import IEA_KNOWLEDGE_SEARCH_SKILL
 
 IEA_CORE_PROMPT = """
 You are the Intent Advisor inside the Intent Encoding Agent for a 5G policy-control system.
@@ -17,6 +17,8 @@ Grounding rules:
 - Use cached evidence directly when it already grounds the answer.
 - Call tools only when a required target is still ambiguous.
 - Do not invent SUPI, app_id, flow_id, association_id, NSSAI, RFSP, or 3GPP semantics.
+- Exclusion phrases such as "do not change", "do not affect", "leave telemetry alone", "先别动", "不是", or "not" identify non-targets; do not optimize the excluded flow.
+- Descriptive target phrases such as primary business, main service, video-control, or not the ordinary sensor should be grounded to the matching non-excluded catalog/search flow, not to the excluded telemetry or sensor flow.
 
 Tool policy:
 - QoS-only requests must not call AM tools.

@@ -12,10 +12,11 @@ from shared.runtime import ArtifactWorkerMixin
 from ...domain.control_plane import (
     GlobalControlIntent,
     MainRetryScope,
+    MainRoundStrategy,
 )
 from shared.logging import log_event
 
-from .prompts import MAIN_CONTROL_DYNAMIC_RULES, MAIN_CONTROL_SYSTEM_PROMPT
+from ...context.prompts import MAIN_CONTROL_DYNAMIC_RULES, MainPromptBuilder, RetryPromptBuilder
 
 
 @dataclass
@@ -52,7 +53,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         self.tools = []
         self.agent = self.create_json_agent(
             tools=self.tools,
-            system_prompt=MAIN_CONTROL_SYSTEM_PROMPT,
+            system_prompt=MainPromptBuilder().system_prompt(),
             response_model=GlobalControlIntent,
             max_iterations=6,
         )
@@ -131,6 +132,11 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     )
                     continue
                 intent = parsed_intent
+                self._normalize_retry_routing(
+                    intent,
+                    user_input=user_input,
+                    context=context,
+                )
                 invocation_error = ""
                 validation_errors = self._validate_global_intent(
                     intent,
@@ -230,51 +236,10 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _build_validation_retry_prompt(*, base_prompt: str, validation_errors: List[str], invocation_error: str) -> str:
-        issues: List[str] = []
-        if invocation_error:
-            issues.append(invocation_error)
-        if validation_errors:
-            issues.extend(validation_errors)
-
-        cleaned = re.sub(
-            r'\n\nRetry feedback \(attempt \d+\).*$',
-            '',
-            base_prompt,
-            flags=re.DOTALL,
-        )
-        cleaned = re.sub(
-            r'\n\nRetry feedback:.*$',
-            '',
-            cleaned,
-            flags=re.DOTALL,
-        )
-        cleaned = re.sub(
-            r'\n\nYour previous draft failed validation.*$',
-            '',
-            cleaned,
-            flags=re.DOTALL,
-        )
-        required_keys = (
-            "supi, round_strategy, next_agent, requested_domains, domain_evidence, "
-            "control_semantics, objective_profile, investigation_targets, uncertainty_flags, "
-            "retry_scope, required_evidence, forbidden_assumptions, intent_encoding_guidance, "
-            "routing_decision, routing_rationale, routing_confidence, reuse_contract, "
-            "handoff_expectations"
-        )
-
-        return (
-            f"{cleaned}\n\n"
-            "Retry feedback:\n"
-            "Correct the output now.\n"
-            "Return exactly one MainControlInvocation raw_result-shaped JSON object.\n"
-            "Top-level output must be an object, never a list.\n"
-            "Do not return markdown, prose, bullets, arrays, or partial sub-objects.\n"
-            "Put the full GlobalControlIntent object under structured_response.\n"
-            "Use messages=[] in the structure example; do not put routing fields under messages.\n"
-            f"Required structured_response keys: {required_keys}.\n"
-            "If a previous draft was a list, convert the intended route into structured_response.\n"
-            "If a previous draft only contained reuse_contract fields, keep those fields nested under structured_response.reuse_contract and add all missing structured_response routing fields.\n\n"
-            "Validation errors:\n- " + "\n- ".join(issues)
+        return RetryPromptBuilder().build_main(
+            base_prompt=base_prompt,
+            validation_errors=validation_errors,
+            invocation_error=invocation_error,
         )
 
     @staticmethod
@@ -297,6 +262,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         context: str = "",
     ) -> List[str]:
         errors: List[str] = []
+        parsed_context = MainControlAgent._parse_context_payload(context)
         allowed_round_strategies = {"initial_grounding", "regrounding", "policy_revision", "joint_replan"}
         allowed_investigation_targets = {
             "domain_boundary",
@@ -326,10 +292,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         if round_match:
             round_index = int(round_match.group(1))
         else:
-            try:
-                parsed_context = json.loads(str(context or "").strip()) if str(context or "").strip() else {}
-            except Exception:
-                parsed_context = {}
             if isinstance(parsed_context, dict):
                 try:
                     round_index = int(parsed_context.get("round_index") or 0)
@@ -356,6 +318,8 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             explicit_supi = unique_explicit_supis[0]
             if str(intent.supi or "").strip() != explicit_supi:
                 errors.append(f"supi must equal explicit user-provided identifier {explicit_supi}")
+        elif len(unique_explicit_supis) > 1 and str(intent.supi or "").strip():
+            errors.append("top-level supi must not comma-join multiple identifiers; leave it empty for multi-SUPI requests")
         if isinstance(intent.domain_evidence, dict) and any(intent.domain_evidence.values()):
             unknown_domains = [key for key in intent.domain_evidence.keys() if key not in {"qos", "mobility"}]
             if unknown_domains:
@@ -407,12 +371,156 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             errors.append("next_agent=optimization_strategy requires reuse_contract.allowed=true")
         if next_agent == "intent_encoding" and intent.reuse_contract.allowed:
             errors.append("reuse_contract.allowed must be false when next_agent=intent_encoding")
+        if round_index > 1 and MainControlAgent._context_indicates_stable_execution_failure(
+            parsed_context=parsed_context,
+            context=context,
+        ):
+            if (
+                next_agent != "optimization_strategy"
+                or retry_scope != "target_stable"
+                or not bool(intent.reuse_contract.allowed)
+            ):
+                errors.append(
+                    "execution_failure with stable bindings must route to optimization_strategy "
+                    "with retry_scope=target_stable and reuse_contract.allowed=true"
+                )
         if next_agent == "intent_encoding" and not str(intent.intent_encoding_guidance or "").strip() and round_index > 1:
             errors.append("retry routing into intent_encoding requires explicit intent_encoding_guidance")
-        if not intent.handoff_expectations:
-            errors.append("handoff_expectations must not be empty")
+        resolved_target_errors = MainControlAgent._validate_main_semantic_boundary(intent)
+        errors.extend(resolved_target_errors)
         # 关键步骤：诊断类别只作为上下文交给 LLM，不在这里做域级硬裁决。
         return errors
+
+    @staticmethod
+    def _parse_context_payload(context: str) -> Dict[str, Any]:
+        text = str(context or "").strip()
+        if not text:
+            return {}
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+
+        payload: Dict[str, Any] = {}
+        round_match = re.search(r"(?im)^\s*-\s*round_index:\s*(\d+)\s*$", text)
+        if round_match:
+            payload["round_index"] = int(round_match.group(1))
+        category_match = re.search(r"(?im)^\s*-\s*root_cause_category:\s*(.+?)\s*$", text)
+        if category_match:
+            payload["previous_diagnosis"] = {"root_cause_category": category_match.group(1).strip()}
+        bindings_match = re.search(r"(?im)^\s*-\s*flow_bindings:\s*(\[.+\])\s*$", text)
+        if bindings_match:
+            try:
+                bindings = json.loads(bindings_match.group(1))
+            except Exception:
+                bindings = []
+            if isinstance(bindings, list):
+                payload["previous_operation_intent"] = {"flow_bindings": bindings}
+        return payload
+
+    @staticmethod
+    def _context_indicates_stable_execution_failure(
+        *,
+        parsed_context: Dict[str, Any],
+        context: str,
+    ) -> bool:
+        if not isinstance(parsed_context, dict):
+            parsed_context = {}
+        diagnosis = parsed_context.get("previous_diagnosis") if isinstance(parsed_context.get("previous_diagnosis"), dict) else {}
+        category = str(diagnosis.get("root_cause_category") or "").strip().lower()
+        if category != "execution_failure":
+            return False
+        context_text = (json.dumps(parsed_context, ensure_ascii=False) + "\n" + str(context or "")).lower()
+        unstable_markers = (
+            "wrong binding",
+            "binding is wrong",
+            "stale binding",
+            "identifier conflict",
+            "missing_flow_binding",
+            "missing grounded assignment",
+            "wrong_supi",
+        )
+        if any(marker in context_text for marker in unstable_markers):
+            return False
+        previous_intent = (
+            parsed_context.get("previous_operation_intent")
+            if isinstance(parsed_context.get("previous_operation_intent"), dict)
+            else {}
+        )
+        bindings = previous_intent.get("flow_bindings") if isinstance(previous_intent.get("flow_bindings"), list) else []
+        return any(
+            isinstance(item, dict)
+            and str(item.get("resolution_status") or "").strip().lower() == "resolved"
+            and str(item.get("flow_id") or "").strip()
+            and str(item.get("app_id") or "").strip()
+            for item in bindings
+        )
+
+    @staticmethod
+    def _validate_main_semantic_boundary(intent: GlobalControlIntent) -> List[str]:
+        errors: List[str] = []
+        for stage_index, stage in enumerate(intent.control_semantics.stages or [], start=1):
+            if list(stage.active_flow_ids or []) or list(stage.active_app_ids or []):
+                errors.append(
+                    "Main must not populate resolved target identifiers in control_semantics; "
+                    f"stage {stage_index} active_flow_ids/active_app_ids must stay empty"
+                )
+            for target_index, target in enumerate(stage.targets or [], start=1):
+                if (
+                    str(target.app_id or "").strip()
+                    or str(target.flow_id or "").strip()
+                    or list(target.matched_flow_ids or [])
+                    or list(target.matched_app_ids or [])
+                ):
+                    errors.append(
+                        "Main must not populate resolved target identifiers in control_semantics; "
+                        f"stage {stage_index} target {target_index} app_id/flow_id/matched ids must stay empty"
+                    )
+        return errors
+
+    @staticmethod
+    def _normalize_retry_routing(
+        intent: GlobalControlIntent,
+        *,
+        user_input: str,
+        context: str = "",
+    ) -> None:
+        parsed_context = MainControlAgent._parse_context_payload(context)
+        try:
+            round_index = int(parsed_context.get("round_index") or 0)
+        except (TypeError, ValueError):
+            round_index = 0
+        if round_index <= 1:
+            return
+        if not MainControlAgent._context_indicates_stable_execution_failure(
+            parsed_context=parsed_context,
+            context=context,
+        ):
+            return
+
+        explicit_supis = re.findall(r"(?i)(imsi-\d{5,})", str(user_input or ""))
+        unique_explicit_supis = list(dict.fromkeys(explicit_supis))
+        if len(unique_explicit_supis) == 1:
+            intent.supi = unique_explicit_supis[0]
+        elif len(unique_explicit_supis) > 1:
+            intent.supi = ""
+
+        intent.next_agent = "optimization_strategy"
+        intent.round_strategy = MainRoundStrategy.POLICY_REVISION
+        intent.retry_scope = MainRetryScope.TARGET_STABLE
+        intent.intent_encoding_guidance = ""
+        intent.reuse_contract.allowed = True
+        intent.reuse_contract.preserve_bindings = True
+        intent.reuse_contract.preserve_domains = True
+        intent.reuse_contract.preserve_stage_scope = True
+        intent.reuse_contract.invalidate_on = []
+        intent.routing_decision = "retry_policy_revision_target_stable"
+        intent.routing_rationale = (
+            "Previous execution failed after IEA had already produced stable resolved bindings; "
+            "reuse the target binding and revise only executable policy values in OSA."
+        )
 
     @staticmethod
     def _enrich_global_intent_contract(

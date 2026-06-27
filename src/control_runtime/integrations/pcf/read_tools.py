@@ -196,6 +196,15 @@ def search_sm_flow_targets(
         snapshot_id=_tool_snapshot_id(runtime),
         limit=limit,
     )
+    if normalized_supi and isinstance(payload, dict) and isinstance(payload.get("candidates"), list):
+        filtered_candidates = [
+            item
+            for item in payload.get("candidates") or []
+            if isinstance(item, dict) and str(item.get("supi") or "").strip() == normalized_supi
+        ]
+        payload = dict(payload)
+        payload["candidates"] = filtered_candidates
+        payload["candidate_count"] = len(filtered_candidates)
     result = json.dumps(payload, ensure_ascii=False, indent=2)
     prefix = ""
     if runtime is not None:

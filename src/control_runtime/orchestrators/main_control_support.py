@@ -52,6 +52,7 @@ def build_main_context(
     round_index: int,
     memory_context: str = "",
     feedback_context: str = "",
+    external_routing_hint: Optional[Dict[str, Any]] = None,
     previous_diagnosis: Optional[Dict[str, Any]] = None,
     previous_execution_feedback: Optional[Dict[str, Any]] = None,
     previous_operation_intent: Optional[Dict[str, Any]] = None,
@@ -77,6 +78,8 @@ def build_main_context(
         f"{_render_mapping({'mediator_conflict_summary': _build_mediator_conflict_summary(previous_execution_feedback or previous_diagnosis or {}), 'assurance_failure_summary': _build_assurance_failure_summary(previous_execution_feedback or {})})}\n\n"
         "## Collaboration Requests\n"
         f"{_render_mapping({'negotiation_request': previous_negotiation_request or {}, 'planning_blocker': previous_planning_blocker or {}, 'execution_reentry': previous_execution_reentry or {}})}\n\n"
+        "## External Routing Hint\n"
+        f"{_render_mapping(external_routing_hint or {})}\n\n"
         "## Memory Context\n"
         f"{memory_context or 'N/A'}\n\n"
         "## Feedback\n"
@@ -116,9 +119,7 @@ def build_planning_context(
         main_uncertainty_flags=[item.value for item in global_intent.uncertainty_flags],
         main_routing_decision=str(global_intent.routing_decision or "").strip(),
         main_routing_rationale=str(global_intent.routing_rationale or "").strip(),
-        main_routing_confidence=float(global_intent.routing_confidence or 0.0),
         main_reuse_contract=global_intent.reuse_contract.model_dump(mode="json"),
-        main_handoff_expectations=[item.model_dump(mode="json") for item in (global_intent.handoff_expectations or [])],
         objective_profile=global_intent.objective_profile.model_dump(mode="json"),
         forbidden_assumptions=list(global_intent.forbidden_assumptions or []),
         required_evidence=list(global_intent.required_evidence or []),

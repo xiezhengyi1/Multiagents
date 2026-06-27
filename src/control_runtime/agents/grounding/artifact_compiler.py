@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ...domain.policy_plan import FlowSelector, GroundingEvidenceBundle, OperationIntent
 from .common import (
@@ -41,14 +41,8 @@ class OperationIntentCompiler:
         flow_catalog = catalog_payload.get("flow_catalog") or []
         semantic_candidates = list(evidence.semantic_candidates or [])
 
-        selected_flow = self._resolve_selected_flow(
-            decision=decision,
-            flow_catalog=flow_catalog,
-            semantic_candidates=semantic_candidates,
-        )
         selected_app_id = self._resolve_selected_app_id(
             decision=decision,
-            selected_flow=selected_flow,
         )
         app_name = self._resolve_selected_app_name(app_catalog=app_catalog, selected_app_id=selected_app_id)
         flows = self._build_compiled_flows(
@@ -77,6 +71,11 @@ class OperationIntentCompiler:
         qos_target_envelopes = self.qos_envelope_builder.build(
             flows=flows,
         )
+        self._validate_qos_target_envelopes(
+            requested_domains=grounded_requested_domains,
+            flows=flows,
+            qos_target_envelopes=qos_target_envelopes,
+        )
         control_semantics = self.control_semantics_grounder.ground(
             directives=directives,
             flows=flows,
@@ -90,8 +89,6 @@ class OperationIntentCompiler:
             supi=str(evidence.supi or "").strip(),
             app_id=selected_app_id,
             app_name=app_name,
-            operation_type=str(decision.operation_type or "modify").strip() or "modify",
-            urgency="Normal",
             raw_input=str(user_input or "").strip(),
             resolution_status=resolution_status,
             requested_domains=grounded_requested_domains,
@@ -116,6 +113,41 @@ class OperationIntentCompiler:
         )
 
     @staticmethod
+    def _validate_qos_target_envelopes(
+        *,
+        requested_domains: List[str],
+        flows: List[FlowSelector],
+        qos_target_envelopes: List[Any],
+    ) -> None:
+        if "qos" not in {str(item or "").strip().lower() for item in (requested_domains or [])}:
+            return
+        envelopes_by_flow_id = {
+            str(envelope.flow_id or "").strip(): envelope
+            for envelope in qos_target_envelopes
+            if str(getattr(envelope, "flow_id", "") or "").strip()
+        }
+        baseline_fields = (
+            "baseline_priority",
+            "baseline_latency_ms",
+            "baseline_jitter_ms",
+            "baseline_packet_error_rate",
+            "baseline_max_br_ul_mbps",
+            "baseline_max_br_dl_mbps",
+            "baseline_gbr_ul_mbps",
+            "baseline_gbr_dl_mbps",
+        )
+        for flow in flows:
+            flow_id = str(flow.flow_id or "").strip()
+            resolution_status = str(flow.resolution_status or "").strip().lower()
+            if not flow_id or resolution_status != "resolved":
+                continue
+            envelope = envelopes_by_flow_id.get(flow_id)
+            if envelope is None:
+                raise ValueError(f"missing QoS baseline envelope for resolved flow_id={flow_id}")
+            if all(getattr(envelope, field, None) is None for field in baseline_fields):
+                raise ValueError(f"missing QoS baseline values for resolved flow_id={flow_id}")
+
+    @staticmethod
     def _resolve_selected_app_name(*, app_catalog: List[Dict[str, Any]], selected_app_id: str) -> Optional[str]:
         selected_app = next(
             (item for item in app_catalog if str(item.get("app_id") or "").strip() == selected_app_id),
@@ -138,17 +170,12 @@ class OperationIntentCompiler:
         self,
         *,
         decision: IntentAdvisorDecision,
-        selected_flow: Optional[Dict[str, Any]],
     ) -> str:
-        selected_app_id = str(decision.selected_app_id or "").strip()
-        if not selected_app_id and decision.flows:
-            for flow in decision.flows:
-                candidate_app_id = str(flow.app_id or "").strip()
-                if candidate_app_id:
-                    return candidate_app_id
-        if not selected_app_id and selected_flow is not None:
-            return str(selected_flow.get("app_id") or "").strip()
-        return selected_app_id
+        for flow in decision.flows:
+            candidate_app_id = str(flow.app_id or "").strip()
+            if candidate_app_id:
+                return candidate_app_id
+        return ""
 
     def _build_compiled_flows(
         self,
@@ -246,22 +273,6 @@ class OperationIntentCompiler:
             evidence_sources=evidence_sources,
         )
 
-    def _resolve_selected_flow(
-        self,
-        *,
-        decision: IntentAdvisorDecision,
-        flow_catalog: List[Dict[str, Any]],
-        semantic_candidates: List[Dict[str, Any]],
-    ) -> Optional[Dict[str, Any]]:
-        selected_flow_id = str(decision.selected_flow_id or "").strip()
-        if selected_flow_id:
-            return self._lookup_flow_record(
-                flow_id=selected_flow_id,
-                flow_catalog=flow_catalog,
-                semantic_candidates=semantic_candidates,
-            )
-        return None
-
     def _build_operation_flows_from_advisor_decision(
         self,
         *,
@@ -340,7 +351,6 @@ class OperationIntentCompiler:
             "service_type_id",
             "description",
             "resolution_status",
-            "resolution_candidates",
         }
         for key, value in advisor_flow.model_dump(mode="json").items():
             if key not in semantic_keys:

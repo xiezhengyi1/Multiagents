@@ -2,23 +2,25 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from ...context.evidence import EvidenceFormatter, build_slice_snssai
 from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import PolicyPlanDraft
 from .planning_artifact_compiler import PlanningArtifactCompiler
-from .planning_evidence import PlanningEvidenceBuilder, build_slice_snssai
 from .planning_validation import PlanningAdvisorValidator, PlanningArtifactValidator
 from .response_models import OsaAdvisorOutput
 
 
 class OptimizationStrategyCompiler:
     def __init__(self) -> None:
-        self.evidence_builder = PlanningEvidenceBuilder()
         self.advisor_validator = PlanningAdvisorValidator()
         self.plan_validator = PlanningArtifactValidator()
         self.artifact_compiler = PlanningArtifactCompiler(validator=self.plan_validator)
 
     def build_planning_evidence(self, planning_request: PlanningRequest) -> Dict[str, Any]:
-        return self.evidence_builder.build_planning_evidence(planning_request)
+        return EvidenceFormatter.for_osa(
+            operation_intent=planning_request.operation_intent,
+            planning_context=planning_request.context,
+        )
 
     def validate_advisor_output(
         self,

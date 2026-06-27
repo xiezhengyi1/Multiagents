@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+for candidate in (ROOT, SRC):
+    candidate_text = str(candidate)
+    if candidate_text not in sys.path:
+        sys.path.insert(0, candidate_text)
+
+from control_runtime.context import (
+    EvidenceFormatter,
+    FlowSelectorProjector,
+    MainPromptBuilder,
+    OperationIntentProjector,
+    ProjectorRegistry,
+    RetryPromptBuilder,
+    field,
+    project_operation_intent_for_prompt,
+)
+from control_runtime.context.projectors.base import BaseProjector
+from control_runtime.domain.collaboration import PlanningContext, PlanningRequest
+from control_runtime.domain.policy_plan import FlowSelector, OperationIntent, QosTargetEnvelope
+
+
+LEGACY_CONTEXT_ENGINEERING_FILES = [
+    "src/control_runtime/agents/common/context_projection.py",
+    "src/control_runtime/agents/grounding/evidence_builder.py",
+    "src/control_runtime/agents/grounding/prompts.py",
+    "src/control_runtime/agents/planning/planning_evidence.py",
+    "src/control_runtime/agents/planning/request_builder.py",
+    "src/control_runtime/agents/planning/prompts.py",
+    "src/control_runtime/agents/main/prompts.py",
+    "src/control_runtime/agents/single/prompts.py",
+    "src/control_runtime/agents/prompt_skills/knowledge_search.py",
+]
+
+LEGACY_IMPORT_PATTERNS = [
+    "agents.common.context_projection",
+    "agents.grounding.evidence_builder",
+    "agents.grounding.prompts",
+    "agents.planning.planning_evidence",
+    "agents.planning.request_builder",
+    "agents.planning.prompts",
+    "agents.main.prompts",
+    "agents.single.prompts",
+    "agents.prompt_skills.knowledge_search",
+    "from ..common import project_",
+]
+
+
+def test_legacy_context_engineering_entrypoints_are_removed() -> None:
+    for legacy_path in LEGACY_CONTEXT_ENGINEERING_FILES:
+        assert not (ROOT / legacy_path).exists(), legacy_path
+
+    scanned_files = [
+        path
+        for base in (ROOT / "src", ROOT / "tests")
+        for path in base.rglob("*.py")
+        if "__pycache__" not in path.parts
+        and path.name != "test_context_engineering_refactor.py"
+    ]
+    offenders: list[str] = []
+    for path in scanned_files:
+        text = path.read_text(encoding="utf-8")
+        for pattern in LEGACY_IMPORT_PATTERNS:
+            if pattern in text:
+                offenders.append(f"{path.relative_to(ROOT)}: {pattern}")
+    assert offenders == []
+
+
+def test_projector_rejects_unknown_model_fields_at_definition_time() -> None:
+    with pytest.raises(TypeError, match="does not exist on FlowSelector"):
+
+        class BadFlowProjector(BaseProjector):
+            model = FlowSelector
+            visible = (field("requested_domains"),)
+
+
+def test_operation_intent_projection_uses_declared_flow_fields_without_dead_or_wrong_fields() -> None:
+    intent = OperationIntent(
+        session_id="s1",
+        snapshot_id="snap1",
+        supi="imsi-1",
+        app_id="app-1",
+        app_name="RemoteDrive",
+        urgency="Normal",
+        raw_input="protect flow",
+        requested_domains=["qos"],
+        flows=[
+            FlowSelector(
+                supi="imsi-1",
+                app_id="app-1",
+                app_name="RemoteDrive",
+                flow_id="flow-1",
+                target_type="flow",
+                name="video",
+                service_type="urllc",
+                service_type_id=1,
+                bw_ul=10.0,
+                current_bw_ul=3.0,
+                current_bw_dl=4.0,
+                five_tuple=["10.0.0.1", "10.0.0.2", 1000, 2000, "udp"],
+                resolution_candidates=["stale-candidate"],
+            )
+        ],
+        qos_target_envelopes=[
+            QosTargetEnvelope(
+                flow_id="flow-1",
+                app_id="app-1",
+                flow_name="video",
+                baseline_latency_ms=10.0,
+                rationale=["derived from SLA"],
+            )
+        ],
+    )
+
+    projected = project_operation_intent_for_prompt(intent)
+    flow_payload = projected["flows"][0]
+
+    assert projected["session_id"] == "s1"
+    assert "urgency" not in projected
+    assert flow_payload["app_name"] == "RemoteDrive"
+    assert flow_payload["target_type"] == "flow"
+    assert flow_payload["five_tuple"] == ["10.0.0.1", "10.0.0.2", 1000, 2000, "udp"]
+    assert "requested_domains" not in flow_payload
+    assert "dnn" not in flow_payload
+    assert "current_bw_ul" not in flow_payload
+    assert "current_bw_dl" not in flow_payload
+    assert "resolution_candidates" not in flow_payload
+    assert "rationale" in projected["qos_target_envelopes"][0]
+
+
+def test_dead_policy_plan_fields_are_removed_from_models() -> None:
+    assert "urgency" not in OperationIntent.model_fields
+    assert "resolution_candidates" not in FlowSelector.model_fields
+
+
+def test_projector_registry_resolves_known_models() -> None:
+    assert ProjectorRegistry.for_model(FlowSelector) is FlowSelectorProjector
+    assert ProjectorRegistry.for_model(OperationIntent) is OperationIntentProjector
+
+
+def test_evidence_formatter_matches_planning_evidence_shape() -> None:
+    request = PlanningRequest(
+        operation_intent=OperationIntent(
+            session_id="s1",
+            snapshot_id="snap1",
+            supi="imsi-1",
+            flows=[
+                FlowSelector(
+                    supi="imsi-1",
+                    app_id="app-1",
+                    flow_id="flow-1",
+                    name="video",
+                    priority=1,
+                    service_type_id=7,
+                )
+            ],
+        ),
+        context=PlanningContext(
+            session_id="s1",
+            snapshot_id="snap1",
+            active_domains=["qos"],
+            objective_profile={"profile_name": "latency"},
+            required_evidence=["optimizer preview"],
+        ),
+    )
+
+    evidence = EvidenceFormatter.for_osa(
+        operation_intent=request.operation_intent,
+        planning_context=request.context,
+    )
+
+    assert evidence["requested_domains"] == ["qos"]
+    assert evidence["objective_profile"] == {"profile_name": "latency"}
+    assert evidence["flows"] == [
+        {
+            "flow_id": "flow-1",
+            "app_id": "app-1",
+            "name": "video",
+            "priority": 1,
+            "service_type_id": 7,
+        }
+    ]
+
+
+def test_main_prompt_builder_and_retry_builder_keep_compatibility_contracts() -> None:
+    from control_runtime.context.prompts import MAIN_CONTROL_SYSTEM_PROMPT
+
+    assert MainPromptBuilder().system_prompt() == MAIN_CONTROL_SYSTEM_PROMPT
+
+    retry_prompt = RetryPromptBuilder().build_main(
+        base_prompt="User input:\nexample",
+        validation_errors=[],
+        invocation_error="Input should be a valid dictionary, got list",
+    )
+
+    assert "Return exactly one GlobalControlIntent JSON object." in retry_prompt
+    assert "Top-level output must be an object, never a list." in retry_prompt
+    assert "Required GlobalControlIntent keys" in retry_prompt

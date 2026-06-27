@@ -36,26 +36,12 @@ class PlanningArtifactCompiler:
         if planning_status == "executable_plan" and advisor_output.am_policy is not None and not mobility_context:
             raise ValueError("am_policy compilation requires grounded mobility context")
 
-        planning_basis = {
-            "planning_mode": "advisor_compiler",
-            "requested_domains": list(planning_request.context.active_domains or []),
-            "main_retry_scope": str(planning_request.context.main_retry_scope or "").strip(),
-            "advisor_rationale": advisor_output.rationale,
-        }
-        constraint_sources = {
-            "required_evidence": list(planning_request.context.required_evidence or []),
-            "forbidden_assumptions": list(planning_request.context.forbidden_assumptions or []),
-            "revision_requests": _json_friendly(planning_request.context.revision_requests or []),
-            "unified_constraints": _json_friendly(planning_request.context.unified_constraints or {}),
-        }
         optimizer_result = {
             "objective_breakdown": dict(optimizer_preview.get("objective_breakdown") or {}) if isinstance(optimizer_preview, dict) else {},
             "cross_domain_verdicts": [
                 _json_friendly(item)
                 for item in ((optimizer_preview.get("cross_domain_verdicts") if isinstance(optimizer_preview, dict) else []) or [])
             ],
-        }
-        execution_writeback = {
             "snapshot_writeback_patch": self._build_snapshot_writeback_patch(optimizer_preview),
         }
 
@@ -64,10 +50,7 @@ class PlanningArtifactCompiler:
             session_id=str(planning_request.context.session_id or "").strip(),
             snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
             planning_status=planning_status,
-            planning_basis=planning_basis,
-            constraint_sources=constraint_sources,
             optimizer_result=optimizer_result,
-            execution_writeback=execution_writeback,
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
                     planning_request.context.objective_profile.get("profile_name")
@@ -250,18 +233,27 @@ class PlanningArtifactCompiler:
             raise ValueError(f"SmPolicySpec requires app_id for flow_id={flow_id}")
         pcc_id = f"pcc-{flow_id}"
         qos_id = f"qos-{flow_id}"
+        gbr_ul_mbps = PlanningArtifactCompiler._bounded_gbr_mbps(
+            spec.gbr_ul_mbps,
+            spec.max_br_ul_mbps,
+        )
+        gbr_dl_mbps = PlanningArtifactCompiler._bounded_gbr_mbps(
+            spec.gbr_dl_mbps,
+            spec.max_br_dl_mbps,
+        )
         qos_payload: Dict[str, Any] = {
             "qosId": qos_id,
+            "5qi": PlanningArtifactCompiler._map_5qi_by_service_type(flow_ctx.service_type_id),
             "priorityLevel": int(spec.priority),
             "packetDelayBudget": int(spec.target_latency_ms),
             "packetErrorRate": str(spec.packet_error_rate),
             "maxbrUl": str(spec.max_br_ul_mbps),
             "maxbrDl": str(spec.max_br_dl_mbps),
         }
-        if spec.gbr_ul_mbps is not None:
-            qos_payload["gbrUl"] = str(spec.gbr_ul_mbps)
-        if spec.gbr_dl_mbps is not None:
-            qos_payload["gbrDl"] = str(spec.gbr_dl_mbps)
+        if gbr_ul_mbps is not None:
+            qos_payload["gbrUl"] = str(gbr_ul_mbps)
+        if gbr_dl_mbps is not None:
+            qos_payload["gbrDl"] = str(gbr_dl_mbps)
         if spec.target_jitter_ms is not None:
             qos_payload["jitterReq"] = spec.target_jitter_ms
         return {
@@ -287,6 +279,20 @@ class PlanningArtifactCompiler:
             },
             "qosDecs": {qos_id: qos_payload},
         }
+
+    @staticmethod
+    def _bounded_gbr_mbps(gbr_mbps: float | None, max_br_mbps: float) -> float | None:
+        if gbr_mbps is None:
+            return None
+        return min(float(gbr_mbps), float(max_br_mbps))
+
+    @staticmethod
+    def _map_5qi_by_service_type(service_type_id: int | None) -> int:
+        try:
+            service_id = int(service_type_id or 0)
+        except (TypeError, ValueError):
+            service_id = 0
+        return {1: 9, 2: 7, 3: 65}.get(service_id, 9)
 
     def _resolve_am_association_id(self, *, planning_request: PlanningRequest, mobility_context: Dict[str, Any]) -> str:
         preserved = PlanningAdvisorValidator._preserved_association_id(planning_request)
@@ -440,14 +446,6 @@ class PlanningArtifactCompiler:
             session_id=str(planning_request.context.session_id or "").strip(),
             snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
             planning_status="needs_upstream_reground",
-            planning_basis={
-                "planning_mode": "upstream_reground_required",
-                "requested_domains": list(planning_request.context.active_domains or []),
-            },
-            constraint_sources={
-                "required_evidence": list(planning_request.context.required_evidence or []),
-                "unified_constraints": _json_friendly(planning_request.context.unified_constraints or {}),
-            },
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
                     planning_request.context.objective_profile.get("profile_name")

@@ -14,6 +14,7 @@ from shared.runtime import JsonlTraceWriter
 from shared.runtime import ArtifactWorkerMixin
 from shared.logging import setup_logger
 
+from ...context.prompts import DispatchPromptBuilder
 from ...domain.policy_compiler import PolicyCompiler
 from ...execution import AssuranceEvaluator, ExecutionController
 from ...integrations.pcf import dispatch_policy_to_pcf_request
@@ -30,10 +31,7 @@ from .contracts import FeedbackReport
 
 class PolicyDispatchAgent(ArtifactWorkerMixin):
     agent_name = "policy_dispatch"
-    TRACE_SYSTEM_PROMPT = (
-        "You are the Policy Dispatch execution component. "
-        "Compile policies, dispatch them to PCF, run assurance checks, and return a deterministic FeedbackReport."
-    )
+    TRACE_SYSTEM_PROMPT = DispatchPromptBuilder().system_prompt()
 
     def __init__(
         self,

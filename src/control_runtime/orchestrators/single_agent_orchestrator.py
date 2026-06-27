@@ -34,10 +34,17 @@ class SingleAgentOrchestrator:
         max_rounds: int = 1,
         use_local_model: bool = False,
         rag_enabled: bool = True,
+        single_model_name: str = "",
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be at least 1")
-        self.single_agent = single_agent or SingleControlAgent(use_local_model=use_local_model, rag_enabled=rag_enabled)
+        single_agent_kwargs: Dict[str, Any] = {
+            "use_local_model": use_local_model,
+            "rag_enabled": rag_enabled,
+        }
+        if str(single_model_name or "").strip():
+            single_agent_kwargs["model_name"] = str(single_model_name).strip()
+        self.single_agent = single_agent or SingleControlAgent(**single_agent_kwargs)
         self.pd_agent = pd_agent or PolicyDispatchAgent(use_local_model=use_local_model)
         self.cr_tool = cr_tool or ConflictResolutionTool()
         self.ad_tool = ad_tool or AssuranceDiagnosisTool()

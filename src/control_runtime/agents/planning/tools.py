@@ -8,12 +8,12 @@ from typing import Any, Dict, Iterable, List, Optional
 from langchain.tools import tool
 
 from shared.tools.wrapper_think import tool_with_reason
+from ...context.evidence import EvidenceFormatter
 from ...domain.collaboration import PlanningRequest
 from ...integrations.scenario.network_status import get_network_status_summary
 from ...integrations.storage import get_ue_context_by_supi
 
 from .policy_normalizer import json_friendly as _json_friendly
-from .request_builder import build_joint_optimizer_request
 
 
 def _pick_first(payload: Dict[str, Any], keys: Iterable[str]) -> Any:
@@ -139,6 +139,11 @@ def _serialize_optimizer_result(result: Any) -> Dict[str, Any]:
 def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], Dict[str, Any]]:
     from ...integrations.optimizer import run_joint_control_optimizer as run_optimizer
     _results_cache: Dict[str, Any] = {}
+    active_domains = {
+        str(item.value if hasattr(item, "value") else item or "").strip().lower()
+        for item in (planning_request.context.active_domains or planning_request.operation_intent.requested_domains or [])
+        if str(item.value if hasattr(item, "value") else item or "").strip()
+    }
 
     def _require_target_supi(candidate: Optional[str]) -> str:
         target = str(candidate or "").strip() or str(planning_request.operation_intent.supi or "").strip()
@@ -175,7 +180,7 @@ def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], D
         slice_kpi_source: str = "qos",
     ) -> str:
         """Run the joint optimizer for executable planning evidence and return result plus summary."""
-        request = build_joint_optimizer_request(
+        request = EvidenceFormatter.for_optimizer(
             planning_request,
             profile_name=str(objective_profile or "balanced").strip().lower(),
             template_name=str(optimization_template or "joint_balanced").strip().lower(),
@@ -205,7 +210,14 @@ def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], D
         trimmed = _require_ue_context(target)
         return json.dumps(_json_friendly(trimmed), ensure_ascii=False)
 
-    return [preview_qos_optimizer, fetch_qos_network_status, inspect_mobility_ue_policies], _results_cache
+    request_tools: List[Any] = []
+    if "qos" in active_domains:
+        request_tools.extend([preview_qos_optimizer, fetch_qos_network_status])
+    if "mobility" in active_domains:
+        request_tools.append(inspect_mobility_ue_policies)
+    if not request_tools:
+        request_tools = [preview_qos_optimizer, fetch_qos_network_status, inspect_mobility_ue_policies]
+    return request_tools, _results_cache
 
 
 __all__ = ["build_request_tools", "_serialize_optimizer_result", "_summarize_optimizer_result"]

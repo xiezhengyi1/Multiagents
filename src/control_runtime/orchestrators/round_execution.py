@@ -265,7 +265,7 @@ def execute_planned_round(
                 "agent": "intent_encoding",
                 "summary": str(
                     operation_intent.domain_revision_rationale
-                    or operation_intent.operation_type
+                    or operation_intent.domain_resolution
                     or ""
                 ).strip(),
                 "payload": operation_intent.model_dump(mode="json"),

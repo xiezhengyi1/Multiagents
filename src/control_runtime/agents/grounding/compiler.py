@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from ...context.evidence import EvidenceFormatter
 from ...domain.policy_plan import OperationIntent
 from .artifact_compiler import OperationIntentCompiler
 from .common import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS, uses_am_grounding, uses_sm_grounding
 from .contracts import IntentAdvisorDecision, IntentEvidence
 from .directives import MainDirectiveExtractor
-from .evidence_builder import IntentEvidenceBuilder
 from .validator import IntentGroundingValidator
 
 
@@ -18,7 +18,6 @@ class IntentCompiler:
 
     def __init__(self) -> None:
         self.directive_extractor = MainDirectiveExtractor()
-        self.evidence_builder = IntentEvidenceBuilder()
         self.validator = IntentGroundingValidator()
         self.operation_compiler = OperationIntentCompiler()
 
@@ -44,7 +43,7 @@ class IntentCompiler:
         am_context_payload: Optional[Dict[str, Any]] = None,
         am_policy_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> IntentEvidence:
-        return self.evidence_builder.build_intent_evidence(
+        return EvidenceFormatter.for_iea(
             user_input=user_input,
             supi=supi,
             main_directives=main_directives,
@@ -59,10 +58,12 @@ class IntentCompiler:
         *,
         evidence: IntentEvidence,
         grounding_tools: List[str],
+        decision: IntentAdvisorDecision | None = None,
     ) -> List[str]:
         return self.validator.validate_intent_grounding(
             evidence=evidence,
             grounding_tools=grounding_tools,
+            decision=decision,
         )
 
     def validate_advisor_decision(

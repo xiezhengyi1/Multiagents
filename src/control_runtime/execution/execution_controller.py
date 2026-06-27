@@ -427,10 +427,10 @@ class ExecutionController:
                 setattr(flow.telemetry, attr, telemetry_patch[key])
 
     def _extract_snapshot_flow_patches(self, strategy_output: Any) -> list[tuple[Optional[str], Optional[str], Optional[str], Dict[str, Any]]]:
-        execution_writeback = getattr(strategy_output, "execution_writeback", {}) or {}
-        if not isinstance(execution_writeback, dict):
+        optimizer_result = getattr(strategy_output, "optimizer_result", {}) or {}
+        if not isinstance(optimizer_result, dict):
             return []
-        writeback_patch = execution_writeback.get("snapshot_writeback_patch") or {}
+        writeback_patch = optimizer_result.get("snapshot_writeback_patch") or {}
         if not isinstance(writeback_patch, dict):
             return []
         qos_plan = writeback_patch.get("qos_plan") or {}

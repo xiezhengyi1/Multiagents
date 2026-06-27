@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
@@ -125,7 +126,16 @@ class SemanticTarget(BaseModel):
     @classmethod
     def _normalize_target_type(cls, v: Any) -> Any:
         if isinstance(v, str):
-            return v.lower()
+            normalized = v.strip().lower().replace("-", "_").replace(" ", "_")
+            _TARGET_TYPE_ALIASES: dict[str, str] = {
+                "ue": "scope",
+                "user_equipment": "scope",
+                "subscriber": "scope",
+                "supi": "scope",
+                "am_policy": "scope",
+                "access_mobility_policy": "scope",
+            }
+            return _TARGET_TYPE_ALIASES.get(normalized, normalized)
         return v
 
     @field_validator("goal", mode="before")
@@ -156,6 +166,12 @@ class SemanticTarget(BaseModel):
             "offload": "protect",
             "select": "protect",
             "steer": "protect",
+            "degrade": "deprioritize",
+            "throttle": "deprioritize",
+            "constrain": "deprioritize",
+            "limit": "deprioritize",
+            "suppress": "deprioritize",
+            "deprioritize": "deprioritize",
         }
         normalized = v.lower()
         return _GOAL_ALIASES.get(normalized, normalized)
@@ -182,8 +198,17 @@ class ControlStage(BaseModel):
             "fallback": "on_previous_failure",
             "after_previous": "after_previous_stage",
             "sequential": "after_previous_stage",
+            "resource_constraint": "after_previous_stage",
+            "resource_constraints": "after_previous_stage",
+            "resource_pressure": "after_previous_stage",
+            "after_protection": "after_previous_stage",
+            "after_protect": "after_previous_stage",
+            "after_stage": "after_previous_stage",
+            "after_stage_1": "after_previous_stage",
         }
-        normalized = v.lower()
+        normalized = v.strip().lower().replace("-", "_")
+        if re.fullmatch(r"after_stage_\d+", normalized):
+            return "after_previous_stage"
         return _TRIGGER_ALIASES.get(normalized, normalized)
 
 
@@ -380,12 +405,6 @@ class ReuseContract(BaseModel):
     invalidate_on: List[str] = Field(default_factory=list)
 
 
-class HandoffExpectation(BaseModel):
-    target_agent: str = Field(default="")
-    expectations: List[str] = Field(default_factory=list)
-    blocking_questions: List[str] = Field(default_factory=list)
-
-
 class AgentContribution(BaseModel):
     agent: str = Field(default="")
     summary: str = Field(default="")
@@ -441,9 +460,7 @@ class GlobalControlIntent(BaseModel):
     intent_encoding_guidance: str = ""
     routing_decision: str = Field(default="")
     routing_rationale: str = Field(default="")
-    routing_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     reuse_contract: ReuseContract = Field(default_factory=ReuseContract)
-    handoff_expectations: List[HandoffExpectation] = Field(default_factory=list)
 
     @field_validator("objective_profile", mode="before")
     @classmethod

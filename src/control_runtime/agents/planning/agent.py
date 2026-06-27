@@ -12,12 +12,12 @@ from shared.runtime import ToolLoopExecutionError
 from shared.runtime import ArtifactWorkerMixin
 from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import PolicyPlanDraft
+from ...context.projectors import project_collaboration_context_for_prompt, project_operation_intent_for_prompt
+from ...context.prompts import PlanningPromptBuilder, RetryPromptBuilder
 from shared.logging import log_event, log_timing
 
-from ..common import project_collaboration_context_for_prompt, project_operation_intent_for_prompt
 from .compiler import OptimizationStrategyCompiler
 from .policy_normalizer import normalize_app_id as _normalize_app_id
-from .prompts import OSA_SYSTEM_PROMPT, build_advisor_user_prompt, build_validation_retry_prompt
 from .response_models import OsaAdvisorOutput
 from .tool_result_adapter import extract_planning_tool_evidence
 from .tools import build_request_tools
@@ -117,10 +117,18 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         self.last_failure_debug = {}
         try:
             planning_evidence = self.compiler.build_planning_evidence(effective_request)
-            base_prompt = build_advisor_user_prompt(
+            prompt_planning_tools, _ = build_request_tools(effective_request)
+            available_tool_names = [
+                str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
+                for tool in [*([] if not self.rag_enabled else self._RAG_TOOLS), *prompt_planning_tools]
+                if str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
+            ]
+            prompt_builder = PlanningPromptBuilder()
+            base_prompt = prompt_builder.advisor_user_prompt(
                 normalized_user_intent=normalized_user_intent,
                 coordination_context=coordination_context,
                 planning_evidence=planning_evidence,
+                available_tool_names=available_tool_names,
             )
             current_prompt = base_prompt
             advisor_output = None
@@ -146,9 +154,10 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     if attempt_index == 2:
                         raise
                     log_event(self.logger, "osa_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
-                    current_prompt = build_validation_retry_prompt(
+                    current_prompt = RetryPromptBuilder().build_osa(
                         base_prompt=base_prompt,
                         issues=[invocation_error],
+                        cached_planning_evidence=self._cached_tool_evidence_for_retry(),
                     )
                     continue
 
@@ -180,7 +189,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
                 log_event(self.logger, "osa_retry", attempt=attempt_index + 2,
                           reason="contract_errors", errors=contract_errors)
-                current_prompt = build_validation_retry_prompt(
+                current_prompt = RetryPromptBuilder().build_osa(
                     base_prompt=base_prompt,
                     issues=list(contract_errors),
                 )
@@ -278,7 +287,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 *([] if not self.rag_enabled else self._RAG_TOOLS),
                 *planning_tools,
             ],
-            system_prompt=OSA_SYSTEM_PROMPT,
+            system_prompt=PlanningPromptBuilder().system_prompt(),
             response_model=OsaAdvisorOutput,
             max_iterations=12,
             tool_result_limits={
@@ -299,6 +308,13 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     "get_knowledge_by_key": 4000,
                 },
                 recent_tool_results_per_tool=1,
+                tool_history_keep_limits={
+                    "preview_qos_optimizer": 2,
+                    "fetch_qos_network_status": 2,
+                    "inspect_mobility_ue_policies": 2,
+                    "search_semantic_knowledge": 2,
+                    "get_knowledge_by_key": 2,
+                },
             ),
         )
         messages = [{"role": "user", "content": prompt}]
@@ -344,6 +360,16 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             "payload": invoke_payload,
             "runtime_context": runtime_context,
             "result": result,
+        }
+
+    def _cached_tool_evidence_for_retry(self) -> dict[str, Any]:
+        tools_cache = getattr(self, "_tools_cache", None)
+        if not isinstance(tools_cache, dict):
+            return {}
+        return {
+            str(key): copy.deepcopy(value)
+            for key, value in tools_cache.items()
+            if value not in (None, "", [], {})
         }
 
     @staticmethod

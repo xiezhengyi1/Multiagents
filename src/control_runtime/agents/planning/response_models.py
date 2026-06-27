@@ -97,6 +97,23 @@ class SmPolicySpec(BaseModel):
         validation_alias=AliasChoices("flow_description", "flowDescription"),
     )
 
+    @model_validator(mode="after")
+    def _validate_gbr_not_above_maxbr(self) -> "SmPolicySpec":
+        errors: List[str] = []
+        if self.gbr_ul_mbps is not None and self.gbr_ul_mbps > self.max_br_ul_mbps:
+            errors.append(
+                "gbr_ul_mbps must not exceed max_br_ul_mbps "
+                f"({self.gbr_ul_mbps} > {self.max_br_ul_mbps})"
+            )
+        if self.gbr_dl_mbps is not None and self.gbr_dl_mbps > self.max_br_dl_mbps:
+            errors.append(
+                "gbr_dl_mbps must not exceed max_br_dl_mbps "
+                f"({self.gbr_dl_mbps} > {self.max_br_dl_mbps})"
+            )
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
+
 
 class AmPolicySpec(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
@@ -125,7 +142,6 @@ class AmPolicySpec(BaseModel):
         default=None,
         validation_alias=AliasChoices("serv_area_res", "servAreaRes"),
     )
-    rationale: str = Field(default="")
 
     @model_validator(mode="after")
     def _validate_snssai_coverage(self) -> "AmPolicySpec":
@@ -157,7 +173,6 @@ class UrspPolicySpec(BaseModel):
         min_length=1,
         validation_alias=AliasChoices("route_sel_param_sets", "routeSelParamSets"),
     )
-    rationale: str = Field(default="")
 
     @field_validator("target_type", mode="before")
     @classmethod
