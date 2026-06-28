@@ -6,10 +6,19 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
+from control_runtime.tool_capabilities import register  # noqa: F401 — side-effect: registers 6G tool aliases
 from knowledge_runtime.retrieval.raw import warmup_knowledge_tool_models
 from shared.memory import MemoryManager
-from agent_runtime.core.token_budget import TokenCounter, TokenBudget
-from agent_runtime.core.context_policy import ContextPolicy
+from shared.runtime import ContextPolicy, TokenBudget, TokenCounter
+
+# Inject database dependencies into the generic runtime storage layer.
+# Must happen before any artifact / task queue operations.
+from database.connection import SessionLocal  # noqa: E402
+import database.models as _db_models  # noqa: E402
+from agent_runtime.storage.runtime_store import configure as _configure_runtime_store  # noqa: E402
+
+_configure_runtime_store(session_factory=SessionLocal, orm_module=_db_models)
+
 from ..context.projectors import project_global_intent_for_prompt, project_memory_payload
 
 from ..agents.dispatch import PolicyDispatchAgent

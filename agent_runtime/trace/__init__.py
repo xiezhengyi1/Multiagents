@@ -1,7 +1,6 @@
 from .builder import TRACE_UNSET, build_run_tree_record, utc_now
 from .legacy_migration import is_legacy_minimal_trace, legacy_trace_to_run_tree
 from .models import RunTreeEvent, RunTreeTraceRecord, collect_descendant_ids, dotted_order_key, iter_runs_in_dotted_order
-from .projectors import project_trace_to_chatml_messages, project_trace_to_training_trace
 from .writer import JsonlTraceWriter, TracedStructuredAgent, build_tool_specs
 
 __all__ = [
@@ -17,7 +16,5 @@ __all__ = [
     "is_legacy_minimal_trace",
     "iter_runs_in_dotted_order",
     "legacy_trace_to_run_tree",
-    "project_trace_to_chatml_messages",
-    "project_trace_to_training_trace",
     "utc_now",
 ]

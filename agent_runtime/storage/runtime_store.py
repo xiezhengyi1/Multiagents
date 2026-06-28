@@ -1,37 +1,49 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from typing import Any, Dict, List, Optional
-
-from database.models import (
-    AgentArtifact,
-    AgentHandoffRecord,
-    AgentTask,
-    EpisodicExperience,
-    SessionContext,
-    SessionStageResult,
-)
-from database.connection import SessionLocal
-import sys
-from pathlib import Path
-
-PACKAGE_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = PACKAGE_ROOT / "src"
-for candidate in (PACKAGE_ROOT, SRC_ROOT):
-    candidate_text = str(candidate)
-    if candidate_text not in sys.path:
-        sys.path.insert(0, candidate_text)
-
-from shared.logging import setup_logger
-
-
-logger = setup_logger(__name__)
-
+import logging
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Dependency injection (set by the application layer at startup) ──────
+# Previous implementation used a sys.path hack to import from database.models,
+# database.connection, and shared.logging — creating a reverse dependency from
+# the generic runtime to the application layer.  Now the application layer
+# injects its SQLAlchemy session factory and ORM model module via configure().
+
+_session_factory: Optional[Callable[[], Any]] = None
+_orm: Any = None  # namespace / module with ORM model classes
+
+
+def configure(*, session_factory: Callable[[], Any], orm_module: Any) -> None:
+    """Inject database dependencies at application startup.
+
+    Must be called once before any CRUD function is used.  Typical call site::
+
+        from database.connection import SessionLocal
+        import database.models as _orm
+        from agent_runtime.storage.runtime_store import configure
+
+        configure(session_factory=SessionLocal, orm_module=_orm)
+    """
+    global _session_factory, _orm
+    _session_factory = session_factory
+    _orm = orm_module
+
+
+def _require() -> None:
+    if _session_factory is None or _orm is None:
+        raise RuntimeError(
+            "runtime_store is not configured — call configure(session_factory=..., orm_module=...) at startup"
+        )
+
 
 @contextmanager
 def session_scope():
-    session = SessionLocal()
+    _require()
+    session = _session_factory()
     try:
         yield session
         session.commit()
@@ -40,6 +52,7 @@ def session_scope():
         raise
     finally:
         session.close()
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -56,6 +69,9 @@ def _summary(payload: Any) -> Dict[str, Any]:
     return {"type": type(payload).__name__}
 
 
+# ── CRUD operations ────────────────────────────────────────────────────
+
+
 def create_or_update_session(
     session_id: str,
     *,
@@ -68,12 +84,11 @@ def create_or_update_session(
 ) -> bool:
     if not session_id:
         return False
-
     try:
         with session_scope() as session:
-            row = session.query(SessionContext).filter(SessionContext.session_id == session_id).first()
+            row = session.query(_orm.SessionContext).filter(_orm.SessionContext.session_id == session_id).first()
             if row is None:
-                row = SessionContext(session_id=session_id)
+                row = _orm.SessionContext(session_id=session_id)
                 session.add(row)
             if status is not None:
                 row.status = status
@@ -111,9 +126,9 @@ def record_artifact(
         return False
     try:
         with session_scope() as session:
-            row = session.query(AgentArtifact).filter(AgentArtifact.artifact_id == artifact_id).first()
+            row = session.query(_orm.AgentArtifact).filter(_orm.AgentArtifact.artifact_id == artifact_id).first()
             if row is None:
-                row = AgentArtifact(artifact_id=artifact_id)
+                row = _orm.AgentArtifact(artifact_id=artifact_id)
                 session.add(row)
             row.correlation_id = correlation_id or None
             row.session_id = session_id or None
@@ -146,12 +161,12 @@ def enqueue_task(
     try:
         with session_scope() as session:
             row = (
-                session.query(AgentTask)
-                .filter(AgentTask.artifact_id == artifact_id, AgentTask.target_agent == target_agent)
+                session.query(_orm.AgentTask)
+                .filter(_orm.AgentTask.artifact_id == artifact_id, _orm.AgentTask.target_agent == target_agent)
                 .first()
             )
             if row is None:
-                row = AgentTask(
+                row = _orm.AgentTask(
                     artifact_id=artifact_id,
                     artifact_type=artifact_type,
                     source_agent=source_agent,
@@ -183,8 +198,8 @@ def acquire_task_lease(
     try:
         with session_scope() as session:
             row = (
-                session.query(AgentTask)
-                .filter(AgentTask.artifact_id == artifact_id, AgentTask.target_agent == target_agent)
+                session.query(_orm.AgentTask)
+                .filter(_orm.AgentTask.artifact_id == artifact_id, _orm.AgentTask.target_agent == target_agent)
                 .first()
             )
             if row is None:
@@ -213,8 +228,8 @@ def complete_task(
     try:
         with session_scope() as session:
             row = (
-                session.query(AgentTask)
-                .filter(AgentTask.artifact_id == artifact_id, AgentTask.target_agent == target_agent)
+                session.query(_orm.AgentTask)
+                .filter(_orm.AgentTask.artifact_id == artifact_id, _orm.AgentTask.target_agent == target_agent)
                 .first()
             )
             if row is None:
@@ -237,8 +252,8 @@ def get_task_status(artifact_id: str, target_agent: str) -> Optional[str]:
     try:
         with session_scope() as session:
             row = (
-                session.query(AgentTask)
-                .filter(AgentTask.artifact_id == artifact_id, AgentTask.target_agent == target_agent)
+                session.query(_orm.AgentTask)
+                .filter(_orm.AgentTask.artifact_id == artifact_id, _orm.AgentTask.target_agent == target_agent)
                 .first()
             )
             return None if row is None else str(row.status or "")
@@ -262,7 +277,7 @@ def record_handoff(
     try:
         with session_scope() as session:
             session.add(
-                AgentHandoffRecord(
+                _orm.AgentHandoffRecord(
                     session_id=session_id or None,
                     snapshot_id=snapshot_id or None,
                     round_index=int(round_index or 0),
@@ -293,7 +308,7 @@ def record_stage_result(
     try:
         with session_scope() as session:
             session.add(
-                SessionStageResult(
+                _orm.SessionStageResult(
                     session_id=session_id,
                     snapshot_id=snapshot_id or None,
                     round_index=int(round_index or 0),
@@ -313,9 +328,9 @@ def list_stage_results(session_id: str) -> List[Dict[str, Any]]:
     try:
         with session_scope() as session:
             rows = (
-                session.query(SessionStageResult)
-                .filter(SessionStageResult.session_id == session_id)
-                .order_by(SessionStageResult.created_at.asc(), SessionStageResult.id.asc())
+                session.query(_orm.SessionStageResult)
+                .filter(_orm.SessionStageResult.session_id == session_id)
+                .order_by(_orm.SessionStageResult.created_at.asc(), _orm.SessionStageResult.id.asc())
                 .all()
             )
             return [
@@ -345,7 +360,7 @@ def record_episodic_experience(
     try:
         with session_scope() as session:
             session.add(
-                EpisodicExperience(
+                _orm.EpisodicExperience(
                     raw_intent=raw_intent,
                     applied_policy=applied_policy,
                     environment_state=environment_state,

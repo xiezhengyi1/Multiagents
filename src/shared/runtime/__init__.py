@@ -10,7 +10,7 @@ the lower-level runtime library.
 from importlib import import_module
 from typing import Any
 
-from agent_runtime.tooling import build_tool_specs, extract_tool_calls, extract_tool_results
+from agent_runtime.messages import build_tool_specs, extract_tool_calls, extract_tool_results
 
 __all__ = [
     "AgentRuntimeContext",

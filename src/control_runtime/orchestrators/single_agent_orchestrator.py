@@ -3,6 +3,15 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
+# Inject database dependencies into the generic runtime storage layer
+# (mirrors the same call in main_control_orchestrator.py — needed when this
+# orchestrator is used standalone by experiment scripts).
+from database.connection import SessionLocal  # noqa: E402
+import database.models as _db_models  # noqa: E402
+from agent_runtime.storage.runtime_store import configure as _configure_runtime_store  # noqa: E402
+
+_configure_runtime_store(session_factory=SessionLocal, orm_module=_db_models)
+
 from ..agents.dispatch import PolicyDispatchAgent
 from ..agents.single import SingleControlAgent
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
@@ -21,6 +22,24 @@ from training.collect_workflow_trajectories import load_user_input_records
 from training.common import processed_dir
 
 
+QWEN_SINGLE_AGENT_MODEL = "qwen3-30b-a3b-instruct"
+
+
+def _average_elapsed_ms(results: List[Mapping[str, Any]]) -> float:
+    values: List[float] = []
+    for item in results:
+        value = item.get("elapsed_ms")
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+            continue
+        if isinstance(value, str) and value.strip():
+            try:
+                values.append(float(value))
+            except ValueError:
+                continue
+    return round(sum(values) / len(values), 4) if values else 0.0
+
+
 def summarize_run_results(results: List[Mapping[str, Any]], *, result_output: Path) -> Dict[str, Any]:
     total = len(results)
     completed = sum(1 for item in results if item.get("completed"))
@@ -34,6 +53,7 @@ def summarize_run_results(results: List[Mapping[str, Any]], *, result_output: Pa
         "completed_case_rate": round(completed / total, 4) if total else 0.0,
         "error_case_rate": round(failed / total, 4) if total else 0.0,
         "exception_case_rate": round(exceptions / total, 4) if total else 0.0,
+        "avg_elapsed_ms": _average_elapsed_ms(results),
         "artifacts": {"run_records": str(result_output)},
     }
 
@@ -50,6 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scenario-prefix", type=str, default="single-agent-experiment")
     parser.add_argument("--scenario-tag", action="append", default=["single_agent_experiment"])
     parser.add_argument("--disable-rag", action="store_true")
+    parser.add_argument(
+        "--qwen",
+        action="store_true",
+        dest="use_qwen",
+        help=f"Use {QWEN_SINGLE_AGENT_MODEL} for the single control agent.",
+    )
     parser.add_argument(
         "--result-output",
         type=Path,
@@ -103,9 +129,11 @@ def main() -> None:
             max_rounds=args.max_rounds,
             use_local_model=False,
             rag_enabled=not args.disable_rag,
+            single_model_name=QWEN_SINGLE_AGENT_MODEL if args.use_qwen else "",
         )
         preview = str(record["user_input"]).replace("\n", " ")[:120]
         print(f"[{record['record_index']}/{total}] single-agent start: {preview}", flush=True)
+        run_started_at = time.perf_counter()
         try:
             run_result = orchestrator.run(
                 str(record["user_input"]),
@@ -158,6 +186,7 @@ def main() -> None:
                 "retry_count": 0,
                 "round_traces": [],
             }
+        result_record["elapsed_ms"] = round((time.perf_counter() - run_started_at) * 1000, 3)
         results.append(result_record)
         append_jsonl(args.result_output, result_record)
 
