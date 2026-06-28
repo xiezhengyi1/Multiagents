@@ -22,13 +22,13 @@ class PromptEngine:
             trim_blocks=True,
             lstrip_blocks=True,
             undefined=StrictUndefined,
-            keep_trailing_newline=False,
+            keep_trailing_newline=True,
         )
         self._env.filters["json_dumps"] = _json_dumps
 
     def render(self, template_name: str, **context: Any) -> str:
         template = self._env.get_template(template_name)
-        return template.render(**context).strip()
+        return template.render(**context)
 
     def render_with_budget(
         self,

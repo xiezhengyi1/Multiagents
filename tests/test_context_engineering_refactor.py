@@ -8,6 +8,7 @@ from jinja2 import UndefinedError
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+PROMPT_FIXTURES = ROOT / "tests" / "fixtures" / "context_prompts"
 for candidate in (ROOT, SRC):
     candidate_text = str(candidate)
     if candidate_text not in sys.path:
@@ -25,6 +26,7 @@ from control_runtime.context import (
 )
 from control_runtime.context.prompts import (
     GroundingPromptBuilder,
+    IEA_SYSTEM_PROMPT,
     MAIN_CONTROL_SYSTEM_PROMPT,
     OSA_SYSTEM_PROMPT,
     PlanningPromptBuilder,
@@ -70,6 +72,10 @@ LEGACY_IMPORT_PATTERNS = [
     "agents.planning.policy_normalizer",
     "from ..common import project_",
 ]
+
+
+def _prompt_fixture(name: str) -> str:
+    return (PROMPT_FIXTURES / name).read_text(encoding="utf-8")
 
 
 def test_legacy_context_engineering_entrypoints_are_removed() -> None:
@@ -228,8 +234,6 @@ def test_prompt_engine_raises_for_missing_template_variables() -> None:
 
 
 def test_prompt_builders_render_jinja_templates_as_compatibility_constants() -> None:
-    from control_runtime.context.prompts import IEA_SYSTEM_PROMPT
-
     assert MainPromptBuilder().system_prompt() == MAIN_CONTROL_SYSTEM_PROMPT
     assert GroundingPromptBuilder().system_prompt() == IEA_SYSTEM_PROMPT
     assert PlanningPromptBuilder().system_prompt() == OSA_SYSTEM_PROMPT
@@ -241,9 +245,42 @@ def test_prompt_builders_render_jinja_templates_as_compatibility_constants() -> 
         PlanningPromptBuilder().system_prompt(),
         SinglePromptBuilder().system_prompt(),
     ):
-        assert "Return raw JSON only" in rendered or "Return JSON only" in rendered
+        assert "JSON" in rendered
         assert "{% block" not in rendered
         assert "{% include" not in rendered
+
+
+def test_system_prompt_templates_preserve_existing_prompt_text_exactly() -> None:
+    expected_prompts = {
+        "main_system.txt": (MAIN_CONTROL_SYSTEM_PROMPT, MainPromptBuilder().system_prompt()),
+        "grounding_system.txt": (IEA_SYSTEM_PROMPT, GroundingPromptBuilder().system_prompt()),
+        "planning_system.txt": (OSA_SYSTEM_PROMPT, PlanningPromptBuilder().system_prompt()),
+        "single_system.txt": (SINGLE_AGENT_ROUND_PROMPT, SinglePromptBuilder().system_prompt()),
+    }
+
+    for fixture_name, rendered_prompts in expected_prompts.items():
+        expected = _prompt_fixture(fixture_name)
+        for rendered in rendered_prompts:
+            assert rendered == expected
+
+
+def test_system_jinja_templates_compose_prompt_fragments() -> None:
+    template_root = ROOT / "src" / "control_runtime" / "context" / "prompts" / "templates"
+
+    for template_name in (
+        "main/system.j2",
+        "grounding/system.j2",
+        "planning/system.j2",
+        "single/system.j2",
+    ):
+        text = (template_root / template_name).read_text(encoding="utf-8")
+        assert "{% include" in text, template_name
+
+    grounding_system = (template_root / "grounding" / "system.j2").read_text(encoding="utf-8")
+    planning_system = (template_root / "planning" / "system.j2").read_text(encoding="utf-8")
+
+    assert "iea_knowledge_search_skill" in grounding_system
+    assert "osa_knowledge_search_skill" in planning_system
 
 
 def test_planning_user_prompt_is_rendered_from_jinja_template() -> None:
@@ -270,3 +307,43 @@ def test_planning_user_prompt_is_rendered_from_jinja_template() -> None:
     assert prompt == engine_rendered
     assert '"session_id": "s1"' in prompt
     assert "Callable tools in this round:" in prompt
+
+
+def test_planning_user_prompt_preserves_existing_prompt_text_exactly() -> None:
+    import json
+
+    from control_runtime.context.prompts import OSA_DYNAMIC_RULES
+    from control_runtime.context.prompts.planning import _OUTPUT_FORMAT_RULES, _render_round_tool_policy
+
+    normalized_user_intent = {"session_id": "s1", "app_id": "app_1"}
+    coordination_context = {"active_domains": ["qos"]}
+    planning_evidence = {"flows": [{"flow_id": "flow-1"}]}
+    tool_policy = _render_round_tool_policy(["preview_qos_optimizer"])
+
+    prompt = PlanningPromptBuilder().advisor_user_prompt(
+        normalized_user_intent=normalized_user_intent,
+        coordination_context=coordination_context,
+        planning_evidence=planning_evidence,
+        available_tool_names=["preview_qos_optimizer"],
+    )
+
+    expected = (
+        "Structured operation intent:\n"
+        f"{json.dumps(normalized_user_intent, ensure_ascii=False, default=str)}\n\n"
+        "Planning context:\n"
+        f"{json.dumps(coordination_context, ensure_ascii=False, default=str)}\n\n"
+        "Planning evidence:\n"
+        f"{json.dumps(planning_evidence, ensure_ascii=False, default=str)}\n\n"
+        f"{tool_policy}\n\n"
+        f"{OSA_DYNAMIC_RULES.strip()}\n\n"
+        "Task:\n"
+        "- Inspect the evidence and return one complete grounded OsaAdvisorOutput.\n"
+        "- If evidence is sufficient, return planning_status=\"executable_plan\" with all required fields grounded.\n"
+        "- If evidence is insufficient or optimizer is infeasible/incomplete, return partial_plan or needs_upstream_reground.\n"
+        "- Respect control_semantics.current_stage; optimize only the active stage flows.\n"
+        "- Prefer optimizer sla values over telemetry values when filling final policy fields.\n\n"
+        f"{_OUTPUT_FORMAT_RULES.strip()}\n\n"
+        "Return one OsaAdvisorOutput JSON object only."
+    )
+
+    assert prompt == expected
