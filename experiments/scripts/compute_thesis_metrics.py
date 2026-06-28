@@ -594,23 +594,43 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow(payload)
 
 
-def parse_args() -> argparse.Namespace:
+def _resolve_summary_paths(summary_dir: Path, patterns: Sequence[str]) -> List[Path]:
+    matched_paths: List[Path] = []
+    seen_paths: set[Path] = set()
+    for pattern in patterns:
+        for summary_path in sorted(summary_dir.glob(pattern)):
+            if summary_path in seen_paths:
+                continue
+            matched_paths.append(summary_path)
+            seen_paths.add(summary_path)
+    return matched_paths
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute thesis metrics (EIC/PGR/DSR/CRR/TCR + average rounds/retries) from experiment summaries and raw run traces.",
     )
     parser.add_argument("--summary-dir", type=Path, default=SUMMARY_ROOT)
     parser.add_argument("--raw-dir", type=Path, default=RAW_RUN_ROOT)
-    parser.add_argument("--summary-glob", default="*.json")
+    parser.add_argument(
+        "--summary-glob",
+        dest="summary_globs",
+        action="append",
+        metavar="PATTERN",
+        help="Repeat this option to include multiple summary file patterns.",
+    )
     parser.add_argument("--output-json", type=Path, default=RESULTS_ROOT / "thesis_metrics.json")
     parser.add_argument("--output-csv", type=Path, default=RESULTS_ROOT / "thesis_metrics.csv")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    args.summary_globs = args.summary_globs or ["*.json"]
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    summary_paths = sorted(args.summary_dir.glob(args.summary_glob))
+    summary_paths = _resolve_summary_paths(args.summary_dir, args.summary_globs)
     if not summary_paths:
-        raise FileNotFoundError(f"No summary files matched {args.summary_glob} under {args.summary_dir}")
+        raise FileNotFoundError(f"No summary files matched {args.summary_globs} under {args.summary_dir}")
 
     run_metrics: List[Dict[str, Any]] = []
     for summary_path in summary_paths:

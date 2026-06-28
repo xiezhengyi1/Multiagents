@@ -27,12 +27,18 @@ def validate_and_compile_intent(
     )
     if advisor_errors or grounding_errors:
         return list(advisor_errors), list(grounding_errors), None
-    compiled = compiler.compile_operation_intent(
-        evidence=evidence,
-        advisor_decision=decision,
-        user_input=user_input,
-        session_id=session_id,
-        snapshot_id=snapshot_id,
-        main_directives=main_directives,
-    )
+    try:
+        compiled = compiler.compile_operation_intent(
+            evidence=evidence,
+            advisor_decision=decision,
+            user_input=user_input,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            main_directives=main_directives,
+        )
+    except ValueError as exc:
+        # Compilation failures (e.g. missing QoS baseline values) are surfaced
+        # as grounding errors so the retry loop can feed them back to the LLM
+        # instead of aborting the entire agent invocation.
+        return [], [str(exc)], None
     return [], [], compiled

@@ -47,6 +47,7 @@ class FlowSelector(BaseModel):
     priority: Optional[int] = Field(default=None, description="Priority level")
     description: Optional[str] = Field(default=None, description="Human-readable flow description")
     five_tuple: Optional[List[Any]] = Field(default=None, description="Resolved five tuple")
+    current_slice_snssai: Optional[str] = Field(default=None, description="Current serving slice S-NSSAI")
     current_bw_ul: Optional[float] = Field(default=None, description="Current uplink bandwidth in Mbps")
     current_bw_dl: Optional[float] = Field(default=None, description="Current downlink bandwidth in Mbps")
     resolution_status: str = Field(default="resolved", description="Resolution status")

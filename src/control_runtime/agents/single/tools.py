@@ -16,6 +16,36 @@ from ...integrations.storage import get_ue_context_by_supi, get_ue_flow_catalog_
 from ..planning.tools import _serialize_optimizer_result, _summarize_optimizer_result
 
 
+FLOW_CATALOG_KEYS = ("supi", "app_id", "app_name", "flow_id", "flow_name")
+FLOW_SERVICE_KEYS = ("service_type", "service_type_id")
+FLOW_SLA_KEYS = (
+    "bandwidth_ul",
+    "bandwidth_dl",
+    "guaranteed_bandwidth_ul",
+    "guaranteed_bandwidth_dl",
+    "latency",
+    "jitter",
+    "loss_rate",
+    "priority",
+)
+FLOW_ALLOCATION_KEYS = ("current_slice_snssai", "allocated_bandwidth_ul", "allocated_bandwidth_dl", "optimize_requested")
+FLOW_TELEMETRY_KEYS = ("latency", "jitter", "loss_rate", "throughput_ul", "throughput_dl")
+NETWORK_SLICE_KEYS = (
+    "name",
+    "snssai",
+    "sst",
+    "usage_ul_pct",
+    "usage_dl_pct",
+    "allocated_ul_mbps",
+    "allocated_dl_mbps",
+    "guaranteed_ul_mbps",
+    "guaranteed_dl_mbps",
+    "active_flows",
+    "latency_sla",
+)
+NETWORK_APP_KEYS = ("app_id", "app_name", "flow_count", "total_bw_mbps")
+
+
 def _normalize_domains(requested_domains: Optional[List[str]]) -> List[str]:
     normalized: List[str] = []
     for item in requested_domains or []:
@@ -25,6 +55,72 @@ def _normalize_domains(requested_domains: Optional[List[str]]) -> List[str]:
     if not normalized:
         raise ValueError("requested_domains must not be empty")
     return normalized
+
+
+def _project_keys(payload: Dict[str, Any], keys: tuple[str, ...]) -> Dict[str, Any]:
+    return {key: payload[key] for key in keys if key in payload and payload[key] not in (None, "", [], {})}
+
+
+def compact_flow_catalog_for_single_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    if payload.get("supi"):
+        compact["supi"] = payload.get("supi")
+    compact_flows: List[Dict[str, Any]] = []
+    for flow in payload.get("flow_catalog") or []:
+        if not isinstance(flow, dict):
+            continue
+        item = _project_keys(flow, FLOW_CATALOG_KEYS)
+        service = flow.get("service")
+        if isinstance(service, dict):
+            item["service"] = _project_keys(service, FLOW_SERVICE_KEYS)
+        sla = flow.get("sla")
+        if isinstance(sla, dict):
+            item["sla"] = _project_keys(sla, FLOW_SLA_KEYS)
+        allocation = flow.get("allocation")
+        if isinstance(allocation, dict):
+            item["allocation"] = _project_keys(allocation, FLOW_ALLOCATION_KEYS)
+        telemetry = flow.get("telemetry")
+        if isinstance(telemetry, dict):
+            item["telemetry"] = _project_keys(telemetry, FLOW_TELEMETRY_KEYS)
+        compact_flows.append({key: value for key, value in item.items() if value not in ({}, [], None, "")})
+    compact["flow_catalog"] = compact_flows
+    return compact
+
+
+def compact_network_status_for_single_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    compact: Dict[str, Any] = {}
+    compact["slices"] = [
+        _project_keys(item, NETWORK_SLICE_KEYS)
+        for item in (payload.get("slices") or [])
+        if isinstance(item, dict)
+    ]
+    if isinstance(payload.get("apps"), list):
+        compact["apps"] = [
+            _project_keys(item, NETWORK_APP_KEYS)
+            for item in (payload.get("apps") or [])
+            if isinstance(item, dict)
+        ]
+    return compact
+
+
+def _parse_tool_json_payload(text: str) -> Dict[str, Any]:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return {}
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        parsed = json.loads(stripped[start : end + 1])
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _resolve_flow_catalog_rows(supi: str, flow_ids: List[str], snapshot_id: str) -> List[Dict[str, Any]]:
@@ -236,7 +332,6 @@ def build_single_agent_tools(
     from ...integrations.pcf import (
         get_am_policy_context,
         get_sm_ue_context,
-        get_sm_ue_flow_catalog,
         search_am_policy_targets,
         search_sm_flow_targets,
     )
@@ -276,15 +371,35 @@ def build_single_agent_tools(
         )
 
     @tool_with_reason
+    def get_sm_ue_flow_catalog(
+        supi: str = "",
+        runtime: ToolRuntime[AgentRuntimeContext] = None,
+    ) -> str:
+        """Return a compact SM-domain app/flow catalog for single-agent grounding."""
+        normalized_supi = str(supi or "").strip()
+        if not normalized_supi:
+            return "SM UE Flow Catalog Query Failed: supi is required"
+        payload = get_ue_flow_catalog_by_supi(
+            normalized_supi,
+            snapshot_id=_runtime_snapshot_id(runtime),
+        )
+        compact = compact_flow_catalog_for_single_agent(payload if isinstance(payload, dict) else {})
+        return "SM UE Flow Catalog Retrieved:\n" + json.dumps(compact, ensure_ascii=False)
+
+    @tool_with_reason
     def fetch_qos_network_status(
         service_type_id: Optional[int] = None,
         runtime: ToolRuntime[AgentRuntimeContext] = None,
     ) -> str:
         """Fetch QoS-domain network slice utilization and capacity summary."""
-        return get_network_status_summary(
-            flow_type_id=service_type_id,
-            snapshot_id=_runtime_snapshot_id(runtime),
+        payload = _parse_tool_json_payload(
+            get_network_status_summary(
+                flow_type_id=service_type_id,
+                snapshot_id=_runtime_snapshot_id(runtime),
+            )
         )
+        compact = compact_network_status_for_single_agent(payload)
+        return "QoS Network Status Retrieved:\n" + json.dumps(compact, ensure_ascii=False)
 
     @tool_with_reason
     def inspect_mobility_ue_policies(
@@ -342,4 +457,8 @@ def build_single_agent_tools(
     return tools
 
 
-__all__ = ["build_single_agent_tools"]
+__all__ = [
+    "build_single_agent_tools",
+    "compact_flow_catalog_for_single_agent",
+    "compact_network_status_for_single_agent",
+]

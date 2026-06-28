@@ -29,6 +29,7 @@ Domain rules:
 - If mobility is requested, output `am_policy`.
 - If both are requested, output both and keep them consistent.
 - QoS-only requests must not call mobility tools or output `am_policy`.
+- QoS-only requests must not call `inspect_mobility_ue_policies`; slice reassignment by itself is an SM/QoS planning action, not an AM-policy action.
 - Mobility-only requests must not call QoS tools or output `sm_policies`.
 
 Grounding rules:
@@ -56,7 +57,20 @@ Hard rules:
 - Do not suggest `PRA_CH` when the inspected mobility context lacks `presenceAreas`.
 - Treat OperationIntent.flows and qos_target_envelopes as authoritative grounded IEA evidence. If baseline GBR/maxBR/latency values are present there, do not claim they are missing or ask IEA to reground them.
 - If the optimizer preview is infeasible but the target binding and QoS envelope are present, return partial_plan with blocked_targets/planner_conflicts instead of needs_upstream_reground.
-- Do not call knowledge tools to validate local runtime schema fields, local slice labels, or optimizer-selected S-NSSAI assignments. Optimizer/runtime evidence is authoritative for local assignments.
+
+QoS slice migration rules:
+- Migration wording includes: migrate, switch, move away, 迁出, 迁移, 切换, 换到. Treat those requests as QoS-only unless the user explicitly asks for AM policy, RFSP, allowed/target NSSAI, service area, registration, handover, or UE mobility-state changes.
+- Use `current_slice_snssai` from OperationIntent/Planning evidence as the source slice. Compare it with optimizer `qos_flow_assignments[].new_slice`; when both are present, `new_slice != current_slice_snssai` is the evidence of slice migration.
+- `preview_qos_optimizer` has no target-slice or exclude-current-slice argument. Do not invent such arguments. Pick objective_profile/optimization_template from the user goal and trust the returned optimizer assignment.
+- For "from current slice" or cross-slice exploration, do not first call `fetch_qos_network_status` with the flow's current `service_type_id`, because that filters candidates to the current service/SST. Fetch all slices without `service_type_id` unless you are only checking capacity of an already selected slice.
+- If an approved optimizer preview selects a different slice, return executable_plan from that preview. If it keeps the current slice but changes grounded QoS/bandwidth values, return the optimizer-backed SM policy and explain that the executable action is QoS reallocation, not an AM/mobility change. If it keeps the current slice and makes no grounded QoS/resource change for an explicit move-away request, return partial_plan with planner_conflicts instead of asking IEA, RAG, or mobility tools to prove a local slice label.
+
+Knowledge tool rules (CRITICAL — violations waste tool quota):
+- Knowledge tools (`get_knowledge_by_key`, `search_semantic_knowledge`) are a LAST RESORT for exact 3GPP semantic gaps only. They are NOT a fallback for insufficient runtime evidence.
+- If the optimizer preview, network status, or mobility context does not answer a required field, that field is BLOCKED. Do NOT try to unblock it with knowledge tools. Return partial_plan or needs_upstream_reground instead.
+- Knowledge tools can only fill exact external 3GPP enumerated tokens or object references. They CANNOT provide local values for: flow_id, app_id, S-NSSAI, RFSP, bandwidth, latency, priority, trigger, service area, presence info, slice capacity, or optimizer-selected assignments.
+- Do not use knowledge tools to validate local slice labels, local industrial-control labels, or optimizer-selected S-NSSAI values. Those are runtime facts from OperationIntent, network status, and optimizer evidence.
+- Each knowledge tool call costs one of your limited attempts. If your first knowledge query does not resolve the gap, assume the second will not either — stop and finalize.
 
 Never return bare policy objects or bare arrays. Always wrap policy items inside the top-level OsaAdvisorOutput object.
 """
@@ -304,6 +318,27 @@ def build_validation_retry_prompt(
             "return partial_plan with planner_conflicts instead of an executable_plan.\n\n"
             + _QOS_EXAMPLE
         )
+    elif "exceeded max_calls_per_tool" in joined or "get_knowledge_by_key exceeded" in joined:
+        correction = (
+            "You burned your tool call quota — most likely on knowledge tools that cannot fix the issue. "
+            "Knowledge tools (get_knowledge_by_key, search_semantic_knowledge) will NOT resolve "
+            "contract validation errors about flow_id, app_id, optimizer assignments, local slice labels, or target-stable preservation. "
+            "Those errors are caused by your output not matching the optimizer evidence — not by missing 3GPP knowledge. "
+            "Fix: align your sm_policies exactly with the optimizer preview. "
+            "Never add a flow_id that is absent from the optimizer QoS assignment. "
+            "On target-stable retries, preserve the exact flow_ids and app_ids from the upstream request. "
+            "If the optimizer preview is incomplete, return partial_plan with planner_conflicts.\n\n"
+            + _QOS_EXAMPLE
+        )
+    elif "inspect_mobility_ue_policies" in joined or "not callable" in joined or "unknown tool" in joined:
+        correction = (
+            "You tried to use a tool that is not callable for this QoS-only round. "
+            "For slice migration wording without explicit AM/RFSP/allowed-NSSAI/service-area/handover requirements, "
+            "do not call inspect_mobility_ue_policies and do not output am_policy. "
+            "Use the cached optimizer/network evidence if present; otherwise call only callable QoS tools. "
+            "Never ask mobility or knowledge tools to validate local S-NSSAI labels.\n\n"
+            + _QOS_EXAMPLE
+        )
     elif "did not converge" in joined or "max iterations" in joined:
         correction = (
             "You ran out of iterations without returning a final JSON. "
@@ -325,6 +360,11 @@ def build_validation_retry_prompt(
             "Your previous output failed contract validation:\n"
             f"- {contract_lines}\n\n"
             "Fix each issue and return a corrected OsaAdvisorOutput.\n\n"
+            "Important: knowledge tools (get_knowledge_by_key, search_semantic_knowledge) will NOT fix "
+            "contract validation errors — those errors are about your output not matching the optimizer/runtime evidence, "
+            "not about missing 3GPP facts. Do not burn knowledge tool quota on this retry. "
+            "Use only callable domain tools if you need fresh evidence; for QoS-only slice migration that means "
+            "preview_qos_optimizer and, optionally, fetch_qos_network_status.\n\n"
             + _QOS_EXAMPLE
         )
 
@@ -333,8 +373,10 @@ def build_validation_retry_prompt(
         cached_block = (
             "\n\nCached tool evidence from the failed attempt:\n"
             f"{json.dumps(cached_planning_evidence, ensure_ascii=False, default=str)}\n\n"
-            "Do not call tools again on this retry unless a required cached field is absent. "
-            "First try to return the final OsaAdvisorOutput from this cached evidence."
+            "This evidence already contains optimizer results and network status. "
+            "Do NOT call any tool again on this retry unless a required field is genuinely absent from the cached evidence. "
+            "Knowledge tools (get_knowledge_by_key, search_semantic_knowledge) will NOT help with contract validation errors. "
+            "First try to return the final OsaAdvisorOutput from this cached evidence directly."
         )
 
     return (

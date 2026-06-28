@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -9,6 +10,59 @@ from .token_budget import TokenBudget, TokenCounter
 
 
 _TRUNCATION_SUFFIX = "\n... [truncated]"
+
+
+def _count_unclosed(text: str) -> tuple[int, int]:
+    """Return (open_braces, open_brackets) that are unclosed in *text*."""
+    braces = 0
+    brackets = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if in_string:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            braces += 1
+        elif ch == "}":
+            braces -= 1
+        elif ch == "[":
+            brackets += 1
+        elif ch == "]":
+            brackets -= 1
+    return max(0, braces), max(0, brackets)
+
+
+def _truncate_text_with_marker(text: str, max_chars: int) -> str:
+    """Truncate to at most *max_chars*, trying to stay on a section boundary
+    and keeping any JSON structure parseable."""
+    if len(text) <= max_chars:
+        return text
+
+    candidate = text[:max_chars]
+    # Prefer a newline boundary (section-based output) that is near the limit
+    last_nl = candidate.rfind("\n")
+    if last_nl > max_chars // 2:
+        candidate = candidate[:last_nl].rstrip()
+
+    stripped = candidate.strip()
+    if stripped and stripped[0] in "{[":
+        # Looks like JSON — close any unclosed braces / brackets
+        braces, brackets = _count_unclosed(candidate)
+        if braces or brackets:
+            candidate = candidate + "}" * braces + "]" * brackets
+        return candidate + _TRUNCATION_SUFFIX
+
+    return candidate + _TRUNCATION_SUFFIX
 
 
 @dataclass(frozen=True)
@@ -45,20 +99,19 @@ class ContextPolicy:
         token_counter: TokenCounter | None = None,
         token_budget: TokenBudget | None = None,
     ) -> str:
+        """Truncate a tool result to the character limit configured for *tool_name*.
+
+        Token-level truncation is intentionally NOT applied here — per-tool call
+        count limits and ``max_iterations`` are the primary backstop against
+        context explosion.  Character truncation only fires on genuinely huge
+        payloads and uses JSON-safe closing so downstream parsers can still
+        consume the result.
+        """
         compacted = str(content or "")
         char_limit = self._char_limit(tool_name)
-        truncated = False
         if len(compacted) > char_limit:
-            compacted = compacted[:char_limit]
-            truncated = True
-
-        if token_counter is not None:
-            token_limit = self._token_limit(tool_name, token_budget)
-            if token_counter.count(compacted) > token_limit:
-                compacted = token_counter.truncate_to_tokens(compacted, token_limit)
-                truncated = True
-
-        return compacted + _TRUNCATION_SUFFIX if truncated else compacted
+            return _truncate_text_with_marker(compacted, char_limit)
+        return compacted
 
     def compact_tool_history(self, messages: Iterable[BaseMessage]) -> list[BaseMessage]:
         compacted = list(messages)

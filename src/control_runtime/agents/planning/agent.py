@@ -151,6 +151,14 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                         "attempt_index": attempt_index + 1,
                         "invocation_error": invocation_error,
                     }
+                    # Merge tool results from the failed invocation into the
+                    # tools_cache so retry prompt can include them.
+                    raw_messages = list(getattr(exc, "_tool_output_messages", None) or [])
+                    if raw_messages:
+                        tools_cache = getattr(self, "_tools_cache", {}) if hasattr(self, "_tools_cache") else {}
+                        cached_preview = tools_cache.get("latest_optimizer_preview") if isinstance(tools_cache, dict) else None
+                        if cached_preview is not None:
+                            tools_cache["latest_optimizer_preview"] = dict(cached_preview)
                     if attempt_index == 2:
                         raise
                     log_event(self.logger, "osa_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
@@ -192,6 +200,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 current_prompt = RetryPromptBuilder().build_osa(
                     base_prompt=base_prompt,
                     issues=list(contract_errors),
+                    cached_planning_evidence=self._cached_tool_evidence_for_retry(),
                 )
 
             if advisor_output is None or advisor_result is None:
@@ -247,6 +256,14 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             for flow_id in (current_stage.active_flow_ids or [])
             if str(flow_id or "").strip()
         }
+        # Mobility-only requests have no QoS flows — active_flow_ids is expected
+        # to be empty because flows are populated by IEA only for QoS targets.
+        is_mobility_only = (
+            planning_request.operation_intent.requested_domains
+            == ["mobility"]
+        )
+        if not active_flow_ids and is_mobility_only:
+            return planning_request
         if not active_flow_ids:
             raise ValueError(
                 "current control stage has no grounded active_flow_ids; OSA must request upstream reground instead of expanding to all flows"
@@ -290,31 +307,28 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             system_prompt=PlanningPromptBuilder().system_prompt(),
             response_model=OsaAdvisorOutput,
             max_iterations=12,
+            max_calls_per_tool=2,
+            tool_call_limits={
+                "get_knowledge_by_key": 1,
+                "search_semantic_knowledge": 1,
+            },
             tool_result_limits={
-                "preview_qos_optimizer": 8000,
-                "fetch_qos_network_status": 4000,
-                "inspect_mobility_ue_policies": 4000,
-                "search_semantic_knowledge": 4000,
-                "get_knowledge_by_key": 4000,
+                "preview_qos_optimizer": 32000,
+                "fetch_qos_network_status": 32000,
+                "inspect_mobility_ue_policies": 8000,
+                "search_semantic_knowledge": 8000,
+                "get_knowledge_by_key": 8000,
             },
             context_policy=ContextPolicy(
-                default_tool_result_chars=4000,
-                default_tool_result_tokens=1000,
+                default_tool_result_chars=8000,
                 tool_result_char_limits={
-                    "preview_qos_optimizer": 8000,
-                    "fetch_qos_network_status": 4000,
-                    "inspect_mobility_ue_policies": 4000,
-                    "search_semantic_knowledge": 4000,
-                    "get_knowledge_by_key": 4000,
+                    "preview_qos_optimizer": 32000,
+                    "fetch_qos_network_status": 32000,
+                    "inspect_mobility_ue_policies": 8000,
+                    "search_semantic_knowledge": 8000,
+                    "get_knowledge_by_key": 8000,
                 },
                 recent_tool_results_per_tool=1,
-                tool_history_keep_limits={
-                    "preview_qos_optimizer": 2,
-                    "fetch_qos_network_status": 2,
-                    "inspect_mobility_ue_policies": 2,
-                    "search_semantic_knowledge": 2,
-                    "get_knowledge_by_key": 2,
-                },
             ),
         )
         messages = [{"role": "user", "content": prompt}]
@@ -337,7 +351,9 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                         f"OSA advisor tool call failed: {failed_tool_call.get('name') or '<unknown>'}: {exc}"
                     ) from exc
                 if "max iterations" in str(exc).lower():
-                    raise RuntimeError(f"OSA advisor did not converge: {exc}") from exc
+                    invocation_error = RuntimeError(f"OSA advisor did not converge: {exc}")
+                    invocation_error._tool_output_messages = list(exc.output_messages)
+                    raise invocation_error from exc
                 error_text = str(exc)
                 if "Input should be a valid dictionary or instance of OsaAdvisorOutput" in error_text:
                     raise RuntimeError(
@@ -349,6 +365,11 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                         "OSA advisor returned a policy item without the required top-level planning object: "
                         "a bare SmPolicySpec appeared instead of OsaAdvisorOutput.sm_policies"
                     ) from exc
+                # Preserve output_messages for tool-limit errors so the retry loop
+                # can inject cached evidence into the prompt.
+                invocation_error = RuntimeError(f"OSA advisor invocation failed: {exc}")
+                invocation_error._tool_output_messages = list(exc.output_messages)
+                raise invocation_error from exc
             raise
         advisor_output = coerce_structured_response(
             result,

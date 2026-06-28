@@ -97,36 +97,35 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             system_prompt=GroundingPromptBuilder().system_prompt(),
             response_model=IntentAdvisorDecision,
             max_iterations=14,
+            max_calls_per_tool=3,
+            tool_call_limits={
+                "get_sm_ue_flow_catalog": 4,
+                "search_sm_flow_targets": 4,
+            },
             tool_result_limits={
-                "get_sm_ue_flow_catalog": 8000,
-                "get_sm_ue_context": 4000,
-                "search_sm_flow_targets": 4000,
-                "get_am_policy_context": 4000,
-                "search_am_policy_targets": 4000,
-                "search_semantic_knowledge": 4000,
-                "get_knowledge_by_key": 4000,
+                "get_sm_ue_flow_catalog": 32000,
+                "get_sm_ue_context": 8000,
+                "search_sm_flow_targets": 8000,
+                "get_am_policy_context": 8000,
+                "search_am_policy_targets": 8000,
+                "search_semantic_knowledge": 8000,
+                "get_knowledge_by_key": 8000,
             },
             context_policy=ContextPolicy(
-                default_tool_result_chars=4000,
-                default_tool_result_tokens=1000,
+                default_tool_result_chars=8000,
                 tool_result_char_limits={
-                    "get_sm_ue_flow_catalog": 8000,
-                    "get_sm_ue_context": 4000,
-                    "search_sm_flow_targets": 4000,
-                    "get_am_policy_context": 4000,
-                    "search_am_policy_targets": 4000,
-                    "search_semantic_knowledge": 4000,
-                    "get_knowledge_by_key": 4000,
+                    "get_sm_ue_flow_catalog": 32000,
+                    "get_sm_ue_context": 8000,
+                    "search_sm_flow_targets": 8000,
+                    "get_am_policy_context": 8000,
+                    "search_am_policy_targets": 8000,
+                    "search_semantic_knowledge": 8000,
+                    "get_knowledge_by_key": 8000,
                 },
                 recent_tool_results_per_tool=1,
                 tool_history_keep_limits={
-                    "get_sm_ue_flow_catalog": 2,
-                    "get_sm_ue_context": 2,
+                    "get_sm_ue_flow_catalog": 3,
                     "search_sm_flow_targets": 2,
-                    "get_am_policy_context": 2,
-                    "search_am_policy_targets": 2,
-                    "search_semantic_knowledge": 2,
-                    "get_knowledge_by_key": 2,
                 },
             ),
         )
@@ -291,6 +290,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     invocation_error = str(exc)
                     if attempt_index == 2:
                         raise
+                    # If the failed invocation produced tool results, extract them
+                    # and merge into evidence so the retry prompt includes the data
+                    # the LLM already collected — prevents burning tool quota re-querying.
+                    raw_messages = list(getattr(exc, "_tool_output_messages", None) or [])
+                    if raw_messages:
+                        fake_result = {"messages": raw_messages}
+                        evidence = self._refresh_intent_evidence_from_tool_results(
+                            evidence=evidence,
+                            advisor_result=fake_result,
+                            main_directives=main_directives,
+                            snapshot_id=snapshot_id,
+                        )
                     log_event(self.logger, "iea_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
                     advisor_prompt = self._build_validation_retry_prompt(
                         base_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
@@ -408,10 +419,11 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             if evidence.candidate_flows:
                 domain_specific_rules.extend(
                     [
-                        "- Current evidence already contains candidate_flows with grounded identifiers (flow_id, app_id). Use those identifiers in flows.",
+                        "- Current evidence already contains candidate_flows with grounded identifiers (flow_id, app_id). Use those identifiers in flows ONLY if the same flow_id is confirmed by get_sm_ue_flow_catalog output.",
                         "- Do not call search_sm_flow_targets or get_sm_ue_context again to reconfirm an already unique exact candidate.",
-                        "- Do not leave flows empty when candidate_flows is already non-empty.",
+                        "- Do not leave flows empty when candidate_flows already contains at least one candidate that is confirmed by the catalog.",
                         "- IMPORTANT: candidate_flows only carries identifiers, NOT SLA parameters (latency, bandwidth). You must call get_sm_ue_flow_catalog to fetch the SLA baseline before finalizing.",
+                        "- If get_sm_ue_flow_catalog returns a catalog that does not contain a candidate flow_id, mark that flow as unresolved.",
                     ]
                 )
             elif str(evidence.explicit_flow_name or "").strip():
@@ -529,6 +541,14 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 message = str(exc)
                 if "max iterations" in message.lower():
                     raise RuntimeError(f"IEA advisor did not converge to valid JSON: {message}") from exc
+                # Preserve output_messages from ToolLoopExecutionError so the
+                # retry loop can extract tool results and inject them into the
+                # retry prompt — avoids burning tool quota re-querying the same data.
+                invocation_error = RuntimeError(
+                    f"IEA advisor invocation failed before structured output validation: {exc}"
+                )
+                invocation_error._tool_output_messages = list(exc.output_messages)
+                raise invocation_error from exc
             raise RuntimeError(f"IEA advisor invocation failed before structured output validation: {exc}") from exc
         return IntentAdvisorInvocation(
             advisor_result=result,
