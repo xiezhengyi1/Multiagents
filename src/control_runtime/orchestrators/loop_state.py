@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..context import ControlRoundResult
 from ..integrations.storage import create_session_context, get_latest_snapshot_metadata, update_session_context
-from .main_control_support import ControlRoundResult
 
 
 @dataclass(frozen=True)

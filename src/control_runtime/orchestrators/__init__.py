@@ -1,6 +1,6 @@
 """Runtime orchestrator entrypoints for the refactored control system."""
 
-from .main_control_support import ControlRoundResult, ControlRoundTrace
+from ..context import ControlRoundResult, ControlRoundTrace
 
 __all__ = [
     "ControlRoundResult",

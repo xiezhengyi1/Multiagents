@@ -7,9 +7,10 @@ from control_runtime.orchestrators.loop_state import (
     OrchestratorLoopState,
     append_round_trace,
 )
-from control_runtime.orchestrators.main_control_support import (
+from control_runtime.context import (
     build_feedback_context_from_snapshots,
     build_main_context,
+    build_memory_context,
 )
 
 
@@ -76,12 +77,6 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
         self.assertNotIn("very old verbose detail", context)
 
     def test_memory_context_prefers_entries_matching_diagnosis_and_routing_hints(self) -> None:
-        try:
-            from control_runtime.orchestrators.main_control_orchestrator import MainControlOrchestrator
-        except ModuleNotFoundError as exc:
-            self.skipTest(f"runtime dependency unavailable: {exc}")
-        orchestrator = MainControlOrchestrator.__new__(MainControlOrchestrator)
-
         class Memory:
             def retrieve(self, _: str) -> dict:
                 return {
@@ -95,10 +90,9 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
                     ],
                 }
 
-        orchestrator.memory_manager = Memory()
-        context = MainControlOrchestrator._build_memory_context(
-            orchestrator,
+        context = build_memory_context(
             "QoS request",
+            memory_manager=Memory(),
             diagnosis_hint="planning_blocked",
             routing_hint="optimization_strategy target_stable",
         )
@@ -107,10 +101,10 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
         self.assertIn("optimization_strategy target_stable", context)
 
     def test_main_context_is_markdown_sections_not_json_blob(self) -> None:
-        import control_runtime.orchestrators.main_control_support as support
+        import control_runtime.context.control_loop as context_api
 
-        original = support.get_snapshot_data_by_id
-        support.get_snapshot_data_by_id = lambda _: {"apps": [], "slices": [], "nodes": [], "mobility": [], "flows": []}
+        original = context_api.get_snapshot_data_by_id
+        context_api.get_snapshot_data_by_id = lambda _: {"apps": [], "slices": [], "nodes": [], "mobility": [], "flows": []}
         try:
             context = build_main_context(
                 "snap-1",
@@ -120,13 +114,25 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
                 previous_diagnosis={"root_cause_category": "planning_blocked"},
             )
         finally:
-            support.get_snapshot_data_by_id = original
+            context_api.get_snapshot_data_by_id = original
 
         self.assertTrue(context.startswith("## Snapshot Summary"))
         self.assertIn("## Previous Round Diagnosis", context)
         self.assertIn("## Retry Hints", context)
         self.assertIn("## Memory Context", context)
         self.assertNotEqual(context[:1], "{")
+
+    def test_context_helpers_are_not_left_in_orchestrator_support_module(self) -> None:
+        import importlib.util
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        self.assertIsNone(importlib.util.find_spec("control_runtime.orchestrators.main_control_support"))
+
+        orchestrator_text = (root / "src" / "control_runtime" / "orchestrators" / "main_control_orchestrator.py").read_text(encoding="utf-8")
+        self.assertNotIn("def _build_memory_context", orchestrator_text)
+        self.assertNotIn("def _build_ie_context", orchestrator_text)
+        self.assertNotIn("def _should_reuse_operation_intent", orchestrator_text)
 
 
 if __name__ == "__main__":

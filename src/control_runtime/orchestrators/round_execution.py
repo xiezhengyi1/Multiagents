@@ -20,7 +20,7 @@ from ..domain.control_loop import (
 from ..domain.control_plane import ControlDomain, DomainStatus, DomainVerdict, GlobalControlIntent, UnifiedControlPlan
 from ..domain.policy_plan import OperationIntent, PolicyPlanDraft
 from ..integrations.storage import get_snapshot_data_by_id, get_ue_context_by_supi
-from .main_control_support import ControlRoundTrace, parse_pda_metrics
+from ..context import ControlRoundTrace, parse_pda_metrics
 
 
 AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"

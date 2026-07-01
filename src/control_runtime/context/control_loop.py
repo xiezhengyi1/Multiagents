@@ -1,15 +1,28 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from shared.runtime import ContextPolicy
 
-from ..agents.dispatch.contracts import FeedbackReport
 from ..domain.collaboration import DomainNegotiationRequest, ExecutionReentryRequest, PlanningBlockerReport, PlanningContext
 from ..domain.control_plane import GlobalControlIntent
-from ..integrations.storage import get_latest_snapshot_metadata, get_snapshot_data_by_id
+from ..domain.policy_plan import OperationIntent
+from .projectors import project_global_intent_for_prompt
+
+
+def get_snapshot_data_by_id(snapshot_id: str) -> Dict[str, Any]:
+    from ..integrations.storage import get_snapshot_data_by_id as _get_snapshot_data_by_id
+
+    return _get_snapshot_data_by_id(snapshot_id) or {}
+
+
+def get_latest_snapshot_metadata() -> Dict[str, Any]:
+    from ..integrations.storage import get_latest_snapshot_metadata as _get_latest_snapshot_metadata
+
+    return _get_latest_snapshot_metadata() or {}
 
 
 @dataclass
@@ -128,7 +141,7 @@ def build_planning_context(
     )
 
 
-def parse_pda_metrics(report: FeedbackReport) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def parse_pda_metrics(report: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     raw_metrics = str(report.performance_metrics or "").strip()
     if not raw_metrics:
         return [], []
@@ -241,6 +254,287 @@ def build_feedback_context_from_snapshots(
         if str(getattr(snap, "feedback_added", "") or "").strip()
     )
     return _truncate_feedback_context("\n".join(block for block in blocks if block.strip()), token_counter=token_counter)
+
+
+def build_memory_context(
+    user_input: str,
+    *,
+    memory_manager: Any,
+    diagnosis_hint: str = "",
+    routing_hint: str = "",
+    context_policy: Optional[ContextPolicy] = None,
+    token_counter: Any = None,
+) -> str:
+    bundle = memory_manager.retrieve(user_input)
+    short_term = bundle.get("short_term", []) if isinstance(bundle, dict) else []
+    long_term = bundle.get("long_term", []) if isinstance(bundle, dict) else []
+    short_term = rerank_by_context_hints(short_term, diagnosis_hint, routing_hint)[:5]
+    long_term = rerank_by_context_hints(long_term, diagnosis_hint, routing_hint)[:5]
+    blocks: List[str] = []
+    if short_term:
+        blocks.append(
+            "[Memory][Short-Term]\n"
+            + "\n".join(
+                f"{item.get('role', 'unknown')}: {item.get('content', '')}"
+                for item in short_term
+                if isinstance(item, dict)
+            )
+        )
+    if long_term:
+        blocks.append("[Memory][Long-Term]\n" + "\n".join(str(item) for item in long_term))
+    rendered = "\n\n".join(block for block in blocks if block.strip())
+    policy = context_policy or ContextPolicy()
+    return policy.compact_text(
+        rendered,
+        max_chars=6000,
+        max_tokens=1500,
+        token_counter=token_counter,
+    )
+
+
+def rerank_by_context_hints(items: List[Any], diagnosis_hint: str = "", routing_hint: str = "") -> List[Any]:
+    hint_text = f"{diagnosis_hint} {routing_hint}".lower()
+    hint_tokens = {
+        token
+        for token in re.split(r"[^a-zA-Z0-9_]+", hint_text)
+        if len(token) >= 3
+    }
+    if not hint_tokens:
+        return list(items)
+
+    def score_item(index_item: tuple[int, Any]) -> tuple[int, int]:
+        index, item = index_item
+        if isinstance(item, dict):
+            text = json.dumps(item, ensure_ascii=False).lower()
+        else:
+            text = str(item or "").lower()
+        item_tokens = {
+            token
+            for token in re.split(r"[^a-zA-Z0-9_]+", text)
+            if len(token) >= 3
+        }
+        return (len(hint_tokens & item_tokens), -index)
+
+    ranked = sorted(enumerate(items), key=score_item, reverse=True)
+    return [item for _, item in ranked]
+
+
+def build_intent_encoding_context(
+    *,
+    global_intent: Dict[str, Any],
+    snapshot_id: str,
+    round_index: int,
+    diagnosis: Dict[str, Any],
+    feedback_context: str,
+) -> str:
+    snapshot = get_snapshot_data_by_id(snapshot_id) or {}
+    projected_global_intent = project_global_intent_for_prompt(global_intent)
+    return (
+        "## Guidance\n"
+        f"- round_index: {round_index}\n"
+        f"- intent_encoding_guidance: {global_intent.get('intent_encoding_guidance', '') or 'N/A'}\n"
+        f"- retry_scope: {global_intent.get('retry_scope') or 'N/A'}\n"
+        f"- routing_decision: {global_intent.get('routing_decision') or 'N/A'}\n"
+        f"- routing_rationale: {global_intent.get('routing_rationale') or 'N/A'}\n\n"
+        "## Evidence\n"
+        f"- main_intent: {json.dumps(projected_global_intent, ensure_ascii=False)}\n"
+        f"- snapshot_summary: {json.dumps(_build_snapshot_summary(snapshot) if snapshot else {}, ensure_ascii=False)}\n"
+        "\n"
+        "## Previous Diagnosis\n"
+        f"{json.dumps(diagnosis or {}, ensure_ascii=False)}\n\n"
+        "## Feedback\n"
+        f"{feedback_context or 'N/A'}"
+    )
+
+
+def scope_global_intent_for_intent_encoding(
+    *,
+    global_intent: GlobalControlIntent,
+    round_index: int,
+) -> GlobalControlIntent:
+    semantics = global_intent.control_semantics
+    stages = list(semantics.stages or [])
+    if not stages:
+        return global_intent
+
+    ordered_stages = sorted(stages, key=lambda stage: int(stage.stage_index or 0))
+    scoped_position = min(max(1, int(round_index or 1)), len(ordered_stages)) - 1
+    scoped_stage = ordered_stages[scoped_position].model_copy(deep=True)
+    scoped_semantics = semantics.model_copy(
+        update={
+            "current_stage": 1,
+            "stages": [
+                scoped_stage.model_copy(
+                    update={"stage_index": 1},
+                    deep=True,
+                )
+            ],
+        },
+        deep=True,
+    )
+    return global_intent.model_copy(
+        update={"control_semantics": scoped_semantics},
+        deep=True,
+    )
+
+
+def build_planning_failure_payload(
+    exc: Exception,
+    *,
+    debug_context: Optional[Dict[str, Any]] = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    message = str(exc or "").strip() or exc.__class__.__name__
+    report_payload = {
+        "execution_status": "Failed",
+        "violation_details": message,
+        "feedback_payload": {
+            "phase": "planning",
+            "error": message,
+            "target_bindings_at_risk": [],
+            "policy_objects_at_risk": [],
+            "reason_by_domain": {},
+            "debug_context": dict(debug_context or {}),
+        },
+    }
+    diagnosis = {
+        "root_cause_category": "planning_failure",
+        "root_cause": message,
+        "reason_summary": message,
+        "recommended_actions": [],
+        "debug_context": dict(debug_context or {}),
+    }
+    return report_payload, diagnosis
+
+
+def has_supi_scope(global_intent: GlobalControlIntent) -> bool:
+    if str(global_intent.supi or "").strip():
+        return True
+    for stage in global_intent.control_semantics.stages or []:
+        for target in stage.targets or []:
+            if str(target.supi or "").strip():
+                return True
+    return False
+
+
+def build_negotiation_request(operation_intent: OperationIntent, *, round_index: int) -> DomainNegotiationRequest:
+    issues = []
+    for question in operation_intent.open_questions:
+        payload = question.model_dump(mode="json") if hasattr(question, "model_dump") else dict(question)
+        issues.append(
+            {
+                "source_agent": "intent_encoding",
+                "issue_type": "domain_boundary",
+                "domain": str((payload.get("related_domains") or [""])[0] or ""),
+                "binding_keys": [],
+                "policy_objects": [],
+                "missing_evidence": [str(payload.get("question") or "").strip()] if str(payload.get("question") or "").strip() else [],
+                "rationale": str(payload.get("question") or "").strip(),
+            }
+        )
+    return DomainNegotiationRequest(
+        round_index=round_index,
+        source_agent="intent_encoding",
+        main_requested_domains=list(operation_intent.main_requested_domains or []),
+        grounded_requested_domains=list(operation_intent.grounded_requested_domains or operation_intent.requested_domains or []),
+        domain_resolution=str(operation_intent.domain_resolution or "cannot_confirm"),
+        domain_revision_needed=bool(operation_intent.domain_revision_needed),
+        issues=issues,
+        recommended_consumers=["main_control", "intent_encoding"],
+        summary=str(operation_intent.domain_revision_rationale or "").strip(),
+    )
+
+
+def build_negotiation_diagnosis(request: DomainNegotiationRequest) -> Dict[str, Any]:
+    issue_reasons = [
+        str(item.rationale or "").strip()
+        for item in (request.issues or [])
+        if str(item.rationale or "").strip()
+    ]
+    return {
+        "root_cause_category": "domain_negotiation_required",
+        "root_cause": request.summary,
+        "reason_summary": request.summary,
+        "recommended_actions": issue_reasons,
+    }
+
+
+def build_reentry_report_payload(request: ExecutionReentryRequest) -> Dict[str, Any]:
+    return {
+        "execution_status": "Failed",
+        "violation_details": request.summary,
+        "feedback_payload": {
+            "failure_scope": request.failure_scope,
+            "target_bindings_at_risk": list(request.target_bindings_at_risk or []),
+            "policy_objects_at_risk": list(request.policy_objects_at_risk or []),
+            "reason_by_domain": dict(request.reason_by_domain or {}),
+            "failures": list(request.failures or []),
+        },
+    }
+
+
+def should_reuse_operation_intent(
+    *,
+    global_intent: GlobalControlIntent,
+    previous_operation_intent: Optional[OperationIntent],
+    previous_report_payload: Dict[str, Any],
+    previous_mediator_decision: Optional[Dict[str, Any]],
+) -> bool:
+    if previous_operation_intent is None:
+        return False
+    if str(global_intent.next_agent or "").strip().lower() != "optimization_strategy":
+        return False
+    contract = global_intent.reuse_contract
+    if not contract.allowed:
+        return False
+    if contract.preserve_bindings and str(previous_operation_intent.supi or "").strip() != str(global_intent.supi or "").strip():
+        return False
+    previous_domains = {str(item or "").strip().lower() for item in (previous_operation_intent.requested_domains or []) if str(item or "").strip()}
+    current_domains = {item.value for item in global_intent.requested_domains}
+    if contract.preserve_domains and previous_domains != current_domains:
+        return False
+    if contract.preserve_stage_scope:
+        stages = previous_operation_intent.control_semantics.stages or []
+        active_stage = next(
+            (
+                stage
+                for stage in stages
+                if int(stage.stage_index or 0) == int(previous_operation_intent.control_semantics.current_stage or 1)
+            ),
+            None,
+        )
+        if active_stage is None:
+            return False
+        if not [flow_id for flow_id in (active_stage.active_flow_ids or []) if str(flow_id or "").strip()]:
+            return False
+    invalidate_text = json.dumps(
+        {
+            "report": previous_report_payload or {},
+            "mediator": previous_mediator_decision or {},
+            "open_questions": previous_operation_intent.open_questions,
+        },
+        ensure_ascii=False,
+    ).lower()
+    for token in contract.invalidate_on:
+        normalized = str(token or "").strip().lower()
+        if normalized and normalized in invalidate_text:
+            return False
+    if previous_operation_intent.open_questions:
+        return False
+    return True
+
+
+def activate_control_stage(
+    *,
+    operation_intent: OperationIntent,
+    round_index: int,
+) -> OperationIntent:
+    semantics = operation_intent.control_semantics
+    if not semantics.stages:
+        return operation_intent
+    activated = operation_intent.model_copy(deep=True)
+    max_stage = max(stage.stage_index for stage in semantics.stages)
+    activated.control_semantics.current_stage = min(max(1, round_index), max_stage)
+    return activated
 
 
 _MAX_FEEDBACK_CHARS = 4000
@@ -518,3 +812,27 @@ def _build_assurance_failure_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(item, dict)
         ]
     }
+
+
+__all__ = [
+    "ControlRoundResult",
+    "ControlRoundTrace",
+    "activate_control_stage",
+    "build_feedback_context_from_snapshots",
+    "build_intent_encoding_context",
+    "build_main_context",
+    "build_memory_context",
+    "build_negotiation_diagnosis",
+    "build_negotiation_request",
+    "build_planning_context",
+    "build_planning_failure_payload",
+    "build_reentry_report_payload",
+    "build_round_feedback_block",
+    "get_latest_snapshot_metadata",
+    "get_snapshot_data_by_id",
+    "has_supi_scope",
+    "parse_pda_metrics",
+    "rerank_by_context_hints",
+    "scope_global_intent_for_intent_encoding",
+    "should_reuse_operation_intent",
+]

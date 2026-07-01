@@ -16,15 +16,15 @@ from ..agents.dispatch import PolicyDispatchAgent
 from ..agents.single import SingleControlAgent
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool
 from ..diagnostics.mediation import ConflictResolutionTool
-from ..domain.control_plane import GlobalControlIntent
-from ..domain.policy_plan import OperationIntent, PolicyPlanDraft
-from .main_control_support import (
+from ..context import (
     ControlRoundResult,
     ControlRoundTrace,
     build_feedback_context_from_snapshots,
-    build_round_feedback_block,
     build_main_context,
+    build_round_feedback_block,
 )
+from ..domain.control_plane import GlobalControlIntent
+from ..domain.policy_plan import OperationIntent, PolicyPlanDraft
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
 from .round_execution import execute_planned_round
 from shared.logging import log_event
