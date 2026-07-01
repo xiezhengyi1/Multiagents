@@ -182,6 +182,14 @@ def build_round_feedback_block(
             f"root_cause: {diagnosis.get('root_cause', '')}\n"
             f"reason_summary: {diagnosis.get('reason_summary', '')}\n"
         )
+    retry_contract = _build_retry_contract(
+        pda_feedback=pda_feedback or {},
+        diagnosis=diagnosis or {},
+        mediator_decision=mediator_decision or {},
+        round_index=round_index,
+    )
+    if retry_contract:
+        blocks.append("[Retry Contract]\n" f"retry_contract: {json.dumps(retry_contract, ensure_ascii=False)}")
     if negotiation_request:
         blocks.append(
             "[Negotiation]\n"
@@ -235,6 +243,108 @@ def build_round_feedback_block(
         if mediator_lines:
             blocks.append("[Mediator]\n" + "\n".join(mediator_lines))
     return "\n".join(block.strip() for block in blocks if block.strip())
+
+
+def _build_retry_contract(
+    *,
+    pda_feedback: Dict[str, Any],
+    diagnosis: Dict[str, Any],
+    mediator_decision: Dict[str, Any],
+    round_index: int,
+) -> Dict[str, Any]:
+    if not pda_feedback and not diagnosis and not mediator_decision:
+        return {}
+
+    root_cause_category = str(diagnosis.get("root_cause_category") or "").strip()
+    root_cause = str(diagnosis.get("root_cause") or "").strip()
+    reason_summary = str(diagnosis.get("reason_summary") or "").strip()
+    correction_suggestion = str(pda_feedback.get("correction_suggestion") or "").strip()
+    recommended_actions = [
+        str(item or "").strip()
+        for item in (diagnosis.get("recommended_actions") or [])
+        if str(item or "").strip()
+    ]
+    affected_flow_ids = _unique_text_values(
+        [
+            *(diagnosis.get("affected_flow_ids") or []),
+            *_extract_ids_from_text(root_cause, prefix="flow"),
+            *_extract_ids_from_text(reason_summary, prefix="flow"),
+            *_extract_ids_from_text(str(pda_feedback.get("violation_details") or ""), prefix="flow"),
+        ]
+    )
+    affected_policy_ids = _unique_text_values(
+        [
+            *(diagnosis.get("affected_policy_ids") or []),
+            *_extract_ids_from_text(root_cause, prefix="smp"),
+            *_extract_ids_from_text(str(pda_feedback.get("violation_details") or ""), prefix="smp"),
+        ]
+    )
+    hard_constraints = []
+    unified_constraints = mediator_decision.get("unified_constraints")
+    if isinstance(unified_constraints, dict):
+        hard_constraints = [
+            str(item or "").strip()
+            for item in (unified_constraints.get("hard_constraints") or [])
+            if str(item or "").strip()
+        ]
+
+    retry_goal_parts = [*recommended_actions]
+    if correction_suggestion:
+        retry_goal_parts.append(correction_suggestion)
+    if not retry_goal_parts and reason_summary:
+        retry_goal_parts.append(reason_summary)
+
+    contract = {
+        "retry_round": int(round_index) + 1,
+        "previous_failure_type": root_cause_category or "unknown",
+        "repair_goal": "; ".join(retry_goal_parts),
+        "must_reuse": {
+            "flow_ids": affected_flow_ids,
+            "policy_ids": affected_policy_ids,
+        },
+        "must_call_next": _infer_retry_tool(
+            root_cause_category=root_cause_category,
+            root_cause=root_cause,
+            reason_summary=reason_summary,
+            affected_flow_ids=affected_flow_ids,
+        ),
+        "forbidden_changes": hard_constraints,
+    }
+    return contract
+
+
+def _infer_retry_tool(
+    *,
+    root_cause_category: str,
+    root_cause: str,
+    reason_summary: str,
+    affected_flow_ids: List[str],
+) -> str:
+    joined = " ".join([root_cause_category, root_cause, reason_summary]).lower()
+    if affected_flow_ids or "qos" in joined or "sm policy" in joined or "latency" in joined or "throughput" in joined:
+        return "preview_qos_optimizer"
+    if "mobility" in joined or "am policy" in joined or "rfsp" in joined or "nssai" in joined:
+        return "inspect_mobility_ue_policies"
+    return ""
+
+
+def _extract_ids_from_text(text: str, *, prefix: str) -> List[str]:
+    if prefix == "flow":
+        pattern = r"\bflow-[A-Za-z0-9_-]+\b"
+    elif prefix == "smp":
+        pattern = r"\bsmp-[A-Za-z0-9_-]+\b"
+    else:
+        return []
+    return re.findall(pattern, str(text or ""))
+
+
+def _unique_text_values(values: List[Any]) -> List[str]:
+    normalized: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
 
 
 def build_feedback_context_from_snapshots(

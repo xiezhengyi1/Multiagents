@@ -199,6 +199,7 @@ class PlanningAdvisorValidator:
         retry_scope = str(planning_request.context.main_retry_scope or "").strip().lower()
         preserved_app_id = self._preserved_app_id(planning_request)
         preserved_flow_ids = self._preserved_flow_ids(planning_request)
+        preserved_flow_app_ids = self._preserved_flow_app_ids(planning_request)
         planning_status = str(advisor_output.planning_status or "").strip().lower()
 
         has_sm = bool(advisor_output.sm_policies)
@@ -247,7 +248,17 @@ class PlanningAdvisorValidator:
         if has_am and not mobility_context:
             errors.append("am_policy requires a parseable mobility context payload")
         if retry_scope == "target_stable":
-            if preserved_app_id:
+            if preserved_flow_app_ids:
+                for index, spec in enumerate(advisor_output.sm_policies):
+                    flow_id = str(spec.flow_id or "").strip()
+                    preserved_spec_app_id = preserved_flow_app_ids.get(flow_id)
+                    if preserved_spec_app_id and _normalize_app_id(spec.app_id) != preserved_spec_app_id:
+                        errors.append(
+                            "target-stable retry "
+                            f"sm_policies[{index}] must preserve app_id={preserved_spec_app_id} "
+                            f"for flow_id={flow_id}; got {spec.app_id}"
+                        )
+            elif preserved_app_id:
                 for index, spec in enumerate(advisor_output.sm_policies):
                     if _normalize_app_id(spec.app_id) != preserved_app_id:
                         errors.append(
@@ -402,6 +413,16 @@ class PlanningAdvisorValidator:
         }
 
     @staticmethod
+    def _preserved_flow_app_ids(planning_request: PlanningRequest) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for flow in planning_request.operation_intent.flows or []:
+            flow_id = str(flow.flow_id or "").strip()
+            app_id = _normalize_app_id(flow.app_id or "")
+            if flow_id and app_id:
+                mapping[flow_id] = app_id
+        return mapping
+
+    @staticmethod
     def _preserved_association_id(planning_request: PlanningRequest) -> str:
         mobility_targets = planning_request.operation_intent.grounding_evidence.grounded_mobility_targets
         if isinstance(mobility_targets, dict):
@@ -445,8 +466,22 @@ class PlanningArtifactValidator:
         if retry_scope == "target_stable":
             preserved_app_id = PlanningAdvisorValidator._preserved_app_id(planning_request)
             preserved_flow_ids = PlanningAdvisorValidator._preserved_flow_ids(planning_request)
+            preserved_flow_app_ids = PlanningAdvisorValidator._preserved_flow_app_ids(planning_request)
             preserved_association_id = PlanningAdvisorValidator._preserved_association_id(planning_request)
-            if preserved_app_id:
+            if preserved_flow_app_ids:
+                drifted_policy_ids = [
+                    item.policy_id
+                    for item in policy_plan.all_policies
+                    if item.policy_type == "SmPolicyDecision"
+                    and str(item.flow_id or "").strip() in preserved_flow_app_ids
+                    and _normalize_app_id(item.app_id) != preserved_flow_app_ids[str(item.flow_id or "").strip()]
+                ]
+                if drifted_policy_ids:
+                    raise ValueError(
+                        "target-stable retry compiled SM policies changed app_id away from preserved "
+                        f"flow/app bindings: {drifted_policy_ids}"
+                    )
+            elif preserved_app_id:
                 drifted_policy_ids = [
                     item.policy_id
                     for item in policy_plan.all_policies

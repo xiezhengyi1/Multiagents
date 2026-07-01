@@ -246,6 +246,27 @@ def build_validation_retry_prompt(
             "return partial_plan with planner_conflicts instead of an executable_plan.\n\n"
             + _QOS_EXAMPLE
         )
+    elif "exceeded max_calls_per_tool" in joined or "get_knowledge_by_key exceeded" in joined:
+        correction = (
+            "You burned your tool call quota — most likely on knowledge tools that cannot fix the issue. "
+            "Knowledge tools (get_knowledge_by_key, search_semantic_knowledge) will NOT resolve "
+            "contract validation errors about flow_id, app_id, optimizer assignments, local slice labels, or target-stable preservation. "
+            "Those errors are caused by your output not matching the optimizer evidence — not by missing 3GPP knowledge. "
+            "Fix: align your sm_policies exactly with the optimizer preview. "
+            "Never add a flow_id that is absent from the optimizer QoS assignment. "
+            "On target-stable retries, preserve the exact flow_ids and app_ids from the upstream request. "
+            "If the optimizer preview is incomplete, return partial_plan with planner_conflicts.\n\n"
+            + _QOS_EXAMPLE
+        )
+    elif "inspect_mobility_ue_policies" in joined or "not callable" in joined or "unknown tool" in joined:
+        correction = (
+            "You tried to use a tool that is not callable for this QoS-only round. "
+            "For slice migration wording without explicit AM/RFSP/allowed-NSSAI/service-area/handover requirements, "
+            "do not call inspect_mobility_ue_policies and do not output am_policy. "
+            "Use the cached optimizer/network evidence if present; otherwise call only callable QoS tools. "
+            "Never ask mobility or knowledge tools to validate local S-NSSAI labels.\n\n"
+            + _QOS_EXAMPLE
+        )
     elif "did not converge" in joined or "max iterations" in joined:
         correction = (
             "You ran out of iterations without returning a final JSON. "
@@ -267,6 +288,11 @@ def build_validation_retry_prompt(
             "Your previous output failed contract validation:\n"
             f"- {contract_lines}\n\n"
             "Fix each issue and return a corrected OsaAdvisorOutput.\n\n"
+            "Important: knowledge tools (get_knowledge_by_key, search_semantic_knowledge) will NOT fix "
+            "contract validation errors — those errors are about your output not matching the optimizer/runtime evidence, "
+            "not about missing 3GPP facts. Do not burn knowledge tool quota on this retry. "
+            "Use only callable domain tools if you need fresh evidence; for QoS-only slice migration that means "
+            "preview_qos_optimizer and, optionally, fetch_qos_network_status.\n\n"
             + _QOS_EXAMPLE
         )
 
@@ -275,8 +301,10 @@ def build_validation_retry_prompt(
         cached_block = (
             "\n\nCached tool evidence from the failed attempt:\n"
             f"{json.dumps(cached_planning_evidence, ensure_ascii=False, default=str)}\n\n"
-            "Do not call tools again on this retry unless a required cached field is absent. "
-            "First try to return the final OsaAdvisorOutput from this cached evidence."
+            "This evidence already contains optimizer results and network status. "
+            "Do NOT call any tool again on this retry unless a required field is genuinely absent from the cached evidence. "
+            "Knowledge tools (get_knowledge_by_key, search_semantic_knowledge) will NOT help with contract validation errors. "
+            "First try to return the final OsaAdvisorOutput from this cached evidence directly."
         )
 
     return (

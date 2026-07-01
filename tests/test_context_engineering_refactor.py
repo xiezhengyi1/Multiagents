@@ -210,6 +210,7 @@ def test_evidence_formatter_matches_planning_evidence_shape() -> None:
             "name": "video",
             "priority": 1,
             "service_type_id": 7,
+            "current_slice_snssai": None,
         }
     ]
 

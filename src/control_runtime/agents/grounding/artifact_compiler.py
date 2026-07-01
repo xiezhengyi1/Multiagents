@@ -397,6 +397,7 @@ class OperationIntentCompiler:
             priority=sla.get("priority"),
             description=str(flow.get("flow_name") or "").strip() or None,
             five_tuple=list(five_tuple) if isinstance(five_tuple, (list, tuple)) else None,
+            current_slice_snssai=str(allocation.get("current_slice_snssai") or "").strip() or None,
             current_bw_ul=allocation.get("allocated_bandwidth_ul"),
             current_bw_dl=allocation.get("allocated_bandwidth_dl"),
             resolution_status="resolved",

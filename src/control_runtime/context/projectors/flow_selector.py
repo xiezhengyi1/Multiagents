@@ -25,6 +25,7 @@ class FlowSelectorProjector(BaseProjector):
         field("jitter_req", doc="Jitter requirement ms"),
         field("priority", doc="Priority level"),
         field("five_tuple", doc="Resolved 5-tuple"),
+        field("current_slice_snssai", doc="Current serving slice S-NSSAI"),
         field("resolution_status", doc="Resolution status"),
         field("target_type", doc="Target scope"),
     )

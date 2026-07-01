@@ -74,6 +74,19 @@ class RetryPromptBuilder:
             "`domain_resolution` must be a scalar string, not an object.",
         ]
         joined = " | ".join(issues)
+
+        # Tool-limit errors: tell the LLM to use cached data instead of re-querying.
+        if "exceeded max_calls_per_tool" in joined or "max iterations" in joined.lower():
+            repair_rules.extend(
+                [
+                    "CRITICAL: Your previous attempt collected tool results but exceeded the call limit before finalizing.",
+                    "The evidence payload below already includes the data collected by the failed attempt.",
+                    "Do NOT call get_sm_ue_flow_catalog again — use the catalog data already embedded in the evidence.",
+                    "Do NOT call any tool you already called in the previous attempt — the results are in the evidence.",
+                    "Finalize immediately from the embedded evidence. If a target is still ungrounded, mark it unresolved.",
+                    "Use at most 1 additional tool call if absolutely required; then finalize.",
+                ]
+            )
         if "QoS advisor decision must include grounded target flows." in joined:
             repair_rules.extend(
                 [
@@ -125,6 +138,16 @@ class RetryPromptBuilder:
                 [
                     "This retry is QoS-only.",
                     "Do not call get_am_policy_context or search_am_policy_targets.",
+                ]
+            )
+        if "missing QoS baseline values" in joined:
+            repair_rules.extend(
+                [
+                    "The previous attempt resolved a flow to a flow_id that does not have SLA baseline data in the catalog.",
+                    "This usually means the resolved flow_id does not exist in the UE's flow catalog.",
+                    "You must call get_sm_ue_flow_catalog and ONLY resolve flows whose flow_ids appear in the returned catalog.",
+                    "Flows returned by search_sm_flow_targets carry identifiers but NOT SLA baselines — those must come from get_sm_ue_flow_catalog.",
+                    "If the catalog does not contain a flow matching the user's intent, mark the flow as unresolved instead of forcing a resolution.",
                 ]
             )
 

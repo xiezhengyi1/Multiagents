@@ -15,8 +15,17 @@ TOOL_RESULT_MARKERS: Dict[str, str] = {
 }
 
 
+_TRUNCATION_MARKER = "\n... [truncated]"
+
+
 def parse_json_payload_from_tool_result(content: Any, *, marker: str) -> Dict[str, Any]:
     text = str(content or "").strip()
+    if not text:
+        return {}
+    # Strip truncation marker that context_policy may have appended after
+    # JSON-safe truncation (the suffix sits outside the JSON structure).
+    if text.endswith(_TRUNCATION_MARKER):
+        text = text[:-len(_TRUNCATION_MARKER)].strip()
     if not text:
         return {}
     payload_text = text

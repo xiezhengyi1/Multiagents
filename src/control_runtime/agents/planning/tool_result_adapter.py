@@ -12,8 +12,17 @@ _STRUCTURED_PLANNING_TOOLS = {
 }
 
 
+_TRUNCATION_MARKER = "\n... [truncated]"
+
+
 def _parse_json_object(content: Any) -> Dict[str, Any]:
     text = str(content or "").strip()
+    if not text:
+        raise ValueError("tool result content is empty")
+    # Strip truncation marker that context_policy may have appended after
+    # JSON-safe truncation (the suffix sits outside the JSON structure).
+    if text.endswith(_TRUNCATION_MARKER):
+        text = text[:-len(_TRUNCATION_MARKER)].strip()
     if not text:
         raise ValueError("tool result content is empty")
     try:

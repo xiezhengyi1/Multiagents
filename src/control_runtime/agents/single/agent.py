@@ -194,33 +194,28 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             tool_error_mode="raise",
             forbid_duplicate_tool_calls=True,
             tool_result_limits={
-                "preview_qos_optimizer": 8000,
-                "get_sm_ue_context": 4000,
-                "get_sm_ue_flow_catalog": 8000,
-                "get_am_policy_context": 4000,
-                "fetch_qos_network_status": 4000,
-                "inspect_mobility_ue_policies": 4000,
-                "search_semantic_knowledge": 4000,
-                "get_knowledge_by_key": 4000,
+                "preview_qos_optimizer": 32000,
+                "get_sm_ue_context": 8000,
+                "get_sm_ue_flow_catalog": 32000,
+                "get_am_policy_context": 8000,
+                "fetch_qos_network_status": 32000,
+                "inspect_mobility_ue_policies": 8000,
+                "search_semantic_knowledge": 8000,
+                "get_knowledge_by_key": 8000,
             },
             context_policy=ContextPolicy(
-                default_tool_result_chars=4000,
-                default_tool_result_tokens=1000,
+                default_tool_result_chars=8000,
                 tool_result_char_limits={
-                    "preview_qos_optimizer": 8000,
-                    "get_sm_ue_context": 4000,
-                    "get_sm_ue_flow_catalog": 8000,
-                    "get_am_policy_context": 4000,
-                    "fetch_qos_network_status": 4000,
-                    "inspect_mobility_ue_policies": 4000,
-                    "search_semantic_knowledge": 4000,
-                    "get_knowledge_by_key": 4000,
+                    "preview_qos_optimizer": 32000,
+                    "get_sm_ue_context": 8000,
+                    "get_sm_ue_flow_catalog": 32000,
+                    "get_am_policy_context": 8000,
+                    "fetch_qos_network_status": 32000,
+                    "inspect_mobility_ue_policies": 8000,
+                    "search_semantic_knowledge": 8000,
+                    "get_knowledge_by_key": 8000,
                 },
                 recent_tool_results_per_tool=1,
-                tool_history_keep_limits={
-                    "search_sm_flow_targets": 2,
-                    "search_am_policy_targets": 2,
-                },
             ),
         )
         prompt = self._build_round_prompt(
@@ -494,6 +489,10 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
 
     @classmethod
     def _normalize_final_list_payload(cls, payload: List[Any], conversation: List[Any]) -> Optional[Dict[str, Any]]:
+        if len(payload) == 1 and isinstance(payload[0], dict):
+            normalized_single = cls._normalize_final_dict_payload(payload[0], [])
+            if normalized_single is not None:
+                return normalized_single
         optimizer_call = cls._latest_successful_optimizer_call(conversation)
         if optimizer_call is None:
             return None

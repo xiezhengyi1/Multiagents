@@ -60,6 +60,7 @@ class EvidenceFormatter:
                     "name": str(flow.name or "").strip(),
                     "priority": flow.priority,
                     "service_type_id": flow.service_type_id,
+                    "current_slice_snssai": str(flow.current_slice_snssai or "").strip() or None,
                 }
             )
         qos_objectives = [

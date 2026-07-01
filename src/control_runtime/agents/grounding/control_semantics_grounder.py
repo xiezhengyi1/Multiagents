@@ -210,7 +210,10 @@ class ControlSemanticsGrounder:
                     matches.append(row)
 
         # Pass 3: LLM semantic matching as last resort.
-        if not matches:
+        # When a SUPI-scoped target names a literal flow/app identifier, an LLM
+        # fallback can silently substitute a different flow on the same UE. Keep
+        # such targets semantic/unresolved unless lexical evidence matches.
+        if not matches and not (target_supi and self._is_literal_named_target(semantic_name)):
             matches = self._semantic_match_flows_with_llm(
                 target=target,
                 candidate_rows=candidate_rows,
@@ -314,6 +317,10 @@ class ControlSemanticsGrounder:
     @staticmethod
     def _normalize_semantic_name(value: str) -> str:
         return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").lower())
+
+    @staticmethod
+    def _is_literal_named_target(value: str) -> bool:
+        return bool(re.search(r"[_-]|\d", str(value or "")))
 
     @staticmethod
     def _deduplicate_flow_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

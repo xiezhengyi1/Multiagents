@@ -51,6 +51,7 @@ dependencies = [
     "langgraph-sdk>=0.3.2",
     "langsmith>=0.6.2",
     "markupsafe>=3.0.3",
+    "matplotlib>=3.10.6",
     "marshmallow>=3.26.2",
     "multidict>=6.7.0",
     "mypy-extensions>=1.1.0",

@@ -190,8 +190,24 @@ def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], D
         result = run_optimizer(request)
         full_payload = _serialize_optimizer_result(result)
         _results_cache["latest_optimizer_preview"] = full_payload
+        summary = _summarize_optimizer_result(full_payload)
+        current_slice_by_flow_id = {
+            str(flow.flow_id or "").strip(): str(flow.current_slice_snssai or "").strip()
+            for flow in (planning_request.operation_intent.flows or [])
+            if str(flow.flow_id or "").strip() and str(flow.current_slice_snssai or "").strip()
+        }
+        for assignment in summary.get("qos_flow_assignments") or []:
+            if not isinstance(assignment, dict):
+                continue
+            flow_id = str(assignment.get("flow_id") or "").strip()
+            current_slice = current_slice_by_flow_id.get(flow_id)
+            if current_slice:
+                assignment["current_slice"] = current_slice
+                assignment["slice_changed"] = (
+                    str(assignment.get("new_slice") or "").strip() != current_slice
+                )
         return json.dumps(
-            {"summary": _summarize_optimizer_result(full_payload)},
+            {"summary": summary},
             ensure_ascii=False,
         )
 
