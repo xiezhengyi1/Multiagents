@@ -78,6 +78,26 @@ class _SingleAgentOutputNormalizingLlm:
 class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "single_control"
     DEEPSEEK_MODEL = "deepseek-v4-flash"
+    LARGE_MODEL_TOOL_RESULT_LIMITS = {
+        "preview_qos_optimizer": 32000,
+        "get_sm_ue_context": 8000,
+        "get_sm_ue_flow_catalog": 32000,
+        "get_am_policy_context": 8000,
+        "fetch_qos_network_status": 32000,
+        "inspect_mobility_ue_policies": 8000,
+        "search_semantic_knowledge": 8000,
+        "get_knowledge_by_key": 8000,
+    }
+    SMALL_MODEL_TOOL_RESULT_LIMITS = {
+        "preview_qos_optimizer": 12000,
+        "get_sm_ue_context": 4000,
+        "get_sm_ue_flow_catalog": 12000,
+        "get_am_policy_context": 4000,
+        "fetch_qos_network_status": 8000,
+        "inspect_mobility_ue_policies": 6000,
+        "search_semantic_knowledge": 3000,
+        "get_knowledge_by_key": 3000,
+    }
     FINAL_PRODUCT_FIELDS = {
         "supi",
         "requested_domains",
@@ -146,6 +166,32 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         finally:
             self.llm = original_llm
 
+    @staticmethod
+    def _uses_small_model_context(model_name: str) -> bool:
+        normalized = str(model_name or "").strip().lower()
+        return not normalized.startswith("deepseek")
+
+    @classmethod
+    def _tool_result_limits_for_model(cls, model_name: str) -> Dict[str, int]:
+        if cls._uses_small_model_context(model_name):
+            return dict(cls.SMALL_MODEL_TOOL_RESULT_LIMITS)
+        return dict(cls.LARGE_MODEL_TOOL_RESULT_LIMITS)
+
+    @classmethod
+    def _tool_context_policy_for_model(cls, model_name: str) -> ContextPolicy:
+        small_model = cls._uses_small_model_context(model_name)
+        limits = cls._tool_result_limits_for_model(model_name)
+        return ContextPolicy(
+            default_tool_result_chars=4000 if small_model else 8000,
+            default_tool_result_tokens=1000 if small_model else 2000,
+            tool_result_char_limits=limits,
+            tool_result_token_limits={
+                name: 1000 if small_model else 2000
+                for name in limits
+            },
+            recent_tool_results_per_tool=1,
+        )
+
     def plan_round(
         self,
         *,
@@ -170,6 +216,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             "supi": supi,
         }
         token_budget, token_counter = self._resolve_token_context()
+        context_policy = self._tool_context_policy_for_model(self.model_name)
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
             session_id=session_id,
@@ -193,30 +240,11 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             max_iterations=12,
             tool_error_mode="raise",
             forbid_duplicate_tool_calls=True,
-            tool_result_limits={
-                "preview_qos_optimizer": 32000,
-                "get_sm_ue_context": 8000,
-                "get_sm_ue_flow_catalog": 32000,
-                "get_am_policy_context": 8000,
-                "fetch_qos_network_status": 32000,
-                "inspect_mobility_ue_policies": 8000,
-                "search_semantic_knowledge": 8000,
-                "get_knowledge_by_key": 8000,
-            },
-            context_policy=ContextPolicy(
-                default_tool_result_chars=8000,
-                tool_result_char_limits={
-                    "preview_qos_optimizer": 32000,
-                    "get_sm_ue_context": 8000,
-                    "get_sm_ue_flow_catalog": 32000,
-                    "get_am_policy_context": 8000,
-                    "fetch_qos_network_status": 32000,
-                    "inspect_mobility_ue_policies": 8000,
-                    "search_semantic_knowledge": 8000,
-                    "get_knowledge_by_key": 8000,
-                },
-                recent_tool_results_per_tool=1,
-            ),
+            max_tool_result_chars=context_policy.default_tool_result_chars,
+            tool_result_limits=context_policy.tool_result_char_limits,
+            max_tool_result_tokens=context_policy.default_tool_result_tokens,
+            tool_result_token_limits=context_policy.tool_result_token_limits,
+            context_policy=context_policy,
         )
         prompt = self._build_round_prompt(
             user_input=user_input,
