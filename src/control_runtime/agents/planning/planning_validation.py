@@ -402,7 +402,11 @@ class PlanningAdvisorValidator:
 
     @staticmethod
     def _preserved_app_id(planning_request: PlanningRequest) -> str:
-        return _normalize_app_id(planning_request.operation_intent.app_id or "")
+        for flow in planning_request.operation_intent.flows or []:
+            app_id = _normalize_app_id(flow.app_id or "")
+            if app_id:
+                return app_id
+        return ""
 
     @staticmethod
     def _preserved_flow_ids(planning_request: PlanningRequest) -> set[str]:

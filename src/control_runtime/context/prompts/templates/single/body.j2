@@ -94,3 +94,51 @@ Policy quality rules:
 - `am_policy` must be a PCF-style `PcfAmPolicyControlPolicyAssociation` payload suitable for PDA dispatch.
 - Prefer local runtime evidence over generic knowledge.
 - Knowledge tools are optional and only for standards semantics, not for local identifier grounding.
+
+Qwen baseline guardrails and few-shot:
+- Call `preview_qos_optimizer` with exactly these semantic argument names:
+  {"supi": "imsi-208930000000008", "flow_ids": ["flow-3521"], "requested_domains": ["qos"], "objective_profile": "latency"}
+- Never call `preview_qos_optimizer` with `objective_profile_hint`, `optimization_template`, `target_slice`, `exclude_slice`, `flow_name`, or an empty `flow_ids` array.
+- After optimizer approval, emit PCF-style policy IDs derived from the grounded flow_id. Never use generic IDs such as `pcc-rule-1`, `rule-1`, `qos-1`, or `sess-rule-1`.
+- `packetDelayBudget` must be an integer number of milliseconds, never a decimal.
+- Do not emit empty `qosDecs`; every `pccRules` item must reference a non-empty `qosDecs` item through `refQosData`.
+
+Correct QoS final product shape example:
+{
+  "supi": "imsi-208930000000008",
+  "requested_domains": ["qos"],
+  "objective_profile_hint": "latency",
+  "sm_policies": [{
+    "flow_id": "flow-3521",
+    "app_id": "app-telemedicine",
+    "pccRules": {
+      "pcc-flow-3521": {
+        "pccRuleId": "pcc-flow-3521",
+        "precedence": 1,
+        "refQosData": ["qos-flow-3521"],
+        "flowInfos": [{
+          "flowDirection": "BIDIRECTIONAL",
+          "flowDescription": "permit out ip from imsi-208930000000008 to any"
+        }]
+      }
+    },
+    "qosDecs": {
+      "qos-flow-3521": {
+        "qosId": "qos-flow-3521",
+        "var5qi": 7,
+        "priorityLevel": 1,
+        "packetDelayBudget": 13,
+        "packetErrorRate": "0.0005",
+        "maxbrUl": "3.8",
+        "maxbrDl": "3.0",
+        "gbrUl": "3.0",
+        "gbrDl": "2.4"
+      }
+    },
+    "sessRules": {
+      "sess-flow-3521": {
+        "sessRuleId": "sess-flow-3521"
+      }
+    }
+  }]
+}

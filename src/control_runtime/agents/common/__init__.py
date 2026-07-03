@@ -1,5 +1,5 @@
-from .intent_pipeline import validate_and_compile_intent
+from .intent_pipeline import validate_operation_intent
 
 __all__ = [
-    "validate_and_compile_intent",
+    "validate_operation_intent",
 ]

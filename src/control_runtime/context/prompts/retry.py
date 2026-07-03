@@ -44,7 +44,7 @@ class RetryPromptBuilder:
             "degrade/throttle/constrain must be rewritten as deprioritize.\n"
             "control_semantics.stages[].trigger must be one of initial, on_previous_failure, after_previous_stage, retry.\n"
             "For staged priority, stage_index=1 uses initial; stage_index>1 uses after_previous_stage.\n"
-            "Do not populate control_semantics target app_id, flow_id, matched_flow_ids, or matched_app_ids; IEA owns resolved identifiers.\n"
+            "GlobalControlIntent control_semantics targets contain only semantic_name, target_type, goal, metric_focus, note, and supi; IEA owns resolved identifiers.\n"
             "For multi-SUPI requests, leave top-level supi empty and set each target.supi separately; never comma-join SUPIs.\n"
             "If validation says execution_failure with stable bindings, route to optimization_strategy, set round_strategy=policy_revision, retry_scope=target_stable, and set reuse_contract.allowed=true.\n"
             "If a previous draft was a list, convert the intended route into the top-level GlobalControlIntent object.\n"
@@ -68,8 +68,8 @@ class RetryPromptBuilder:
         if grounding_validation_errors:
             issues.extend(grounding_validation_errors)
         repair_rules: List[str] = [
-            "Return one corrected IntentAdvisorDecision JSON object only.",
-            "Do not guess missing identifiers, and do not rely on downstream compilation to fill them.",
+            "Return one corrected OperationIntent JSON object only.",
+            "Do not guess missing identifiers, and do not rely on downstream code to fill OperationIntent fields.",
             "Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
             "`domain_resolution` must be a scalar string, not an object.",
         ]
@@ -87,7 +87,7 @@ class RetryPromptBuilder:
                     "Use at most 1 additional tool call if absolutely required; then finalize.",
                 ]
             )
-        if "QoS advisor decision must include grounded target flows." in joined:
+        if "QoS OperationIntent must include grounded target flows." in joined:
             repair_rules.extend(
                 [
                     "This retry is specifically failing because your previous JSON omitted flows.",
@@ -105,10 +105,10 @@ class RetryPromptBuilder:
                     "Do not output a nested object under `domain_resolution`.",
                 ]
             )
-        if "cannot_confirm domain resolution requires domain_revision_rationale" in joined:
+        if "cannot_confirm domain resolution requires open_questions" in joined:
             repair_rules.extend(
                 [
-                    "If you set `domain_resolution` to `cannot_confirm`, you must include a non-empty `domain_revision_rationale`.",
+                    "If you set `domain_resolution` to `cannot_confirm`, add a non-empty `open_questions` item.",
                     "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
                 ]
             )

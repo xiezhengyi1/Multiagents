@@ -541,16 +541,23 @@ def build_negotiation_request(operation_intent: OperationIntent, *, round_index:
                 "rationale": str(payload.get("question") or "").strip(),
             }
         )
+    domain_resolution = str(operation_intent.domain_resolution or "cannot_confirm").strip() or "cannot_confirm"
+    revision_needed = domain_resolution != "confirmed" or bool(issues)
+    summary = "; ".join(
+        item["rationale"]
+        for item in issues
+        if str(item.get("rationale") or "").strip()
+    )
     return DomainNegotiationRequest(
         round_index=round_index,
         source_agent="intent_encoding",
-        main_requested_domains=list(operation_intent.main_requested_domains or []),
-        grounded_requested_domains=list(operation_intent.grounded_requested_domains or operation_intent.requested_domains or []),
-        domain_resolution=str(operation_intent.domain_resolution or "cannot_confirm"),
-        domain_revision_needed=bool(operation_intent.domain_revision_needed),
+        main_requested_domains=[],
+        grounded_requested_domains=list(operation_intent.requested_domains or []),
+        domain_resolution=domain_resolution,
+        domain_revision_needed=revision_needed,
         issues=issues,
         recommended_consumers=["main_control", "intent_encoding"],
-        summary=str(operation_intent.domain_revision_rationale or "").strip(),
+        summary=summary or domain_resolution,
     )
 
 
@@ -863,8 +870,7 @@ def _build_previous_operation_intent_summary(previous_operation_intent: Dict[str
     return {
         "supi": str(previous_operation_intent.get("supi") or "").strip(),
         "requested_domains": list(previous_operation_intent.get("requested_domains") or []),
-        "grounded_requested_domains": list(previous_operation_intent.get("grounded_requested_domains") or []),
-        "domain_revision_needed": bool(previous_operation_intent.get("domain_revision_needed") or False),
+        "domain_resolution": str(previous_operation_intent.get("domain_resolution") or "").strip(),
         "control_semantics": previous_operation_intent.get("control_semantics") or {},
         "flow_bindings": [
             {

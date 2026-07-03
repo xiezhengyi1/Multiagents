@@ -11,17 +11,10 @@ from .qos_envelope import QosTargetEnvelopeProjector
 class OperationIntentProjector(BaseProjector):
     model = OperationIntent
     visible = (
-        field("session_id"),
-        field("snapshot_id"),
         field("supi"),
-        field("app_id"),
-        field("app_name"),
-        field("raw_input"),
+        field("resolution_status"),
         field("requested_domains"),
-        field("grounded_requested_domains"),
         field("domain_resolution"),
-        field("domain_revision_needed"),
-        field("domain_revision_rationale"),
         field("control_semantics"),
         field("mobility_intent"),
     )

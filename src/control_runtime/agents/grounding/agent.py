@@ -22,12 +22,12 @@ from ...integrations.pcf import (
 from ...context.projectors import project_intent_evidence_for_prompt
 from ...domain.policy_plan import OperationIntent
 from ...context.prompts import GroundingPromptBuilder, RetryPromptBuilder
-from ..common import validate_and_compile_intent
+from ..common import validate_operation_intent
 from shared.logging import log_event, log_timing
 
 from .compiler import IntentCompiler
 from .common import extract_requested_supis, merge_candidate_dicts, merge_catalog_payloads
-from .contracts import IntentAdvisorDecision, IntentEvidence
+from .contracts import IntentEvidence
 from ...context.prompts import IEA_DYNAMIC_RULES
 from .tool_result_adapter import extract_grounding_tool_payloads
 
@@ -42,15 +42,13 @@ class IntentAdvisorInvocation:
     def write_final_trace(
         self,
         *,
-        advisor_decision: IntentAdvisorDecision,
         operation_intent: OperationIntent | None,
         status: str,
         error: str | None = None,
     ) -> None:
         payload = dict(self.trace_payload)
         metadata = dict(payload.get("trace_metadata") or {})
-        metadata["advisor_decision"] = advisor_decision.model_dump(mode="json")
-        metadata["compiler_output"] = None if operation_intent is None else operation_intent.model_dump(mode="json")
+        metadata["operation_intent"] = None if operation_intent is None else operation_intent.model_dump(mode="json")
         payload["trace_metadata"] = metadata
         self.trace_agent.write_trace(
             payload=payload,
@@ -58,7 +56,7 @@ class IntentAdvisorInvocation:
             result=self.advisor_result,
             status=status,
             error=error,
-            structured_response_override=metadata["compiler_output"],
+            structured_response_override=metadata["operation_intent"],
         )
 
 
@@ -95,7 +93,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         return self.create_json_agent(
             tools=tools,
             system_prompt=GroundingPromptBuilder().system_prompt(),
-            response_model=IntentAdvisorDecision,
+            response_model=OperationIntent,
             max_iterations=14,
             max_calls_per_tool=3,
             tool_call_limits={
@@ -274,7 +272,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 self._filter_tools_for_domains(self.tools, evidence.requested_domains)
             )
             advisor_prompt = self._build_advisor_prompt(evidence=evidence, context=context)
-            advisor_decision = None
+            operation_intent = None
             grounding_tools: List[str] = []
             validation_errors: List[str] = []
             advisor_validation_errors: List[str] = []
@@ -311,9 +309,9 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     )
                     continue
                 advisor_result = advisor_invocation.advisor_result
-                advisor_decision = coerce_structured_response(
+                operation_intent = coerce_structured_response(
                     advisor_result,
-                    IntentAdvisorDecision,
+                    OperationIntent,
                     error_message="IEA advisor returned no structured_response",
                 )
                 grounding_tools = extract_grounding_tool_names(advisor_result, self.GROUNDING_TOOLS)
@@ -323,21 +321,17 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     main_directives=main_directives,
                     snapshot_id=snapshot_id,
                 )
-                advisor_validation_errors, validation_errors, _ = validate_and_compile_intent(
+                advisor_validation_errors, validation_errors, _ = validate_operation_intent(
                     compiler=self.compiler,
                     evidence=refreshed_evidence,
-                    decision=advisor_decision,
+                    operation_intent=operation_intent,
                     grounding_tools=grounding_tools,
-                    user_input=user_input,
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
-                    main_directives=main_directives,
                 )
                 self.last_failure_debug = {
                     "phase": "intent_encoding",
                     "attempt_index": attempt_index + 1,
                     "grounding_tools": list(grounding_tools or []),
-                    "advisor_decision": advisor_decision.model_dump(mode="json"),
+                    "operation_intent": operation_intent.model_dump(mode="json"),
                     "advisor_validation_errors": list(advisor_validation_errors or []),
                     "grounding_validation_errors": list(validation_errors or []),
                     "evidence_snapshot": refreshed_evidence.model_dump(mode="json"),
@@ -359,33 +353,27 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     grounding_validation_errors=validation_errors,
                     invocation_error="",
                 )
-            if advisor_decision is None:
-                raise RuntimeError("IEA advisor returned no decision payload")
-            _, _, compiled = validate_and_compile_intent(
+            if operation_intent is None:
+                raise RuntimeError("IEA advisor returned no OperationIntent payload")
+            _, _, validated_intent = validate_operation_intent(
                 compiler=self.compiler,
                 evidence=evidence,
-                decision=advisor_decision,
+                operation_intent=operation_intent,
                 grounding_tools=grounding_tools,
-                user_input=user_input,
-                session_id=session_id,
-                snapshot_id=snapshot_id,
-                main_directives=main_directives,
             )
-            if compiled is None:
-                raise RuntimeError("IEA could not compile OperationIntent after validation")
+            if validated_intent is None:
+                raise RuntimeError("IEA OperationIntent failed validation after retry loop")
             advisor_invocation.write_final_trace(
-                advisor_decision=advisor_decision,
-                operation_intent=compiled,
+                operation_intent=validated_intent,
                 status="success",
             )
             log_timing(self.logger, "iea_total", time.perf_counter() - total_start, status="success")
             self.last_failure_debug = {}
-            return compiled
+            return validated_intent
         except Exception as exc:
-            if "advisor_invocation" in locals() and "advisor_decision" in locals():
+            if "advisor_invocation" in locals() and "operation_intent" in locals():
                 advisor_invocation.write_final_trace(
-                    advisor_decision=advisor_decision,
-                    operation_intent=None,
+                    operation_intent=operation_intent,
                     status="error",
                     error=str(exc),
                 )
@@ -488,12 +476,12 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             "- Resolve only the semantic choices that remain ambiguous.\n"
             "- Use tools only when the structured evidence does not already ground the required target.\n"
             "- You may revise Main's requested domain boundary when grounding evidence proves it is too narrow, too wide, or cannot be confirmed.\n"
-            "- If you revise the domain boundary, populate grounded_requested_domains, domain_resolution, domain_revision_needed, and domain_revision_rationale explicitly.\n"
+            "- If you revise the domain boundary, set requested_domains to the grounded domain set, set domain_resolution, and add open_questions when confirmation is impossible.\n"
             "- For every QoS flow with resolution_status='resolved', include grounded flow_id and app_id in the final JSON.\n"
             "- If a QoS target is not fully grounded to flow_id + app_id, do not mark it resolved.\n"
             "- If the structured evidence already contains the grounded answer, finalize from that evidence without extra tool calls.\n"
             f"{chr(10).join(domain_specific_rules)}\n"
-            "- Return one IntentAdvisorDecision JSON object only."
+            "- Return one OperationIntent JSON object only."
         )
 
     @staticmethod

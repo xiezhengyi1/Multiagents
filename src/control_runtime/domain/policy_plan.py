@@ -4,7 +4,7 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from .control_plane import (
     ControlSemantics,
@@ -85,20 +85,12 @@ class QosTargetEnvelope(BaseModel):
 
 
 class OperationIntent(BaseModel):
-    session_id: str = Field(default="", description="Session identifier")
-    snapshot_id: str = Field(default="", description="Planning snapshot identifier")
+    model_config = ConfigDict(extra="ignore")
+
     supi: str = Field(default="", description="UE identifier")
-    app_id: Optional[str] = Field(default="", description="Application identifier")
-    app_name: Optional[str] = Field(default=None, description="Application name")
-    raw_input: str = Field(default="", description="Original user input")
     resolution_status: str = Field(default="", description="Top-level resolution status")
     requested_domains: List[str] = Field(default_factory=list, description="Requested control domains inferred from intent")
-    main_requested_domains: List[str] = Field(default_factory=list, description="Domain set explicitly requested by Main")
-    grounded_requested_domains: List[str] = Field(default_factory=list, description="Domain set confirmed or revised by IEA")
-    domain_revision_needed: bool = Field(default=False, description="Whether IEA revised or could not confirm Main's domain boundary")
-    domain_revision_rationale: str = Field(default="", description="Why IEA revised or could not confirm the domain boundary")
     domain_resolution: str = Field(default="confirmed", description="confirmed, narrowed, widened, or cannot_confirm")
-    domain_evidence: Dict[str, List[str]] = Field(default_factory=dict, description="Evidence supporting each domain decision")
     control_semantics: ControlSemantics = Field(default_factory=ControlSemantics, description="Structured staged control semantics derived from the user intent")
     mobility_intent: Dict[str, Any] = Field(default_factory=dict, description="Mobility / AM policy goals extracted from the user request")
     grounding_evidence: GroundingEvidenceBundle = Field(default_factory=GroundingEvidenceBundle, description="Structured grounding evidence carried forward for traceability")
@@ -106,23 +98,80 @@ class OperationIntent(BaseModel):
     qos_target_envelopes: List[QosTargetEnvelope] = Field(default_factory=list, description="IEA-owned QoS target envelopes derived from grounded baselines")
     open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
-    @field_validator("domain_evidence", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def _normalize_domain_evidence(cls, value: Any) -> Dict[str, List[str]]:
-        if isinstance(value, dict):
-            normalized: Dict[str, List[str]] = {}
-            for key, items in value.items():
-                if isinstance(items, list):
-                    normalized[str(key)] = [str(item) for item in items if str(item or "").strip()]
-                elif items not in (None, "", [], {}):
-                    normalized[str(key)] = [str(items)]
-            return normalized
-        if isinstance(value, list):
-            items = [str(item) for item in value if str(item or "").strip()]
-            return {"general": items} if items else {}
-        if value in (None, "", {}, []):
-            return {}
-        return {"general": [str(value)]}
+    def _normalize_operation_intent_shapes(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+
+        grounded_domains = data.get("grounded_requested_domains")
+        if not data.get("requested_domains") and isinstance(grounded_domains, list):
+            data["requested_domains"] = grounded_domains
+
+        mobility_intent = data.get("mobility_intent")
+        am_policy_context = data.get("am_policy_context")
+        if (not isinstance(mobility_intent, dict) or not mobility_intent) and isinstance(am_policy_context, dict):
+            normalized_mobility = dict(am_policy_context)
+            if "rfsp" in normalized_mobility and "current_rfsp" not in normalized_mobility:
+                normalized_mobility["current_rfsp"] = normalized_mobility.get("rfsp")
+            if "allowed_snssais" in normalized_mobility and "current_allowed_snssais" not in normalized_mobility:
+                normalized_mobility["current_allowed_snssais"] = normalized_mobility.get("allowed_snssais")
+            if "current_association_id" in normalized_mobility and "association_id" not in normalized_mobility:
+                normalized_mobility["association_id"] = normalized_mobility.get("current_association_id")
+            data["mobility_intent"] = normalized_mobility
+
+        flows = data.get("flows")
+        if isinstance(flows, list):
+            data["flows"] = [cls._normalize_flow_shape(flow) for flow in flows]
+        return data
+
+    @staticmethod
+    def _normalize_flow_shape(flow: Any) -> Any:
+        if not isinstance(flow, dict):
+            return flow
+        flow_data = dict(flow)
+        baseline = flow_data.get("sla_baseline")
+        if not isinstance(baseline, dict):
+            return flow_data
+        baseline_to_flow = {
+            "bandwidth_ul": "bw_ul",
+            "bandwidth_dl": "bw_dl",
+            "max_br_ul_mbps": "bw_ul",
+            "max_br_dl_mbps": "bw_dl",
+            "guaranteed_bandwidth_ul": "gbr_ul",
+            "guaranteed_bandwidth_dl": "gbr_dl",
+            "gbr_ul_mbps": "gbr_ul",
+            "gbr_dl_mbps": "gbr_dl",
+            "latency": "lat",
+            "latency_ms": "lat",
+            "loss_rate": "loss_req",
+            "packet_error_rate": "loss_req",
+            "jitter": "jitter_req",
+            "jitter_ms": "jitter_req",
+            "priority": "priority",
+        }
+        for source_key, target_key in baseline_to_flow.items():
+            if source_key not in baseline:
+                continue
+            if flow_data.get(target_key) in (None, ""):
+                flow_data[target_key] = baseline.get(source_key)
+        return flow_data
+
+    @model_validator(mode="after")
+    def _validate_grounded_qos_flows(self) -> "OperationIntent":
+        for index, flow in enumerate(self.flows or []):
+            resolution_status = str(flow.resolution_status or "").strip().lower()
+            if resolution_status != "resolved":
+                continue
+            flow_id = str(flow.flow_id or "").strip()
+            app_id = str(flow.app_id or "").strip()
+            if not flow_id or not app_id:
+                raise ValueError(
+                    "resolved qos flow must include both flow_id and app_id "
+                    f"(flows[{index}] has flow_id={flow_id or '<empty>'}, app_id={app_id or '<empty>'})"
+                )
+        return self
 
     @field_validator("mobility_intent", mode="before")
     @classmethod

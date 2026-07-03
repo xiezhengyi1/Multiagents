@@ -5,7 +5,7 @@ import re
 from typing import Any, Dict, List
 
 from ...domain.policy_plan import FlowSelector, QosTargetEnvelope
-from .contracts import IntentAdvisorDecision, IntentEvidence
+from .contracts import IntentEvidence
 
 VALID_DOMAINS = {"qos", "mobility"}
 SM_GROUNDING_TOOLS = {
@@ -248,37 +248,6 @@ def merge_candidate_dicts(*candidate_groups: List[Dict[str, Any]]) -> List[Dict[
             seen.add(dedupe_key)
             merged.append(dict(item))
     return merged
-
-
-def classify_domain_resolution(
-    *,
-    main_requested_domains: List[str],
-    grounded_requested_domains: List[str],
-    decision: IntentAdvisorDecision,
-) -> tuple[str, bool]:
-    explicit_resolution = str(decision.domain_resolution or "").strip().lower()
-    if explicit_resolution in {"confirmed", "narrowed", "widened", "cannot_confirm"}:
-        revision_needed = bool(decision.domain_revision_needed) or explicit_resolution != "confirmed"
-        return explicit_resolution, revision_needed
-    main_set = {
-        str(item or "").strip().lower()
-        for item in (main_requested_domains or [])
-        if str(item or "").strip()
-    }
-    grounded_set = {
-        str(item or "").strip().lower()
-        for item in (grounded_requested_domains or [])
-        if str(item or "").strip()
-    }
-    if not grounded_set:
-        return "cannot_confirm", True
-    if grounded_set == main_set:
-        return "confirmed", bool(decision.domain_revision_needed)
-    if grounded_set.issubset(main_set):
-        return "narrowed", True
-    if main_set.issubset(grounded_set):
-        return "widened", True
-    return "cannot_confirm", True
 
 
 def mobility_request_mentions_specific_targets(user_input: str) -> bool:

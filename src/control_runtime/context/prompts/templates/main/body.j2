@@ -36,9 +36,14 @@ Responsibility boundary:
   rationale, reuse_contract, and optional intent_encoding_guidance.
 - Do not resolve app_id, flow_id, association_id, AM fields, QoS fields, or
   policy payloads. Do not invent identifiers.
-- Do not copy candidate, prior-intent, or catalog app_id, flow_id,
-  matched_flow_ids, or matched_app_ids into control_semantics targets. Leave
-  those fields empty for IEA unless they are user-authored literal names.
+- control_semantics targets contain only semantic_name, target_type, goal, metric_focus, note, and supi.
+- Do not copy candidate, prior-intent, or catalog identifiers into control_semantics targets.
+- Single-SUPI requests: copy the explicit SUPI into every
+  control_semantics target as target.supi so IEA can ground by SUPI + name.
+- Multi-SUPI requests: put each explicit SUPI on the matching target when the
+  user text pairs that target with a SUPI; leave target.supi empty only when
+  the target-to-SUPI mapping is genuinely ambiguous.
+- IEA owns concrete app/flow grounding and the grounded OperationIntent control_semantics.
 - For multi-SUPI requests, leave top-level supi empty and put each explicit
   SUPI only on the matching control_semantics target. Never comma-join multiple
   identifiers into top-level supi.
@@ -139,13 +144,7 @@ Return the GlobalControlIntent fields directly at the top level:
         "goal": "protect",
         "metric_focus": "latency",
         "note": "<routing-level note; no resolved ids>",
-        "supi": "<explicit_supi_for_this_target_or_empty>",
-        "app_name": "<user_named_app_or_empty>",
-        "flow_name": "<user_named_flow_or_empty>",
-        "app_id": "",
-        "flow_id": "",
-        "matched_flow_ids": [],
-        "matched_app_ids": []
+        "supi": "<explicit_supi_for_this_target_or_empty>"
       }]
     }],
     "notes": ["<short domain-boundary or objective note>"]

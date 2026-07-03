@@ -125,7 +125,7 @@ class PlanningArtifactCompiler:
 
         for spec in advisor_output.sm_policies:
             flow_ctx = self._resolve_flow(planning_request, spec.flow_id)
-            if _normalize_app_id(spec.app_id) != _normalize_app_id(flow_ctx.app_id or planning_request.operation_intent.app_id or ""):
+            if _normalize_app_id(spec.app_id) != _normalize_app_id(flow_ctx.app_id or ""):
                 raise ValueError(f"sm policy app_id does not match resolved flow context for flow_id={spec.flow_id}")
             resource_keys = PlanningAdvisorValidator()._extract_qos_resource_keys(optimizer_preview, flow_id=spec.flow_id)
             if not resource_keys:

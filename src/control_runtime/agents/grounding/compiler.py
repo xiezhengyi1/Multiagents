@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from ...context.evidence import EvidenceFormatter
 from ...domain.policy_plan import OperationIntent
-from .artifact_compiler import OperationIntentCompiler
 from .common import (
     AM_GROUNDING_TOOLS,
     SM_GROUNDING_TOOLS,
@@ -13,7 +12,7 @@ from .common import (
     uses_am_grounding,
     uses_sm_grounding,
 )
-from .contracts import IntentAdvisorDecision, IntentEvidence
+from .contracts import IntentEvidence
 from .validator import IntentGroundingValidator
 
 
@@ -25,7 +24,6 @@ class IntentCompiler:
     def __init__(self) -> None:
         self.directive_extractor = MainDirectiveExtractor()
         self.validator = IntentGroundingValidator()
-        self.operation_compiler = OperationIntentCompiler()
 
     @classmethod
     def uses_sm_grounding(cls, requested_domains: List[str] | None) -> bool:
@@ -64,40 +62,21 @@ class IntentCompiler:
         *,
         evidence: IntentEvidence,
         grounding_tools: List[str],
-        decision: IntentAdvisorDecision | None = None,
+        operation_intent: OperationIntent | None = None,
     ) -> List[str]:
         return self.validator.validate_intent_grounding(
             evidence=evidence,
             grounding_tools=grounding_tools,
-            decision=decision,
+            operation_intent=operation_intent,
         )
 
-    def validate_advisor_decision(
+    def validate_operation_intent(
         self,
         *,
         evidence: IntentEvidence,
-        decision: IntentAdvisorDecision,
+        operation_intent: OperationIntent,
     ) -> List[str]:
-        return self.validator.validate_advisor_decision(
+        return self.validator.validate_operation_intent(
             evidence=evidence,
-            decision=decision,
-        )
-
-    def compile_operation_intent(
-        self,
-        *,
-        evidence: IntentEvidence,
-        advisor_decision: Optional[IntentAdvisorDecision],
-        user_input: str,
-        session_id: str,
-        snapshot_id: str,
-        main_directives: Optional[Dict[str, Any]] = None,
-    ) -> OperationIntent:
-        return self.operation_compiler.compile_operation_intent(
-            evidence=evidence,
-            advisor_decision=advisor_decision,
-            user_input=user_input,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            main_directives=main_directives,
+            operation_intent=operation_intent,
         )

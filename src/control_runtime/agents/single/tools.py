@@ -297,14 +297,9 @@ def _build_runtime_planning_request(
     flow_rows = _resolve_flow_catalog_rows(normalized_supi, flow_ids, snapshot_id)
     flows = [_flow_selector_from_catalog(item, normalized_supi) for item in flow_rows]
     operation_intent = OperationIntent(
-        session_id=session_id,
-        snapshot_id=snapshot_id,
         supi=normalized_supi,
-        app_id=str(flows[0].app_id or "").strip() if flows else "",
-        raw_input="",
         resolution_status="resolved",
         requested_domains=normalized_domains,
-        domain_evidence={},
         flows=flows,
         qos_target_envelopes=_build_qos_target_envelopes(flows, normalized_profile),
     )

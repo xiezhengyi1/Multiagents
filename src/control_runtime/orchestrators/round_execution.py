@@ -263,11 +263,7 @@ def execute_planned_round(
             {"agent": "main_control", "summary": str(global_intent.routing_rationale or "").strip(), "payload": global_intent.model_dump(mode="json")},
             {
                 "agent": "intent_encoding",
-                "summary": str(
-                    operation_intent.domain_revision_rationale
-                    or operation_intent.domain_resolution
-                    or ""
-                ).strip(),
+                "summary": str(operation_intent.domain_resolution or "").strip(),
                 "payload": operation_intent.model_dump(mode="json"),
             },
             {"agent": "optimization_strategy", "summary": str(policy_plan.planning_rationale.explanation or "").strip(), "payload": policy_plan.model_dump(mode="json")},
@@ -275,11 +271,11 @@ def execute_planned_round(
         agent_conflicts=[
             {
                 "agents": ["main_control", "intent_encoding"],
-                "summary": str(operation_intent.domain_revision_rationale or "").strip(),
+                "summary": str(operation_intent.domain_resolution or "").strip(),
                 "impact": str(operation_intent.domain_resolution or "").strip(),
             }
             for _ in [1]
-            if operation_intent.domain_revision_needed
+            if str(operation_intent.domain_resolution or "confirmed").strip() != "confirmed"
         ],
         handoff_records=[
             {"source_agent": "main_control", "target_agent": "intent_encoding", "artifact_type": "GlobalControlIntent", "summary": str(global_intent.routing_decision or "").strip()},

@@ -4,7 +4,7 @@ import re
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from model.PcfAmPolicyControl import (
     AccessType,
@@ -107,6 +107,137 @@ class ControlSemanticMode(str, Enum):
     CONDITIONAL_FALLBACK = "conditional_fallback"
 
 
+class MainSemanticTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    semantic_name: str = Field(default="")
+    target_type: SemanticTargetType = Field(default=SemanticTargetType.NAMED_OBJECT)
+    goal: SemanticGoal = Field(default=SemanticGoal.PROTECT)
+    metric_focus: Optional[str] = Field(default=None)
+    note: str = Field(default="")
+    supi: str = Field(default="")
+
+    @field_validator("target_type", mode="before")
+    @classmethod
+    def _normalize_target_type(cls, v: Any) -> Any:
+        return _normalize_semantic_target_type(v)
+
+    @field_validator("goal", mode="before")
+    @classmethod
+    def _normalize_goal(cls, v: Any) -> Any:
+        return _normalize_semantic_goal(v)
+
+
+class MainControlStage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stage_index: int = Field(default=1, ge=1)
+    name: str = Field(default="")
+    trigger: StageTrigger = Field(default=StageTrigger.INITIAL)
+    summary: str = Field(default="")
+    targets: List[MainSemanticTarget] = Field(default_factory=list)
+
+    @field_validator("trigger", mode="before")
+    @classmethod
+    def _normalize_trigger(cls, v: Any) -> Any:
+        return _normalize_stage_trigger(v)
+
+
+class MainControlSemantics(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: ControlSemanticMode = Field(default=ControlSemanticMode.SINGLE_STEP)
+    current_stage: int = Field(default=1, ge=1)
+    stages: List[MainControlStage] = Field(default_factory=list)
+    notes: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _normalize_current_stage(self) -> "MainControlSemantics":
+        if not self.stages:
+            self.current_stage = 1
+            return self
+        max_stage = max(stage.stage_index for stage in self.stages)
+        if self.current_stage > max_stage:
+            self.current_stage = max_stage
+        return self
+
+
+def _normalize_semantic_target_type(v: Any) -> Any:
+    if isinstance(v, str):
+        normalized = v.strip().lower().replace("-", "_").replace(" ", "_")
+        _TARGET_TYPE_ALIASES: dict[str, str] = {
+            "ue": "scope",
+            "user_equipment": "scope",
+            "subscriber": "scope",
+            "supi": "scope",
+            "am_policy": "scope",
+            "access_mobility_policy": "scope",
+        }
+        return _TARGET_TYPE_ALIASES.get(normalized, normalized)
+    return v
+
+
+def _normalize_semantic_goal(v: Any) -> Any:
+    if not isinstance(v, str):
+        return v
+    _GOAL_ALIASES: dict[str, str] = {
+        "improve": "protect",
+        "optimize": "protect",
+        "enhance": "protect",
+        "prioritize": "protect",
+        "boost": "protect",
+        "reduce": "protect",
+        "lower": "protect",
+        "minimize": "protect",
+        "maximize": "protect",
+        "maintain": "protect",
+        "ensure": "protect",
+        "guarantee": "protect",
+        "migrate": "protect",
+        "transfer": "protect",
+        "move": "protect",
+        "switch": "protect",
+        "reroute": "protect",
+        "redirect": "protect",
+        "reassign": "protect",
+        "offload": "protect",
+        "select": "protect",
+        "steer": "protect",
+        "degrade": "deprioritize",
+        "throttle": "deprioritize",
+        "constrain": "deprioritize",
+        "limit": "deprioritize",
+        "suppress": "deprioritize",
+        "deprioritize": "deprioritize",
+    }
+    normalized = v.lower()
+    return _GOAL_ALIASES.get(normalized, normalized)
+
+
+def _normalize_stage_trigger(v: Any) -> Any:
+    if not isinstance(v, str):
+        return v
+    _TRIGGER_ALIASES: dict[str, str] = {
+        "on_retry": "retry",
+        "on_failure": "on_previous_failure",
+        "failure": "on_previous_failure",
+        "fallback": "on_previous_failure",
+        "after_previous": "after_previous_stage",
+        "sequential": "after_previous_stage",
+        "resource_constraint": "after_previous_stage",
+        "resource_constraints": "after_previous_stage",
+        "resource_pressure": "after_previous_stage",
+        "after_protection": "after_previous_stage",
+        "after_protect": "after_previous_stage",
+        "after_stage": "after_previous_stage",
+        "after_stage_1": "after_previous_stage",
+    }
+    normalized = v.strip().lower().replace("-", "_")
+    if re.fullmatch(r"after_stage_\d+", normalized):
+        return "after_previous_stage"
+    return _TRIGGER_ALIASES.get(normalized, normalized)
+
+
 class SemanticTarget(BaseModel):
     semantic_name: str = Field(default="")
     target_type: SemanticTargetType = Field(default=SemanticTargetType.NAMED_OBJECT)
@@ -125,56 +256,12 @@ class SemanticTarget(BaseModel):
     @field_validator("target_type", mode="before")
     @classmethod
     def _normalize_target_type(cls, v: Any) -> Any:
-        if isinstance(v, str):
-            normalized = v.strip().lower().replace("-", "_").replace(" ", "_")
-            _TARGET_TYPE_ALIASES: dict[str, str] = {
-                "ue": "scope",
-                "user_equipment": "scope",
-                "subscriber": "scope",
-                "supi": "scope",
-                "am_policy": "scope",
-                "access_mobility_policy": "scope",
-            }
-            return _TARGET_TYPE_ALIASES.get(normalized, normalized)
-        return v
+        return _normalize_semantic_target_type(v)
 
     @field_validator("goal", mode="before")
     @classmethod
     def _normalize_goal(cls, v: Any) -> Any:
-        if not isinstance(v, str):
-            return v
-        _GOAL_ALIASES: dict[str, str] = {
-            "improve": "protect",
-            "optimize": "protect",
-            "enhance": "protect",
-            "prioritize": "protect",
-            "boost": "protect",
-            "reduce": "protect",
-            "lower": "protect",
-            "minimize": "protect",
-            "maximize": "protect",
-            "maintain": "protect",
-            "ensure": "protect",
-            "guarantee": "protect",
-            "migrate": "protect",
-            "transfer": "protect",
-            "move": "protect",
-            "switch": "protect",
-            "reroute": "protect",
-            "redirect": "protect",
-            "reassign": "protect",
-            "offload": "protect",
-            "select": "protect",
-            "steer": "protect",
-            "degrade": "deprioritize",
-            "throttle": "deprioritize",
-            "constrain": "deprioritize",
-            "limit": "deprioritize",
-            "suppress": "deprioritize",
-            "deprioritize": "deprioritize",
-        }
-        normalized = v.lower()
-        return _GOAL_ALIASES.get(normalized, normalized)
+        return _normalize_semantic_goal(v)
 
 
 class ControlStage(BaseModel):
@@ -189,27 +276,7 @@ class ControlStage(BaseModel):
     @field_validator("trigger", mode="before")
     @classmethod
     def _normalize_trigger(cls, v: Any) -> Any:
-        if not isinstance(v, str):
-            return v
-        _TRIGGER_ALIASES: dict[str, str] = {
-            "on_retry": "retry",
-            "on_failure": "on_previous_failure",
-            "failure": "on_previous_failure",
-            "fallback": "on_previous_failure",
-            "after_previous": "after_previous_stage",
-            "sequential": "after_previous_stage",
-            "resource_constraint": "after_previous_stage",
-            "resource_constraints": "after_previous_stage",
-            "resource_pressure": "after_previous_stage",
-            "after_protection": "after_previous_stage",
-            "after_protect": "after_previous_stage",
-            "after_stage": "after_previous_stage",
-            "after_stage_1": "after_previous_stage",
-        }
-        normalized = v.strip().lower().replace("-", "_")
-        if re.fullmatch(r"after_stage_\d+", normalized):
-            return "after_previous_stage"
-        return _TRIGGER_ALIASES.get(normalized, normalized)
+        return _normalize_stage_trigger(v)
 
 
 class ControlSemantics(BaseModel):
@@ -450,7 +517,7 @@ class GlobalControlIntent(BaseModel):
     next_agent: Literal["intent_encoding", "optimization_strategy"]
     requested_domains: List[ControlDomain] = Field(default_factory=list)
     domain_evidence: Dict[str, List[str]] = Field(default_factory=dict)
-    control_semantics: ControlSemantics = Field(default_factory=ControlSemantics)
+    control_semantics: MainControlSemantics = Field(default_factory=MainControlSemantics)
     objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)
     investigation_targets: List[MainInvestigationTarget] = Field(default_factory=list)
     uncertainty_flags: List[MainUncertaintyFlag] = Field(default_factory=list)

@@ -336,20 +336,10 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             flows.append(FlowSelector.model_validate(payload))
 
         app_id = next((str(flow.app_id or "").strip() for flow in flows if str(flow.app_id or "").strip()), "")
-        domain_evidence = {
-            domain: [f"single_agent_final_{domain}_product"]
-            for domain in requested_domains
-        }
         return OperationIntent(
-            session_id=str(session_id or "").strip(),
-            snapshot_id=str(snapshot_id or "").strip(),
             supi=str(decision.supi or "").strip(),
-            app_id=app_id,
-            raw_input=str(user_input or "").strip(),
             resolution_status="final_product",
             requested_domains=requested_domains,
-            grounded_requested_domains=requested_domains,
-            domain_evidence=domain_evidence,
             flows=flows,
         )
 
@@ -599,7 +589,91 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             sess_rule_id = str(sess_rule.get("sessRuleId") or sess_rule.get("sessionRuleId") or "sess-rule-1").strip()
             sess_rule["sessRuleId"] = sess_rule_id
             data["sessRules"] = {sess_rule_id: sess_rule}
+        explicit_flow_id = cls._explicit_policy_flow_id(data)
+        if explicit_flow_id:
+            cls._repair_single_flow_policy_identity(data, explicit_flow_id)
+        cls._coerce_sm_policy_scalar_types(data)
         return data
+
+    @staticmethod
+    def _explicit_policy_flow_id(data: Dict[str, Any]) -> str:
+        for key in ("flow_id", "flowId"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _is_generic_pcf_id(value: Any, *, kind: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return True
+        patterns = {
+            "pcc": (r"^pcc-rule-\d{1,2}$", r"^rule-\d{1,2}$"),
+            "qos": (r"^qos-\d{1,2}$",),
+            "sess": (r"^sess-rule-\d{1,2}$", r"^session-rule-\d{1,2}$"),
+        }
+        return any(re.match(pattern, text, flags=re.IGNORECASE) for pattern in patterns.get(kind, ()))
+
+    @classmethod
+    def _repair_single_flow_policy_identity(cls, data: Dict[str, Any], flow_id: str) -> None:
+        target_pcc_id = f"pcc-{flow_id}"
+        target_qos_id = f"qos-{flow_id}"
+        target_sess_id = f"sess-{flow_id}"
+
+        pcc_rules = data.get("pccRules")
+        qos_decs = data.get("qosDecs")
+        if isinstance(pcc_rules, dict) and len(pcc_rules) == 1:
+            current_key, current_rule = next(iter(pcc_rules.items()))
+            if isinstance(current_rule, dict):
+                current_id = str(current_rule.get("pccRuleId") or current_key or "").strip()
+                if cls._is_generic_pcf_id(current_key, kind="pcc") or cls._is_generic_pcf_id(current_id, kind="pcc"):
+                    repaired_rule = dict(current_rule)
+                    repaired_rule["pccRuleId"] = target_pcc_id
+                    refs = repaired_rule.get("refQosData")
+                    if not isinstance(refs, list) or not refs or all(cls._is_generic_pcf_id(item, kind="qos") for item in refs):
+                        repaired_rule["refQosData"] = [target_qos_id]
+                    data["pccRules"] = {target_pcc_id: repaired_rule}
+
+        if isinstance(qos_decs, dict) and len(qos_decs) == 1:
+            current_key, current_qos = next(iter(qos_decs.items()))
+            if isinstance(current_qos, dict):
+                current_id = str(current_qos.get("qosId") or current_key or "").strip()
+                if cls._is_generic_pcf_id(current_key, kind="qos") or cls._is_generic_pcf_id(current_id, kind="qos"):
+                    repaired_qos = dict(current_qos)
+                    repaired_qos["qosId"] = target_qos_id
+                    data["qosDecs"] = {target_qos_id: repaired_qos}
+
+        sess_rules = data.get("sessRules")
+        if isinstance(sess_rules, dict) and len(sess_rules) == 1:
+            current_key, current_rule = next(iter(sess_rules.items()))
+            if isinstance(current_rule, dict):
+                current_id = str(current_rule.get("sessRuleId") or current_key or "").strip()
+                if cls._is_generic_pcf_id(current_key, kind="sess") or cls._is_generic_pcf_id(current_id, kind="sess"):
+                    repaired_rule = dict(current_rule)
+                    repaired_rule["sessRuleId"] = target_sess_id
+                    data["sessRules"] = {target_sess_id: repaired_rule}
+
+    @staticmethod
+    def _coerce_sm_policy_scalar_types(data: Dict[str, Any]) -> None:
+        qos_decs = data.get("qosDecs")
+        if not isinstance(qos_decs, dict):
+            return
+        for qos in qos_decs.values():
+            if not isinstance(qos, dict) or "packetDelayBudget" not in qos:
+                continue
+            value = qos.get("packetDelayBudget")
+            if isinstance(value, int):
+                continue
+            if isinstance(value, float):
+                qos["packetDelayBudget"] = int(round(value))
+                continue
+            if isinstance(value, str) and value.strip():
+                try:
+                    parsed = float(value)
+                except ValueError:
+                    continue
+                qos["packetDelayBudget"] = int(round(parsed))
 
     @staticmethod
     def _normalize_pcc_rules(value: Any) -> Dict[str, Any]:
@@ -928,7 +1002,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             app_id = str(
                 flow_ctx.app_id
                 or self._extract_sm_policy_app_id(normalized_policy_details)
-                or planning_request.operation_intent.app_id
+                or self._operation_intent_app_id(planning_request.operation_intent, flow_id=flow_id)
                 or ""
             ).strip()
             resource_keys = self.plan_compiler.advisor_validator._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id)
@@ -1021,7 +1095,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     policy_details=policy_details,
                     planning_request=planning_request,
                 )
-                or planning_request.operation_intent.app_id
+                or self._operation_intent_app_id(planning_request.operation_intent, flow_id=flow_id)
                 or ""
             ).strip(),
             flow_id=str(flow_id or "").strip(),
@@ -1056,7 +1130,18 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             if app_id:
                 return app_id
         if planning_request is not None:
-            return str(planning_request.operation_intent.app_id or "").strip()
+            return cls._operation_intent_app_id(planning_request.operation_intent, flow_id=target_flow_id)
+        return ""
+
+    @staticmethod
+    def _operation_intent_app_id(operation_intent: OperationIntent, *, flow_id: str | None = None) -> str:
+        target_flow_id = str(flow_id or "").strip()
+        for flow in operation_intent.flows or []:
+            if target_flow_id and str(flow.flow_id or "").strip() != target_flow_id:
+                continue
+            app_id = str(flow.app_id or "").strip()
+            if app_id:
+                return app_id
         return ""
 
     @classmethod
@@ -1243,7 +1328,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             round_strategy=MainRoundStrategy.INITIAL_GROUNDING,
             next_agent="optimization_strategy",
             requested_domains=requested_domains,
-            domain_evidence=operation_intent.domain_evidence,
+            domain_evidence={domain: ["single_agent_final_product"] for domain in decision.requested_domains},
             control_semantics=operation_intent.control_semantics,
             objective_profile=ObjectiveProfile(
                 profile_name=str(decision.objective_profile_hint or "").strip()

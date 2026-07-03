@@ -137,6 +137,10 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     user_input=user_input,
                     context=context,
                 )
+                self._normalize_semantic_target_scope(
+                    intent,
+                    user_input=user_input,
+                )
                 invocation_error = ""
                 validation_errors = self._validate_global_intent(
                     intent,
@@ -388,6 +392,15 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             errors.append("retry routing into intent_encoding requires explicit intent_encoding_guidance")
         resolved_target_errors = MainControlAgent._validate_main_semantic_boundary(intent)
         errors.extend(resolved_target_errors)
+        if len(unique_explicit_supis) == 1:
+            explicit_supi = unique_explicit_supis[0]
+            for stage_index, stage in enumerate(intent.control_semantics.stages or [], start=1):
+                for target_index, target in enumerate(stage.targets or [], start=1):
+                    if not str(target.supi or "").strip():
+                        errors.append(
+                            "single-SUPI semantic target must carry target.supi "
+                            f"stage {stage_index} target {target_index}: expected {explicit_supi}"
+                        )
         # 关键步骤：诊断类别只作为上下文交给 LLM，不在这里做域级硬裁决。
         return errors
 
@@ -460,25 +473,10 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _validate_main_semantic_boundary(intent: GlobalControlIntent) -> List[str]:
-        errors: List[str] = []
-        for stage_index, stage in enumerate(intent.control_semantics.stages or [], start=1):
-            if list(stage.active_flow_ids or []) or list(stage.active_app_ids or []):
-                errors.append(
-                    "Main must not populate resolved target identifiers in control_semantics; "
-                    f"stage {stage_index} active_flow_ids/active_app_ids must stay empty"
-                )
-            for target_index, target in enumerate(stage.targets or [], start=1):
-                if (
-                    str(target.app_id or "").strip()
-                    or str(target.flow_id or "").strip()
-                    or list(target.matched_flow_ids or [])
-                    or list(target.matched_app_ids or [])
-                ):
-                    errors.append(
-                        "Main must not populate resolved target identifiers in control_semantics; "
-                        f"stage {stage_index} target {target_index} app_id/flow_id/matched ids must stay empty"
-                    )
-        return errors
+        # GlobalControlIntent uses a Main-only semantic target schema that does
+        # not contain resolved identifiers. Pydantic extra="forbid" rejects
+        # app_id/flow_id/matched_* before this semantic validator runs.
+        return []
 
     @staticmethod
     def _normalize_retry_routing(
@@ -521,6 +519,26 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             "Previous execution failed after IEA had already produced stable resolved bindings; "
             "reuse the target binding and revise only executable policy values in OSA."
         )
+
+    @staticmethod
+    def _normalize_semantic_target_scope(
+        intent: GlobalControlIntent,
+        *,
+        user_input: str,
+    ) -> None:
+        explicit_supis = re.findall(r"(?i)(imsi-\d{5,})", str(user_input or ""))
+        unique_explicit_supis = list(dict.fromkeys(explicit_supis))
+        default_supi = ""
+        if len(unique_explicit_supis) == 1:
+            default_supi = unique_explicit_supis[0]
+        elif len(unique_explicit_supis) == 0:
+            default_supi = str(intent.supi or "").strip()
+        if not default_supi:
+            return
+        for stage in intent.control_semantics.stages or []:
+            for target in stage.targets or []:
+                if not str(target.supi or "").strip():
+                    target.supi = default_supi
 
     @staticmethod
     def _enrich_global_intent_contract(
