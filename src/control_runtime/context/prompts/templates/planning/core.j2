@@ -48,14 +48,16 @@ Hard rules:
 - Treat `main_retry_scope`, `revision_requests`, and `unified_constraints` as binding control guidance.
 - Do not suggest `PRA_CH` when the inspected mobility context lacks `presenceAreas`.
 - Treat OperationIntent.flows and qos_target_envelopes as authoritative grounded IEA evidence. If baseline GBR/maxBR/latency values are present there, do not claim they are missing or ask IEA to reground them.
+- Every `sm_policies[].flow_id` and `sm_policies[].app_id` must come from OperationIntent.flows. Never substitute a nearby optimizer/app flow, even if the optimizer preview mentions it.
 - If the optimizer preview is infeasible but the target binding and QoS envelope are present, return partial_plan with blocked_targets/planner_conflicts instead of needs_upstream_reground.
 
 QoS slice migration rules:
 - Migration wording includes: migrate, switch, move away, 迁出, 迁移, 切换, 换到. Treat those requests as QoS-only unless the user explicitly asks for AM policy, RFSP, allowed/target NSSAI, service area, registration, handover, or UE mobility-state changes.
 - Use `current_slice_snssai` from OperationIntent/Planning evidence as the source slice. Compare it with optimizer `qos_flow_assignments[].new_slice`; when both are present, `new_slice != current_slice_snssai` is the evidence of slice migration.
+- If Planning evidence or OperationIntent contains `operation_constraints[].require_slice_change=true`, keeping `new_slice == source_slice_snssai` is not a valid executable migration. Return `partial_plan` with `planner_conflicts` if the optimizer cannot produce a different grounded slice.
 - `preview_qos_optimizer` has no target-slice or exclude-current-slice argument. Do not invent such arguments. Pick objective_profile/optimization_template from the user goal and trust the returned optimizer assignment.
 - For "from current slice" or cross-slice exploration, do not first call `fetch_qos_network_status` with the flow's current `service_type_id`, because that filters candidates to the current service/SST. Fetch all slices without `service_type_id` unless you are only checking capacity of an already selected slice.
-- If an approved optimizer preview selects a different slice, return executable_plan from that preview. If it keeps the current slice but changes grounded QoS/bandwidth values, return the optimizer-backed SM policy and explain that the executable action is QoS reallocation, not an AM/mobility change. If it keeps the current slice and makes no grounded QoS/resource change for an explicit move-away request, return partial_plan with planner_conflicts instead of asking IEA, RAG, or mobility tools to prove a local slice label.
+- If an approved optimizer preview selects a different slice, return executable_plan from that preview. If it keeps the current slice but changes grounded QoS/bandwidth values and no `require_slice_change` constraint is active, return the optimizer-backed SM policy and explain that the executable action is QoS reallocation, not an AM/mobility change. If `require_slice_change` is active or it makes no grounded QoS/resource change for an explicit move-away request, return partial_plan with planner_conflicts instead of asking IEA, RAG, or mobility tools to prove a local slice label.
 
 Knowledge tool rules (CRITICAL — violations waste tool quota):
 - Knowledge tools (`get_knowledge_by_key`, `search_semantic_knowledge`) are a LAST RESORT for exact 3GPP semantic gaps only. They are NOT a fallback for insufficient runtime evidence.

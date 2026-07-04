@@ -772,6 +772,14 @@ class SliceOptimizationEngine:
                 prob += total_allocated_dl + gbr_gap_dl[flow_key] >= f.sla.guaranteed_bandwidth_dl
 
                 for s in slices:
+                    excluded_slices = {
+                        str(item or "").strip()
+                        for item in (f.allocation.excluded_slice_snssais or [])
+                        if str(item or "").strip()
+                    }
+                    if s.snssai in excluded_slices:
+                        prob += x[app.id, f.id, s.snssai] == 0
+
                     if self.config.enable_sla_constraints:
                         slice_latency, slice_processing_delay, slice_jitter, slice_loss = self._slice_kpis_for_constraints(s)
                         violates_latency = slice_latency + slice_processing_delay > f.sla.latency

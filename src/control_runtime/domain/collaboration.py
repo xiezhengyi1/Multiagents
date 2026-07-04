@@ -7,12 +7,22 @@ from pydantic import BaseModel, Field
 from .policy_plan import OperationIntent
 
 
+class SharedControlContext(BaseModel):
+    """Typed blackboard shared across agents for user-level control goals."""
+
+    raw_user_input: str = Field(default="", description="Original user request preserved across agent boundaries")
+    main_control_semantics: Dict[str, Any] = Field(default_factory=dict, description="Main-owned staged control semantics")
+    operation_constraints: list[Dict[str, Any]] = Field(default_factory=list, description="Hard operation constraints inferred by Main")
+    shared_facts: Dict[str, Any] = Field(default_factory=dict, description="Compact cross-agent facts safe for every downstream agent")
+
+
 class PlanningContext(BaseModel):
     round_index: int = Field(default=1, description="Closed-loop round number")
     session_id: str = Field(default="", description="Session identifier")
     snapshot_id: str = Field(default="", description="Bound planning snapshot identifier")
     snapshot_metadata: Dict[str, Any] = Field(default_factory=dict, description="Snapshot metadata bound to this round")
     memory_context: str = Field(default="", description="Retrieved memory context for the round")
+    shared_context: SharedControlContext = Field(default_factory=SharedControlContext, description="Typed cross-agent context shared by Main, IEA, OSA, and tools")
     feedback_context: str = Field(default="", description="Aggregated feedback context from previous rounds")
     handoff_history: list[Dict[str, Any]] = Field(
         default_factory=list,

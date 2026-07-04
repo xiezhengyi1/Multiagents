@@ -14,6 +14,7 @@ class PlanningContextProjector(BaseProjector):
         field("snapshot_id"),
         field("snapshot_metadata"),
         field("memory_context"),
+        field("shared_context"),
         field("feedback_context"),
         field("active_domains"),
         field("main_round_strategy"),

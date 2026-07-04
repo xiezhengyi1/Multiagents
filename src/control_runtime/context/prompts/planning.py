@@ -124,6 +124,7 @@ Output format (CRITICAL — violations will be rejected):
 SmPolicySpec fields (flow-scoped, inside sm_policies array):
   Required: flow_id, app_id, priority (1-15), target_latency_ms (>=1.0), packet_error_rate (0.0-1.0), max_br_ul_mbps (>=0), max_br_dl_mbps (>=0)
   Optional: gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, flow_description
+  Binding: flow_id and app_id MUST match one of the OperationIntent.flows entries exactly. Never output a different flow_id/app_id.
 
 AmPolicySpec fields (inside am_policy):
   Required: triggers (non-empty array), rfsp (>=1), allowed_snssais (non-empty array), target_snssais (non-empty array, subset of allowed_snssais)
@@ -253,10 +254,18 @@ def build_validation_retry_prompt(
             "contract validation errors about flow_id, app_id, optimizer assignments, local slice labels, or target-stable preservation. "
             "Those errors are caused by your output not matching the optimizer evidence — not by missing 3GPP knowledge. "
             "Fix: align your sm_policies exactly with the optimizer preview. "
-            "Never add a flow_id that is absent from the optimizer QoS assignment. "
+            "Never add a flow_id that is absent from OperationIntent.flows or from the optimizer QoS assignment. "
             "On target-stable retries, preserve the exact flow_ids and app_ids from the upstream request. "
             "If the optimizer preview is incomplete, return partial_plan with planner_conflicts.\n\n"
             + _QOS_EXAMPLE
+        )
+    elif "outside operationintent flows" in joined:
+        correction = (
+            "Your previous SM policy drifted to a flow outside OperationIntent.flows. "
+            "You must preserve the exact flow_id/app_id from OperationIntent.flows. "
+            "Do not substitute a semantically similar optimizer flow. "
+            "If the optimizer preview does not contain an assignment for the OperationIntent flow, return partial_plan with blocked_targets and planner_conflicts.\n\n"
+            + _INFEASIBLE_EXAMPLE
         )
     elif "inspect_mobility_ue_policies" in joined or "not callable" in joined or "unknown tool" in joined:
         correction = (

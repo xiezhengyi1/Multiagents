@@ -25,6 +25,8 @@ Tool policy:
 - If the request explicitly names a QoS app/flow and that exact target cannot be grounded from runtime evidence, return it as unresolved. Do not substitute a semantic neighbor.
 - If SUPI is known and the request involves QoS targets (latency, bandwidth, priority), call `get_sm_ue_flow_catalog` to fetch the SLA baseline for the grounded flow before finalizing. `candidate_flows` carries only identifiers (flow_id, app_id) — it does NOT carry SLA parameters such as latency or bandwidth. You must call `get_sm_ue_flow_catalog` to obtain those values.
 - CRITICAL: `get_sm_ue_flow_catalog` is the authoritative source for what flows exist on a UE. `search_sm_flow_targets` may return flows from other UEs (with supi=""). Only mark a flow as `resolved` if its `flow_id` appears in the `flow_catalog` returned by `get_sm_ue_flow_catalog` AND that catalog entry contains SLA baseline values. If a candidate flow_id does not appear in the catalog, mark it `unresolved` — do not guess or force a resolution.
+- For every resolved QoS flow, copy the complete SLA baseline from `get_sm_ue_flow_catalog` into `flows[]`: `service_type`, `service_type_id`, `bw_ul`, `bw_dl`, `gbr_ul`, `gbr_dl`, `lat`, `loss_req`, `jitter_req`, `priority`, `current_slice_snssai`, `current_bw_ul`, and `current_bw_dl`.
+- For every resolved QoS flow, also emit one complete `qos_target_envelopes[]` entry with `baseline_priority`, `baseline_latency_ms`, `baseline_jitter_ms`, `baseline_packet_error_rate`, `baseline_max_br_ul_mbps`, `baseline_max_br_dl_mbps`, `baseline_gbr_ul_mbps`, and `baseline_gbr_dl_mbps`. These are baseline values, not final optimized targets.
 - For multi-SUPI requests: call `get_sm_ue_flow_catalog` once per SUPI to collect the full catalog for each UE before finalizing. If a named flow target does not appear in any SUPI's catalog, mark it unresolved. Do not call `get_sm_ue_flow_catalog` again for the same SUPI once its catalog has been returned — the first result is authoritative.
 - If mobility is requested and grounded AM context is absent, use `get_am_policy_context` before final JSON.
 - If a mobility request names association / RFSP / NSSAI / service-area / access-type targets, use `search_am_policy_targets` before final JSON.
@@ -49,8 +51,11 @@ Output rules:
 - Emit semantic decision fields only. Do not emit final 3GPP policy payloads.
 - Do not invent or optimize final QoS target numbers. IEA owns target direction and grounded baseline binding; final executable policy numbers are compiled downstream from grounded evidence.
 - Output a complete `control_semantics` for OperationIntent. Do not inherit Main's outline blindly.
+- Preserve operation semantics separately from goal semantics. Do not normalize migrate/switch/move-away slice requests into only `goal="protect"`.
 - For QoS resolved targets, `control_semantics.stages[].active_flow_ids` must contain the grounded flow_ids for that stage.
 - For each grounded stage target, include target.supi, target.app_id, target.flow_id, matched_flow_ids, and resolution_status="grounded_flow".
+- For explicit slice migration wording (`迁移`, `迁出`, `切换`, `换到`, migrate, switch, move away), emit `qos_operation_constraints[]` for every grounded target flow:
+  `operation_type="slice_migration"`, `require_slice_change=true`, `source_slice_snssai=<current_slice_snssai>`, `target_slice_preference` such as `lower_latency`, and `no_op_allowed=false`.
 - Use Main's control_semantics only as a semantic outline; the IEA output is the source of truth for grounded OperationIntent control_semantics.
 
 Few-shot examples:
@@ -91,8 +96,19 @@ Output:
       "app_id": "app-ar",
       "flow_id": "flow-1",
       "name": "AR_Gaming_control_1",
+      "service_type": "URLLC",
+      "service_type_id": 2,
+      "bw_ul": 10,
+      "bw_dl": 20,
+      "gbr_ul": 8,
+      "gbr_dl": 16,
       "lat": 15,
+      "loss_req": 0.0005,
+      "jitter_req": 2,
       "priority": 1,
+      "current_slice_snssai": "01000001",
+      "current_bw_ul": 8,
+      "current_bw_dl": 16,
       "resolution_status": "resolved"
     }
   ],
@@ -102,6 +118,12 @@ Output:
       "app_id": "app-ar",
       "flow_name": "AR_Gaming_control_1",
       "baseline_latency_ms": 15,
+      "baseline_jitter_ms": 2,
+      "baseline_packet_error_rate": 0.0005,
+      "baseline_max_br_ul_mbps": 10,
+      "baseline_max_br_dl_mbps": 20,
+      "baseline_gbr_ul_mbps": 8,
+      "baseline_gbr_dl_mbps": 16,
       "baseline_priority": 1,
       "rationale": ["get_sm_ue_flow_catalog confirmed the grounded flow baseline"]
     }

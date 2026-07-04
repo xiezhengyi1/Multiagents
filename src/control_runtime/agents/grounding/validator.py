@@ -147,7 +147,24 @@ class IntentGroundingValidator:
             for envelope in (operation_intent.qos_target_envelopes or [])
             if str(envelope.flow_id or "").strip()
         }
-        baseline_fields = (
+        flow_by_id = {
+            str(flow.flow_id or "").strip(): flow
+            for flow in operation_intent.flows
+            if str(flow.flow_id or "").strip()
+        }
+        flow_baseline_fields = (
+            "service_type_id",
+            "bw_ul",
+            "bw_dl",
+            "gbr_ul",
+            "gbr_dl",
+            "lat",
+            "loss_req",
+            "jitter_req",
+            "priority",
+            "current_slice_snssai",
+        )
+        envelope_baseline_fields = (
             "baseline_priority",
             "baseline_latency_ms",
             "baseline_jitter_ms",
@@ -158,12 +175,34 @@ class IntentGroundingValidator:
             "baseline_gbr_dl_mbps",
         )
         for flow_id in sorted(resolved_flow_ids):
+            flow = flow_by_id.get(flow_id)
+            if flow is not None:
+                missing_flow_fields = [
+                    field
+                    for field in flow_baseline_fields
+                    if _missing_baseline_value(getattr(flow, field, None))
+                ]
+                if missing_flow_fields:
+                    errors.append(
+                        f"incomplete QoS flow selector for resolved flow_id={flow_id}: "
+                        + ", ".join(missing_flow_fields)
+                    )
             envelope = envelope_by_flow_id.get(flow_id)
             if envelope is None:
                 errors.append(f"missing QoS baseline envelope for resolved flow_id={flow_id}")
                 continue
-            if all(getattr(envelope, field, None) is None for field in baseline_fields):
+            missing_envelope_fields = [
+                field
+                for field in envelope_baseline_fields
+                if _missing_baseline_value(getattr(envelope, field, None))
+            ]
+            if len(missing_envelope_fields) == len(envelope_baseline_fields):
                 errors.append(f"missing QoS baseline values for resolved flow_id={flow_id}")
+            elif missing_envelope_fields:
+                errors.append(
+                    f"incomplete QoS baseline for resolved flow_id={flow_id}: "
+                    + ", ".join(missing_envelope_fields)
+                )
         stages = list(operation_intent.control_semantics.stages or [])
         if not stages:
             errors.append("QoS OperationIntent must include IEA-owned control_semantics stages.")
@@ -183,3 +222,7 @@ class IntentGroundingValidator:
                 + ", ".join(sorted(unknown_active_ids))
             )
         return errors
+
+
+def _missing_baseline_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())

@@ -78,13 +78,25 @@ def extract_planning_tool_evidence(
         elif tool_name == "inspect_mobility_ue_policies":
             mobility_contexts.append(record)
 
-    # Prefer the full cached payload for optimizer results (avoids truncated-ToolMessage parse issues).
+    # Prefer the full cached payload for optimizer results (avoids truncated-ToolMessage parse issues),
+    # but preserve the compact tool summary because it may carry normalized qos_flow_assignments
+    # that the full optimizer payload does not expose at top level.
     cached_optimizer = dict((tool_payload_cache or {}).get("latest_optimizer_preview") or {})
+    latest_tool_payload = dict((optimizer_previews[-1]["payload"] if optimizer_previews else {}))
+    if cached_optimizer and latest_tool_payload:
+        cached_optimizer = {
+            **cached_optimizer,
+            **{
+                key: value
+                for key, value in latest_tool_payload.items()
+                if key in {"summary", "status", "qos_flow_assignments", "qos_meta_status"}
+            },
+        }
     return {
         "optimizer_previews": optimizer_previews,
         "latest_optimizer_preview": (
             cached_optimizer
-            or dict((optimizer_previews[-1]["payload"] if optimizer_previews else {}))
+            or latest_tool_payload
         ),
         "network_statuses": network_statuses,
         "latest_network_status": dict((network_statuses[-1]["payload"] if network_statuses else {})),

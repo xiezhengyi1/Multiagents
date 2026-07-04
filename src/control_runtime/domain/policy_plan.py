@@ -35,21 +35,21 @@ class FlowSelector(BaseModel):
     flow_id: Optional[str] = Field(default=None, description="Flow identifier")
     target_type: str = Field(default="flow", description="Target scope")
     name: str = Field(default="", description="Flow name")
-    service_type: Optional[str] = Field(default=None, description="Service type")
-    service_type_id: Optional[int] = Field(default=None, description="Service type identifier")
-    bw_ul: Optional[float] = Field(default=None, description="Requested uplink bandwidth in Mbps")
-    bw_dl: Optional[float] = Field(default=None, description="Requested downlink bandwidth in Mbps")
-    gbr_ul: Optional[float] = Field(default=None, description="Guaranteed uplink bitrate in Mbps")
-    gbr_dl: Optional[float] = Field(default=None, description="Guaranteed downlink bitrate in Mbps")
-    lat: Optional[float] = Field(default=None, description="Latency requirement in ms")
-    loss_req: Optional[float] = Field(default=None, description="Packet loss requirement")
-    jitter_req: Optional[float] = Field(default=None, description="Jitter requirement in ms")
-    priority: Optional[int] = Field(default=None, description="Priority level")
+    service_type: Optional[str] = Field(default=None, description="Grounded service type from the UE flow catalog")
+    service_type_id: Optional[int] = Field(default=None, description="Grounded service type identifier from the UE flow catalog")
+    bw_ul: Optional[float] = Field(default=None, description="Grounded baseline uplink max bitrate in Mbps")
+    bw_dl: Optional[float] = Field(default=None, description="Grounded baseline downlink max bitrate in Mbps")
+    gbr_ul: Optional[float] = Field(default=None, description="Grounded baseline uplink guaranteed bitrate in Mbps")
+    gbr_dl: Optional[float] = Field(default=None, description="Grounded baseline downlink guaranteed bitrate in Mbps")
+    lat: Optional[float] = Field(default=None, description="Grounded baseline latency requirement in ms")
+    loss_req: Optional[float] = Field(default=None, description="Grounded baseline packet loss requirement")
+    jitter_req: Optional[float] = Field(default=None, description="Grounded baseline jitter requirement in ms")
+    priority: Optional[int] = Field(default=None, description="Grounded baseline priority level")
     description: Optional[str] = Field(default=None, description="Human-readable flow description")
     five_tuple: Optional[List[Any]] = Field(default=None, description="Resolved five tuple")
-    current_slice_snssai: Optional[str] = Field(default=None, description="Current serving slice S-NSSAI")
-    current_bw_ul: Optional[float] = Field(default=None, description="Current uplink bandwidth in Mbps")
-    current_bw_dl: Optional[float] = Field(default=None, description="Current downlink bandwidth in Mbps")
+    current_slice_snssai: Optional[str] = Field(default=None, description="Grounded current serving slice S-NSSAI")
+    current_bw_ul: Optional[float] = Field(default=None, description="Grounded current uplink bandwidth in Mbps")
+    current_bw_dl: Optional[float] = Field(default=None, description="Grounded current downlink bandwidth in Mbps")
     resolution_status: str = Field(default="resolved", description="Resolution status")
 
 
@@ -84,6 +84,27 @@ class QosTargetEnvelope(BaseModel):
     rationale: List[str] = Field(default_factory=list, description="Deterministic reasons for the envelope")
 
 
+class QosOperationConstraint(BaseModel):
+    flow_id: str = Field(default="", description="Grounded flow identifier")
+    app_id: str = Field(default="", description="Grounded application identifier")
+    operation_type: str = Field(default="", description="QoS operation type such as slice_migration or qos_reallocation")
+    require_slice_change: bool = Field(default=False, description="True when satisfying the user goal requires selecting a different slice")
+    source_slice_snssai: Optional[str] = Field(default=None, description="Current/source slice that must be treated as the migration origin")
+    excluded_slice_snssais: List[str] = Field(default_factory=list, description="Slices the optimizer must not select for this flow")
+    target_slice_preference: str = Field(default="", description="Preference such as lower_latency or higher_throughput")
+    no_op_allowed: bool = Field(default=True, description="False when keeping the same slice cannot satisfy the operation")
+    rationale: List[str] = Field(default_factory=list, description="Why this constraint is required")
+
+    @model_validator(mode="after")
+    def _derive_excluded_source(self) -> "QosOperationConstraint":
+        source = str(self.source_slice_snssai or "").strip()
+        existing = [str(item or "").strip() for item in self.excluded_slice_snssais if str(item or "").strip()]
+        if self.require_slice_change and source and source not in existing:
+            existing.append(source)
+        self.excluded_slice_snssais = existing
+        return self
+
+
 class OperationIntent(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -96,6 +117,7 @@ class OperationIntent(BaseModel):
     grounding_evidence: GroundingEvidenceBundle = Field(default_factory=GroundingEvidenceBundle, description="Structured grounding evidence carried forward for traceability")
     flows: List[FlowSelector] = Field(default_factory=list, description="Resolved flow selectors")
     qos_target_envelopes: List[QosTargetEnvelope] = Field(default_factory=list, description="IEA-owned QoS target envelopes derived from grounded baselines")
+    qos_operation_constraints: List[QosOperationConstraint] = Field(default_factory=list, description="IEA/Main-owned hard QoS operation constraints")
     open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
     @model_validator(mode="before")

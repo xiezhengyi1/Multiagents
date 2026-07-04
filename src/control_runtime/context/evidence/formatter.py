@@ -67,6 +67,10 @@ class EvidenceFormatter:
             objective.model_dump(mode="json")
             for objective in operation_intent.qos_target_envelopes
         ]
+        operation_constraints = _qos_operation_constraints_for_flows(
+            operation_intent.model_dump(mode="json"),
+            planning_context,
+        )
         return {
             "requested_domains": list(planning_context.active_domains or []),
             "main_retry_scope": str(planning_context.main_retry_scope or "").strip(),
@@ -75,8 +79,10 @@ class EvidenceFormatter:
             "forbidden_assumptions": list(planning_context.forbidden_assumptions or []),
             "revision_requests": list(planning_context.revision_requests or []),
             "unified_constraints": dict(planning_context.unified_constraints or {}),
+            "shared_context": planning_context.shared_context.model_dump(mode="json"),
             "flows": flows,
             "qos_target_envelopes": qos_objectives,
+            "operation_constraints": operation_constraints,
         }
 
     @classmethod
@@ -138,12 +144,21 @@ class EvidenceFormatter:
                 raise ValueError("slice_kpi_source must be either 'qos' or 'telemetry'")
             problem_config.slice_kpi_source = normalized_source
 
+        optimizer_operation_intent = _canonicalize_operation_intent_for_optimizer(
+            operation_intent.model_dump(mode="json"),
+            snapshot,
+        )
+        _apply_qos_operation_constraints(
+            optimizer_operation_intent,
+            planning_request.context,
+        )
+
         return JointOptimizationRequest(
             session_id=planning_request.context.session_id,
             snapshot_id=snapshot_id,
             target_ues=target_supis,
             requested_domains=requested_domains,
-            operation_intent=operation_intent.model_dump(mode="json"),
+            operation_intent=optimizer_operation_intent,
             traffic_state={
                 "apps": snapshot.get("apps", []),
                 "slices": snapshot.get("slices", []),
@@ -182,3 +197,225 @@ def _collect_target_supis(planning_request: PlanningRequest) -> list[str]:
     for flow in operation_intent.flows or []:
         _append(flow.supi)
     return target_supis
+
+
+def _canonicalize_operation_intent_for_optimizer(
+    operation_intent_payload: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = dict(operation_intent_payload or {})
+    flow_catalog = _snapshot_flow_catalog_by_id(snapshot)
+    canonical_flows: List[Dict[str, Any]] = []
+    for flow_payload in payload.get("flows") or []:
+        if not isinstance(flow_payload, dict):
+            canonical_flows.append(flow_payload)
+            continue
+        flow = dict(flow_payload)
+        flow_id = str(flow.get("flow_id") or flow.get("id") or "").strip()
+        catalog_entry = flow_catalog.get(flow_id)
+        if catalog_entry is not None:
+            _apply_snapshot_flow_defaults(flow, catalog_entry)
+        canonical_flows.append(flow)
+    payload["flows"] = canonical_flows
+    return payload
+
+
+def _qos_operation_constraints_for_flows(
+    operation_intent_payload: Dict[str, Any],
+    planning_context: PlanningContext,
+) -> List[Dict[str, Any]]:
+    flow_by_id = {
+        str(flow.get("flow_id") or "").strip(): flow
+        for flow in (operation_intent_payload.get("flows") or [])
+        if isinstance(flow, dict) and str(flow.get("flow_id") or "").strip()
+    }
+    constraints: List[Dict[str, Any]] = []
+    for raw_constraint in operation_intent_payload.get("qos_operation_constraints") or []:
+        if not isinstance(raw_constraint, dict):
+            continue
+        constraint = _normalize_qos_operation_constraint(raw_constraint, flow_by_id)
+        if constraint:
+            constraints.append(constraint)
+
+    shared = planning_context.shared_context
+    for raw_constraint in shared.operation_constraints or []:
+        if not isinstance(raw_constraint, dict):
+            continue
+        if str(raw_constraint.get("type") or "").strip() != "qos_slice_migration":
+            continue
+        for flow_id, flow in flow_by_id.items():
+            if any(item.get("flow_id") == flow_id for item in constraints):
+                continue
+            source_slice = str(flow.get("current_slice_snssai") or "").strip()
+            preference = str(((raw_constraint.get("target_slice_policy") or {}).get("preference")) or "").strip()
+            constraint = _normalize_qos_operation_constraint(
+                {
+                    "flow_id": flow_id,
+                    "app_id": normalize_app_id(flow.get("app_id")),
+                    "operation_type": "slice_migration",
+                    "require_slice_change": bool(raw_constraint.get("required", True)),
+                    "source_slice_snssai": source_slice,
+                    "target_slice_preference": preference,
+                    "no_op_allowed": bool(raw_constraint.get("no_op_allowed", False)),
+                    "rationale": [
+                        "Main shared_context marked this request as a required QoS slice migration",
+                    ],
+                },
+                flow_by_id,
+            )
+            if constraint:
+                constraints.append(constraint)
+    return constraints
+
+
+def _normalize_qos_operation_constraint(
+    raw_constraint: Dict[str, Any],
+    flow_by_id: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    flow_id = str(raw_constraint.get("flow_id") or "").strip()
+    if not flow_id or flow_id not in flow_by_id:
+        return None
+    flow = flow_by_id[flow_id]
+    source_slice = str(raw_constraint.get("source_slice_snssai") or flow.get("current_slice_snssai") or "").strip()
+    excluded = [
+        str(item or "").strip()
+        for item in (raw_constraint.get("excluded_slice_snssais") or [])
+        if str(item or "").strip()
+    ]
+    require_slice_change = bool(raw_constraint.get("require_slice_change", False))
+    no_op_allowed = bool(raw_constraint.get("no_op_allowed", not require_slice_change))
+    if require_slice_change and source_slice and source_slice not in excluded:
+        excluded.append(source_slice)
+    return {
+        "flow_id": flow_id,
+        "app_id": normalize_app_id(raw_constraint.get("app_id") or flow.get("app_id")),
+        "operation_type": str(raw_constraint.get("operation_type") or "").strip() or "qos_reallocation",
+        "require_slice_change": require_slice_change,
+        "source_slice_snssai": source_slice or None,
+        "excluded_slice_snssais": excluded,
+        "target_slice_preference": str(raw_constraint.get("target_slice_preference") or "").strip(),
+        "no_op_allowed": no_op_allowed,
+        "rationale": list(raw_constraint.get("rationale") or []),
+    }
+
+
+def _apply_qos_operation_constraints(
+    operation_intent_payload: Dict[str, Any],
+    planning_context: PlanningContext,
+) -> None:
+    constraints = _qos_operation_constraints_for_flows(operation_intent_payload, planning_context)
+    if constraints:
+        operation_intent_payload["qos_operation_constraints"] = constraints
+    by_flow_id = {item["flow_id"]: item for item in constraints if item.get("flow_id")}
+    for flow in operation_intent_payload.get("flows") or []:
+        if not isinstance(flow, dict):
+            continue
+        flow_id = str(flow.get("flow_id") or "").strip()
+        constraint = by_flow_id.get(flow_id)
+        if not constraint:
+            continue
+        flow["require_slice_change"] = bool(constraint.get("require_slice_change"))
+        flow["excluded_slice_snssais"] = list(constraint.get("excluded_slice_snssais") or [])
+        flow["target_slice_preference"] = str(constraint.get("target_slice_preference") or "").strip()
+        flow["no_op_allowed"] = bool(constraint.get("no_op_allowed", True))
+
+
+def _snapshot_flow_catalog_by_id(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    catalog: Dict[str, Dict[str, Any]] = {}
+    for app in snapshot.get("apps") or []:
+        if not isinstance(app, dict):
+            continue
+        for flow in app.get("flows") or []:
+            if not isinstance(flow, dict):
+                continue
+            flow_id = str(flow.get("flow_id") or flow.get("id") or "").strip()
+            if flow_id:
+                catalog[flow_id] = {"app": app, "flow": flow}
+    return catalog
+
+
+def _apply_snapshot_flow_defaults(flow: Dict[str, Any], catalog_entry: Dict[str, Any]) -> None:
+    app = catalog_entry["app"]
+    snapshot_flow = catalog_entry["flow"]
+    service = snapshot_flow.get("service") if isinstance(snapshot_flow.get("service"), dict) else {}
+    sla = snapshot_flow.get("sla") if isinstance(snapshot_flow.get("sla"), dict) else {}
+    allocation = snapshot_flow.get("allocation") if isinstance(snapshot_flow.get("allocation"), dict) else {}
+
+    canonical_values = {
+        "supi": _coalesce(_first_present(snapshot_flow, "supi"), _first_present(app, "supi")),
+        "app_id": _coalesce(_first_present(app, "app_id", "id"), _first_present(snapshot_flow, "app_id")),
+        "app_name": _coalesce(_first_present(app, "app_name", "name"), _first_present(snapshot_flow, "app_name")),
+        "flow_id": _first_present(snapshot_flow, "flow_id", "id"),
+        "name": _first_present(snapshot_flow, "flow_name", "name"),
+        "service_type": _coalesce(_first_present(snapshot_flow, "service_type"), _first_present(service, "service_type")),
+        "service_type_id": _coalesce(_first_present(snapshot_flow, "service_type_id"), _first_present(service, "service_type_id")),
+        "bw_ul": _coalesce(
+            _first_present(snapshot_flow, "bw_ul", "bandwidth_ul", "max_br_ul_mbps"),
+            _first_present(sla, "bandwidth_ul", "max_br_ul_mbps"),
+        ),
+        "bw_dl": _coalesce(
+            _first_present(snapshot_flow, "bw_dl", "bandwidth_dl", "max_br_dl_mbps"),
+            _first_present(sla, "bandwidth_dl", "max_br_dl_mbps"),
+        ),
+        "gbr_ul": _coalesce(
+            _first_present(snapshot_flow, "gbr_ul", "guaranteed_bandwidth_ul", "gbr_ul_mbps"),
+            _first_present(sla, "guaranteed_bandwidth_ul", "gbr_ul_mbps"),
+        ),
+        "gbr_dl": _coalesce(
+            _first_present(snapshot_flow, "gbr_dl", "guaranteed_bandwidth_dl", "gbr_dl_mbps"),
+            _first_present(sla, "guaranteed_bandwidth_dl", "gbr_dl_mbps"),
+        ),
+        "lat": _coalesce(
+            _first_present(snapshot_flow, "lat", "latency", "latency_ms"),
+            _first_present(sla, "latency", "latency_ms"),
+        ),
+        "loss_req": _coalesce(
+            _first_present(snapshot_flow, "loss_req", "loss_rate", "packet_error_rate"),
+            _first_present(sla, "loss_rate", "packet_error_rate"),
+        ),
+        "jitter_req": _coalesce(
+            _first_present(snapshot_flow, "jitter_req", "jitter", "jitter_ms"),
+            _first_present(sla, "jitter", "jitter_ms"),
+        ),
+        "priority": _coalesce(_first_present(snapshot_flow, "priority"), _first_present(sla, "priority")),
+        "current_slice_snssai": _coalesce(
+            _first_present(snapshot_flow, "current_slice_snssai"),
+            _first_present(allocation, "current_slice_snssai"),
+        ),
+        "current_bw_ul": _coalesce(
+            _first_present(snapshot_flow, "current_bw_ul"),
+            _first_present(allocation, "allocated_bandwidth_ul"),
+        ),
+        "current_bw_dl": _coalesce(
+            _first_present(snapshot_flow, "current_bw_dl"),
+            _first_present(allocation, "allocated_bandwidth_dl"),
+        ),
+    }
+
+    for key in ("supi", "app_id", "app_name", "flow_id", "name"):
+        if canonical_values.get(key) is not None:
+            flow[key] = canonical_values[key]
+    for key, value in canonical_values.items():
+        if key in {"supi", "app_id", "app_name", "flow_id", "name"}:
+            continue
+        if _is_missing(flow.get(key)) and value is not None:
+            flow[key] = value
+
+
+def _first_present(payload: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if not _is_missing(value):
+            return value
+    return None
+
+
+def _coalesce(*values: Any) -> Any:
+    for value in values:
+        if not _is_missing(value):
+            return value
+    return None
+
+
+def _is_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())

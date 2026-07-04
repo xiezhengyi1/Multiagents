@@ -216,6 +216,12 @@ class PlanningAdvisorValidator:
             errors.append("mobility-active planning requires am_policy")
         if has_sm:
             errors.extend(self._validate_sm_policy_qos_bounds(advisor_output.sm_policies))
+            errors.extend(
+                self._validate_sm_policy_target_bindings(
+                    advisor_output.sm_policies,
+                    planning_request=planning_request,
+                )
+            )
         optimizer_preview = self._latest_optimizer_preview(normalized_tool_evidence)
         mobility_context = self._latest_mobility_context(normalized_tool_evidence)
         if (
@@ -224,6 +230,10 @@ class PlanningAdvisorValidator:
             and self._optimizer_preview_has_grounded_qos_assignments(
                 optimizer_preview,
                 flow_ids=preserved_flow_ids,
+            )
+            and not self._validate_required_slice_changes(
+                optimizer_preview,
+                planning_request=planning_request,
             )
         ):
             errors.append(
@@ -245,6 +255,12 @@ class PlanningAdvisorValidator:
                         errors.append(
                             f"optimizer preview does not contain a grounded QoS assignment for flow_id={spec.flow_id}"
                         )
+                errors.extend(
+                    self._validate_required_slice_changes(
+                        optimizer_preview,
+                        planning_request=planning_request,
+                    )
+                )
         if has_am and not mobility_context:
             errors.append("am_policy requires a parseable mobility context payload")
         if retry_scope == "target_stable":
@@ -276,10 +292,17 @@ class PlanningAdvisorValidator:
     @staticmethod
     def _latest_optimizer_preview(planning_tool_evidence: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(planning_tool_evidence.get("latest_optimizer_preview") or {})
+        summary = payload.get("summary")
         result = payload.get("result")
         if isinstance(result, dict):
-            return dict(result)
-        summary = payload.get("summary")
+            merged = dict(result)
+            if isinstance(summary, dict):
+                for key in ("status", "qos_meta_status", "qos_flow_assignments", "infeasible_reasons"):
+                    if key in summary and key not in merged:
+                        merged[key] = summary[key]
+                if "qos_flow_assignments" in summary:
+                    merged["qos_flow_assignments"] = summary["qos_flow_assignments"]
+            return merged
         if isinstance(summary, dict):
             return dict(summary)
         if isinstance(payload, dict) and payload.get("status") is not None:
@@ -307,6 +330,37 @@ class PlanningAdvisorValidator:
                 errors.append(
                     f"sm_policies[{index}].gbr_dl_mbps must not exceed max_br_dl_mbps "
                     f"({float(gbr_dl)} > {max_dl})"
+                )
+        return errors
+
+    @staticmethod
+    def _validate_sm_policy_target_bindings(
+        sm_policies: List[Any],
+        *,
+        planning_request: PlanningRequest,
+    ) -> List[str]:
+        allowed_flow_app_ids = {
+            str(flow.flow_id or "").strip(): _normalize_app_id(flow.app_id or "")
+            for flow in (planning_request.operation_intent.flows or [])
+            if str(flow.flow_id or "").strip()
+        }
+        if not allowed_flow_app_ids:
+            return []
+        errors: List[str] = []
+        for index, spec in enumerate(sm_policies or []):
+            flow_id = str(getattr(spec, "flow_id", "") or "").strip()
+            app_id = _normalize_app_id(getattr(spec, "app_id", "") or "")
+            expected_app_id = allowed_flow_app_ids.get(flow_id)
+            if expected_app_id is None:
+                errors.append(
+                    f"sm_policies[{index}].flow_id={flow_id or '<empty>'} is outside OperationIntent flows "
+                    f"{sorted(allowed_flow_app_ids)}"
+                )
+                continue
+            if expected_app_id and app_id != expected_app_id:
+                errors.append(
+                    f"sm_policies[{index}].app_id must preserve OperationIntent app_id={expected_app_id} "
+                    f"for flow_id={flow_id}; got {app_id or '<empty>'}"
                 )
         return errors
 
@@ -399,6 +453,92 @@ class PlanningAdvisorValidator:
                     if snssai is not None:
                         keys.append(f"snssai:{json.dumps(snssai, sort_keys=True, ensure_ascii=False)}")
         return list(dict.fromkeys(keys))
+
+    def _validate_required_slice_changes(
+        self,
+        optimizer_preview: Dict[str, Any],
+        *,
+        planning_request: PlanningRequest,
+    ) -> List[str]:
+        errors: List[str] = []
+        for requirement in self._required_slice_change_constraints(planning_request):
+            flow_id = requirement["flow_id"]
+            source_slice = requirement["source_slice_snssai"]
+            selected_slice = self._extract_selected_slice(optimizer_preview, flow_id=flow_id)
+            if not selected_slice:
+                continue
+            if selected_slice == source_slice:
+                errors.append(
+                    "required QoS slice migration was not satisfied: "
+                    f"flow_id={flow_id} remained on source_slice_snssai={source_slice}"
+                )
+        return errors
+
+    @staticmethod
+    def _required_slice_change_constraints(planning_request: PlanningRequest) -> List[Dict[str, str]]:
+        flow_source_slice = {
+            str(flow.flow_id or "").strip(): str(flow.current_slice_snssai or "").strip()
+            for flow in (planning_request.operation_intent.flows or [])
+            if str(flow.flow_id or "").strip()
+        }
+        requirements: List[Dict[str, str]] = []
+        for constraint in planning_request.operation_intent.qos_operation_constraints or []:
+            if not constraint.require_slice_change:
+                continue
+            flow_id = str(constraint.flow_id or "").strip()
+            source_slice = str(constraint.source_slice_snssai or flow_source_slice.get(flow_id) or "").strip()
+            if flow_id and source_slice:
+                requirements.append({"flow_id": flow_id, "source_slice_snssai": source_slice})
+
+        shared_context = planning_request.context.shared_context
+        for raw_constraint in shared_context.operation_constraints or []:
+            if not isinstance(raw_constraint, dict):
+                continue
+            if str(raw_constraint.get("type") or "") != "qos_slice_migration":
+                continue
+            if not bool(raw_constraint.get("required", True)):
+                continue
+            for flow_id, source_slice in flow_source_slice.items():
+                if flow_id and source_slice and not any(item["flow_id"] == flow_id for item in requirements):
+                    requirements.append({"flow_id": flow_id, "source_slice_snssai": source_slice})
+        return requirements
+
+    @staticmethod
+    def _extract_selected_slice(joint_result: Any, *, flow_id: str) -> str:
+        qos_plan = joint_result.get("qos_plan", {}) if isinstance(joint_result, dict) else {}
+        flow_sets: List[List[Dict[str, Any]]] = []
+        if isinstance(qos_plan, dict):
+            for key in ("target_apps",):
+                target_apps = qos_plan.get(key)
+                if not isinstance(target_apps, list):
+                    continue
+                for item in target_apps:
+                    if isinstance(item, dict) and isinstance(item.get("flows"), list):
+                        flow_sets.append(item["flows"])
+            target_app = qos_plan.get("target_app")
+            if isinstance(target_app, dict) and isinstance(target_app.get("flows"), list):
+                flow_sets.append(target_app["flows"])
+        for flows in flow_sets:
+            for item in flows:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("id") or "").strip() != flow_id:
+                    continue
+                allocation = item.get("allocation") if isinstance(item.get("allocation"), dict) else {}
+                selected = str(allocation.get("current_slice_snssai") or "").strip()
+                if selected:
+                    return selected
+        summary_assignments = joint_result.get("qos_flow_assignments") if isinstance(joint_result, dict) else []
+        if isinstance(summary_assignments, list):
+            for item in summary_assignments:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("flow_id") or item.get("id") or "").strip() != flow_id:
+                    continue
+                selected = str(item.get("new_slice") or item.get("current_slice_snssai") or item.get("slice_snssai") or "").strip()
+                if selected:
+                    return selected
+        return ""
 
     @staticmethod
     def _preserved_app_id(planning_request: PlanningRequest) -> str:

@@ -140,13 +140,19 @@ class RetryPromptBuilder:
                     "Do not call get_am_policy_context or search_am_policy_targets.",
                 ]
             )
-        if "missing QoS baseline values" in joined:
+        if (
+            "missing QoS baseline values" in joined
+            or "incomplete QoS baseline" in joined
+            or "incomplete QoS flow selector" in joined
+        ):
             repair_rules.extend(
                 [
                     "The previous attempt resolved a flow to a flow_id that does not have SLA baseline data in the catalog.",
                     "This usually means the resolved flow_id does not exist in the UE's flow catalog.",
                     "You must call get_sm_ue_flow_catalog and ONLY resolve flows whose flow_ids appear in the returned catalog.",
                     "Flows returned by search_sm_flow_targets carry identifiers but NOT SLA baselines — those must come from get_sm_ue_flow_catalog.",
+                    "For every resolved QoS flow, copy complete catalog baseline fields into flows[]: service_type_id, bw_ul, bw_dl, gbr_ul, gbr_dl, lat, loss_req, jitter_req, priority, and current_slice_snssai.",
+                    "For every resolved QoS flow, copy complete baseline fields into qos_target_envelopes[]: baseline_priority, baseline_latency_ms, baseline_jitter_ms, baseline_packet_error_rate, baseline_max_br_ul_mbps, baseline_max_br_dl_mbps, baseline_gbr_ul_mbps, and baseline_gbr_dl_mbps.",
                     "If the catalog does not contain a flow matching the user's intent, mark the flow as unresolved instead of forcing a resolution.",
                 ]
             )

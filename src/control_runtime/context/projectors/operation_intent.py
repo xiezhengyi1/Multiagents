@@ -41,4 +41,11 @@ class OperationIntentProjector(BaseProjector):
         ]
         if envelopes:
             projected["qos_target_envelopes"] = envelopes
+        constraints = [
+            without_empty_values(dict(constraint))
+            for constraint in (raw.get("qos_operation_constraints") or [])
+            if isinstance(constraint, dict)
+        ]
+        if constraints:
+            projected["qos_operation_constraints"] = constraints
         return without_empty_values(projected)

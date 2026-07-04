@@ -124,6 +124,8 @@ def _flow_trace_view(flow: Flow) -> Dict[str, Any]:
         "allocated_bandwidth_ul": flow.allocation.allocated_bandwidth_ul,
         "allocated_bandwidth_dl": flow.allocation.allocated_bandwidth_dl,
         "optimize_requested": flow.allocation.optimize_requested,
+        "excluded_slice_snssais": list(flow.allocation.excluded_slice_snssais or []),
+        "target_slice_preference": flow.allocation.target_slice_preference,
         "sla": {
             "bandwidth_ul": flow.sla.bandwidth_ul,
             "bandwidth_dl": flow.sla.bandwidth_dl,
@@ -344,6 +346,8 @@ def _clone_flow(flow: Flow) -> Flow:
             allocated_bandwidth_ul=flow.allocation.allocated_bandwidth_ul,
             allocated_bandwidth_dl=flow.allocation.allocated_bandwidth_dl,
             optimize_requested=flow.allocation.optimize_requested,
+            excluded_slice_snssais=list(flow.allocation.excluded_slice_snssais or []),
+            target_slice_preference=flow.allocation.target_slice_preference,
         ),
         telemetry=FlowTelemetry(
             throughput_ul=flow.telemetry.throughput_ul,
@@ -417,6 +421,12 @@ def _build_flow_from_payload(flow_payload: Dict[str, Any], matched_old_flow: Opt
             allocated_bandwidth_ul=matched_old_flow.allocation.allocated_bandwidth_ul if matched_old_flow else None,
             allocated_bandwidth_dl=matched_old_flow.allocation.allocated_bandwidth_dl if matched_old_flow else None,
             optimize_requested=True,
+            excluded_slice_snssais=[
+                str(item or "").strip()
+                for item in (flow_payload.get("excluded_slice_snssais") or [])
+                if str(item or "").strip()
+            ],
+            target_slice_preference=str(flow_payload.get("target_slice_preference") or "").strip(),
         ),
         telemetry=FlowTelemetry(
             throughput_ul=matched_old_flow.telemetry.throughput_ul if matched_old_flow else None,

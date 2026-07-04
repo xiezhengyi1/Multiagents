@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from shared.runtime import ContextPolicy
 
-from ..domain.collaboration import DomainNegotiationRequest, ExecutionReentryRequest, PlanningBlockerReport, PlanningContext
+from ..domain.collaboration import DomainNegotiationRequest, ExecutionReentryRequest, PlanningBlockerReport, PlanningContext, SharedControlContext
 from ..domain.control_plane import GlobalControlIntent
 from ..domain.policy_plan import OperationIntent
 from .projectors import project_global_intent_for_prompt
@@ -113,12 +113,14 @@ def build_planning_context(
     revision_requests: Optional[List[Dict[str, Any]]] = None,
     unified_constraints: Optional[Dict[str, Any]] = None,
 ) -> PlanningContext:
+    shared_context = _build_shared_control_context(global_intent)
     return PlanningContext(
         round_index=round_index,
         session_id=session_id,
         snapshot_id=snapshot_id,
         snapshot_metadata={**(get_latest_snapshot_metadata() or {}), "snapshot_id": snapshot_id},
         memory_context=memory_context,
+        shared_context=shared_context,
         feedback_context=feedback_context,
         handoff_history=list(handoff_history or [])[-2:],
         active_domains=list(active_domains or [item.value for item in global_intent.requested_domains]),
@@ -139,6 +141,67 @@ def build_planning_context(
         revision_requests=list(revision_requests or []),
         unified_constraints=dict(unified_constraints or {}),
     )
+
+
+def _build_shared_control_context(global_intent: GlobalControlIntent) -> SharedControlContext:
+    raw_input = str(global_intent.raw_input or "").strip()
+    semantics = global_intent.control_semantics.model_dump(mode="json")
+    constraints: List[Dict[str, Any]] = []
+    if _has_qos_slice_migration_goal(global_intent):
+        constraints.append(
+            {
+                "type": "qos_slice_migration",
+                "required": True,
+                "no_op_allowed": False,
+                "source": "main_control",
+                "target_slice_policy": {
+                    "exclude_current": True,
+                    "preference": _infer_slice_preference(raw_input, semantics),
+                },
+                "semantic_cues": _slice_migration_cues(raw_input, semantics),
+            }
+        )
+    return SharedControlContext(
+        raw_user_input=raw_input,
+        main_control_semantics=semantics,
+        operation_constraints=constraints,
+        shared_facts={
+            "requested_domains": [item.value for item in global_intent.requested_domains],
+            "objective_profile": global_intent.objective_profile.model_dump(mode="json"),
+        },
+    )
+
+
+def _has_qos_slice_migration_goal(global_intent: GlobalControlIntent) -> bool:
+    domains = {str(item.value if hasattr(item, "value") else item).strip().lower() for item in global_intent.requested_domains}
+    if "qos" not in domains:
+        return False
+    text = " ".join(
+        [
+            str(global_intent.raw_input or ""),
+            str(global_intent.routing_rationale or ""),
+            json.dumps(global_intent.control_semantics.model_dump(mode="json"), ensure_ascii=False),
+        ]
+    ).lower()
+    return any(token in text for token in ("迁移", "迁出", "切换", "换到", "migrate", "migration", "switch", "move away"))
+
+
+def _infer_slice_preference(raw_input: str, semantics: Dict[str, Any]) -> str:
+    text = f"{raw_input} {json.dumps(semantics, ensure_ascii=False)}".lower()
+    if any(token in text for token in ("低时延", "更低时延", "lower latency", "lower-latency", "latency")):
+        return "lower_latency"
+    if any(token in text for token in ("高吞吐", "throughput", "bandwidth")):
+        return "higher_throughput"
+    return "runtime_feasible"
+
+
+def _slice_migration_cues(raw_input: str, semantics: Dict[str, Any]) -> List[str]:
+    text = f"{raw_input} {json.dumps(semantics, ensure_ascii=False)}".lower()
+    cues = []
+    for token in ("迁移", "迁出", "切换", "换到", "migrate", "migration", "switch", "move away"):
+        if token in text:
+            cues.append(token)
+    return cues
 
 
 def parse_pda_metrics(report: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:

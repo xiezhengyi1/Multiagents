@@ -64,6 +64,8 @@ class FlowAllocation:
     allocated_bandwidth_ul: Optional[float] = None
     allocated_bandwidth_dl: Optional[float] = None
     optimize_requested: bool = False
+    excluded_slice_snssais: List[str] = field(default_factory=list)
+    target_slice_preference: str = ""
 
 
 @dataclass
