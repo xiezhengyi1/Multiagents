@@ -178,6 +178,7 @@ def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], D
         optimization_template: str = "joint_balanced",
         qos_relaxation_ratio: float = 0.2,
         slice_kpi_source: str = "qos",
+        qos_feasibility_mode: str = "auto",
     ) -> str:
         """Run the joint optimizer for executable planning evidence and return result plus summary."""
         request = EvidenceFormatter.for_optimizer(
@@ -186,6 +187,7 @@ def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], D
             template_name=str(optimization_template or "joint_balanced").strip().lower(),
             qos_relaxation_ratio=qos_relaxation_ratio,
             slice_kpi_source=slice_kpi_source,
+            qos_feasibility_mode=qos_feasibility_mode,
         )
         result = run_optimizer(request)
         full_payload = _serialize_optimizer_result(result)

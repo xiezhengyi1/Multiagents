@@ -411,6 +411,8 @@ class OptimizationProblemConfig(BaseModel):
     )
     qos_relaxation_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
     slice_kpi_source: Literal["qos", "telemetry"] = Field(default="qos")
+    qos_feasibility_mode: Literal["hard", "soft"] = Field(default="hard")
+    enable_sla_constraints: bool = Field(default=True)
 
     def grouped_decision_variables(self) -> Dict[str, List[str]]:
         variables = set(self.decision_variables)
@@ -461,6 +463,8 @@ class OptimizationProblemConfig(BaseModel):
             decision_variables=decision_variables,
             qos_relaxation_ratio=self.qos_relaxation_ratio,
             slice_kpi_source=self.slice_kpi_source,
+            qos_feasibility_mode=self.qos_feasibility_mode,
+            enable_sla_constraints=self.enable_sla_constraints,
         )
 
 

@@ -94,6 +94,7 @@ class EvidenceFormatter:
         template_name: str | None = None,
         qos_relaxation_ratio: float | None = None,
         slice_kpi_source: str | None = None,
+        qos_feasibility_mode: str | None = None,
     ) -> JointOptimizationRequest:
         from ...integrations.storage import get_snapshot_data_by_id, get_ue_context_by_supi
 
@@ -143,6 +144,12 @@ class EvidenceFormatter:
             if normalized_source not in {"qos", "telemetry"}:
                 raise ValueError("slice_kpi_source must be either 'qos' or 'telemetry'")
             problem_config.slice_kpi_source = normalized_source
+        normalized_feasibility_mode = _resolve_qos_feasibility_mode(
+            planning_request,
+            requested_mode=qos_feasibility_mode,
+        )
+        problem_config.qos_feasibility_mode = normalized_feasibility_mode
+        problem_config.enable_sla_constraints = normalized_feasibility_mode == "hard"
 
         optimizer_operation_intent = _canonicalize_operation_intent_for_optimizer(
             operation_intent.model_dump(mode="json"),
@@ -318,6 +325,70 @@ def _apply_qos_operation_constraints(
         flow["excluded_slice_snssais"] = list(constraint.get("excluded_slice_snssais") or [])
         flow["target_slice_preference"] = str(constraint.get("target_slice_preference") or "").strip()
         flow["no_op_allowed"] = bool(constraint.get("no_op_allowed", True))
+
+
+def _resolve_qos_feasibility_mode(
+    planning_request: PlanningRequest,
+    *,
+    requested_mode: str | None,
+) -> str:
+    normalized = str(requested_mode or "auto").strip().lower()
+    if normalized in {"hard", "strict"}:
+        return "hard"
+    if normalized in {"soft", "best_effort", "best-effort"}:
+        return "soft"
+    if normalized not in {"", "auto"}:
+        raise ValueError("qos_feasibility_mode must be 'auto', 'hard', or 'soft'")
+
+    raw_text = str(planning_request.context.shared_context.raw_user_input or "").strip().lower()
+    if not raw_text:
+        return "soft"
+
+    hard_sla_patterns = (
+        "时延必须",
+        "延迟必须",
+        "抖动必须",
+        "丢包必须",
+        "带宽必须",
+        "必须不超过",
+        "不得超过",
+        "不能超过",
+        "不超过",
+        "硬约束",
+        "latency must",
+        "jitter must",
+        "loss must",
+        "bandwidth must",
+        "no more than",
+        "at most",
+        "hard constraint",
+    )
+    softening_markers = ("尽量", "尽可能", "最好", "优先", "prefer", "best effort", "best-effort")
+    if any(pattern in raw_text for pattern in hard_sla_patterns) and not any(
+        marker in raw_text for marker in softening_markers
+    ):
+        return "hard"
+
+    soft_markers = (
+        "尽量",
+        "尽可能",
+        "一些",
+        "调稳",
+        "调优",
+        "优化",
+        "优先",
+        "看看",
+        "best effort",
+        "best-effort",
+        "prefer",
+        "priority",
+        "optimize",
+        "improve",
+    )
+    if any(marker in raw_text for marker in soft_markers):
+        return "soft"
+
+    return "soft"
 
 
 def _snapshot_flow_catalog_by_id(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:

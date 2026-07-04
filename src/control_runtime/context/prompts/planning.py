@@ -11,7 +11,8 @@ OSA_DYNAMIC_RULES = """
 Dynamic planning rules for this round:
 - Treat `main_retry_scope`, `revision_requests`, and `unified_constraints` from the user prompt as binding guidance.
 - Prefer the smallest executable policy set that satisfies the current round objective.
-- If optimizer/runtime evidence is insufficient or infeasible, return partial_plan or needs_upstream_reground instead of guessing.
+- For soft QoS tuning, use best-effort optimizer evidence before declaring the plan blocked.
+- If runtime evidence is insufficient or a hard optimizer preview is infeasible, return partial_plan or needs_upstream_reground instead of guessing.
 """
 
 

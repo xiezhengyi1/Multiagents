@@ -161,14 +161,6 @@ class QosEnvelopeBuilder:
                     baseline_max_br_dl_mbps=flow.bw_dl,
                     baseline_gbr_ul_mbps=flow.gbr_ul,
                     baseline_gbr_dl_mbps=flow.gbr_dl,
-                    strictest_priority=flow.priority,
-                    strictest_latency_ms=flow.lat,
-                    strictest_jitter_ms=flow.jitter_req,
-                    strictest_packet_error_rate=flow.loss_req,
-                    strictest_max_br_ul_mbps=flow.bw_ul,
-                    strictest_max_br_dl_mbps=flow.bw_dl,
-                    strictest_gbr_ul_mbps=flow.gbr_ul,
-                    strictest_gbr_dl_mbps=flow.gbr_dl,
                     rationale=[f"grounded_from_flow:{flow_id}"],
                 )
             )

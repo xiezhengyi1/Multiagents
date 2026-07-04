@@ -216,6 +216,8 @@ def _run_qos_subproblem(
             "policy_state": request.policy_state,
             "slice_kpi_source": problem_config.slice_kpi_source,
             "qos_relaxation_ratio": problem_config.qos_relaxation_ratio,
+            "qos_feasibility_mode": problem_config.qos_feasibility_mode,
+            "enable_sla_constraints": problem_config.enable_sla_constraints,
         },
     )
     if not isinstance(result, dict):

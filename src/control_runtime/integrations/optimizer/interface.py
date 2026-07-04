@@ -680,6 +680,8 @@ def optimize_network_slices(
         "mobility_policy_summary": _summarize_policy_state(debug_context),
         "slice_kpi_source": str((debug_context or {}).get("slice_kpi_source") or "qos"),
         "qos_relaxation_ratio": float((debug_context or {}).get("qos_relaxation_ratio") or 0.2),
+        "qos_feasibility_mode": str((debug_context or {}).get("qos_feasibility_mode") or "hard"),
+        "enable_sla_constraints": bool((debug_context or {}).get("enable_sla_constraints", True)),
         "solver_mode": mode,
         "weights": {"w1": w1, "w2": w2, "w3": w3, "w4": w4},
         "mobility_risk_weight": mobility_risk_weight,
@@ -783,6 +785,7 @@ def optimize_network_slices(
             am_policy_state=am_policy_state,
             qos_relaxation_ratio=float((debug_context or {}).get("qos_relaxation_ratio") or 0.2),
             slice_kpi_source=str((debug_context or {}).get("slice_kpi_source") or "qos"),
+            enable_sla_constraints=bool((debug_context or {}).get("enable_sla_constraints", True)),
         )
         engine = SliceOptimizationEngine(config)
 

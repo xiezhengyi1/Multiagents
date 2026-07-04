@@ -14,7 +14,8 @@ Planning evidence:
 Task:
 - Inspect the evidence and return one complete grounded OsaAdvisorOutput.
 - If evidence is sufficient, return planning_status="executable_plan" with all required fields grounded.
-- If evidence is insufficient or optimizer is infeasible/incomplete, return partial_plan or needs_upstream_reground.
+- If evidence is insufficient or a hard optimizer preview is infeasible/incomplete, return partial_plan or needs_upstream_reground.
+- For soft QoS tuning, use best-effort optimizer evidence before declaring the plan blocked.
 - Respect control_semantics.current_stage; optimize only the active stage flows.
 - Prefer optimizer sla values over telemetry values when filling final policy fields.
 
