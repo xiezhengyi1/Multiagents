@@ -328,8 +328,19 @@ def _build_policy_state_payload(apps: List[App]) -> Dict[str, Any]:
         if not supi:
             continue
         mobility_context = _build_seed_mobility_context(supi, app_index, app)
+        am_policy_context = _build_seed_am_policy_context(supi, app_index, mobility_context)
+        current_association_id = next(iter(am_policy_context.get("associations", {}).keys()), None)
         policy_state[supi] = {
-            "amPolicy": _build_seed_am_policy_context(supi, app_index, mobility_context),
+            "amPolicy": am_policy_context,
+            "amPolicyContext": am_policy_context,
+            "accessMobilityContext": mobility_context,
+            "mobilitySummary": {
+                "currentAssociationId": current_association_id,
+                "currentTriggers": ["LOC_CH", "PRA_CH", "ALLOWED_NSSAI_CH"],
+                "lastMobilityEventType": "INITIAL_ATTACH",
+                "currentRfsp": am_policy_context.get("rfsp"),
+                "lastUpdatedReason": "scenario_seed",
+            },
             "appId": app.id,
             "appName": app.name,
         }

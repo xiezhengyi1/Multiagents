@@ -21,9 +21,16 @@ CATEGORY_ORDER = [
     "qos_adjustment",
     "resource_conflict",
     "multi_object_ambiguity",
+    "cross_domain_coordination",
 ]
-EXPECTED_CATEGORY_COUNT = 5
-EXPECTED_TOTAL_COUNT = len(CATEGORY_ORDER) * EXPECTED_CATEGORY_COUNT
+EXPECTED_CATEGORY_COUNTS = {
+    "slice_migration": 7,
+    "qos_adjustment": 7,
+    "resource_conflict": 7,
+    "multi_object_ambiguity": 7,
+    "cross_domain_coordination": 8,
+}
+EXPECTED_TOTAL_COUNT = sum(EXPECTED_CATEGORY_COUNTS.values())
 
 
 def _build_task_catalog() -> Dict[str, Any]:
@@ -241,6 +248,189 @@ def _build_task_catalog() -> Dict[str, Any]:
             "expected_direction": "只做 mobility/AM policy 调整",
             "success_criteria": "requested_domains 仅含 mobility，QoS 不被误改",
         },
+        {
+            "task_id": "T021",
+            "category": "slice_migration",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "把 Remote_Drive_video_1 从当前切片迁到低时延资源上，但这次只做 QoS 侧迁移，不要改 allowed NSSAI 或 RFSP。",
+            "expected_objects": {"app": "Remote_Drive", "flow": "Remote_Drive_video_1"},
+            "expected_direction": "低时延 QoS 迁移，显式排除 AM policy 修改",
+            "success_criteria": "能够区分 SM/QoS 切片重分配与 AM policy 同步，不误改 mobility",
+        },
+        {
+            "task_id": "T022",
+            "category": "slice_migration",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "把 4K_Video_stream_1 换到吞吐更高的切片，4K_Video_control_2 先别动；如果换片不可执行，就只提高下行保障。",
+            "expected_objects": {
+                "app": "4K_Video",
+                "target_flow": "4K_Video_stream_1",
+                "excluded_flow": "4K_Video_control_2",
+            },
+            "expected_direction": "优先切到高吞吐切片，失败时退化为 QoS 带宽调整",
+            "success_criteria": "目标流与排除流区分正确，fallback 不改变控制流",
+        },
+        {
+            "task_id": "T023",
+            "category": "qos_adjustment",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "Cloud_Render_stream_1 先保证下行吞吐，抖动次要；Cloud_Render_telemetry_2 不动，也不要改 mobility。",
+            "expected_objects": {
+                "app": "Cloud_Render",
+                "target_flow": "Cloud_Render_stream_1",
+                "excluded_flow": "Cloud_Render_telemetry_2",
+            },
+            "expected_direction": "只对主渲染流做 QoS 调整，吞吐优先于抖动",
+            "success_criteria": "不误伤 telemetry 流，不输出 AM policy",
+        },
+        {
+            "task_id": "T024",
+            "category": "qos_adjustment",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "Remote_Drive_video_1 的稳定性优先；如果低时延切片不可用，不要强行迁移，先降低 jitter 和 loss 并保持 AM policy 不变。",
+            "expected_objects": {"app": "Remote_Drive", "flow": "Remote_Drive_video_1"},
+            "expected_direction": "稳定性优先的 best-effort QoS 调整，保留 mobility",
+            "success_criteria": "能把不可行迁移转成软 QoS 优化，并保持对象绑定",
+        },
+        {
+            "task_id": "T025",
+            "category": "resource_conflict",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "同一轮处理 Factory_Robot_video_1 和 IoT_Sensor_telemetry_1：保机器人控制稳定，必要时压低 IoT 遥测资源，不要动 UE allowed NSSAI。",
+            "expected_objects": {
+                "primary_flow": "Factory_Robot_video_1",
+                "secondary_flow": "IoT_Sensor_telemetry_1",
+            },
+            "expected_direction": "保护工业控制流，降配同 UE 的低优先级遥测",
+            "success_criteria": "能处理同 UE 多应用资源冲突，不把 IoT 当成目标保护流",
+        },
+        {
+            "task_id": "T026",
+            "category": "resource_conflict",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "Remote_Drive_video_1 和 Telemedicine_video_1 同时抢低时延资源时，先保远程驾驶控制稳定，再保医疗上行，其它视频业务可以让步。",
+            "expected_objects": {"flows": ["Remote_Drive_video_1", "Telemedicine_video_1"]},
+            "expected_direction": "跨 UE 双关键流分级保护",
+            "success_criteria": "Main/IEA/OSA 能保留两个目标和优先级顺序，而不是只优化一个流",
+        },
+        {
+            "task_id": "T027",
+            "category": "multi_object_ambiguity",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "AR gaming 那个控制流要更稳，不是视频流；带宽只小幅提高，时延别恶化，mobility 不动。",
+            "expected_objects": {
+                "app": "AR_Gaming",
+                "target_flow": "AR_Gaming_control_1",
+                "excluded_flow": "AR_Gaming_video_2",
+            },
+            "expected_direction": "解析到 AR 控制流并做轻量 QoS 优化",
+            "success_criteria": "不把“AR gaming”误绑定到视频流，不改 AM policy",
+        },
+        {
+            "task_id": "T028",
+            "category": "multi_object_ambiguity",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "4K 视频里只动主 stream，不动 control；如果为了吞吐要牺牲，先不要碰控制流。",
+            "expected_objects": {
+                "app": "4K_Video",
+                "target_flow": "4K_Video_stream_1",
+                "excluded_flow": "4K_Video_control_2",
+            },
+            "expected_direction": "区分同 app 的 stream 与 control flow",
+            "success_criteria": "控制流保持不变，QoS 调整只落在主视频流",
+        },
+        {
+            "task_id": "T029",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "先把 Remote_Drive_video_1 低时延化；如果 OSA 选择了新切片，就同步 AM allowed/target NSSAI，否则只下发 SM policy，不要凭空改 AM。",
+            "expected_objects": {"app": "Remote_Drive", "flow": "Remote_Drive_video_1"},
+            "expected_direction": "条件式 QoS-AM 同步",
+            "success_criteria": "跨域计划以 optimizer 结果为条件，避免无依据 AM policy 修改",
+        },
+        {
+            "task_id": "T030",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "Telemedicine_video_1 需要上行保障；若切片变化导致 allowed NSSAI 不包含目标切片，就更新 AM policy，但 Web_Browse 业务不动。",
+            "expected_objects": {
+                "app": ["Telemedicine", "Web_Browse"],
+                "target_flow": "Telemedicine_video_1",
+            },
+            "expected_direction": "医疗 QoS 优化与必要 AM 同步，排除同 UE 浏览业务",
+            "success_criteria": "只在切片选择需要时同步 AM，Web_Browse 不被误调",
+        },
+        {
+            "task_id": "T031",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "AR_Gaming_control_1 延迟优先；如果需要迁移切片，要保持同 UE 的 AR_Gaming_video_2 业务连续性，不要把视频流一起降配。",
+            "expected_objects": {
+                "app": "AR_Gaming",
+                "target_flow": "AR_Gaming_control_1",
+                "excluded_flow": "AR_Gaming_video_2",
+            },
+            "expected_direction": "控制流低时延优先，同时保护同 UE 视频连续性",
+            "success_criteria": "跨流约束被保留，策略不牺牲排除的视频流",
+        },
+        {
+            "task_id": "T032",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "Cloud_Render_stream_1 要切到更好的资源；如果必须改 UE-AMBR，AMBR 不能低于优化后的 SM 带宽，telemetry 流不动。",
+            "expected_objects": {
+                "app": "Cloud_Render",
+                "target_flow": "Cloud_Render_stream_1",
+                "excluded_flow": "Cloud_Render_telemetry_2",
+            },
+            "expected_direction": "QoS 带宽结果与 AMBR 保持一致",
+            "success_criteria": "跨域数值一致性正确，telemetry 流不被纳入策略",
+        },
+        {
+            "task_id": "T033",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "Factory_Robot_video_1 迁到工业优先资源；如果第一次执行失败，第二轮保持这个 flow 绑定并改成 best-effort QoS，不要转去 IoT_Sensor。",
+            "expected_objects": {
+                "app": ["Factory_Robot", "IoT_Sensor"],
+                "target_flow": "Factory_Robot_video_1",
+            },
+            "expected_direction": "闭环重试保持目标绑定并降级为 best-effort QoS",
+            "success_criteria": "失败反馈进入共享上下文后不发生对象漂移",
+        },
+        {
+            "task_id": "T034",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S2", "S3", "S2P", "S3P"],
+            "user_input": "Remote_Drive_video_1 和 Telemedicine_video_1 同时保护；QoS 负责切片和带宽，AM 只在目标切片缺失时同步 allowed NSSAI，不改 RFSP。",
+            "expected_objects": {"flows": ["Remote_Drive_video_1", "Telemedicine_video_1"]},
+            "expected_direction": "双关键流联合保护，AM 只做最小同步",
+            "success_criteria": "跨域职责边界清晰，RFSP 不被误改",
+        },
+        {
+            "task_id": "T035",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S3", "S3P"],
+            "user_input": "Drone_Control_video_1 和 Smart_Meter_telemetry_1 拥塞时，保护无人机控制，可降智能电表遥测；若无人机切片变更，再同步 AM policy。",
+            "expected_objects": {
+                "primary_flow": "Drone_Control_video_1",
+                "secondary_flow": "Smart_Meter_telemetry_1",
+            },
+            "expected_direction": "S3-only 跨 UE 关键控制保护与低优先级遥测降配",
+            "success_criteria": "无人机控制优先级高于智能电表遥测，AM 同步有条件触发",
+        },
+        {
+            "task_id": "T036",
+            "category": "cross_domain_coordination",
+            "scenario_ids": ["S3", "S3P"],
+            "user_input": "Web_Browse_session_2 可以牺牲；不能影响 Drone_Control_video_1 和 Factory_Robot_video_1；如果调度失败，重试时保持两个控制流绑定。",
+            "expected_objects": {
+                "flows": ["Drone_Control_video_1", "Factory_Robot_video_1"],
+                "deprioritized_flows": ["Web_Browse_session_2"],
+            },
+            "expected_direction": "S3-only 多控制流保护与闭环重试绑定保持",
+            "success_criteria": "两个关键控制流不丢失，降配对象不会被反向保护",
+        },
     ]
     return {
         "meta": {
@@ -293,10 +483,14 @@ def _validate_task_inventory(tasks: List[Dict[str, Any]]) -> None:
             raise ValueError(f"Task {task_id} uses unsupported category: {category}")
         category_counts[category] += 1
 
-    mismatched = {k: v for k, v in category_counts.items() if v != EXPECTED_CATEGORY_COUNT}
+    mismatched = {
+        category: category_counts.get(category, 0)
+        for category, expected in EXPECTED_CATEGORY_COUNTS.items()
+        if category_counts.get(category, 0) != expected
+    }
     if mismatched:
         raise ValueError(
-            f"Expected each category to contain {EXPECTED_CATEGORY_COUNT} tasks, got {mismatched}"
+            f"Expected category counts {EXPECTED_CATEGORY_COUNTS}, got {mismatched}"
         )
 
 
@@ -522,7 +716,7 @@ def _resolve_record_scenario_id(task: Dict[str, Any], *, explicit_scenario_id: s
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build experiment user inputs from the canonical 20-task catalog.")
+    parser = argparse.ArgumentParser(description="Build experiment user inputs from the canonical 36-task catalog.")
     parser.add_argument("--scenario", default="", help="Filter tasks by scenario id, e.g. S2")
     parser.add_argument("--experiment", default="", help="Filter tasks by experiment id, e.g. E1")
     return parser.parse_args()

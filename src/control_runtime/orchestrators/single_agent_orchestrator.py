@@ -23,8 +23,7 @@ from ..context import (
     build_main_context,
     build_round_feedback_block,
 )
-from ..domain.control_plane import GlobalControlIntent
-from ..domain.policy_plan import OperationIntent, PolicyPlanDraft
+from ..domain.policy_plan import PolicyPlanDraft
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
 from .round_execution import execute_planned_round
 from shared.logging import log_event
@@ -104,7 +103,7 @@ class SingleAgentOrchestrator:
         previous_report_payload: Dict[str, Any],
         previous_mediator_decision: Optional[Dict[str, Any]],
         round_traces: List[Dict[str, Any]],
-    ) -> tuple[GlobalControlIntent, OperationIntent, PolicyPlanDraft]:
+    ) -> PolicyPlanDraft:
         intent_context = build_main_context(
             snapshot_id,
             round_index=round_index,
@@ -142,8 +141,6 @@ class SingleAgentOrchestrator:
                 round_index=round_index,
                 retry_count=max(0, round_index - 1),
             )
-            global_intent = None
-            operation_intent = None
             policy_plan = None
             mediator_decision_payload = None
             report = None
@@ -153,7 +150,7 @@ class SingleAgentOrchestrator:
             diagnosis: Dict[str, Any] = {}
             exception_feedback: Dict[str, Any] = {}
             try:
-                global_intent, operation_intent, policy_plan = self._plan_round(
+                policy_plan = self._plan_round(
                     user_input=user_input,
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -169,8 +166,6 @@ class SingleAgentOrchestrator:
                     session_id=session_id,
                     snapshot_id=snapshot_id,
                     round_index=round_index,
-                    global_intent=global_intent,
-                    operation_intent=operation_intent,
                     policy_plan=policy_plan,
                     cr_tool=self.cr_tool,
                     pd_agent=self.pd_agent,
@@ -187,7 +182,7 @@ class SingleAgentOrchestrator:
                     session_id=session_id,
                     snapshot_id=snapshot_id,
                     completed=state.completed,
-                    global_intent=global_intent.model_dump(mode="json"),
+                    global_intent={},
                     unified_plan=round_execution.unified_plan.model_dump(mode="json"),
                     qos_feedback=qos_feedback,
                     mobility_feedback=mobility_feedback,
@@ -204,7 +199,7 @@ class SingleAgentOrchestrator:
                     session_id=session_id,
                     snapshot_id=snapshot_id,
                     completed=False,
-                    global_intent=global_intent.model_dump(mode="json") if global_intent is not None else {},
+                    global_intent={},
                     unified_plan={},
                     qos_feedback={},
                     mobility_feedback={},
@@ -223,8 +218,8 @@ class SingleAgentOrchestrator:
                 )
             trace = ControlRoundTrace(
                 round_index=round_index,
-                global_intent=global_intent.model_dump(mode="json") if global_intent is not None else {},
-                operation_intent=operation_intent.model_dump(mode="json") if operation_intent is not None else {},
+                global_intent={},
+                operation_intent={},
                 policy_plan=policy_plan.model_dump(mode="json") if policy_plan is not None else {},
                 domain_verdicts=domain_verdicts,
                 pda_feedback=report.model_dump(mode="json") if report is not None else exception_feedback if diagnosis.get("root_cause_category") == "single_control_round_exception" else {},

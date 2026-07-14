@@ -17,7 +17,7 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
 from control_runtime.integrations.scenario.init_scenario import rebuild_ue_related_tables_from_graph_snapshot
 from control_runtime.orchestrators.single_agent_orchestrator import SingleAgentOrchestrator
 from experiments.paths import default_catalog_input_path, resolve_scenario_source_path
-from experiments.scripts.common import append_jsonl, write_json
+from experiments.scripts.common import append_jsonl, reset_simulator_state, write_json
 from training.collect_workflow_trajectories import load_user_input_records
 from training.common import processed_dir
 
@@ -189,6 +189,7 @@ def main() -> None:
         result_record["elapsed_ms"] = round((time.perf_counter() - run_started_at) * 1000, 3)
         results.append(result_record)
         append_jsonl(args.result_output, result_record)
+        reset_simulator_state()
 
     summary = summarize_run_results(results, result_output=args.result_output)
     write_json(args.summary_output, summary)

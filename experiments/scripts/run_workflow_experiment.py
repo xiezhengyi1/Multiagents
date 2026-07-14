@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from training.collect_workflow_trajectories import collect_workflow_trajectories, load_user_input_records
 from training.common import processed_dir
-from experiments.scripts.common import write_json
+from experiments.scripts.common import reset_simulator_state, write_json
 
 
 def _average_elapsed_ms(results: List[Mapping[str, Any]]) -> float:
@@ -344,6 +344,7 @@ def main() -> None:
         reset_scenario_each_run=True,
         snapshot_id=args.snapshot_id,
         use_deepseek=args.use_deepseek,
+        case_finished_callback=reset_simulator_state,
     )
     results = collection["results"]
     summary = summarize_run_results(

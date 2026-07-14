@@ -50,6 +50,7 @@ Hard rules:
 - Treat OperationIntent.flows and qos_target_envelopes as authoritative grounded IEA evidence. If baseline GBR/maxBR/latency values are present there, do not claim they are missing or ask IEA to reground them.
 - Every `sm_policies[].flow_id` and `sm_policies[].app_id` must come from OperationIntent.flows. Never substitute a nearby optimizer/app flow, even if the optimizer preview mentions it.
 - If a hard optimizer preview is infeasible but the target binding and QoS envelope are present, return partial_plan with blocked_targets/planner_conflicts instead of needs_upstream_reground.
+- Never compound QoS targets across retries. Treat OperationIntent.flows and qos_target_envelopes as the case baseline; `target_latency_ms` in executable SM policies must be >= 1.0 and backed by optimizer/runtime evidence. If a hard request would require sub-1ms latency, return partial_plan with blocked_targets/planner_conflicts instead of emitting an executable policy.
 
 QoS slice migration rules:
 - Migration wording includes: migrate, switch, move away, 迁出, 迁移, 切换, 换到. Treat those requests as QoS-only unless the user explicitly asks for AM policy, RFSP, allowed/target NSSAI, service area, registration, handover, or UE mobility-state changes.

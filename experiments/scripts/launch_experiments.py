@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -36,6 +37,7 @@ BUILD_INPUTS_SCRIPT = EXPERIMENT_ROOT / "scripts" / "build_user_inputs.py"
 RUN_METHOD_SCRIPT = EXPERIMENT_ROOT / "scripts" / "run_method.py"
 AGGREGATE_SCRIPT = EXPERIMENT_ROOT / "scripts" / "aggregate_results.py"
 FAILED_RUNS_PATH = LEDGER_ROOT / "failed_experiments.jsonl"
+ENV_PATH = PROJECT_ROOT / ".env"
 
 
 def _append_failed_run(record: Dict[str, Any]) -> None:
@@ -75,6 +77,40 @@ def _parse_run_method_output(stdout: str) -> Dict[str, Any]:
         if isinstance(payload, dict) and payload.get("result_path") and payload.get("summary_path"):
             return payload
     raise RuntimeError("Failed to parse run_method.py JSON output")
+
+
+def _load_model_name_from_env() -> str:
+    env_value = str(os.getenv("MODEL_NAME") or "").strip()
+    if env_value:
+        return env_value
+    if not ENV_PATH.exists():
+        return ""
+    for raw_line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() != "MODEL_NAME":
+            continue
+        return value.strip().strip('"').strip("'")
+    return ""
+
+
+def _resolve_model_flags(args: argparse.Namespace, *, method_id: str) -> Dict[str, bool]:
+    model_name = _load_model_name_from_env().lower()
+    if model_name:
+        is_single_agent = str(method_id or "").strip() in {"B1", "B2", "B3"}
+        return {
+            "use_qwen": is_single_agent and "qwen" in model_name,
+            "use_deepseek": (not is_single_agent) and "deepseek" in model_name,
+        }
+
+    explicit_qwen = bool(getattr(args, "use_qwen", False))
+    explicit_deepseek = bool(getattr(args, "use_deepseek", False))
+    if explicit_qwen or explicit_deepseek:
+        return {"use_qwen": explicit_qwen, "use_deepseek": explicit_deepseek}
+
+    return {"use_qwen": False, "use_deepseek": False}
 
 
 def _iter_selected_experiments(
@@ -386,9 +422,10 @@ def main() -> None:
                                 "--start-index",
                                 str(start_index),
                             ]
-                        if args.use_deepseek:
+                        model_flags = _resolve_model_flags(args, method_id=method_id)
+                        if model_flags["use_deepseek"]:
                             run_method_cmd.append("--deepseek")
-                        if args.use_qwen:
+                        if model_flags["use_qwen"]:
                             run_method_cmd.append("--qwen")
                         stdout = _run_command(
                             run_method_cmd,

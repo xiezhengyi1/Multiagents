@@ -5,7 +5,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PACKAGE_ROOT.parent
@@ -295,6 +295,7 @@ def collect_workflow_trajectories(
     reset_scenario_each_run: bool,
     snapshot_id: str = "",
     use_deepseek: bool = False,
+    case_finished_callback: Callable[[], None] | None = None,
 ) -> Dict[str, Any]:
     ensure_agent_layout("workflow")
     init_db()
@@ -406,6 +407,8 @@ def collect_workflow_trajectories(
         result_record["elapsed_ms"] = round((time.perf_counter() - run_started_at) * 1000, 3)
         results.append(result_record)
         _write_jsonl_incremental(result_output, result_record)
+        if case_finished_callback is not None:
+            case_finished_callback()
 
     projection_summary = _store_projected_trajectories(
         results=results,

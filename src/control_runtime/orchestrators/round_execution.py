@@ -74,17 +74,137 @@ def approved_policies(report: Optional[FeedbackReport]) -> List[Dict[str, Any]]:
     return approved
 
 
+def _global_intent_payload(global_intent: Optional[GlobalControlIntent]) -> Dict[str, Any]:
+    return global_intent.model_dump(mode="json") if global_intent is not None else {}
+
+
+def _operation_intent_payload(operation_intent: Optional[OperationIntent]) -> Dict[str, Any]:
+    return operation_intent.model_dump(mode="json") if operation_intent is not None else {}
+
+
+def _effective_supi(
+    global_intent: Optional[GlobalControlIntent],
+    operation_intent: Optional[OperationIntent],
+    policy_plan: PolicyPlanDraft,
+) -> str:
+    if global_intent is not None and str(global_intent.supi or "").strip():
+        return str(global_intent.supi or "").strip()
+    if operation_intent is not None and str(operation_intent.supi or "").strip():
+        return str(operation_intent.supi or "").strip()
+    return str(policy_plan.supi or "").strip()
+
+
+def _requested_domains(operation_intent: Optional[OperationIntent], policy_plan: PolicyPlanDraft) -> List[str]:
+    if operation_intent is not None:
+        domains = [
+            str(item or "").strip().lower()
+            for item in (operation_intent.requested_domains or [])
+            if str(item or "").strip()
+        ]
+        if domains:
+            return domains
+    inferred: List[str] = []
+    for item in policy_plan.all_policies or policy_plan.partial_policies or []:
+        domain = "mobility" if item.policy_type == AM_POLICY_TYPE else "qos"
+        if domain not in inferred:
+            inferred.append(domain)
+    return inferred
+
+
+def _open_questions(operation_intent: Optional[OperationIntent], policy_plan: PolicyPlanDraft) -> List[Any]:
+    if operation_intent is None:
+        return list(policy_plan.open_questions)
+    return list(operation_intent.open_questions + policy_plan.open_questions)
+
+
+def _objective_breakdown(policy_plan: PolicyPlanDraft, global_intent: Optional[GlobalControlIntent]) -> Dict[str, Any]:
+    if policy_plan.optimizer_result:
+        return dict(policy_plan.optimizer_result)
+    if global_intent is not None:
+        return global_intent.objective_profile.model_dump(mode="json")
+    return {}
+
+
+def _planning_source_agent(global_intent: Optional[GlobalControlIntent]) -> str:
+    return "optimization_strategy" if global_intent is not None else "single_control"
+
+
+def _agent_contributions(
+    *,
+    global_intent: Optional[GlobalControlIntent],
+    operation_intent: Optional[OperationIntent],
+    policy_plan: PolicyPlanDraft,
+) -> List[Dict[str, Any]]:
+    if global_intent is None:
+        return [
+            {
+                "agent": "single_control",
+                "summary": str(policy_plan.planning_rationale.explanation or "").strip(),
+                "payload": {"policy_plan": policy_plan.model_dump(mode="json")},
+            }
+        ]
+    operation_payload = _operation_intent_payload(operation_intent)
+    return [
+        {"agent": "main_control", "summary": str(global_intent.routing_rationale or "").strip(), "payload": global_intent.model_dump(mode="json")},
+        {
+            "agent": "intent_encoding",
+            "summary": str((operation_intent.domain_resolution if operation_intent is not None else "") or "").strip(),
+            "payload": operation_payload,
+        },
+        {"agent": "optimization_strategy", "summary": str(policy_plan.planning_rationale.explanation or "").strip(), "payload": policy_plan.model_dump(mode="json")},
+    ]
+
+
+def _agent_conflicts(
+    *,
+    global_intent: Optional[GlobalControlIntent],
+    operation_intent: Optional[OperationIntent],
+) -> List[Dict[str, Any]]:
+    if global_intent is None or operation_intent is None:
+        return []
+    if str(operation_intent.domain_resolution or "confirmed").strip() == "confirmed":
+        return []
+    return [
+        {
+            "agents": ["main_control", "intent_encoding"],
+            "summary": str(operation_intent.domain_resolution or "").strip(),
+            "impact": str(operation_intent.domain_resolution or "").strip(),
+        }
+    ]
+
+
+def _handoff_records(
+    *,
+    global_intent: Optional[GlobalControlIntent],
+    operation_intent: Optional[OperationIntent],
+    policy_plan: PolicyPlanDraft,
+) -> List[Dict[str, Any]]:
+    if global_intent is None:
+        return [
+            {
+                "source_agent": "single_control",
+                "target_agent": "policy_dispatch",
+                "artifact_type": "PolicyPlanDraft",
+                "summary": str(policy_plan.planning_rationale.explanation or "").strip(),
+            }
+        ]
+    return [
+        {"source_agent": "main_control", "target_agent": "intent_encoding", "artifact_type": "GlobalControlIntent", "summary": str(global_intent.routing_decision or "").strip()},
+        {"source_agent": "intent_encoding", "target_agent": "optimization_strategy", "artifact_type": "OperationIntent", "summary": str((operation_intent.domain_resolution if operation_intent is not None else "") or "").strip()},
+    ]
+
+
 def execute_planned_round(
     *,
     session_id: str,
     snapshot_id: str,
     round_index: int,
-    global_intent: GlobalControlIntent,
-    operation_intent: OperationIntent,
     policy_plan: PolicyPlanDraft,
     cr_tool: ConflictResolutionTool,
     pd_agent: PolicyDispatchAgent,
     ad_tool: AssuranceDiagnosisTool,
+    operation_intent: Optional[OperationIntent] = None,
+    global_intent: Optional[GlobalControlIntent] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
 ) -> RoundExecutionArtifacts:
     snapshot_data = get_snapshot_data_by_id(snapshot_id) or {}
@@ -94,7 +214,7 @@ def execute_planned_round(
     if planning_status != "executable_plan":
         blocker = PlanningBlockerReport(
             round_index=round_index,
-            source_agent="optimization_strategy",
+            source_agent=_planning_source_agent(global_intent),
             planning_status=planning_status or "needs_upstream_reground",
             missing_evidence=list(policy_plan.missing_evidence or []),
             blocked_targets=list(policy_plan.blocked_targets or []),
@@ -122,17 +242,17 @@ def execute_planned_round(
         unified_plan = UnifiedControlPlan(
             session_id=session_id,
             snapshot_id=snapshot_id,
-            supi=global_intent.supi or operation_intent.supi,
+            supi=_effective_supi(global_intent, operation_intent, policy_plan),
             global_intent=global_intent,
             domain_verdicts=[],
-            blocked_domains=[ControlDomain(item) for item in operation_intent.requested_domains if item in {ControlDomain.QOS.value, ControlDomain.MOBILITY.value}],
-            objective_breakdown=policy_plan.optimizer_result or global_intent.objective_profile.model_dump(mode="json"),
-            open_questions=list(operation_intent.open_questions + policy_plan.open_questions),
+            blocked_domains=[ControlDomain(item) for item in _requested_domains(operation_intent, policy_plan) if item in {ControlDomain.QOS.value, ControlDomain.MOBILITY.value}],
+            objective_breakdown=_objective_breakdown(policy_plan, global_intent),
+            open_questions=_open_questions(operation_intent, policy_plan),
         )
         trace = ControlRoundTrace(
             round_index=round_index,
-            global_intent=global_intent.model_dump(mode="json"),
-            operation_intent=operation_intent.model_dump(mode="json"),
+            global_intent=_global_intent_payload(global_intent),
+            operation_intent=_operation_intent_payload(operation_intent),
             policy_plan=policy_plan.model_dump(mode="json"),
             domain_verdicts=[],
             pda_feedback={},
@@ -166,7 +286,7 @@ def execute_planned_round(
             snapshot_id=snapshot_id,
             **build_conflict_request_payload(
                 policy_plan=policy_plan,
-                ue_context=get_ue_context_by_supi(global_intent.supi or operation_intent.supi or "", snapshot_id=snapshot_id),
+                ue_context=get_ue_context_by_supi(_effective_supi(global_intent, operation_intent, policy_plan), snapshot_id=snapshot_id),
                 snapshot_data=snapshot_data,
             ),
         )
@@ -219,8 +339,8 @@ def execute_planned_round(
         session_id=session_id,
         snapshot_id=snapshot_id,
         upstream_context={
-            "global_intent": global_intent.model_dump(mode="json"),
-            "operation_intent": operation_intent.model_dump(mode="json"),
+            "global_intent": _global_intent_payload(global_intent),
+            "operation_intent": _operation_intent_payload(operation_intent),
             "conflict_result": conflict_result.model_dump(mode="json"),
         },
     )
@@ -243,7 +363,7 @@ def execute_planned_round(
     unified_plan = UnifiedControlPlan(
         session_id=session_id,
         snapshot_id=snapshot_id,
-        supi=global_intent.supi or operation_intent.supi,
+        supi=_effective_supi(global_intent, operation_intent, policy_plan),
         global_intent=global_intent,
         qos_proposal=qos_proposal,
         mobility_proposal=mobility_proposal,
@@ -257,39 +377,20 @@ def execute_planned_round(
             for verdict in domain_verdicts
             if verdict.status in {DomainStatus.REJECTED, DomainStatus.NEEDS_REVISION, DomainStatus.INCOMPLETE_CONTEXT, DomainStatus.FAILED}
         ],
-        objective_breakdown=policy_plan.optimizer_result or global_intent.objective_profile.model_dump(mode="json"),
+        objective_breakdown=_objective_breakdown(policy_plan, global_intent),
         control_churn_count=len(approved_policies(report)),
-        agent_contributions=[
-            {"agent": "main_control", "summary": str(global_intent.routing_rationale or "").strip(), "payload": global_intent.model_dump(mode="json")},
-            {
-                "agent": "intent_encoding",
-                "summary": str(operation_intent.domain_resolution or "").strip(),
-                "payload": operation_intent.model_dump(mode="json"),
-            },
-            {"agent": "optimization_strategy", "summary": str(policy_plan.planning_rationale.explanation or "").strip(), "payload": policy_plan.model_dump(mode="json")},
-        ],
-        agent_conflicts=[
-            {
-                "agents": ["main_control", "intent_encoding"],
-                "summary": str(operation_intent.domain_resolution or "").strip(),
-                "impact": str(operation_intent.domain_resolution or "").strip(),
-            }
-            for _ in [1]
-            if str(operation_intent.domain_resolution or "confirmed").strip() != "confirmed"
-        ],
-        handoff_records=[
-            {"source_agent": "main_control", "target_agent": "intent_encoding", "artifact_type": "GlobalControlIntent", "summary": str(global_intent.routing_decision or "").strip()},
-            {"source_agent": "intent_encoding", "target_agent": "optimization_strategy", "artifact_type": "OperationIntent", "summary": str(operation_intent.domain_resolution or "").strip()},
-        ],
+        agent_contributions=_agent_contributions(global_intent=global_intent, operation_intent=operation_intent, policy_plan=policy_plan),
+        agent_conflicts=_agent_conflicts(global_intent=global_intent, operation_intent=operation_intent),
+        handoff_records=_handoff_records(global_intent=global_intent, operation_intent=operation_intent, policy_plan=policy_plan),
         open_questions=[
             item.model_dump(mode="json") if hasattr(item, "model_dump") else item
-            for item in (operation_intent.open_questions + policy_plan.open_questions)
+            for item in _open_questions(operation_intent, policy_plan)
         ],
     )
     trace = ControlRoundTrace(
         round_index=round_index,
-        global_intent=global_intent.model_dump(mode="json"),
-        operation_intent=operation_intent.model_dump(mode="json"),
+        global_intent=_global_intent_payload(global_intent),
+        operation_intent=_operation_intent_payload(operation_intent),
         policy_plan=policy_plan.model_dump(mode="json"),
         domain_verdicts=[item.model_dump(mode="json") for item in domain_verdicts],
         pda_feedback=report.model_dump(mode="json") if report is not None else {},

@@ -163,6 +163,8 @@ class MainControlSemantics(BaseModel):
 
 
 def _normalize_semantic_target_type(v: Any) -> Any:
+    if isinstance(v, SemanticTargetType):
+        return v.value
     if isinstance(v, str):
         normalized = v.strip().lower().replace("-", "_").replace(" ", "_")
         _TARGET_TYPE_ALIASES: dict[str, str] = {
@@ -178,6 +180,8 @@ def _normalize_semantic_target_type(v: Any) -> Any:
 
 
 def _normalize_semantic_goal(v: Any) -> Any:
+    if isinstance(v, SemanticGoal):
+        return v.value
     if not isinstance(v, str):
         return v
     _GOAL_ALIASES: dict[str, str] = {
@@ -215,6 +219,8 @@ def _normalize_semantic_goal(v: Any) -> Any:
 
 
 def _normalize_stage_trigger(v: Any) -> Any:
+    if isinstance(v, StageTrigger):
+        return v.value
     if not isinstance(v, str):
         return v
     _TRIGGER_ALIASES: dict[str, str] = {
@@ -238,10 +244,18 @@ def _normalize_stage_trigger(v: Any) -> Any:
     return _TRIGGER_ALIASES.get(normalized, normalized)
 
 
+def _normalize_control_semantic_mode(v: Any) -> Any:
+    if isinstance(v, ControlSemanticMode):
+        return v.value
+    if not isinstance(v, str):
+        return v
+    return v.strip().lower().replace("-", "_").replace(" ", "_")
+
+
 class SemanticTarget(BaseModel):
     semantic_name: str = Field(default="")
-    target_type: SemanticTargetType = Field(default=SemanticTargetType.NAMED_OBJECT)
-    goal: SemanticGoal = Field(default=SemanticGoal.PROTECT)
+    target_type: str = Field(default=SemanticTargetType.NAMED_OBJECT.value)
+    goal: str = Field(default=SemanticGoal.PROTECT.value)
     metric_focus: Optional[str] = Field(default=None)
     note: str = Field(default="")
     supi: str = Field(default="")
@@ -267,7 +281,7 @@ class SemanticTarget(BaseModel):
 class ControlStage(BaseModel):
     stage_index: int = Field(default=1, ge=1)
     name: str = Field(default="")
-    trigger: StageTrigger = Field(default=StageTrigger.INITIAL)
+    trigger: str = Field(default=StageTrigger.INITIAL.value)
     summary: str = Field(default="")
     targets: List[SemanticTarget] = Field(default_factory=list)
     active_flow_ids: List[str] = Field(default_factory=list)
@@ -280,10 +294,15 @@ class ControlStage(BaseModel):
 
 
 class ControlSemantics(BaseModel):
-    mode: ControlSemanticMode = Field(default=ControlSemanticMode.SINGLE_STEP)
+    mode: str = Field(default=ControlSemanticMode.SINGLE_STEP.value)
     current_stage: int = Field(default=1, ge=1)
     stages: List[ControlStage] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, v: Any) -> Any:
+        return _normalize_control_semantic_mode(v)
 
     @model_validator(mode="after")
     def _normalize_current_stage(self) -> "ControlSemantics":
@@ -633,7 +652,7 @@ class UnifiedControlPlan(BaseModel):
     session_id: str
     snapshot_id: str
     supi: str
-    global_intent: GlobalControlIntent
+    global_intent: Optional[GlobalControlIntent] = None
     qos_proposal: Optional[DomainProposal] = None
     mobility_proposal: Optional[DomainProposal] = None
     domain_verdicts: List[DomainVerdict] = Field(default_factory=list)

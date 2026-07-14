@@ -20,6 +20,15 @@ from shared.logging import setup_logger
 load_dotenv()
 
 
+def resolve_agent_model_name(model_name: str = "", *, use_local_model: bool = False) -> str:
+    env_model_name = str(os.getenv("MODEL_NAME") or "").strip()
+    if env_model_name:
+        return env_model_name
+    if use_local_model:
+        return str(os.getenv("vLLM_MODEL_NAME") or model_name or "").strip()
+    return str(model_name or "qwen-plus").strip()
+
+
 def extract_grounding_tool_names(result: dict[str, Any], grounding_tools: Iterable[str]) -> list[str]:
     allowed = {
         str(name).strip()
@@ -67,7 +76,7 @@ class BaseAgent:
         self._cache = RuntimeCache()
         if use_local_model:
             base_url = os.getenv("vLLM_URL")
-            resolved_model_name = os.getenv("vLLM_MODEL_NAME")
+            resolved_model_name = resolve_agent_model_name(model_name, use_local_model=True)
             self.model_name = resolved_model_name
             self.temperature = temperature
             self.llm = ChatOpenAI(
@@ -89,10 +98,11 @@ class BaseAgent:
         raw_timeout = os.getenv("OPENAI_TIMEOUT_SECONDS", "120")
         raw_max_retries = os.getenv("OPENAI_MAX_RETRIES", "2")
 
-        self.model_name = model_name
+        resolved_model_name = resolve_agent_model_name(model_name, use_local_model=False)
+        self.model_name = resolved_model_name
         self.temperature = temperature
         self.llm = ChatOpenAI(
-            model=model_name,
+            model=resolved_model_name,
             temperature=temperature,
             api_key=resolved_api_key,
             base_url=resolved_base_url,

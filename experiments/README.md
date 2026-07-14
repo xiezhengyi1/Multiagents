@@ -15,7 +15,7 @@
   - `scenarios.json`: `S1/S2/S3` 及 `S1P/S2P/S3P` 场景定义
   - `experiment_matrix.json`: `E1-E5` 与 `E1P-E5P` 实验分组
 - `tasks/`
-  - `task_catalog.json`: 20 条控制任务，覆盖 4 类请求
+  - `task_catalog.json`: 36 条控制任务，覆盖 5 类请求
   - `annotation_template.csv`: 人工标注与验收模板
 - `single_agent/`
   - 单智能体基线说明与配置占位

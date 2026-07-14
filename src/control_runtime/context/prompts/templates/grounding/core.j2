@@ -16,6 +16,8 @@ Grounding rules:
 - Call tools only when a required target is still ambiguous.
 - Do not invent SUPI, app_id, flow_id, association_id, NSSAI, RFSP, or 3GPP semantics.
 - Exclusion phrases such as "do not change", "do not affect", "leave telemetry alone", "先别动", "不是", or "not" identify non-targets; do not optimize the excluded flow.
+- Negative/exclusion mentions are constraints, not required target flows. Preserve them as `exclude_from_fallback`, stage notes, or control_semantics notes when useful, but do not put excluded flows into active_flow_ids unless the user explicitly asks to deprioritize that same flow.
+- Resolve generic telemetry phrases only inside the explicit SUPI/app namespace from the user request and runtime catalog; never substitute telemetry from another UE or app. If no telemetry flow exists in that namespace, return the target as unresolved or excluded instead of borrowing a semantically similar flow.
 - Descriptive target phrases such as primary business, main service, video-control, or not the ordinary sensor should be grounded to the matching non-excluded catalog/search flow, not to the excluded telemetry or sensor flow.
 
 Tool policy:
@@ -54,6 +56,8 @@ Output rules:
 - Preserve operation semantics separately from goal semantics. Do not normalize migrate/switch/move-away slice requests into only `goal="protect"`.
 - For QoS resolved targets, `control_semantics.stages[].active_flow_ids` must contain the grounded flow_ids for that stage.
 - For each grounded stage target, include target.supi, target.app_id, target.flow_id, matched_flow_ids, and resolution_status="grounded_flow".
+- OperationIntent `control_semantics.mode`, `control_semantics.stages[].trigger`, and `control_semantics.targets[].goal` are plain strings. Preserve precise operation directives when the basic labels are too lossy, such as `fallback_best_effort`, `exclude_from_fallback`, `preserve_continuity`, or `conditional_am_sync`.
+- In every OperationIntent control stage, emit the current schema fields: `stage_index`, `name`, `trigger`, `summary`, `targets`, `active_flow_ids`, and `active_app_ids` when applicable. Never use stale fields such as `stage_id`, `intent`, or a scalar `target`.
 - For explicit slice migration wording (`迁移`, `迁出`, `切换`, `换到`, migrate, switch, move away), emit `qos_operation_constraints[]` for every grounded target flow:
   `operation_type="slice_migration"`, `require_slice_change=true`, `source_slice_snssai=<current_slice_snssai>`, `target_slice_preference` such as `lower_latency`, and `no_op_allowed=false`.
 - Use Main's control_semantics only as a semantic outline; the IEA output is the source of truth for grounded OperationIntent control_semantics.
@@ -69,24 +73,28 @@ Output:
   "requested_domains": ["qos"],
   "domain_resolution": "confirmed",
   "control_semantics": {
-    "summary": "Protect the grounded AR gaming control flow.",
+    "mode": "single_step",
+    "current_stage": 1,
     "stages": [
       {
-        "stage_id": "stage-qos-protect-ar-control",
-        "intent": "protect_qos",
-        "target": "AR_Gaming_control_1",
-        "active_flow_ids": ["flow-1"],
+        "stage_index": 1,
+        "name": "stage-qos-protect-ar-control",
+        "trigger": "initial",
+        "summary": "Protect the grounded AR gaming control flow.",
         "targets": [
           {
             "semantic_name": "AR_Gaming_control_1",
             "target_type": "flow",
+            "goal": "protect",
             "supi": "imsi-1",
             "app_id": "app-ar",
             "flow_id": "flow-1",
             "matched_flow_ids": ["flow-1"],
             "resolution_status": "grounded_flow"
           }
-        ]
+        ],
+        "active_flow_ids": ["flow-1"],
+        "active_app_ids": []
       }
     ]
   },
@@ -139,21 +147,25 @@ Output:
   "requested_domains": ["mobility"],
   "domain_resolution": "confirmed",
   "control_semantics": {
-    "summary": "Adjust UE mobility steering from grounded AM policy context.",
+    "mode": "single_step",
+    "current_stage": 1,
     "stages": [
       {
-        "stage_id": "stage-mobility-steering",
-        "intent": "mobility_steering",
-        "target": "imsi-2",
-        "active_flow_ids": [],
+        "stage_index": 1,
+        "name": "stage-mobility-steering",
+        "trigger": "initial",
+        "summary": "Adjust UE mobility steering from grounded AM policy context.",
         "targets": [
           {
             "semantic_name": "imsi-2",
-            "target_type": "ue",
+            "target_type": "scope",
+            "goal": "protect",
             "supi": "imsi-2",
             "resolution_status": "grounded_ue"
           }
-        ]
+        ],
+        "active_flow_ids": [],
+        "active_app_ids": []
       }
     ]
   },
@@ -163,4 +175,157 @@ Output:
     "current_allowed_snssais": ["1-010203"]
   },
   "flows": []
+}
+
+Input evidence summary:
+requested_domains=["qos"], supi="imsi-6", get_sm_ue_flow_catalog confirms Factory_Robot_video_1 as flow-robot/app-robot and IoT_Sensor_telemetry_1 as flow-iot/app-iot. User says to protect robot control, deprioritize IoT telemetry if needed, and if the first execution fails retry the same robot flow with best-effort QoS.
+Output:
+{
+  "supi": "imsi-6",
+  "resolution_status": "resolved",
+  "requested_domains": ["qos"],
+  "domain_resolution": "confirmed",
+  "control_semantics": {
+    "mode": "staged_priority",
+    "current_stage": 1,
+    "stages": [
+      {
+        "stage_index": 1,
+        "name": "protect_robot_control",
+        "trigger": "initial",
+        "summary": "Protect the grounded factory robot control flow first.",
+        "targets": [
+          {
+            "semantic_name": "Factory_Robot_video_1",
+            "target_type": "flow",
+            "goal": "protect",
+            "metric_focus": "latency",
+            "note": "Primary target; preserve this flow binding across retries.",
+            "supi": "imsi-6",
+            "app_id": "app-robot",
+            "flow_id": "flow-robot",
+            "matched_flow_ids": ["flow-robot"],
+            "resolution_status": "grounded_flow"
+          },
+          {
+            "semantic_name": "IoT_Sensor_telemetry_1",
+            "target_type": "flow",
+            "goal": "deprioritize",
+            "metric_focus": "bandwidth",
+            "note": "Secondary target; may yield resources only if needed.",
+            "supi": "imsi-6",
+            "app_id": "app-iot",
+            "flow_id": "flow-iot",
+            "matched_flow_ids": ["flow-iot"],
+            "resolution_status": "grounded_flow"
+          }
+        ],
+        "active_flow_ids": ["flow-robot", "flow-iot"],
+        "active_app_ids": []
+      },
+      {
+        "stage_index": 2,
+        "name": "fallback_best_effort_same_flow",
+        "trigger": "on_previous_failure",
+        "summary": "If execution fails, keep the robot flow binding and retry with best-effort QoS instead of switching to IoT.",
+        "targets": [
+          {
+            "semantic_name": "Factory_Robot_video_1",
+            "target_type": "flow",
+            "goal": "fallback_best_effort",
+            "metric_focus": "resource_share",
+            "note": "Fallback still targets the robot flow.",
+            "supi": "imsi-6",
+            "app_id": "app-robot",
+            "flow_id": "flow-robot",
+            "matched_flow_ids": ["flow-robot"],
+            "resolution_status": "grounded_flow"
+          },
+          {
+            "semantic_name": "IoT_Sensor_telemetry_1",
+            "target_type": "flow",
+            "goal": "exclude_from_fallback",
+            "metric_focus": "binding",
+            "note": "Do not switch the fallback policy target to this flow.",
+            "supi": "imsi-6",
+            "app_id": "app-iot",
+            "flow_id": "flow-iot",
+            "matched_flow_ids": ["flow-iot"],
+            "resolution_status": "grounded_flow"
+          }
+        ],
+        "active_flow_ids": ["flow-robot"],
+        "active_app_ids": []
+      }
+    ],
+    "notes": ["UE allowed NSSAI is explicitly out of scope for this QoS-only request."]
+  },
+  "flows": [
+    {
+      "supi": "imsi-6",
+      "app_id": "app-robot",
+      "flow_id": "flow-robot",
+      "name": "Factory_Robot_video_1",
+      "service_type": "URLLC",
+      "service_type_id": 2,
+      "bw_ul": 3.8,
+      "bw_dl": 3.0,
+      "gbr_ul": 3.0,
+      "gbr_dl": 2.4,
+      "lat": 5,
+      "loss_req": 0.0003,
+      "jitter_req": 1.5,
+      "priority": 1,
+      "current_slice_snssai": "01000001",
+      "resolution_status": "resolved"
+    },
+    {
+      "supi": "imsi-6",
+      "app_id": "app-iot",
+      "flow_id": "flow-iot",
+      "name": "IoT_Sensor_telemetry_1",
+      "service_type": "mMTC",
+      "service_type_id": 3,
+      "bw_ul": 0.2,
+      "bw_dl": 0.05,
+      "gbr_ul": 0.12,
+      "gbr_dl": 0.03,
+      "lat": 120,
+      "loss_req": 0.02,
+      "jitter_req": 30,
+      "priority": 8,
+      "current_slice_snssai": "03000001",
+      "resolution_status": "resolved"
+    }
+  ],
+  "qos_target_envelopes": [
+    {
+      "flow_id": "flow-robot",
+      "app_id": "app-robot",
+      "flow_name": "Factory_Robot_video_1",
+      "baseline_latency_ms": 5,
+      "baseline_jitter_ms": 1.5,
+      "baseline_packet_error_rate": 0.0003,
+      "baseline_max_br_ul_mbps": 3.8,
+      "baseline_max_br_dl_mbps": 3.0,
+      "baseline_gbr_ul_mbps": 3.0,
+      "baseline_gbr_dl_mbps": 2.4,
+      "baseline_priority": 1,
+      "rationale": ["get_sm_ue_flow_catalog confirmed the grounded robot flow baseline"]
+    },
+    {
+      "flow_id": "flow-iot",
+      "app_id": "app-iot",
+      "flow_name": "IoT_Sensor_telemetry_1",
+      "baseline_latency_ms": 120,
+      "baseline_jitter_ms": 30,
+      "baseline_packet_error_rate": 0.02,
+      "baseline_max_br_ul_mbps": 0.2,
+      "baseline_max_br_dl_mbps": 0.05,
+      "baseline_gbr_ul_mbps": 0.12,
+      "baseline_gbr_dl_mbps": 0.03,
+      "baseline_priority": 8,
+      "rationale": ["get_sm_ue_flow_catalog confirmed the grounded secondary telemetry baseline"]
+    }
+  ]
 }

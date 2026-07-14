@@ -24,10 +24,111 @@ from model.PcfAmPolicyControl import (
     SmfSelectionData,
     Snssai,
     UserLocation,
+    WirelineServiceAreaRestriction,
 )
 
 
 REQUIRED_MOBILITY_FIELDS = ("accessType", "userLoc", "guami", "servingPlmn")
+
+
+def _is_empty_mobility_value(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+def _fill_missing(target: Dict[str, Any], source: Any, keys: List[str] | None = None) -> None:
+    if not isinstance(source, dict):
+        return
+    source_keys = keys or list(source.keys())
+    for key in source_keys:
+        value = source.get(key)
+        if _is_empty_mobility_value(value):
+            continue
+        if _is_empty_mobility_value(target.get(key)):
+            target[key] = value
+
+
+def _select_ue_policy_state(request: JointOptimizationRequest, supi: str) -> Dict[str, Any]:
+    policy_state = request.policy_state or {}
+    if not isinstance(policy_state, dict):
+        return {}
+    if isinstance(policy_state.get(supi), dict):
+        return dict(policy_state.get(supi) or {})
+    return dict(policy_state)
+
+
+def _fill_mobility_context_from_policy_state(raw_ctx: Dict[str, Any], request: JointOptimizationRequest, supi: str) -> Dict[str, Any]:
+    merged = dict(raw_ctx or {})
+    ue_ctx = _select_ue_policy_state(request, supi)
+    if not ue_ctx:
+        return merged
+
+    access_context = (
+        ue_ctx.get("accessMobilityContext")
+        or ue_ctx.get("access_mobility_context")
+        or {}
+    )
+    _fill_missing(merged, access_context)
+
+    mobility_summary = (
+        ue_ctx.get("mobilitySummary")
+        or ue_ctx.get("mobility_summary")
+        or {}
+    )
+    _fill_missing(
+        merged,
+        mobility_summary,
+        ["currentAssociationId", "currentTriggers", "currentRfsp", "currentServAreaRes", "currentWlServAreaRes"],
+    )
+
+    am_policy_context = (
+        ue_ctx.get("amPolicyContext")
+        or ue_ctx.get("amPolicy")
+        or ue_ctx.get("am_policy")
+        or {}
+    )
+    if isinstance(am_policy_context, dict):
+        _fill_missing(
+            merged,
+            am_policy_context,
+            ["allowedSnssais", "targetSnssais", "mappingSnssais", "rfsp", "pras"],
+        )
+        if _is_empty_mobility_value(merged.get("presenceAreas")) and isinstance(am_policy_context.get("pras"), dict):
+            merged["presenceAreas"] = am_policy_context["pras"]
+        if _is_empty_mobility_value(merged.get("currentRfsp")) and not _is_empty_mobility_value(am_policy_context.get("rfsp")):
+            merged["currentRfsp"] = am_policy_context["rfsp"]
+
+        associations = am_policy_context.get("associations")
+        if isinstance(associations, dict) and associations:
+            association_id = str(mobility_summary.get("currentAssociationId") or "").strip()
+            association = associations.get(association_id) if association_id else None
+            if not isinstance(association, dict):
+                association_id, association = next(
+                    ((str(key), value) for key, value in associations.items() if isinstance(value, dict)),
+                    ("", {}),
+                )
+            if association_id and _is_empty_mobility_value(merged.get("currentAssociationId")):
+                merged["currentAssociationId"] = association_id
+            request_payload = association.get("request") if isinstance(association, dict) else {}
+            _fill_missing(merged, request_payload)
+            _fill_missing(
+                merged,
+                association,
+                ["triggers", "rfsp", "pras", "servAreaRes", "wlServAreaRes", "smfSelInfo"],
+            )
+            if _is_empty_mobility_value(merged.get("currentTriggers")) and association.get("triggers"):
+                merged["currentTriggers"] = association["triggers"]
+            if _is_empty_mobility_value(merged.get("currentRfsp")) and association.get("rfsp") is not None:
+                merged["currentRfsp"] = association["rfsp"]
+            if _is_empty_mobility_value(merged.get("presenceAreas")) and isinstance(association.get("pras"), dict):
+                merged["presenceAreas"] = association["pras"]
+            if _is_empty_mobility_value(merged.get("currentServAreaRes")) and isinstance(association.get("servAreaRes"), dict):
+                merged["currentServAreaRes"] = association["servAreaRes"]
+            if _is_empty_mobility_value(merged.get("currentWlServAreaRes")) and isinstance(association.get("wlServAreaRes"), dict):
+                merged["currentWlServAreaRes"] = association["wlServAreaRes"]
+            if _is_empty_mobility_value(merged.get("currentSmfSelInfo")) and isinstance(association.get("smfSelInfo"), dict):
+                merged["currentSmfSelInfo"] = association["smfSelInfo"]
+
+    return merged
 
 
 def coerce_snssai_list(raw_items: Any) -> List[Snssai]:
@@ -84,6 +185,7 @@ def build_mobility_snapshot(request: JointOptimizationRequest, supi: str) -> Mob
                 if isinstance(item, dict) and str(item.get("supi") or "").strip() == supi:
                     raw_ctx = dict(item)
                     break
+    raw_ctx = _fill_mobility_context_from_policy_state(raw_ctx, request, supi)
 
     missing_fields = [name for name in REQUIRED_MOBILITY_FIELDS if not raw_ctx.get(name)]
 
@@ -103,6 +205,10 @@ def build_mobility_snapshot(request: JointOptimizationRequest, supi: str) -> Mob
         mappingSnssais=coerce_mapping_snssai_list(raw_ctx.get("mappingSnssais")),
         currentAssociationId=raw_ctx.get("currentAssociationId"),
         currentTriggers=[PcfAmPolicyControlRequestTrigger(item) for item in raw_ctx.get("currentTriggers", []) if item],
+        currentServAreaRes=ServiceAreaRestriction.model_validate(raw_ctx["currentServAreaRes"]) if isinstance(raw_ctx.get("currentServAreaRes"), dict) else None,
+        currentWlServAreaRes=WirelineServiceAreaRestriction.model_validate(raw_ctx["currentWlServAreaRes"]) if isinstance(raw_ctx.get("currentWlServAreaRes"), dict) else None,
+        currentRfsp=int(raw_ctx["currentRfsp"]) if raw_ctx.get("currentRfsp") is not None else None,
+        currentSmfSelInfo=SmfSelectionData.model_validate(raw_ctx["currentSmfSelInfo"]) if isinstance(raw_ctx.get("currentSmfSelInfo"), dict) else None,
         missing_fields=missing_fields,
     )
 

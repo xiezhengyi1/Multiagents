@@ -194,6 +194,7 @@ class ExecutionController:
                 )
             except ExecutionDecisionError as exc:
                 batch["total_dispatch_attempts"] += exc.dispatch_attempts
+                feedback_payload = dict(exc.feedback_payload or {})
                 batch["execution_receipts"].append(
                     {
                         "status": "failed",
@@ -202,6 +203,9 @@ class ExecutionController:
                         "flow_id": policy.get("flow_id"),
                         "error": str(exc),
                         "phase": "dispatch",
+                        "dispatch_attempts": exc.dispatch_attempts,
+                        "feedback_payload": feedback_payload,
+                        "last_dispatch_result": feedback_payload.get("last_dispatch_result"),
                     }
                 )
                 batch["failures"].append(

@@ -10,13 +10,14 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import AIMessage
 
 from shared.agents import BaseAgent, coerce_structured_response
+from shared.agents.base import resolve_agent_model_name
 from shared.runtime import ArtifactWorkerMixin, ContextPolicy, ToolLoopExecutionError, extract_tool_calls, extract_tool_results
 from shared.logging import log_event, log_timing
 
 from ...context.prompts import SinglePromptBuilder
-from ...domain.collaboration import PlanningContext, PlanningRequest
-from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
-from ...domain.policy_plan import FlowSelector, OperationIntent, PlanningRationale, PolicyDraft, PolicyPlanDraft
+from ...domain.collaboration import PlanningContext, SharedControlContext
+from ...domain.control_plane import ControlDomain
+from ...domain.policy_plan import FlowSelector, PlanningRationale, PolicyDraft, PolicyPlanDraft
 from ...integrations.storage import get_latest_snapshot_metadata
 from ..planning.planning_validation import normalize_policy_plan_draft
 from ..planning.compiler import OptimizationStrategyCompiler
@@ -125,7 +126,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         use_local_model: bool = False,
         rag_enabled: bool = True,
     ) -> None:
-        use_deepseek_model = str(model_name or "").strip().lower().startswith("deepseek")
+        resolved_model_name = resolve_agent_model_name(model_name, use_local_model=use_local_model)
+        use_deepseek_model = str(resolved_model_name or "").strip().lower().startswith("deepseek")
         deepseek_api_key = os.getenv("DEEPSEEK_API_KEY") if use_deepseek_model else None
         deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL") if use_deepseek_model else None
         if not use_local_model and use_deepseek_model:
@@ -134,7 +136,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             if not deepseek_base_url:
                 raise RuntimeError("DEEPSEEK_BASE_URL is required for SingleControlAgent")
         super().__init__(
-            model_name=model_name,
+            model_name=resolved_model_name,
             use_local_model=use_local_model,
             api_key=deepseek_api_key,
             base_url=deepseek_base_url,
@@ -146,7 +148,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             raw_timeout = os.getenv("OPENAI_TIMEOUT_SECONDS", "120")
             raw_max_retries = os.getenv("OPENAI_MAX_RETRIES", "2")
             self.llm = _SingleAgentChatDeepSeek(
-                model=model_name,
+                model=resolved_model_name,
                 temperature=0,
                 api_key=deepseek_api_key,
                 base_url=deepseek_base_url,
@@ -204,7 +206,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         round_traces: Optional[List[Dict[str, Any]]] = None,
         previous_mediator_decision: Optional[Dict[str, Any]] = None,
         allow_user_interaction: bool = False,
-    ) -> tuple[GlobalControlIntent, OperationIntent, PolicyPlanDraft]:
+    ) -> PolicyPlanDraft:
         self.ensure_worker_runtime_initialized()
         total_start = time.perf_counter()
         log_event(self.logger, "single_control_round_plan_start", session_id=session_id, round_index=round_index)
@@ -264,24 +266,9 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
         planning_tool_evidence = extract_planning_tool_evidence(advisor_result=result)
-        operation_intent = self._build_compat_operation_intent_from_final_product(
+        planning_context = self._build_planning_context(
             decision=decision,
-            advisor_result=result,
-            planning_tool_evidence=planning_tool_evidence,
             user_input=user_input,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-        )
-        global_intent = self._build_global_intent(
-            decision=decision,
-            operation_intent=operation_intent,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            user_input=user_input,
-        )
-        planning_request = self._build_planning_request(
-            global_intent=global_intent,
-            operation_intent=operation_intent,
             session_id=session_id,
             snapshot_id=snapshot_id,
             round_index=round_index,
@@ -291,57 +278,12 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
         policy_plan = self._assemble_policy_plan_from_decision(
             decision=decision,
-            planning_request=planning_request,
+            planning_context=planning_context,
             planning_tool_evidence=planning_tool_evidence,
+            advisor_result=result,
         )
         log_timing(self.logger, "single_control_round_plan_total", time.perf_counter() - total_start, status="success")
-        return global_intent, operation_intent, policy_plan
-
-    def _build_compat_operation_intent_from_final_product(
-        self,
-        *,
-        decision: SingleAgentRoundDecision,
-        advisor_result: Dict[str, Any],
-        planning_tool_evidence: Dict[str, Any],
-        user_input: str,
-        session_id: str,
-        snapshot_id: str,
-    ) -> OperationIntent:
-        requested_domains = list(decision.requested_domains or [])
-        optimizer_preview = self.plan_compiler.advisor_validator._latest_optimizer_preview(planning_tool_evidence)
-        optimizer_flow_ids = self._optimizer_flow_ids(optimizer_preview)
-        policy_flow_ids: List[str] = []
-        for policy_details in decision.sm_policies or []:
-            normalized = self._normalize_sm_policy_payload(policy_details)
-            inferred = self._extract_sm_policy_flow_id(normalized)
-            if inferred and inferred in optimizer_flow_ids:
-                candidate = inferred
-            elif len(optimizer_flow_ids) == 1:
-                candidate = optimizer_flow_ids[0]
-            else:
-                candidate = inferred
-            if candidate and candidate not in policy_flow_ids:
-                policy_flow_ids.append(candidate)
-        for flow_id in optimizer_flow_ids:
-            if flow_id and flow_id not in policy_flow_ids:
-                policy_flow_ids.append(flow_id)
-
-        catalog_rows = self._catalog_rows_by_flow_id(advisor_result)
-        flows: List[FlowSelector] = []
-        for flow_id in policy_flow_ids:
-            row = catalog_rows.get(flow_id, {})
-            payload = self._flow_selector_payload(supi=decision.supi, flow_id=flow_id, row=row)
-            if not payload.get("app_id"):
-                payload["app_id"] = self._extract_app_id_for_flow_from_policies(decision.sm_policies, flow_id=flow_id)
-            flows.append(FlowSelector.model_validate(payload))
-
-        app_id = next((str(flow.app_id or "").strip() for flow in flows if str(flow.app_id or "").strip()), "")
-        return OperationIntent(
-            supi=str(decision.supi or "").strip(),
-            resolution_status="final_product",
-            requested_domains=requested_domains,
-            flows=flows,
-        )
+        return policy_plan
 
     @classmethod
     def _catalog_rows_by_flow_id(cls, advisor_result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -894,10 +836,10 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             raise RuntimeError(f"Single control round advisor invocation failed: {exc}") from exc
 
     @staticmethod
-    def _validate_policy_presence(*, decision: SingleAgentRoundDecision, planning_request: PlanningRequest) -> None:
+    def _validate_policy_presence(*, decision: SingleAgentRoundDecision, active_domains: set[str]) -> None:
         requested_domains = {
             str(domain or "").strip().lower()
-            for domain in (planning_request.operation_intent.requested_domains or [])
+            for domain in (active_domains or set())
             if str(domain or "").strip()
         }
         has_sm = bool(decision.sm_policies)
@@ -919,18 +861,19 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         self,
         *,
         decision: SingleAgentRoundDecision,
-        planning_request: PlanningRequest,
+        planning_context: PlanningContext,
         planning_tool_evidence: Dict[str, Any],
+        advisor_result: Dict[str, Any],
     ) -> PolicyPlanDraft:
-        self._validate_policy_presence(decision=decision, planning_request=planning_request)
         optimizer_preview = self.plan_compiler.advisor_validator._latest_optimizer_preview(planning_tool_evidence)
         mobility_context = self.plan_compiler.advisor_validator._latest_mobility_context(planning_tool_evidence)
 
         active_domains = {
             str(item).strip().lower()
-            for item in (planning_request.context.active_domains or [])
+            for item in (planning_context.active_domains or [])
             if str(item).strip()
         }
+        self._validate_policy_presence(decision=decision, active_domains=active_domains)
         if ControlDomain.QOS.value in active_domains:
             self.plan_compiler.advisor_validator._validate_optimizer_preview(optimizer_preview)
         if ControlDomain.MOBILITY.value in active_domains and decision.am_policy is not None and not mobility_context:
@@ -938,11 +881,11 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
 
         planning_metadata = {
             "planning_mode": "single_agent_direct_pcf",
-            "requested_domains": list(planning_request.context.active_domains or []),
-            "main_retry_scope": str(planning_request.context.main_retry_scope or "").strip(),
+            "requested_domains": list(planning_context.active_domains or []),
+            "main_retry_scope": str(planning_context.main_retry_scope or "").strip(),
             "objective_breakdown": dict(optimizer_preview.get("objective_breakdown") or {}) if isinstance(optimizer_preview, dict) else {},
-            "revision_requests": planning_request.context.revision_requests or [],
-            "unified_constraints": planning_request.context.unified_constraints or {},
+            "revision_requests": planning_context.revision_requests or [],
+            "unified_constraints": planning_context.unified_constraints or {},
             "optimizer_cross_domain_verdicts": [
                 item
                 for item in ((optimizer_preview.get("cross_domain_verdicts") if isinstance(optimizer_preview, dict) else []) or [])
@@ -951,13 +894,13 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         }
 
         plan = PolicyPlanDraft(
-            supi=str(planning_request.operation_intent.supi or "").strip(),
-            session_id=str(planning_request.context.session_id or "").strip(),
-            snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
+            supi=str(decision.supi or "").strip(),
+            session_id=str(planning_context.session_id or "").strip(),
+            snapshot_id=str(planning_context.snapshot_id or "").strip(),
             planning_metadata=planning_metadata,
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
-                    planning_request.context.objective_profile.get("profile_name")
+                    planning_context.objective_profile.get("profile_name")
                     or decision.objective_profile_hint
                     or ""
                 ).strip(),
@@ -967,15 +910,15 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     for item in [
                         "tool:preview_qos_optimizer" if decision.sm_policies else "",
                         "tool:inspect_mobility_ue_policies" if decision.am_policy is not None else "",
-                        "mediator_constraints" if planning_request.context.unified_constraints else "",
-                        "revision_requests" if planning_request.context.revision_requests else "",
+                        "mediator_constraints" if planning_context.unified_constraints else "",
+                        "revision_requests" if planning_context.revision_requests else "",
                     ]
                     if item
                 ],
                 active_constraints=[
                     str(item)
                     for item in self.plan_compiler.artifact_compiler._normalized_hard_constraints(
-                        planning_request.context.unified_constraints
+                        planning_context.unified_constraints
                     )
                     if str(item).strip()
                 ],
@@ -990,11 +933,10 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             flow_id = self._resolve_pcflow_id(
                 normalized_policy_details,
                 decision=decision,
-                planning_request=planning_request,
                 optimizer_preview=optimizer_preview,
             )
             flow_ctx = self._resolve_single_agent_flow_context(
-                planning_request=planning_request,
+                advisor_result=advisor_result,
                 decision=decision,
                 flow_id=flow_id,
                 policy_details=normalized_policy_details,
@@ -1002,7 +944,6 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             app_id = str(
                 flow_ctx.app_id
                 or self._extract_sm_policy_app_id(normalized_policy_details)
-                or self._operation_intent_app_id(planning_request.operation_intent, flow_id=flow_id)
                 or ""
             ).strip()
             resource_keys = self.plan_compiler.advisor_validator._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id)
@@ -1011,7 +952,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             plan.all_policies.append(
                 PolicyDraft(
                     recommended_actions=[f"Apply PCF SM policy for {flow_id}"],
-                    supi=str(flow_ctx.supi or planning_request.operation_intent.supi or "").strip(),
+                    supi=str(flow_ctx.supi or decision.supi or "").strip(),
                     app_id=app_id,
                     flow_id=flow_id,
                     target_type="flow",
@@ -1025,18 +966,18 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         if decision.am_policy is not None:
             normalized_am_policy = self._normalize_am_policy_payload(
                 decision.am_policy,
-                planning_request=planning_request,
+                supi=str(decision.supi or "").strip(),
                 mobility_context=mobility_context,
             )
             plan.all_policies.append(
                 PolicyDraft(
                     recommended_actions=[],
-                    supi=str(planning_request.operation_intent.supi or "").strip(),
+                    supi=str(decision.supi or "").strip(),
                     app_id="",
                     flow_id=None,
                     target_type="ue",
-                    policy_id=self.plan_compiler.artifact_compiler._resolve_am_association_id(
-                        planning_request=planning_request,
+                    policy_id=self._resolve_single_agent_am_association_id(
+                        policy_details=decision.am_policy,
                         mobility_context=mobility_context,
                     ),
                     policy_type="PcfAmPolicyControlPolicyAssociation",
@@ -1048,19 +989,17 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             flow_id = self._resolve_pcflow_id(
                 policy_details,
                 decision=decision,
-                planning_request=planning_request,
                 allow_missing=True,
             )
             app_id = self._resolve_decision_app_id(
                 decision,
                 flow_id=flow_id,
                 policy_details=policy_details,
-                planning_request=planning_request,
             )
             plan.all_policies.append(
                 PolicyDraft(
                     recommended_actions=[],
-                    supi=str(planning_request.operation_intent.supi or "").strip(),
+                    supi=str(decision.supi or "").strip(),
                     app_id=app_id,
                     flow_id=flow_id,
                     target_type="flow" if flow_id else "app",
@@ -1071,31 +1010,35 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             )
 
         normalized = normalize_policy_plan_draft(plan)
-        self.plan_compiler.plan_validator.validate_compiled_plan(normalized, planning_request)
+        self._validate_single_policy_plan(normalized, active_domains=active_domains)
         return normalized
 
     def _resolve_single_agent_flow_context(
         self,
         *,
-        planning_request: PlanningRequest,
+        advisor_result: Dict[str, Any],
         decision: SingleAgentRoundDecision,
         flow_id: str,
         policy_details: Dict[str, Any],
     ) -> FlowSelector:
-        try:
-            return self.plan_compiler.artifact_compiler._resolve_flow(planning_request, flow_id)
-        except Exception:
-            pass
+        row = self._catalog_rows_by_flow_id(advisor_result).get(str(flow_id or "").strip(), {})
+        payload = self._flow_selector_payload(supi=decision.supi, flow_id=flow_id, row=row)
+        if not payload.get("app_id"):
+            payload["app_id"] = self._resolve_decision_app_id(
+                decision,
+                flow_id=flow_id,
+                policy_details=policy_details,
+            )
+        if payload.get("app_id"):
+            return FlowSelector.model_validate(payload)
         return FlowSelector(
-            supi=str(decision.supi or planning_request.operation_intent.supi or "").strip(),
+            supi=str(decision.supi or "").strip(),
             app_id=str(
                 self._resolve_decision_app_id(
                     decision,
                     flow_id=flow_id,
                     policy_details=policy_details,
-                    planning_request=planning_request,
                 )
-                or self._operation_intent_app_id(planning_request.operation_intent, flow_id=flow_id)
                 or ""
             ).strip(),
             flow_id=str(flow_id or "").strip(),
@@ -1111,16 +1054,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         *,
         flow_id: str | None = None,
         policy_details: Optional[Dict[str, Any]] = None,
-        planning_request: Optional[PlanningRequest] = None,
     ) -> str:
         target_flow_id = str(flow_id or "").strip()
-        request_flows = planning_request.operation_intent.flows if planning_request is not None else []
-        for flow in request_flows or []:
-            if target_flow_id and str(flow.flow_id or "").strip() != target_flow_id:
-                continue
-            app_id = str(flow.app_id or "").strip()
-            if app_id:
-                return app_id
         if policy_details:
             app_id = str(cls._extract_sm_policy_app_id(policy_details) or "").strip()
             if app_id:
@@ -1129,38 +1064,41 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             app_id = str(cls._extract_sm_policy_app_id(policy) or "").strip()
             if app_id:
                 return app_id
-        if planning_request is not None:
-            return cls._operation_intent_app_id(planning_request.operation_intent, flow_id=target_flow_id)
         return ""
 
     @staticmethod
-    def _operation_intent_app_id(operation_intent: OperationIntent, *, flow_id: str | None = None) -> str:
-        target_flow_id = str(flow_id or "").strip()
-        for flow in operation_intent.flows or []:
-            if target_flow_id and str(flow.flow_id or "").strip() != target_flow_id:
-                continue
-            app_id = str(flow.app_id or "").strip()
-            if app_id:
-                return app_id
-        return ""
+    def _resolve_single_agent_am_association_id(
+        *,
+        policy_details: Dict[str, Any],
+        mobility_context: Dict[str, Any],
+    ) -> str:
+        payload = policy_details if isinstance(policy_details, dict) else {}
+        association_id = str(payload.get("associationId") or payload.get("association_id") or "").strip()
+        if association_id:
+            return association_id
+        mobility_summary = mobility_context.get("mobilitySummary") if isinstance(mobility_context, dict) else {}
+        association_id = str((mobility_summary or {}).get("currentAssociationId") or "").strip()
+        if association_id:
+            return association_id
+        raise ValueError("mobility context does not contain a grounded association_id")
 
-    @classmethod
+    @staticmethod
     def _normalize_am_policy_payload(
-        cls,
         policy_details: Dict[str, Any],
         *,
-        planning_request: PlanningRequest,
+        supi: str,
         mobility_context: Dict[str, Any],
     ) -> Dict[str, Any]:
         payload = copy.deepcopy(policy_details)
+        normalized_supi = str(supi or payload.get("supi") or "").strip()
         if isinstance(payload.get("request"), dict):
             request = copy.deepcopy(payload["request"])
-            request["supi"] = str(planning_request.operation_intent.supi or request.get("supi") or "").strip()
+            request["supi"] = str(normalized_supi or request.get("supi") or "").strip()
             request.setdefault("suppFeat", str(payload.get("suppFeat") or "1"))
             normalized = {
                 key: copy.deepcopy(value)
                 for key, value in payload.items()
-                if key in cls._am_policy_allowed_fields()
+                if key in SingleControlAgent._am_policy_allowed_fields()
             }
             normalized["request"] = request
             normalized.setdefault("suppFeat", str(payload.get("suppFeat") or request.get("suppFeat") or "1"))
@@ -1176,7 +1114,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         base_policy = copy.deepcopy(association_payload) if isinstance(association_payload, dict) else {}
         base_request = base_policy.get("request") if isinstance(base_policy.get("request"), dict) else {}
         request = copy.deepcopy(base_request)
-        request["supi"] = str(planning_request.operation_intent.supi or payload.get("supi") or request.get("supi") or "").strip()
+        request["supi"] = str(normalized_supi or payload.get("supi") or request.get("supi") or "").strip()
         request["notificationUri"] = str(
             payload.get("notificationUri")
             or payload.get("notification_uri")
@@ -1205,7 +1143,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         normalized = {
             key: copy.deepcopy(value)
             for key, value in base_policy.items()
-            if key in cls._am_policy_allowed_fields() and key != "request"
+            if key in SingleControlAgent._am_policy_allowed_fields() and key != "request"
         }
         normalized["request"] = request
         if payload.get("triggers") is not None:
@@ -1276,19 +1214,12 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         policy_details: Dict[str, Any],
         *,
         decision: SingleAgentRoundDecision,
-        planning_request: Optional[PlanningRequest] = None,
         optimizer_preview: Any = None,
         allow_missing: bool = False,
     ) -> str:
         inferred_flow_id = cls._extract_sm_policy_flow_id(policy_details)
-        request_flows = planning_request.operation_intent.flows if planning_request is not None else []
-        grounded_flow_ids = [
-            str(flow.flow_id or "").strip()
-            for flow in request_flows or []
-            if str(flow.flow_id or "").strip()
-        ]
         optimizer_flow_ids = cls._optimizer_flow_ids(optimizer_preview)
-        authoritative_flow_ids = list(dict.fromkeys(optimizer_flow_ids + grounded_flow_ids))
+        authoritative_flow_ids = list(dict.fromkeys(optimizer_flow_ids))
 
         if inferred_flow_id and inferred_flow_id in authoritative_flow_ids:
             return inferred_flow_id
@@ -1300,6 +1231,32 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             raise ValueError("PCF-style policy payload does not contain a grounded flow_id")
         return ""
 
+    def _validate_single_policy_plan(self, policy_plan: PolicyPlanDraft, *, active_domains: set[str]) -> None:
+        if policy_plan.planning_status == "needs_upstream_reground":
+            if policy_plan.all_policies:
+                raise ValueError("needs_upstream_reground must not contain executable policies")
+            if not policy_plan.upstream_requests and not policy_plan.missing_evidence and not policy_plan.blocked_targets:
+                raise ValueError("needs_upstream_reground must preserve explicit upstream requests or missing evidence")
+            return
+        if policy_plan.planning_status == "partial_plan":
+            if not policy_plan.all_policies and not policy_plan.partial_policies:
+                raise ValueError("partial_plan must preserve executable fragments or partial policies")
+            if not policy_plan.missing_evidence and not policy_plan.blocked_targets and not policy_plan.planner_conflicts:
+                raise ValueError("partial_plan must preserve unresolved gaps")
+            return
+        if not policy_plan.all_policies:
+            raise ValueError("SingleControlAgent produced no policies for the requested domain.")
+        if ControlDomain.QOS.value in active_domains:
+            has_sm_policy = any(item.policy_type == "SmPolicyDecision" for item in policy_plan.all_policies)
+            if not has_sm_policy:
+                raise ValueError("SingleControlAgent did not include an executable SM policy for a qos-active round.")
+        if ControlDomain.MOBILITY.value in active_domains:
+            has_am_policy = any(item.policy_type == "PcfAmPolicyControlPolicyAssociation" for item in policy_plan.all_policies)
+            if not has_am_policy:
+                raise ValueError("SingleControlAgent did not include an executable AM policy for a mobility-active round.")
+        if ControlDomain.QOS.value in active_domains and ControlDomain.MOBILITY.value in active_domains:
+            self.plan_compiler.plan_validator._validate_joint_snssai_consistency(policy_plan)
+
     @staticmethod
     def _required_evidence_from_domains(domains: List[str]) -> List[str]:
         required: List[str] = []
@@ -1310,64 +1267,48 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             required.append("mobility_policy_context")
         return required
 
-    def _build_global_intent(
-        self,
+    @staticmethod
+    def _build_planning_context(
         *,
         decision: SingleAgentRoundDecision,
-        operation_intent: OperationIntent,
-        session_id: str,
-        snapshot_id: str,
         user_input: str,
-    ) -> GlobalControlIntent:
-        requested_domains = [ControlDomain(item) for item in decision.requested_domains]
-        return GlobalControlIntent(
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            raw_input=user_input,
-            supi=str(operation_intent.supi or "").strip(),
-            round_strategy=MainRoundStrategy.INITIAL_GROUNDING,
-            next_agent="optimization_strategy",
-            requested_domains=requested_domains,
-            domain_evidence={domain: ["single_agent_final_product"] for domain in decision.requested_domains},
-            control_semantics=operation_intent.control_semantics,
-            objective_profile=ObjectiveProfile(
-                profile_name=str(decision.objective_profile_hint or "").strip()
-            ),
-            investigation_targets=[],
-            uncertainty_flags=[],
-            required_evidence=self._required_evidence_from_domains(decision.requested_domains),
-            forbidden_assumptions=[],
-        )
-
-    @staticmethod
-    def _build_planning_request(
-        *,
-        global_intent: GlobalControlIntent,
-        operation_intent: OperationIntent,
         session_id: str,
         snapshot_id: str,
         round_index: int,
         feedback_context: str,
         round_traces: List[Dict[str, Any]],
         previous_mediator_decision: Dict[str, Any],
-    ) -> PlanningRequest:
-        return PlanningRequest(
-            operation_intent=operation_intent,
-            context=PlanningContext(
-                round_index=round_index,
-                session_id=session_id,
-                snapshot_id=snapshot_id,
-                snapshot_metadata=get_latest_snapshot_metadata() or {},
-                feedback_context=feedback_context,
-                handoff_history=round_traces[-2:],
-                active_domains=[item.value for item in global_intent.requested_domains],
-                main_round_strategy=global_intent.round_strategy.value,
-                objective_profile=global_intent.objective_profile.model_dump(mode="json"),
-                forbidden_assumptions=list(global_intent.forbidden_assumptions or []),
-                required_evidence=list(global_intent.required_evidence or []),
-                revision_requests=list((previous_mediator_decision or {}).get("revision_requests") or []),
-                unified_constraints=dict((previous_mediator_decision or {}).get("unified_constraints") or {}),
+    ) -> PlanningContext:
+        active_domains = [
+            str(item or "").strip().lower()
+            for item in (decision.requested_domains or [])
+            if str(item or "").strip()
+        ]
+        objective_profile_hint = str(decision.objective_profile_hint or "").strip()
+        objective_profile = {"profile_name": objective_profile_hint} if objective_profile_hint else {}
+        return PlanningContext(
+            round_index=round_index,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            snapshot_metadata=get_latest_snapshot_metadata() or {},
+            shared_context=SharedControlContext(
+                raw_user_input=str(user_input or "").strip(),
+                shared_facts={
+                    "source_agent": "single_control",
+                    "single_agent_direct_plan": True,
+                },
             ),
+            feedback_context=feedback_context,
+            handoff_history=round_traces[-2:],
+            active_domains=active_domains,
+            main_round_strategy="single_control",
+            main_routing_decision="single_control_direct_plan",
+            main_routing_rationale="Single agent produced the executable planning artifact directly.",
+            objective_profile=objective_profile,
+            forbidden_assumptions=[],
+            required_evidence=SingleControlAgent._required_evidence_from_domains(active_domains),
+            revision_requests=list((previous_mediator_decision or {}).get("revision_requests") or []),
+            unified_constraints=dict((previous_mediator_decision or {}).get("unified_constraints") or {}),
         )
 
 

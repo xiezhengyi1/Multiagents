@@ -248,6 +248,16 @@ def build_validation_retry_prompt(
             "return partial_plan with planner_conflicts instead of an executable_plan.\n\n"
             + _QOS_EXAMPLE
         )
+    elif "target_latency_ms" in joined and (">= 1.0" in joined or "greater than or equal to 1" in joined or "sub-1ms" in joined):
+        correction = (
+            "Your previous SM policy used an invalid latency target. "
+            "Never emit sub-1ms executable SM policy targets: target_latency_ms must be >= 1.0. "
+            "Do not keep tightening latency across retries below the runtime floor or below optimizer evidence. "
+            "If the requested hard latency is below 1ms, or the optimizer cannot support a target at or above 1ms, "
+            "return planning_status=\"partial_plan\" with blocked_targets and planner_conflicts. "
+            "Only return executable_plan when the optimizer/runtime evidence supports target_latency_ms >= 1.0.\n\n"
+            + _INFEASIBLE_EXAMPLE
+        )
     elif "exceeded max_calls_per_tool" in joined or "get_knowledge_by_key exceeded" in joined:
         correction = (
             "You burned your tool call quota — most likely on knowledge tools that cannot fix the issue. "

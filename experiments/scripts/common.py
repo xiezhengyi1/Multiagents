@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence
 
 import yaml
+import requests
 
 from experiments.paths import (
     CONFIG_ROOT,
@@ -23,6 +24,25 @@ from experiments.paths import (
     TASK_ROOT,
     WORKSPACE_ROOT,
 )
+
+
+SIMULATOR_RESET_URL = "http://127.0.0.1:18081/v1/reset"
+SIMULATOR_RESET_TIMEOUT_SECONDS = 30.0
+
+
+def reset_simulator_state(
+    *,
+    url: str = SIMULATOR_RESET_URL,
+    timeout_seconds: float = SIMULATOR_RESET_TIMEOUT_SECONDS,
+) -> None:
+    response = requests.post(url, timeout=timeout_seconds)
+    if response.status_code != 200:
+        body = str(response.text or "").strip()[:500]
+        raise RuntimeError(
+            f"Simulator reset expected HTTP 200 but received {response.status_code}"
+            + (f": {body}" if body else "")
+        )
+    print(f"[simulator] reset complete: HTTP {response.status_code}", flush=True)
 
 
 
@@ -119,6 +139,7 @@ __all__ = [
     "load_json",
     "load_yaml_mapping",
     "read_jsonl",
+    "reset_simulator_state",
     "resolve_python_executable",
     "run_project_python",
     "write_csv",

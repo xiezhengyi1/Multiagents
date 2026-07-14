@@ -61,7 +61,7 @@ class SmPolicySpec(BaseModel):
     app_id: str = Field(min_length=1, validation_alias=AliasChoices("app_id", "appId"))
     priority: int = Field(ge=1, le=15)
     target_latency_ms: float = Field(
-        ge=1.0,
+        ge=0.0,
         validation_alias=AliasChoices("target_latency_ms", "targetLatencyMs"),
     )
     packet_error_rate: float = Field(
