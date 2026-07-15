@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import re
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from model.PcfAmPolicyControl import (
     AccessType,
@@ -117,17 +116,6 @@ class MainSemanticTarget(BaseModel):
     note: str = Field(default="")
     supi: str = Field(default="")
 
-    @field_validator("target_type", mode="before")
-    @classmethod
-    def _normalize_target_type(cls, v: Any) -> Any:
-        return _normalize_semantic_target_type(v)
-
-    @field_validator("goal", mode="before")
-    @classmethod
-    def _normalize_goal(cls, v: Any) -> Any:
-        return _normalize_semantic_goal(v)
-
-
 class MainControlStage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -136,12 +124,6 @@ class MainControlStage(BaseModel):
     trigger: StageTrigger = Field(default=StageTrigger.INITIAL)
     summary: str = Field(default="")
     targets: List[MainSemanticTarget] = Field(default_factory=list)
-
-    @field_validator("trigger", mode="before")
-    @classmethod
-    def _normalize_trigger(cls, v: Any) -> Any:
-        return _normalize_stage_trigger(v)
-
 
 class MainControlSemantics(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -162,96 +144,6 @@ class MainControlSemantics(BaseModel):
         return self
 
 
-def _normalize_semantic_target_type(v: Any) -> Any:
-    if isinstance(v, SemanticTargetType):
-        return v.value
-    if isinstance(v, str):
-        normalized = v.strip().lower().replace("-", "_").replace(" ", "_")
-        _TARGET_TYPE_ALIASES: dict[str, str] = {
-            "ue": "scope",
-            "user_equipment": "scope",
-            "subscriber": "scope",
-            "supi": "scope",
-            "am_policy": "scope",
-            "access_mobility_policy": "scope",
-        }
-        return _TARGET_TYPE_ALIASES.get(normalized, normalized)
-    return v
-
-
-def _normalize_semantic_goal(v: Any) -> Any:
-    if isinstance(v, SemanticGoal):
-        return v.value
-    if not isinstance(v, str):
-        return v
-    _GOAL_ALIASES: dict[str, str] = {
-        "improve": "protect",
-        "optimize": "protect",
-        "enhance": "protect",
-        "prioritize": "protect",
-        "boost": "protect",
-        "reduce": "protect",
-        "lower": "protect",
-        "minimize": "protect",
-        "maximize": "protect",
-        "maintain": "protect",
-        "ensure": "protect",
-        "guarantee": "protect",
-        "migrate": "protect",
-        "transfer": "protect",
-        "move": "protect",
-        "switch": "protect",
-        "reroute": "protect",
-        "redirect": "protect",
-        "reassign": "protect",
-        "offload": "protect",
-        "select": "protect",
-        "steer": "protect",
-        "degrade": "deprioritize",
-        "throttle": "deprioritize",
-        "constrain": "deprioritize",
-        "limit": "deprioritize",
-        "suppress": "deprioritize",
-        "deprioritize": "deprioritize",
-    }
-    normalized = v.lower()
-    return _GOAL_ALIASES.get(normalized, normalized)
-
-
-def _normalize_stage_trigger(v: Any) -> Any:
-    if isinstance(v, StageTrigger):
-        return v.value
-    if not isinstance(v, str):
-        return v
-    _TRIGGER_ALIASES: dict[str, str] = {
-        "on_retry": "retry",
-        "on_failure": "on_previous_failure",
-        "failure": "on_previous_failure",
-        "fallback": "on_previous_failure",
-        "after_previous": "after_previous_stage",
-        "sequential": "after_previous_stage",
-        "resource_constraint": "after_previous_stage",
-        "resource_constraints": "after_previous_stage",
-        "resource_pressure": "after_previous_stage",
-        "after_protection": "after_previous_stage",
-        "after_protect": "after_previous_stage",
-        "after_stage": "after_previous_stage",
-        "after_stage_1": "after_previous_stage",
-    }
-    normalized = v.strip().lower().replace("-", "_")
-    if re.fullmatch(r"after_stage_\d+", normalized):
-        return "after_previous_stage"
-    return _TRIGGER_ALIASES.get(normalized, normalized)
-
-
-def _normalize_control_semantic_mode(v: Any) -> Any:
-    if isinstance(v, ControlSemanticMode):
-        return v.value
-    if not isinstance(v, str):
-        return v
-    return v.strip().lower().replace("-", "_").replace(" ", "_")
-
-
 class SemanticTarget(BaseModel):
     semantic_name: str = Field(default="")
     target_type: str = Field(default=SemanticTargetType.NAMED_OBJECT.value)
@@ -267,17 +159,6 @@ class SemanticTarget(BaseModel):
     matched_app_ids: List[str] = Field(default_factory=list)
     resolution_status: str = Field(default="semantic")
 
-    @field_validator("target_type", mode="before")
-    @classmethod
-    def _normalize_target_type(cls, v: Any) -> Any:
-        return _normalize_semantic_target_type(v)
-
-    @field_validator("goal", mode="before")
-    @classmethod
-    def _normalize_goal(cls, v: Any) -> Any:
-        return _normalize_semantic_goal(v)
-
-
 class ControlStage(BaseModel):
     stage_index: int = Field(default=1, ge=1)
     name: str = Field(default="")
@@ -287,22 +168,11 @@ class ControlStage(BaseModel):
     active_flow_ids: List[str] = Field(default_factory=list)
     active_app_ids: List[str] = Field(default_factory=list)
 
-    @field_validator("trigger", mode="before")
-    @classmethod
-    def _normalize_trigger(cls, v: Any) -> Any:
-        return _normalize_stage_trigger(v)
-
-
 class ControlSemantics(BaseModel):
     mode: str = Field(default=ControlSemanticMode.SINGLE_STEP.value)
     current_stage: int = Field(default=1, ge=1)
     stages: List[ControlStage] = Field(default_factory=list)
     notes: List[str] = Field(default_factory=list)
-
-    @field_validator("mode", mode="before")
-    @classmethod
-    def _normalize_mode(cls, v: Any) -> Any:
-        return _normalize_control_semantic_mode(v)
 
     @model_validator(mode="after")
     def _normalize_current_stage(self) -> "ControlSemantics":
@@ -529,13 +399,6 @@ class GlobalControlIntent(BaseModel):
     snapshot_id: str = ""
     raw_input: str = ""
     supi: str = ""
-
-    @field_validator("supi", mode="before")
-    @classmethod
-    def _normalize_supi(cls, v: Any) -> Any:
-        if isinstance(v, str) and v.strip().isdigit():
-            return f"imsi-{v.strip()}"
-        return v
     round_strategy: MainRoundStrategy = Field(default=MainRoundStrategy.INITIAL_GROUNDING)
     next_agent: Literal["intent_encoding", "optimization_strategy"]
     requested_domains: List[ControlDomain] = Field(default_factory=list)
@@ -551,13 +414,6 @@ class GlobalControlIntent(BaseModel):
     routing_decision: str = Field(default="")
     routing_rationale: str = Field(default="")
     reuse_contract: ReuseContract = Field(default_factory=ReuseContract)
-
-    @field_validator("objective_profile", mode="before")
-    @classmethod
-    def _normalize_objective_profile(cls, value: Any) -> Any:
-        if isinstance(value, str):
-            return {"profile_name": value}
-        return value
 
 
 class DomainTaskEnvelope(BaseModel):

@@ -75,7 +75,6 @@ Round invariants:
 Priority staging:
 - If the user expresses ordered priorities with words like 先 / first / priority / before / 再 / then / 其余 / remaining / 必要时 / if needed, use control_semantics.mode="staged_priority".
 - Preserve stage_index order: earlier protected targets get lower stage_index values, later optional or competing targets get later stage_index values.
-- control_semantics.stages[].trigger must be one of initial, on_previous_failure, after_previous_stage, retry.
 - For staged priority, stage_index=1 uses initial; stage_index>1 uses after_previous_stage. Put resource-pressure conditions such as "if resources are insufficient" in summary or note, not trigger.
 - Map primary protected targets to goal="protect"; map competing services that should be lowered only if needed to goal="deprioritize"; map remaining work that should wait to goal="defer".
 - Do not collapse ordered protect/deprioritize/defer requests into an unordered single_step plan.
@@ -110,8 +109,6 @@ Required reasoning:
 - routing_rationale must explain why the route is correct for this round.
 
 Semantic target rules:
-- control_semantics.targets[].target_type must be one of flow, app, scope, named_object.
-- UE / user equipment / AM policy targets must use target_type="scope"; do not use unsupported values such as ue, subscriber, or am_policy.
 - control_semantics.targets[].goal must be one of protect, deprioritize, defer, observe.
 - User words such as degrade, throttle, constrain, lower resource share, or
   reduce a competing service map to goal="deprioritize".
@@ -179,9 +176,3 @@ Bad outputs that must never be returned:
 - {"allowed": false, "contract_id": ""}
 - Any runtime wrapper object with messages plus structured_response keys.
 - Any object missing next_agent.
-
-Return one GlobalControlIntent object with these top-level fields:
-supi, round_strategy, next_agent, requested_domains, domain_evidence,
-control_semantics, objective_profile, investigation_targets, uncertainty_flags,
-retry_scope, required_evidence, forbidden_assumptions, intent_encoding_guidance,
-routing_decision, routing_rationale, reuse_contract.

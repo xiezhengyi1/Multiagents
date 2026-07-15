@@ -111,35 +111,15 @@ Example — Infeasible optimizer, must NOT return executable_plan:
 
 
 OSA_OUTPUT_FORMAT_RULES = """
-Output format (CRITICAL — violations will be rejected):
-- Top-level MUST be one JSON object with planning_status, rationale, sm_policies, am_policy, ursp_policies, and partial_policies.
-- `rationale` MUST be a string, never an object or array. Put structured details in missing_evidence, blocked_targets, upstream_requests, or planner_conflicts.
-- `sm_policies` and `ursp_policies` MUST be JSON arrays. Use `[]` when empty, never `null`.
-- `am_policy` may be `null` when mobility is not requested; otherwise it must be an object. Never emit empty `am_policy: {}`.
-- Never return a bare array `[...]` as the top-level value.
+Output contract (violations are rejected):
+- Return raw JSON: exactly one OsaAdvisorOutput object; never markdown or `planning_metadata`. Never add top-level keys outside the OsaAdvisorOutput schema.
+- Required root fields: planning_status, rationale, missing_evidence, blocked_targets, upstream_requests, planner_conflicts, sm_policies, am_policy, ursp_policies, partial_policies.
+- `rationale` MUST be a string. Lists are `[]` when empty; `am_policy` is `null` only when mobility is inactive. Never emit `{}` as an optional policy value.
 - Never return a bare policy object like `{\"flow_id\":...}` outside the sm_policies array.
-- Never add top-level keys outside the OsaAdvisorOutput schema.
-- Never emit `planning_metadata`.
-- Omit optional sections or set them to `null`/`[]`; never emit empty objects like `{}` for optional policy fields.
-
-SmPolicySpec fields (flow-scoped, inside sm_policies array):
-  Required: flow_id, app_id, priority (1-15), target_latency_ms (>=1.0), packet_error_rate (0.0-1.0), max_br_ul_mbps (>=0), max_br_dl_mbps (>=0)
-  Optional: gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, flow_description
-  Binding: flow_id and app_id MUST match one of the OperationIntent.flows entries exactly. Never output a different flow_id/app_id.
-
-AmPolicySpec fields (inside am_policy):
-  Required: triggers (non-empty array), rfsp (>=1), allowed_snssais (non-empty array), target_snssais (non-empty array, subset of allowed_snssais)
-  Optional: ue_ambr_ul_mbps, ue_ambr_dl_mbps, serv_area_res
-
-Partial policy items (inside partial_policies array):
-  Partial policy items MUST include: policy_type, policy_id.
-  For QoS partials, use policy_type="SmPolicyDecision" and a stable policy_id such as "partial-sm-<flow_id>".
-  Include flow_id, app_id, target_type, blocked_reason, and any grounded policy_details when available.
-
-Knowledge tools:
-- Use `get_knowledge_by_key` for exact 3GPP object names (e.g. \"29.512:QosData\").
-- Use `search_semantic_knowledge` only when a required output field still cannot be grounded from runtime evidence.
-- Do not query knowledge tools for local schema names like OsaAdvisorOutput, SmPolicySpec, AmPolicySpec, local slice labels, or optimizer-selected S-NSSAI values.
+- Every SmPolicySpec has an exact OperationIntent flow_id/app_id, priority 1-15, target_latency_ms >= 1.0, packet_error_rate 0-1, max_br_ul_mbps, and max_br_dl_mbps. Optional GBR cannot exceed maxBR.
+- Every AmPolicySpec has non-empty triggers, rfsp >= 1, non-empty allowed_snssais, and target_snssais contained in allowed_snssais.
+- Every UrspPolicySpec uses target_type `flow` or `app`, app_id, relat_precedence >= 1, and non-empty route_sel_param_sets; a flow target also needs flow_id and traffic_desc.
+- Partial policy items MUST include: policy_type, policy_id, and grounded flow_id/app_id/target_type plus blocked_reason when available.
 
 Return raw JSON only, no markdown fence, no prose outside the JSON object.
 """

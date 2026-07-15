@@ -69,10 +69,9 @@ def build_negotiation_request(operation_intent: OperationIntent, *, round_index:
     return DomainNegotiationRequest(
         round_index=round_index,
         source_agent="intent_encoding",
-        main_requested_domains=[],
-        grounded_requested_domains=list(operation_intent.requested_domains or []),
+        requested_domains=list(operation_intent.requested_domains or []),
         domain_resolution=domain_resolution,
-        domain_revision_needed=revision_needed,
+        requires_domain_review=revision_needed,
         issues=issues,
         recommended_consumers=["main_control", "intent_encoding"],
         summary=summary or domain_resolution,

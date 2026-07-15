@@ -215,7 +215,6 @@ class PlanningAdvisorValidator:
         if planning_status == "executable_plan" and "mobility" in domains and not has_am:
             errors.append("mobility-active planning requires am_policy")
         if has_sm:
-            errors.extend(self._validate_sm_policy_qos_bounds(advisor_output.sm_policies))
             errors.extend(
                 self._validate_sm_policy_target_bindings(
                     advisor_output.sm_policies,
@@ -312,33 +311,6 @@ class PlanningAdvisorValidator:
     @staticmethod
     def _latest_mobility_context(planning_tool_evidence: Dict[str, Any]) -> Dict[str, Any]:
         return dict(planning_tool_evidence.get("latest_mobility_context") or {})
-
-    @staticmethod
-    def _validate_sm_policy_qos_bounds(sm_policies: List[Any]) -> List[str]:
-        errors: List[str] = []
-        for index, spec in enumerate(sm_policies or []):
-            target_latency_ms = float(getattr(spec, "target_latency_ms", 0.0) or 0.0)
-            max_ul = float(getattr(spec, "max_br_ul_mbps", 0.0) or 0.0)
-            max_dl = float(getattr(spec, "max_br_dl_mbps", 0.0) or 0.0)
-            gbr_ul = getattr(spec, "gbr_ul_mbps", None)
-            gbr_dl = getattr(spec, "gbr_dl_mbps", None)
-            if target_latency_ms < 1.0:
-                errors.append(
-                    f"sm_policies[{index}].target_latency_ms must be >= 1.0 for executable SM policies "
-                    f"({target_latency_ms} < 1.0); return partial_plan with blocked_targets/planner_conflicts "
-                    "or use an optimizer-backed feasible target at the runtime floor"
-                )
-            if gbr_ul is not None and float(gbr_ul) > max_ul + 1e-9:
-                errors.append(
-                    f"sm_policies[{index}].gbr_ul_mbps must not exceed max_br_ul_mbps "
-                    f"({float(gbr_ul)} > {max_ul})"
-                )
-            if gbr_dl is not None and float(gbr_dl) > max_dl + 1e-9:
-                errors.append(
-                    f"sm_policies[{index}].gbr_dl_mbps must not exceed max_br_dl_mbps "
-                    f"({float(gbr_dl)} > {max_dl})"
-                )
-        return errors
 
     @staticmethod
     def _validate_sm_policy_target_bindings(

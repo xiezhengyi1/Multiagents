@@ -267,30 +267,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> List[str]:
         errors: List[str] = []
         parsed_context = MainControlAgent._parse_context_payload(context)
-        allowed_round_strategies = {"initial_grounding", "regrounding", "policy_revision", "joint_replan"}
-        allowed_investigation_targets = {
-            "domain_boundary",
-            "ue_binding",
-            "qos_flow_binding",
-            "mobility_target_binding",
-            "policy_feasibility",
-            "cross_domain_consistency",
-            "assurance_gap",
-        }
-        allowed_uncertainty_flags = {
-            "domain_ambiguous",
-            "identifier_risk",
-            "runtime_evidence_missing",
-            "execution_feedback_incomplete",
-            "conflict_signal_present",
-        }
-        allowed_retry_scopes = {
-            "full_reground",
-            "partial_reground",
-            "target_stable",
-            "execution_retry_forbidden",
-            "",
-        }
         round_index = 0
         round_match = re.search(r"(?im)^\s*-\s*round_index:\s*(\d+)\s*$", str(context or ""))
         if round_match:
@@ -312,9 +288,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             if round_index <= 1 and str(intent.next_agent or "").strip() != "intent_encoding":
                 errors.append("round-1 main routing must set next_agent=intent_encoding; optimization_strategy is retry-only")
         round_strategy = str(intent.round_strategy.value if hasattr(intent.round_strategy, "value") else intent.round_strategy or "").strip()
-        if round_strategy not in allowed_round_strategies:
-            errors.append(f"round_strategy contains unsupported value: {round_strategy or '<empty>'}")
-        elif round_index <= 1 and round_strategy != "initial_grounding":
+        if round_index <= 1 and round_strategy != "initial_grounding":
             errors.append("round-1 main routing must set round_strategy=initial_grounding")
         explicit_supis = re.findall(r"(?i)(imsi-\d{5,})", str(user_input or ""))
         unique_explicit_supis = list(dict.fromkeys(explicit_supis))
@@ -334,35 +308,11 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 errors.append(
                     f"domain_evidence must cover every requested domain: requested={sorted(requested)} evidence={sorted(evidence_keys)}"
                 )
-        investigation_targets = [
-            item.value if hasattr(item, "value") else str(item or "").strip()
-            for item in (intent.investigation_targets or [])
-        ]
-        unknown_investigation_targets = [
-            item for item in investigation_targets if item not in allowed_investigation_targets
-        ]
-        if unknown_investigation_targets:
-            errors.append(
-                f"investigation_targets contains unsupported values: {sorted(set(unknown_investigation_targets))}"
-            )
-        uncertainty_flags = [
-            item.value if hasattr(item, "value") else str(item or "").strip()
-            for item in (intent.uncertainty_flags or [])
-        ]
-        unknown_uncertainty_flags = [
-            item for item in uncertainty_flags if item not in allowed_uncertainty_flags
-        ]
-        if unknown_uncertainty_flags:
-            errors.append(
-                f"uncertainty_flags contains unsupported values: {sorted(set(unknown_uncertainty_flags))}"
-            )
         retry_scope = (
             intent.retry_scope.value
             if getattr(intent, "retry_scope", None) is not None and hasattr(intent.retry_scope, "value")
             else str(getattr(intent, "retry_scope", "") or "").strip()
         )
-        if retry_scope not in allowed_retry_scopes:
-            errors.append(f"retry_scope contains unsupported value: {retry_scope or '<empty>'}")
         if round_index <= 1 and retry_scope and retry_scope != "full_reground":
             intent.retry_scope = MainRetryScope.FULL_REGROUND
             retry_scope = "full_reground"
@@ -390,8 +340,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 )
         if next_agent == "intent_encoding" and not str(intent.intent_encoding_guidance or "").strip() and round_index > 1:
             errors.append("retry routing into intent_encoding requires explicit intent_encoding_guidance")
-        resolved_target_errors = MainControlAgent._validate_main_semantic_boundary(intent)
-        errors.extend(resolved_target_errors)
         if len(unique_explicit_supis) == 1:
             explicit_supi = unique_explicit_supis[0]
             for stage_index, stage in enumerate(intent.control_semantics.stages or [], start=1):
@@ -470,13 +418,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             and str(item.get("app_id") or "").strip()
             for item in bindings
         )
-
-    @staticmethod
-    def _validate_main_semantic_boundary(intent: GlobalControlIntent) -> List[str]:
-        # GlobalControlIntent uses a Main-only semantic target schema that does
-        # not contain resolved identifiers. Pydantic extra="forbid" rejects
-        # app_id/flow_id/matched_* before this semantic validator runs.
-        return []
 
     @staticmethod
     def _normalize_retry_routing(

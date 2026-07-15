@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Any
 
 from ...context.evidence import EvidenceFormatter
-from ...context.iea_contract import (
+from ...domain.intent_encoding import (
     AM_GROUNDING_TOOLS,
     SM_GROUNDING_TOOLS,
     VALID_DOMAINS,
@@ -42,6 +42,7 @@ class IntentCompiler:
         supi: str,
         main_directives: Dict[str, Any],
         catalog_payload: Dict[str, Any],
+        catalog_evidence_observed: bool = False,
         semantic_candidates: List[Dict[str, Any]],
         am_context_payload: Optional[Dict[str, Any]] = None,
         am_policy_candidates: Optional[List[Dict[str, Any]]] = None,
@@ -51,6 +52,7 @@ class IntentCompiler:
             supi=supi,
             main_directives=main_directives,
             catalog_payload=catalog_payload,
+            catalog_evidence_observed=catalog_evidence_observed,
             semantic_candidates=semantic_candidates,
             am_context_payload=am_context_payload,
             am_policy_candidates=am_policy_candidates,

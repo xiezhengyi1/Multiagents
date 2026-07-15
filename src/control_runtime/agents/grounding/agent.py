@@ -395,14 +395,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             f"- Domain mode for this request: {domain_mode}.",
             "- Final answer must be exactly one raw JSON object with no markdown fence and no surrounding prose.",
             "- `domain_resolution` must be one scalar string value, never an object.",
+            "- `open_questions` is optional. When present, every item must be an object with owner_agent, question, blocking, and related_domains; never emit a bare question string.",
+            "- Use JSON strings, never null, for control_semantics target identifiers. Unresolved targets use app_id='', flow_id='', matched_flow_ids=[], and resolution_status='unresolved'.",
         ]
         if qos_required:
             domain_specific_rules.extend(
                 [
                     "- This request includes QoS grounding. Final JSON must contain a non-empty flows array.",
+                    "- With a known SUPI, call get_sm_ue_flow_catalog before final JSON, even if the target will remain unresolved.",
                     "- Every resolved QoS flow must include grounded app_id and grounded flow_id.",
                     "- If the current evidence does not already ground the QoS target, keep using SM grounding tools until flows is populated or the target is explicitly unresolved.",
                     "- The grounded binding must appear inside flows.",
+                    "- A missing flow binding does not make the QoS domain uncertain: keep domain_resolution='confirmed' when QoS is still the confirmed domain, then return one unresolved flow entry with name and resolution_status='unresolved'.",
                 ]
             )
             if evidence.candidate_flows:
@@ -419,8 +423,8 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 domain_specific_rules.extend(
                     [
                         f"- No grounded candidate_flows currently exist for the explicit QoS target '{evidence.explicit_flow_name}'.",
-                        "- Before final JSON, call search_sm_flow_targets for that explicit flow target.",
-                        "- After search returns a grounded exact match, copy that app_id + flow_id into flows immediately.",
+                        "- Call search_sm_flow_targets for that explicit flow target, then call get_sm_ue_flow_catalog for the SUPI.",
+                        "- Resolve only when the catalog confirms the searched app_id + flow_id and supplies its SLA baseline; otherwise return that target unresolved.",
                     ]
                 )
             explicit_target_names = [
@@ -572,6 +576,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             supi=supi,
             main_directives=main_directives,
             catalog_payload={},
+            catalog_evidence_observed=False,
             semantic_candidates=[],
             am_context_payload={},
             am_policy_candidates=[],
@@ -587,6 +592,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> IntentEvidence:
         semantic_candidates: List[Dict[str, Any]] = list(evidence.semantic_candidates or [])
         catalog_payload: Dict[str, Any] = dict(evidence.catalog_payload or {})
+        catalog_evidence_observed = bool(evidence.catalog_evidence_observed)
         am_context_payload: Dict[str, Any] = dict(evidence.am_context_payload or {})
         am_policy_candidates: List[Dict[str, Any]] = list(evidence.am_policy_candidates or [])
         requested_domains = list(evidence.requested_domains or [])
@@ -599,6 +605,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             if tool_name == "get_sm_ue_flow_catalog" and self.compiler.uses_sm_grounding(requested_domains):
                 payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
                 if not requested_supis or payload_supi in requested_supis:
+                    catalog_evidence_observed = True
                     catalog_payload = merge_catalog_payloads(catalog_payload, payload)
             elif tool_name == "search_sm_flow_targets" and self.compiler.uses_sm_grounding(requested_domains):
                 semantic_candidates = merge_candidate_dicts(semantic_candidates, list(payload.get("candidates") or []))
@@ -614,6 +621,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             supi=evidence.supi,
             main_directives=main_directives,
             catalog_payload=catalog_payload,
+            catalog_evidence_observed=catalog_evidence_observed,
             semantic_candidates=semantic_candidates,
             am_context_payload=am_context_payload,
             am_policy_candidates=am_policy_candidates,

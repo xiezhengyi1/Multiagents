@@ -72,6 +72,8 @@ class RetryPromptBuilder:
             "Do not guess missing identifiers, and do not rely on downstream code to fill OperationIntent fields.",
             "Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
             "`domain_resolution` must be a scalar string, not an object.",
+            "`open_questions` must be an array of objects with owner_agent, question, blocking, and related_domains; never emit question strings.",
+            "Semantic target identifier fields are strings, never null. For unresolved targets use app_id='', flow_id='', matched_flow_ids=[], and resolution_status='unresolved'.",
         ]
         joined = " | ".join(issues)
 
@@ -94,8 +96,17 @@ class RetryPromptBuilder:
                     "For the next answer, flows must be non-empty.",
                     "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
                     "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
-                    "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return either a resolved or explicitly unresolved flow entry.",
+                    "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return an explicitly unresolved flow entry: {\"supi\":\"<known SUPI>\",\"name\":\"<target>\",\"resolution_status\":\"unresolved\"}.",
+                    "An unresolved flow does not require domain_resolution='cannot_confirm' when the QoS domain is known.",
                     "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
+                ]
+            )
+        if "requires get_sm_ue_flow_catalog" in joined or "catalog evidence" in joined:
+            repair_rules.extend(
+                [
+                    "This QoS request has a known SUPI but no authoritative UE flow catalog in the visible evidence.",
+                    "Call get_sm_ue_flow_catalog for that SUPI before finalizing. Use its result as the only authority for a resolved flow binding and SLA baseline.",
+                    "If that catalog is empty or lacks the named target, preserve the target as an unresolved flows entry instead of omitting it.",
                 ]
             )
         if "domain_resolution must be confirmed, narrowed, widened, or cannot_confirm" in joined:

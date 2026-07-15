@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...domain.policy_plan import FlowSelector
-from ..iea_contract import normalize_domain_evidence, normalize_requested_domains, uses_am_grounding, uses_sm_grounding
+from ...domain.intent_encoding import normalize_domain_evidence, normalize_requested_domains, uses_am_grounding, uses_sm_grounding
 from ...agents.grounding.contracts import ExplicitFlowTarget, FlowCandidateEvidence, IntentEvidence
 
 
@@ -16,6 +16,7 @@ class IntentEvidenceBuilder:
         supi: str,
         main_directives: Dict[str, Any],
         catalog_payload: Dict[str, Any],
+        catalog_evidence_observed: bool = False,
         semantic_candidates: List[Dict[str, Any]],
         am_context_payload: Optional[Dict[str, Any]] = None,
         am_policy_candidates: Optional[List[Dict[str, Any]]] = None,
@@ -95,7 +96,6 @@ class IntentEvidenceBuilder:
             supi=str(supi or "").strip(),
             requested_domains=requested_domains,
             retry_scope=str(main_directives.get("retry_scope") or "").strip(),
-            main_requested_domains=requested_domains,
             explicit_app_id=explicit_app_id,
             explicit_app_name=explicit_app_name,
             explicit_flow_id=explicit_flow_id,
@@ -106,6 +106,7 @@ class IntentEvidenceBuilder:
             domain_evidence=normalize_domain_evidence(main_directives.get("domain_evidence")),
             am_context_summary=self._summarize_am_context(resolved_am_context),
             am_policy_candidates=self._normalize_am_policy_candidates(resolved_am_policy_candidates),
+            catalog_evidence_observed=bool(catalog_evidence_observed or resolved_catalog_payload),
             catalog_payload=resolved_catalog_payload,
             semantic_candidates=resolved_semantic_candidates,
             am_context_payload=resolved_am_context,

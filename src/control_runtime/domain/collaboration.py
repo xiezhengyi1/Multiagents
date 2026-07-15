@@ -84,10 +84,9 @@ class CoordinationIssue(BaseModel):
 class DomainNegotiationRequest(BaseModel):
     round_index: int = Field(default=1)
     source_agent: str = Field(default="intent_encoding")
-    main_requested_domains: list[str] = Field(default_factory=list)
-    grounded_requested_domains: list[str] = Field(default_factory=list)
+    requested_domains: list[str] = Field(default_factory=list)
     domain_resolution: str = Field(default="cannot_confirm")
-    domain_revision_needed: bool = False
+    requires_domain_review: bool = False
     issues: list[CoordinationIssue] = Field(default_factory=list)
     recommended_consumers: list[str] = Field(default_factory=list)
     summary: str = Field(default="")

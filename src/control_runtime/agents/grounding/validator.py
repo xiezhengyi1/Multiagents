@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, List
 
-from ...context.iea_contract import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS
+from ...domain.intent_encoding import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS
 from .common import flow_id_is_grounded, mobility_request_mentions_specific_targets
 from .contracts import IntentEvidence
 from ...domain.policy_plan import OperationIntent
@@ -23,6 +23,11 @@ class IntentGroundingValidator:
             errors.append("mobility-only intent must not call SM grounding tools")
         if requested_domains == {"qos"} and (used_grounding_tools & AM_GROUNDING_TOOLS):
             errors.append("QoS-only intent must not call AM grounding tools")
+        if "qos" in requested_domains and str(evidence.supi or "").strip():
+            if not evidence.catalog_evidence_observed:
+                errors.append(
+                    "QoS intent with a known SUPI requires get_sm_ue_flow_catalog catalog evidence before final intent"
+                )
         if list(evidence.requested_domains or []) == ["mobility"]:
             decision_has_am_context = self._operation_intent_has_grounded_am_policy(operation_intent)
             if not evidence.am_context_summary and not decision_has_am_context:
@@ -33,16 +38,18 @@ class IntentGroundingValidator:
                         "mobility intent that names association/RFSP/NSSAI/service-area/access targets requires search_am_policy_targets evidence"
                     )
             return errors
-        named_flow_request = (
-            "/" in str(evidence.user_input or "")
-            and not str(evidence.explicit_app_id or "").strip()
-            and not str(evidence.explicit_flow_id or "").strip()
-            and not list(evidence.explicit_flow_targets or [])
+        named_flow_request = bool(
+            str(evidence.explicit_app_id or "").strip()
+            or str(evidence.explicit_app_name or "").strip()
+            or str(evidence.explicit_flow_id or "").strip()
+            or str(evidence.explicit_flow_name or "").strip()
+            or list(evidence.explicit_flow_targets or [])
         )
         if (
             "qos" in requested_domains
             and named_flow_request
             and not evidence.candidate_flows
+            and (evidence.catalog_payload or {}).get("flow_catalog")
             and "search_sm_flow_targets" not in used_grounding_tools
         ):
             errors.append("named QoS flow request requires search_sm_flow_targets before returning final intent")
@@ -136,6 +143,10 @@ class IntentGroundingValidator:
             ):
                 errors.append(
                     f"QoS OperationIntent flow[{index}] resolved flow_id={flow_id} is not grounded by catalog/search evidence."
+                )
+            if resolution_status == "unresolved" and not str(flow.name or "").strip():
+                errors.append(
+                    f"QoS OperationIntent unresolved flow[{index}] must preserve the named target in name."
                 )
         resolved_flow_ids = {
             str(flow.flow_id or "").strip()

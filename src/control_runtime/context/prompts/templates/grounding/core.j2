@@ -25,7 +25,6 @@ Tool policy:
 - Mobility-only requests must not call SM tools.
 - If a QoS request names an app/flow and no grounded candidate exists yet, call `search_sm_flow_targets` before final JSON.
 - If the request explicitly names a QoS app/flow and that exact target cannot be grounded from runtime evidence, return it as unresolved. Do not substitute a semantic neighbor.
-- If SUPI is known and the request involves QoS targets (latency, bandwidth, priority), call `get_sm_ue_flow_catalog` to fetch the SLA baseline for the grounded flow before finalizing. `candidate_flows` carries only identifiers (flow_id, app_id) — it does NOT carry SLA parameters such as latency or bandwidth. You must call `get_sm_ue_flow_catalog` to obtain those values.
 - CRITICAL: `get_sm_ue_flow_catalog` is the authoritative source for what flows exist on a UE. `search_sm_flow_targets` may return flows from other UEs (with supi=""). Only mark a flow as `resolved` if its `flow_id` appears in the `flow_catalog` returned by `get_sm_ue_flow_catalog` AND that catalog entry contains SLA baseline values. If a candidate flow_id does not appear in the catalog, mark it `unresolved` — do not guess or force a resolution.
 - For every resolved QoS flow, copy the complete SLA baseline from `get_sm_ue_flow_catalog` into `flows[]`: `service_type`, `service_type_id`, `bw_ul`, `bw_dl`, `gbr_ul`, `gbr_dl`, `lat`, `loss_req`, `jitter_req`, `priority`, `current_slice_snssai`, `current_bw_ul`, and `current_bw_dl`.
 - For every resolved QoS flow, also emit one complete `qos_target_envelopes[]` entry with `baseline_priority`, `baseline_latency_ms`, `baseline_jitter_ms`, `baseline_packet_error_rate`, `baseline_max_br_ul_mbps`, `baseline_max_br_dl_mbps`, `baseline_gbr_ul_mbps`, and `baseline_gbr_dl_mbps`. These are baseline values, not final optimized targets.
@@ -35,19 +34,19 @@ Tool policy:
 - Use knowledge tools only for exact 3GPP semantic ambiguity that runtime evidence cannot answer.
 
 Output rules:
-- Return raw JSON only.
-- Return one `OperationIntent`.
 - The top-level output must be exactly one JSON object, not markdown, not a fenced code block, not prose before or after the JSON object.
 - Never wrap the answer in ```json ... ``` or any other markdown fence.
 - `domain_resolution` must be a scalar string enum: `confirmed`, `narrowed`, `widened`, or `cannot_confirm`.
 - Do not output runtime envelope fields: `session_id`, `snapshot_id`, `raw_input`.
 - Do not output top-level `app_id`, `app_name`, `main_requested_domains`, `grounded_requested_domains`, `domain_revision_needed`, `domain_revision_rationale`, or `domain_evidence`.
-- When `domain_resolution` is `cannot_confirm`, add `open_questions` describing what Main or the user must clarify.
+- An ungrounded QoS flow does not by itself make the QoS domain boundary uncertain. Keep `domain_resolution="confirmed"` when the domain is known and return that flow as unresolved; use `cannot_confirm` only when the domain boundary itself cannot be confirmed.
+- When `domain_resolution` is `cannot_confirm`, `open_questions` must be an array of objects, never strings. Every item has this shape: `{"owner_agent":"intent_encoding","question":"what must be clarified","blocking":true,"related_domains":["qos"]}`.
 - For QoS requests, return non-empty `flows`.
+- For every QoS request with a known SUPI, call `get_sm_ue_flow_catalog` before the final answer. If the returned catalog is empty or does not contain the named target, keep that target as an unresolved `flows` entry; never omit it.
 - For mobility-only requests, keep `flows` empty.
 - For every QoS flow whose `resolution_status` is `resolved`, you must return both grounded `flow_id` and grounded `app_id`.
-- Never return a QoS flow that is `resolved` but missing `flow_id` or `app_id`.
-- If a named QoS target is not fully grounded to `flow_id` + `app_id`, return it as unresolved instead of guessing or leaving identifier fields blank.
+- If a named QoS target is not fully grounded to `flow_id` + `app_id`, return one unresolved entry instead of guessing: `{"supi":"<known SUPI>","name":"<named target>","resolution_status":"unresolved"}`. It still belongs in the non-empty `flows` array, but must not have a QoS envelope or active_flow_id.
+- All `SemanticTarget` identifier fields are strings, never JSON `null`. For an unresolved stage target use `app_id:""`, `flow_id:""`, `matched_flow_ids:[]`, and `resolution_status:"unresolved"`.
 - If `candidate_flows` already contains one exact grounded match for the named QoS target, do not call `search_sm_flow_targets` or `get_sm_ue_context` again for identity reassurance. However, you must still call `get_sm_ue_flow_catalog` to fetch the SLA baseline parameters before finalizing, because `candidate_flows` does not carry SLA data.
 - If an SM grounding tool already returned one exact grounded match for the named QoS target in this attempt, the next answer must finalize with that binding in `flows`.
 - Emit semantic decision fields only. Do not emit final 3GPP policy payloads.

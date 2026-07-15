@@ -9,7 +9,7 @@ from .control_loop import (
     rerank_by_context_hints,
 )
 from .intent_context import DefaultIntentContextBuilder, IntentContextBuilder
-from .iea_contract import IntentEncodingDirectives
+from ..domain.intent_encoding import IntentEncodingDirectives
 from .evidence import EvidenceFormatter, build_slice_snssai, normalize_app_id
 from .observability import measure_context_components
 from .projectors import (
