@@ -20,10 +20,23 @@ from ..domain.control_loop import (
 from ..domain.control_plane import ControlDomain, DomainStatus, DomainVerdict, GlobalControlIntent, UnifiedControlPlan
 from ..domain.policy_plan import OperationIntent, PolicyPlanDraft
 from ..integrations.storage import get_snapshot_data_by_id, get_ue_context_by_supi
-from ..context import ControlRoundTrace, parse_pda_metrics
+from .contracts import ControlRoundTrace
 
 
 AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
+
+
+def _parse_pda_metrics(report: FeedbackReport) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    raw_metrics = str(report.performance_metrics or "").strip()
+    if not raw_metrics:
+        return [], []
+    payload = json.loads(raw_metrics)
+    if not isinstance(payload, dict):
+        raise TypeError("performance_metrics must be a JSON object")
+    return (
+        payload.get("dispatch_results", []) if isinstance(payload.get("dispatch_results"), list) else [],
+        payload.get("assurance_results", []) if isinstance(payload.get("assurance_results"), list) else [],
+    )
 
 
 @dataclass
@@ -303,7 +316,7 @@ def execute_planned_round(
 
     if str(conflict_result.mediator_status or "").strip().lower() == "approved":
         report = pd_agent.execute_and_evaluate(policy_plan, trace_metadata=trace_metadata)
-        dispatch_receipts, assurance_verdicts = parse_pda_metrics(report)
+        dispatch_receipts, assurance_verdicts = _parse_pda_metrics(report)
         qos_feedback, mobility_feedback = build_domain_feedback(
             report,
             dispatch_receipts=dispatch_receipts,

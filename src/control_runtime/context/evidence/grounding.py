@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...domain.policy_plan import FlowSelector
-from ...agents.grounding.common import normalize_domain_evidence, normalize_requested_domains, uses_am_grounding, uses_sm_grounding
+from ..iea_contract import normalize_domain_evidence, normalize_requested_domains, uses_am_grounding, uses_sm_grounding
 from ...agents.grounding.contracts import ExplicitFlowTarget, FlowCandidateEvidence, IntentEvidence
 
 

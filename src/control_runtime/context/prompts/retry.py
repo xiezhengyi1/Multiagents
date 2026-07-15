@@ -166,25 +166,6 @@ class RetryPromptBuilder:
             + "\n- ".join(issues)
         )
 
-    def build_osa(
-        self,
-        *,
-        base_prompt: str,
-        issues: list[str],
-        cached_planning_evidence: Dict[str, Any] | None = None,
-    ) -> str:
-        # The OSA retry contract is still kept in the legacy module because its
-        # examples are scanned directly by existing tests. This facade gives
-        # callers a single import path while preserving that contract.
-        from .planning import build_validation_retry_prompt
-
-        return build_validation_retry_prompt(
-            base_prompt=base_prompt,
-            issues=issues,
-            cached_planning_evidence=cached_planning_evidence,
-        )
-
-
 def _strip_retry_feedback(base_prompt: str) -> str:
     cleaned = re.sub(
         r"\n\nRetry feedback \(attempt \d+\).*$",

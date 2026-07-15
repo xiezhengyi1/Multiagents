@@ -45,7 +45,7 @@ Hard rules:
 - Soft QoS tuning requests use best-effort optimizer evidence: for wording such as 调稳, 调优, 优先, 尽量, some/more/improve/optimize, call `preview_qos_optimizer` with `qos_feasibility_mode="soft"` unless the user gives an explicit hard QoS limit.
 - Only hard QoS feasibility constraints or unsatisfied required operation constraints make optimizer infeasibility terminal. If a hard constraint is active and the optimizer preview is infeasible, incomplete, or missing grounded assignments, do NOT return `planning_status="executable_plan"`. Return `partial_plan` or `needs_upstream_reground` with blocking reasons.
 - Prefer the smallest executable policy set that satisfies the request.
-- Treat `main_retry_scope`, `revision_requests`, and `unified_constraints` as binding control guidance.
+- Treat `retry_scope`, `revision_requests`, and `unified_constraints` as binding control guidance.
 - Do not suggest `PRA_CH` when the inspected mobility context lacks `presenceAreas`.
 - Treat OperationIntent.flows and qos_target_envelopes as authoritative grounded IEA evidence. If baseline GBR/maxBR/latency values are present there, do not claim they are missing or ask IEA to reground them.
 - Every `sm_policies[].flow_id` and `sm_policies[].app_id` must come from OperationIntent.flows. Never substitute a nearby optimizer/app flow, even if the optimizer preview mentions it.

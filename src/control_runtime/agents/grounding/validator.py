@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, List
 
-from .common import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS, flow_id_is_grounded, mobility_request_mentions_specific_targets
+from ...context.iea_contract import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS
+from .common import flow_id_is_grounded, mobility_request_mentions_specific_targets
 from .contracts import IntentEvidence
 from ...domain.policy_plan import OperationIntent
 

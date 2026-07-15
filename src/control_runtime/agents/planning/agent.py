@@ -14,7 +14,7 @@ from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import PolicyPlanDraft
 from ...context.projectors import project_collaboration_context_for_prompt, project_operation_intent_for_prompt
 from ...context.observability import measure_context_components
-from ...context.prompts import PlanningPromptBuilder, RetryPromptBuilder
+from ...context.prompts import PlanningPromptBuilder
 from shared.logging import log_event, log_timing
 
 from .compiler import OptimizationStrategyCompiler
@@ -163,7 +163,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     if attempt_index == 2:
                         raise
                     log_event(self.logger, "osa_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
-                    current_prompt = RetryPromptBuilder().build_osa(
+                    current_prompt = prompt_builder.validation_retry_prompt(
                         base_prompt=base_prompt,
                         issues=[invocation_error],
                         cached_planning_evidence=self._cached_tool_evidence_for_retry(),
@@ -198,7 +198,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
                 log_event(self.logger, "osa_retry", attempt=attempt_index + 2,
                           reason="contract_errors", errors=contract_errors)
-                current_prompt = RetryPromptBuilder().build_osa(
+                current_prompt = prompt_builder.validation_retry_prompt(
                     base_prompt=base_prompt,
                     issues=list(contract_errors),
                     cached_planning_evidence=self._cached_tool_evidence_for_retry(),

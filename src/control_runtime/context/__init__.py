@@ -2,26 +2,14 @@ from __future__ import annotations
 
 from .budget import TokenBudget
 from .control_loop import (
-    ControlRoundResult,
-    ControlRoundTrace,
-    activate_control_stage,
     build_feedback_context_from_snapshots,
-    build_intent_encoding_context,
     build_main_context,
     build_memory_context,
-    build_negotiation_diagnosis,
-    build_negotiation_request,
-    build_planning_context,
-    build_planning_failure_payload,
-    build_reentry_report_payload,
     build_round_feedback_block,
-    get_snapshot_data_by_id,
-    has_supi_scope,
-    parse_pda_metrics,
     rerank_by_context_hints,
-    scope_global_intent_for_intent_encoding,
-    should_reuse_operation_intent,
 )
+from .intent_context import DefaultIntentContextBuilder, IntentContextBuilder
+from .iea_contract import IntentEncodingDirectives
 from .evidence import EvidenceFormatter, build_slice_snssai, normalize_app_id
 from .observability import measure_context_components
 from .projectors import (
@@ -57,8 +45,7 @@ from .prompts import (
 
 __all__ = [
     "BaseProjector",
-    "ControlRoundResult",
-    "ControlRoundTrace",
+    "DefaultIntentContextBuilder",
     "DispatchPromptBuilder",
     "EvidenceFormatter",
     "ExcludeSpec",
@@ -79,31 +66,21 @@ __all__ = [
     "RetryPromptBuilder",
     "SinglePromptBuilder",
     "TokenBudget",
-    "activate_control_stage",
     "build_feedback_context_from_snapshots",
-    "build_intent_encoding_context",
     "build_main_context",
     "build_memory_context",
-    "build_negotiation_diagnosis",
-    "build_negotiation_request",
-    "build_planning_context",
-    "build_planning_failure_payload",
-    "build_reentry_report_payload",
     "build_round_feedback_block",
     "build_slice_snssai",
     "exclude",
     "field",
-    "get_snapshot_data_by_id",
-    "has_supi_scope",
+    "IntentContextBuilder",
+    "IntentEncodingDirectives",
     "normalize_app_id",
     "measure_context_components",
-    "parse_pda_metrics",
     "project_collaboration_context_for_prompt",
     "project_global_intent_for_prompt",
     "project_intent_evidence_for_prompt",
     "project_memory_payload",
     "project_operation_intent_for_prompt",
     "rerank_by_context_hints",
-    "scope_global_intent_for_intent_encoding",
-    "should_reuse_operation_intent",
 ]

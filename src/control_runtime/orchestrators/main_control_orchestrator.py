@@ -19,22 +19,13 @@ from agent_runtime.storage.runtime_store import configure as _configure_runtime_
 _configure_runtime_store(session_factory=SessionLocal, orm_module=_db_models)
 
 from ..context import (
-    ControlRoundResult,
-    activate_control_stage,
+    DefaultIntentContextBuilder,
+    IntentContextBuilder,
     build_feedback_context_from_snapshots,
-    build_intent_encoding_context,
     build_main_context,
     build_memory_context,
-    build_negotiation_diagnosis,
-    build_negotiation_request,
-    build_planning_context,
-    build_planning_failure_payload,
-    build_reentry_report_payload,
     build_round_feedback_block,
-    has_supi_scope,
     project_memory_payload,
-    scope_global_intent_for_intent_encoding,
-    should_reuse_operation_intent,
 )
 
 from ..agents.dispatch import PolicyDispatchAgent
@@ -49,8 +40,18 @@ from ..domain.collaboration import (
 )
 from ..domain.control_plane import GlobalControlIntent
 from ..domain.policy_plan import OperationIntent
+from .contracts import ControlRoundResult
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
 from .round_execution import execute_planned_round
+from .round_transitions import (
+    activate_control_stage,
+    build_negotiation_diagnosis,
+    build_negotiation_request,
+    build_planning_failure_payload,
+    build_reentry_report_payload,
+    has_supi_scope,
+    should_reuse_operation_intent,
+)
 from shared.logging import log_event
 
 
@@ -67,6 +68,7 @@ class MainControlOrchestrator:
         cr_tool: Optional[ConflictResolutionTool] = None,
         ad_tool: Optional[AssuranceDiagnosisTool] = None,
         memory_manager: Optional[MemoryManager] = None,
+        intent_context_builder: Optional[IntentContextBuilder] = None,
         max_rounds: int = 3,
         use_local_model: bool = False,
         use_deepseek: bool = False,
@@ -86,6 +88,7 @@ class MainControlOrchestrator:
             short_term_limit=max(20, max_rounds * 8),
             enable_llm_summarization=True,
         )
+        self.intent_context_builder = intent_context_builder or DefaultIntentContextBuilder()
         self.max_rounds = max_rounds
         self.rag_enabled = rag_enabled
         self._token_counter = TokenCounter()
@@ -225,13 +228,13 @@ class MainControlOrchestrator:
                 selected_next_agent=selected_next_agent,
             )
         else:
-            ie_scoped_intent = scope_global_intent_for_intent_encoding(
+            ie_scoped_intent = self.intent_context_builder.scope_global_intent_for_intent_encoding(
                 global_intent=global_intent,
                 round_index=round_index,
             )
             operation_intent = self.ie_agent.analyze_operation_intent(
                 user_input=user_input,
-                context=build_intent_encoding_context(
+                context=self.intent_context_builder.build_intent_encoding_context(
                     global_intent=ie_scoped_intent.model_dump(mode="json"),
                     round_index=round_index,
                     diagnosis=previous_diagnosis,
@@ -255,7 +258,7 @@ class MainControlOrchestrator:
 
         planning_request = PlanningRequest(
             operation_intent=operation_intent,
-            context=build_planning_context(
+            context=self.intent_context_builder.build_planning_context(
                 global_intent,
                 session_id,
                 snapshot_id,

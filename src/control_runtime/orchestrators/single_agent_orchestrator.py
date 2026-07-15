@@ -17,13 +17,12 @@ from ..agents.single import SingleControlAgent
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool
 from ..diagnostics.mediation import ConflictResolutionTool
 from ..context import (
-    ControlRoundResult,
-    ControlRoundTrace,
     build_feedback_context_from_snapshots,
     build_main_context,
     build_round_feedback_block,
 )
 from ..domain.policy_plan import PolicyPlanDraft
+from .contracts import ControlRoundResult, ControlRoundTrace
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
 from .round_execution import execute_planned_round
 from shared.logging import log_event

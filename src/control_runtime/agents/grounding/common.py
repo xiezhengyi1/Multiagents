@@ -1,87 +1,10 @@
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Dict, List
 
 from ...domain.policy_plan import FlowSelector, QosTargetEnvelope
 from .contracts import IntentEvidence
-
-VALID_DOMAINS = {"qos", "mobility"}
-SM_GROUNDING_TOOLS = {
-    "get_sm_ue_context",
-    "get_sm_ue_flow_catalog",
-    "search_sm_flow_targets",
-    "get_ue_flow_catalog",
-    "search_flow_targets_by_name",
-}
-AM_GROUNDING_TOOLS = {"get_am_policy_context", "search_am_policy_targets"}
-
-
-def uses_sm_grounding(requested_domains: List[str] | None) -> bool:
-    normalized = {
-        str(item or "").strip().lower()
-        for item in (requested_domains or [])
-        if str(item or "").strip()
-    }
-    return not normalized or "qos" in normalized
-
-
-def uses_am_grounding(requested_domains: List[str] | None) -> bool:
-    normalized = {
-        str(item or "").strip().lower()
-        for item in (requested_domains or [])
-        if str(item or "").strip()
-    }
-    return not normalized or "mobility" in normalized
-
-
-def normalize_requested_domains(requested_domains: Any) -> List[str]:
-    normalized = [
-        str(item or "").strip().lower()
-        for item in (requested_domains or [])
-        if str(item or "").strip()
-    ]
-    valid = [item for item in normalized if item in VALID_DOMAINS]
-    return list(dict.fromkeys(valid))
-
-
-def normalize_domain_evidence(domain_evidence: Any) -> Dict[str, List[str]]:
-    normalized: Dict[str, List[str]] = {}
-    if not isinstance(domain_evidence, dict):
-        return normalized
-    for key, values in domain_evidence.items():
-        items = [str(item or "").strip() for item in (values or []) if str(item or "").strip()]
-        if items:
-            normalized[str(key).strip().lower()] = items
-    return normalized
-
-
-class MainDirectiveExtractor:
-    def extract_main_directives(self, context: str) -> Dict[str, Any]:
-        text = str(context or "").strip()
-        if not text:
-            return {}
-        try:
-            payload = json.loads(text)
-        except (TypeError, ValueError):
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-
-        main_intent = payload.get("main_intent")
-        if not isinstance(main_intent, dict):
-            return {}
-
-        requested_domains = normalize_requested_domains(main_intent.get("requested_domains"))
-        domain_evidence = normalize_domain_evidence(main_intent.get("domain_evidence"))
-        return {
-            "requested_domains": requested_domains,
-            "domain_evidence": domain_evidence,
-            "supi": str(main_intent.get("supi") or "").strip(),
-            "retry_scope": str(main_intent.get("retry_scope") or "").strip(),
-        }
-
 
 class QosEnvelopeBuilder:
     def build(

@@ -3,15 +3,15 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Any
 
 from ...context.evidence import EvidenceFormatter
-from ...domain.policy_plan import OperationIntent
-from .common import (
+from ...context.iea_contract import (
     AM_GROUNDING_TOOLS,
     SM_GROUNDING_TOOLS,
     VALID_DOMAINS,
-    MainDirectiveExtractor,
+    IntentEncodingDirectives,
     uses_am_grounding,
     uses_sm_grounding,
 )
+from ...domain.policy_plan import OperationIntent
 from .contracts import IntentEvidence
 from .validator import IntentGroundingValidator
 
@@ -22,7 +22,6 @@ class IntentCompiler:
     AM_GROUNDING_TOOLS = AM_GROUNDING_TOOLS
 
     def __init__(self) -> None:
-        self.directive_extractor = MainDirectiveExtractor()
         self.validator = IntentGroundingValidator()
 
     @classmethod
@@ -34,7 +33,7 @@ class IntentCompiler:
         return uses_am_grounding(requested_domains)
 
     def extract_main_directives(self, context: str) -> Dict[str, Any]:
-        return self.directive_extractor.extract_main_directives(context)
+        return IntentEncodingDirectives.from_context(context).model_dump()
 
     def build_intent_evidence(
         self,
