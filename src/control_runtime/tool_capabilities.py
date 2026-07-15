@@ -18,6 +18,7 @@ CONTROL_RUNTIME_CAPABILITY_ALIASES: Dict[str, List[str]] = {
     "search_flow_targets_by_name": ["sm_flow_target_resolution"],
     "get_am_policy_context": ["am_policy_context"],
     "search_am_policy_targets": ["am_policy_target_resolution"],
+    "get_ue_slice_subscription": ["ue_slice_subscription_entitlement"],
     "preview_qos_optimizer": ["optimizer_counterfactual", "qos_runtime_evidence"],
     "preview_optimizer": ["optimizer_counterfactual", "qos_runtime_evidence"],
     "fetch_qos_network_status": ["qos_runtime_evidence"],

@@ -16,6 +16,7 @@ from ...integrations.pcf import (
     get_am_policy_context,
     get_sm_ue_context,
     get_sm_ue_flow_catalog,
+    get_ue_slice_subscription,
     search_am_policy_targets,
     search_sm_flow_targets,
 )
@@ -65,7 +66,8 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "intent_encoding"
     SM_GROUNDING_TOOLS = {"search_sm_flow_targets", "get_sm_ue_context", "get_sm_ue_flow_catalog"}
     AM_GROUNDING_TOOLS = {"get_am_policy_context", "search_am_policy_targets"}
-    GROUNDING_TOOLS = SM_GROUNDING_TOOLS | AM_GROUNDING_TOOLS | {"search_semantic_knowledge", "get_knowledge_by_key"}
+    SUBSCRIPTION_GROUNDING_TOOLS = {"get_ue_slice_subscription"}
+    GROUNDING_TOOLS = SM_GROUNDING_TOOLS | AM_GROUNDING_TOOLS | SUBSCRIPTION_GROUNDING_TOOLS | {"search_semantic_knowledge", "get_knowledge_by_key"}
 
     def __init__(
         self,
@@ -83,6 +85,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             get_sm_ue_context,
             get_sm_ue_flow_catalog,
             get_am_policy_context,
+            get_ue_slice_subscription,
             search_am_policy_targets,
         ]
         if self.rag_enabled:
@@ -107,6 +110,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 "search_sm_flow_targets": 8000,
                 "get_am_policy_context": 8000,
                 "search_am_policy_targets": 8000,
+                "get_ue_slice_subscription": 8000,
                 "search_semantic_knowledge": 8000,
                 "get_knowledge_by_key": 8000,
             },
@@ -118,6 +122,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     "search_sm_flow_targets": 8000,
                     "get_am_policy_context": 8000,
                     "search_am_policy_targets": 8000,
+                    "get_ue_slice_subscription": 8000,
                     "search_semantic_knowledge": 8000,
                     "get_knowledge_by_key": 8000,
                 },
@@ -131,22 +136,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
 
     @classmethod
     def _filter_tools_for_domains(cls, tools: List[Any], requested_domains: List[str] | None) -> List[Any]:
-        domains = {
-            str(item.value if hasattr(item, "value") else item or "").strip().lower()
-            for item in (requested_domains or [])
-            if str(item.value if hasattr(item, "value") else item or "").strip()
-        }
-        if not domains:
-            return list(tools)
-        filtered: List[Any] = []
-        for tool in tools:
-            name = str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
-            if name in cls.SM_GROUNDING_TOOLS and "qos" not in domains:
-                continue
-            if name in cls.AM_GROUNDING_TOOLS and "mobility" not in domains:
-                continue
-            filtered.append(tool)
-        return filtered
+        return list(tools)
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> OperationIntent:
         payload = envelope.payload or {}
@@ -321,6 +311,10 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     advisor_result=advisor_result,
                     main_directives=main_directives,
                     snapshot_id=snapshot_id,
+                )
+                operation_intent = self._attach_subscription_evidence(
+                    operation_intent=operation_intent,
+                    evidence=refreshed_evidence,
                 )
                 advisor_validation_errors, validation_errors, _ = validate_operation_intent(
                     compiler=self.compiler,
@@ -580,6 +574,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             semantic_candidates=[],
             am_context_payload={},
             am_policy_candidates=[],
+            subscription_payload={},
         )
 
     def _refresh_intent_evidence_from_tool_results(
@@ -595,6 +590,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         catalog_evidence_observed = bool(evidence.catalog_evidence_observed)
         am_context_payload: Dict[str, Any] = dict(evidence.am_context_payload or {})
         am_policy_candidates: List[Dict[str, Any]] = list(evidence.am_policy_candidates or [])
+        subscription_payload: Dict[str, Any] = dict(evidence.subscription_payload or {})
         requested_domains = list(evidence.requested_domains or [])
         requested_supis = set(extract_requested_supis(evidence.supi, evidence.user_input))
 
@@ -602,19 +598,23 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             tool_name = str(entry.get("tool_name") or "").strip()
             call_args = dict(entry.get("call_args") or {})
             payload = dict(entry.get("payload") or {})
-            if tool_name == "get_sm_ue_flow_catalog" and self.compiler.uses_sm_grounding(requested_domains):
+            if tool_name == "get_sm_ue_flow_catalog":
                 payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
                 if not requested_supis or payload_supi in requested_supis:
                     catalog_evidence_observed = True
                     catalog_payload = merge_catalog_payloads(catalog_payload, payload)
-            elif tool_name == "search_sm_flow_targets" and self.compiler.uses_sm_grounding(requested_domains):
+            elif tool_name == "search_sm_flow_targets":
                 semantic_candidates = merge_candidate_dicts(semantic_candidates, list(payload.get("candidates") or []))
-            elif tool_name == "get_am_policy_context" and self.compiler.uses_am_grounding(requested_domains):
+            elif tool_name == "get_am_policy_context":
                 payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
                 if not requested_supis or payload_supi in requested_supis:
                     am_context_payload = {**am_context_payload, **dict(payload)}
-            elif tool_name == "search_am_policy_targets" and self.compiler.uses_am_grounding(requested_domains):
+            elif tool_name == "search_am_policy_targets":
                 am_policy_candidates = merge_candidate_dicts(am_policy_candidates, list(payload.get("candidates") or []))
+            elif tool_name == "get_ue_slice_subscription":
+                payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
+                if not requested_supis or payload_supi in requested_supis:
+                    subscription_payload = {**subscription_payload, **payload}
 
         return self.compiler.build_intent_evidence(
             user_input=evidence.user_input,
@@ -625,5 +625,28 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             semantic_candidates=semantic_candidates,
             am_context_payload=am_context_payload,
             am_policy_candidates=am_policy_candidates,
+            subscription_payload=subscription_payload,
         )
+
+    @staticmethod
+    def _attach_subscription_evidence(
+        *,
+        operation_intent: OperationIntent,
+        evidence: IntentEvidence,
+    ) -> OperationIntent:
+        subscription = dict(evidence.subscription_summary or {})
+        if not subscription:
+            return operation_intent
+        enriched = operation_intent.model_copy(deep=True)
+        mobility_targets = dict(enriched.grounding_evidence.grounded_mobility_targets or {})
+        mobility_targets["subscription_entitlement"] = subscription
+        enriched.grounding_evidence.grounded_mobility_targets = mobility_targets
+        sources = dict(enriched.grounding_evidence.evidence_sources or {})
+        source_list = list(sources.get("ue_slice_subscription") or [])
+        authority = str(subscription.get("authority") or "free5gc_udr_subscription_data").strip()
+        if authority and authority not in source_list:
+            source_list.append(authority)
+        sources["ue_slice_subscription"] = source_list
+        enriched.grounding_evidence.evidence_sources = sources
+        return enriched
 

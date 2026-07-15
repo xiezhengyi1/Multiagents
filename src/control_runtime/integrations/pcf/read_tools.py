@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 
 from langchain.tools import ToolRuntime
+import requests
 
 from shared.logging import setup_logger
 from shared.runtime import AgentRuntimeContext
@@ -17,6 +19,93 @@ from ..storage import (
 from .helpers import _trim_am_policy_context_for_agent, _trim_sm_ue_context_for_agent, _trim_ue_context_for_agent
 
 logger = setup_logger(__name__)
+
+UDR_BASE_URL = str(os.getenv("UDR_BASE_URL", "http://10.100.200.4:8000")).rstrip("/")
+UDR_SERVING_PLMN_ID = str(os.getenv("UDR_SERVING_PLMN_ID", "20893")).strip()
+try:
+    UDR_REQUEST_TIMEOUT_SEC = max(0.1, float(os.getenv("UDR_REQUEST_TIMEOUT_SEC", "5")))
+except (TypeError, ValueError):
+    UDR_REQUEST_TIMEOUT_SEC = 5.0
+
+
+def _normalize_snssai_key(value: object) -> str:
+    if isinstance(value, dict):
+        try:
+            sst = int(value.get("sst"))
+        except (TypeError, ValueError):
+            return ""
+        sd = str(value.get("sd") or "").strip().lower()
+        if not 0 <= sst <= 255 or len(sd) != 6 or any(char not in "0123456789abcdef" for char in sd):
+            return ""
+        return f"{sst:02x}{sd}"
+    text = str(value or "").strip().lower()
+    if len(text) == 8 and all(char in "0123456789abcdef" for char in text):
+        return text
+    return ""
+
+
+def _read_udr_json(path: str) -> tuple[dict, bool]:
+    response = requests.get(f"{UDR_BASE_URL}{path}", timeout=UDR_REQUEST_TIMEOUT_SEC)
+    if response.status_code == 404:
+        return {}, False
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f"UDR returned a non-object payload for {path}")
+    return dict(payload), True
+
+
+def _normalize_ue_slice_subscription(
+    *,
+    supi: str,
+    serving_plmn_id: str,
+    am_data: dict,
+    smf_selection_data: dict,
+    am_data_found: bool,
+    smf_selection_found: bool,
+) -> dict:
+    nssai = am_data.get("nssai") if isinstance(am_data.get("nssai"), dict) else {}
+    subscribed_infos = (
+        smf_selection_data.get("subscribedSnssaiInfos")
+        if isinstance(smf_selection_data.get("subscribedSnssaiInfos"), dict)
+        else {}
+    )
+    default_snssais = [
+        key
+        for key in (_normalize_snssai_key(item) for item in (nssai.get("defaultSingleNssais") or []))
+        if key
+    ]
+    am_single_snssais = [
+        key
+        for key in (_normalize_snssai_key(item) for item in (nssai.get("singleNssais") or []))
+        if key
+    ]
+    subscribed_snssai_infos: dict[str, dict] = {}
+    for raw_key, value in subscribed_infos.items():
+        key = _normalize_snssai_key(raw_key)
+        if key and isinstance(value, dict):
+            subscribed_snssai_infos[key] = dict(value)
+    authorized_snssais = list(
+        dict.fromkeys([*default_snssais, *am_single_snssais, *subscribed_snssai_infos.keys()])
+    )
+    dnn_availability = {
+        key: [
+            str(item.get("dnn") or "").strip()
+            for item in (details.get("dnnInfos") or [])
+            if isinstance(item, dict) and str(item.get("dnn") or "").strip()
+        ]
+        for key, details in subscribed_snssai_infos.items()
+    }
+    return {
+        "supi": supi,
+        "authority": "free5gc_udr_subscription_data",
+        "serving_plmn_id": serving_plmn_id,
+        "records_found": bool(am_data_found or smf_selection_found),
+        "authorized_snssais": authorized_snssais,
+        "default_snssais": list(dict.fromkeys(default_snssais)),
+        "subscribed_snssai_infos": subscribed_snssai_infos,
+        "dnn_availability": dnn_availability,
+    }
 
 
 def _project_sm_flow_catalog_for_agent(catalog: object) -> dict:
@@ -187,6 +276,49 @@ def get_sm_ue_flow_catalog(
         ctx = runtime.context
         prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
     return f"{prefix}SM UE Flow Catalog Retrieved:\n {result}"
+
+
+@tool_with_reason
+def get_ue_slice_subscription(
+    supi: str = "",
+    serving_plmn_id: str = "",
+    runtime: ToolRuntime[AgentRuntimeContext] = None,
+) -> str:
+    """
+    Read authoritative UE slice subscription entitlement from free5GC UDR.
+    Use this before treating a requested S-NSSAI change as executable.
+    This tool is read-only and does not create or modify subscription data.
+    """
+    normalized_supi = str(supi or "").strip()
+    normalized_plmn = str(serving_plmn_id or UDR_SERVING_PLMN_ID).strip()
+    if not normalized_supi:
+        return "UE Slice Subscription Query Failed: supi is required"
+    if not normalized_plmn:
+        return "UE Slice Subscription Query Failed: serving_plmn_id is required"
+
+    base_path = f"/nudr-dr/v2/subscription-data/{normalized_supi}/{normalized_plmn}/provisioned-data"
+    try:
+        am_data, am_data_found = _read_udr_json(f"{base_path}/am-data")
+        smf_selection_data, smf_selection_found = _read_udr_json(
+            f"{base_path}/smf-selection-subscription-data"
+        )
+        subscription = _normalize_ue_slice_subscription(
+            supi=normalized_supi,
+            serving_plmn_id=normalized_plmn,
+            am_data=am_data,
+            smf_selection_data=smf_selection_data,
+            am_data_found=am_data_found,
+            smf_selection_found=smf_selection_found,
+        )
+    except (requests.RequestException, ValueError) as exc:
+        logger.error(f"Failed to read UE slice subscription for {normalized_supi}: {exc}")
+        return f"UE Slice Subscription Query Failed: {exc}"
+
+    prefix = ""
+    if runtime is not None:
+        ctx = runtime.context
+        prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
+    return f"{prefix}UE Slice Subscription Retrieved:\n{json.dumps(subscription, ensure_ascii=False, indent=2)}"
 
 
 @tool_with_reason

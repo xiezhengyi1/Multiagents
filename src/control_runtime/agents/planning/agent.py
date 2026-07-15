@@ -58,6 +58,22 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         self.initialize_agent_runtime(logger_color="\033[94m")
         self.last_failure_debug: dict[str, Any] = {}
 
+    @staticmethod
+    def _active_domain_names(planning_request: PlanningRequest) -> set[str]:
+        domain_values = (
+            planning_request.context.active_domains
+            or planning_request.operation_intent.requested_domains
+            or []
+        )
+        return {
+            str(item.value if hasattr(item, "value") else item or "").strip().lower()
+            for item in domain_values
+            if str(item.value if hasattr(item, "value") else item or "").strip()
+        }
+
+    def _include_knowledge_tools(self, planning_request: PlanningRequest) -> bool:
+        return self.rag_enabled and self._active_domain_names(planning_request) != {"qos"}
+
     def handle_artifact(self, envelope: ArtifactEnvelope) -> PolicyPlanDraft:
         planning_request = PlanningRequest.model_validate(envelope.payload)
         return self._generate_strategy(planning_request=planning_request, request_envelope=envelope)
@@ -119,9 +135,10 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         try:
             planning_evidence = self.compiler.build_planning_evidence(effective_request)
             prompt_planning_tools, _ = build_request_tools(effective_request)
+            include_knowledge_tools = self._include_knowledge_tools(effective_request)
             available_tool_names = [
                 str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
-                for tool in [*([] if not self.rag_enabled else self._RAG_TOOLS), *prompt_planning_tools]
+                for tool in [*(self._RAG_TOOLS if include_knowledge_tools else []), *prompt_planning_tools]
                 if str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
             ]
             prompt_builder = PlanningPromptBuilder()
@@ -319,9 +336,10 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         )
         planning_tools, tools_cache = build_request_tools(planning_request)
         self._tools_cache = tools_cache
+        include_knowledge_tools = self._include_knowledge_tools(planning_request)
         advisor_agent = self.create_json_agent(
             tools=[
-                *([] if not self.rag_enabled else self._RAG_TOOLS),
+                *(self._RAG_TOOLS if include_knowledge_tools else []),
                 *planning_tools,
             ],
             system_prompt=PlanningPromptBuilder().system_prompt(),

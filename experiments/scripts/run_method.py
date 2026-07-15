@@ -52,6 +52,24 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _summary_model_suffix(*, is_workflow_method: bool, use_deepseek: bool = False, use_qwen: bool = False) -> str:
+    if is_workflow_method:
+        return "deepseek" if use_deepseek else "qwen"
+    return "qwen" if use_qwen else "deepseek"
+
+
+def _summary_output_path(
+    *,
+    method_slug: str,
+    stamp: str,
+    scenario_id: str,
+    model_suffix: str,
+) -> Path:
+    scenario_suffix = str(scenario_id or "").strip() or "mixed"
+    normalized_model_suffix = str(model_suffix or "").strip() or "default"
+    return SUMMARY_DIR / f"{method_slug}_summary_{stamp}_{scenario_suffix}_{normalized_model_suffix}.json"
+
+
 def _append_ledger(row: Dict[str, Any]) -> None:
     with LEDGER_PATH.open("a", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -154,7 +172,12 @@ def _run_ours(
     result_output = RAW_RUN_DIR / f"{method_slug}_runs_{stamp}.jsonl"
     workflow_output = RAW_RUN_DIR / f"{method_slug}_trajectories_{stamp}.jsonl"
     spec_output = RAW_RUN_DIR / f"{method_slug}_specs_{stamp}.jsonl"
-    summary_output = SUMMARY_DIR / f"{method_slug}_summary_{stamp}.json"
+    summary_output = _summary_output_path(
+        method_slug=method_slug,
+        stamp=stamp,
+        scenario_id=scenario_id,
+        model_suffix=_summary_model_suffix(is_workflow_method=True, use_deepseek=use_deepseek),
+    )
 
     command = [
         str(PYTHON_EXE),
@@ -213,7 +236,12 @@ def _run_single_agent(
     case_count = _resolve_case_count(user_inputs_path, start_index=start_index)
     stamp = _timestamp()
     result_output = RAW_RUN_DIR / f"{method_id.lower()}_runs_{stamp}.jsonl"
-    summary_output = SUMMARY_DIR / f"{method_id.lower()}_summary_{stamp}.json"
+    summary_output = _summary_output_path(
+        method_slug=method_id.lower(),
+        stamp=stamp,
+        scenario_id=scenario_id,
+        model_suffix=_summary_model_suffix(is_workflow_method=False, use_qwen=use_qwen),
+    )
     command = [
         str(PYTHON_EXE),
         str(PROJECT_ROOT / "experiments" / "scripts" / "run_single_agent_experiment.py"),

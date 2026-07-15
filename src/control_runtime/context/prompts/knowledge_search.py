@@ -37,7 +37,7 @@ OSA-specific knowledge-search rules:
 - Search only when one required executable field still depends on an exact external 3GPP object or enumerated token that local runtime evidence does not provide.
 - If an executable field is blocked by missing optimizer or mobility evidence, return `partial_plan` or `needs_upstream_reground` instead of searching for a standards-side substitute.
 - Never use knowledge tools to validate, justify, or soften values that are already fixed by optimizer output, live UE context, or local schema.
-- You have at most 2 calls to `get_knowledge_by_key` per round. If the first call does not resolve the missing fact exactly, assume the second will not either — finalize from current evidence. Do not burn both calls without new evidence to guide the second query.
+- You have at most 1 call to `get_knowledge_by_key` per round. If it does not resolve the missing fact exactly, finalize from current evidence. Do not retry the same knowledge lookup.
 """
 )
 

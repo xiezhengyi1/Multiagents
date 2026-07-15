@@ -117,6 +117,7 @@ Output contract (violations are rejected):
 - `rationale` MUST be a string. Lists are `[]` when empty; `am_policy` is `null` only when mobility is inactive. Never emit `{}` as an optional policy value.
 - Never return a bare policy object like `{\"flow_id\":...}` outside the sm_policies array.
 - Every SmPolicySpec has an exact OperationIntent flow_id/app_id, priority 1-15, target_latency_ms >= 1.0, packet_error_rate 0-1, max_br_ul_mbps, and max_br_dl_mbps. Optional GBR cannot exceed maxBR.
+- Optimizer output is evidence, not an SmPolicySpec. Never copy `new_slice`, `current_slice`, `slice_snssai`, `jitter_ms`, or other allocation metadata into sm_policies. The compiler retains the optimizer assignment and generates the executable policy_id; `policy_id` belongs only in partial_policies. When jitter is needed in an SM policy, use the exact key `target_jitter_ms`.
 - Every AmPolicySpec has non-empty triggers, rfsp >= 1, non-empty allowed_snssais, and target_snssais contained in allowed_snssais.
 - Every UrspPolicySpec uses target_type `flow` or `app`, app_id, relat_precedence >= 1, and non-empty route_sel_param_sets; a flow target also needs flow_id and traffic_desc.
 - Partial policy items MUST include: policy_type, policy_id, and grounded flow_id/app_id/target_type plus blocked_reason when available.
@@ -187,7 +188,7 @@ def build_validation_retry_prompt(
             "Your previous answer included fields not in the OsaAdvisorOutput schema. "
             "Remove every unsupported top-level field. "
             "Unsupported fields may be nested, not only top-level. "
-            "Inside sm_policies, remove policy_id, policy_type, target_type, policy_details, and any other field outside SmPolicySpec. "
+            "Inside sm_policies, remove policy_id, policy_type, target_type, policy_details, slice_snssai, new_slice, jitter_ms, and any other field outside SmPolicySpec. "
             "SmPolicySpec fields are only: flow_id, app_id, priority, target_latency_ms, packet_error_rate, "
             "max_br_ul_mbps, max_br_dl_mbps, optional gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, flow_description. "
             "Only emit the defined OsaAdvisorOutput fields.\n\n"

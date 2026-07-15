@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -10,8 +11,17 @@ import requests
 from .helpers import _coerce_identifier, _parse_policy_details
 from .policy_enrichment import _enrich_sm_policy_details
 
+def _positive_env_float(name: str, default: float) -> float:
+    try:
+        return max(0.01, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
 PCF_BASE_URL = str(os.getenv('PCF_BASE_URL', 'http://localhost:18080')).rstrip('/')
-PCF_FEEDBACK_REQUEST_TIMEOUT_SEC = 5
+PCF_FEEDBACK_REQUEST_TIMEOUT_SEC = _positive_env_float('PCF_FEEDBACK_REQUEST_TIMEOUT_SEC', 5)
+PCF_POLICY_POLL_INTERVAL_SEC = _positive_env_float('PCF_POLICY_POLL_INTERVAL_SEC', 0.5)
+PCF_POLICY_OVERALL_DEADLINE_SEC = _positive_env_float('PCF_POLICY_OVERALL_DEADLINE_SEC', 30)
 AM_POLICY_TYPE = 'PcfAmPolicyControlPolicyAssociation'
 POLICY_EXECUTION_PATH = '/policy-executions'
 
@@ -75,6 +85,7 @@ def dispatch_policy_to_pcf_request(
     request_id: Optional[str] = None,
     session_id: Optional[str] = None,
     snapshot_id: Optional[str] = None,
+    overall_deadline_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
     try:
         payload = build_dispatch_envelope(
@@ -106,6 +117,7 @@ def dispatch_policy_to_pcf_request(
         response = requests.post(
             f"{PCF_BASE_URL}{POLICY_EXECUTION_PATH}",
             json=payload,
+            timeout=PCF_FEEDBACK_REQUEST_TIMEOUT_SEC,
         )
     except requests.exceptions.RequestException as exc:
         return {
@@ -122,6 +134,8 @@ def dispatch_policy_to_pcf_request(
     result: Dict[str, Any] = {"status": "success" if response.ok else "failed", "response_code": response.status_code, **payload}
     if response.ok:
         result.update(response_payload if isinstance(response_payload, dict) else {"response": response_payload})
+        if str(result.get('status') or '').strip().lower() == 'pending':
+            return _poll_policy_execution(payload, result, overall_deadline_sec=overall_deadline_sec)
     else:
         result["error"] = (
             response_payload.get("error")
@@ -141,24 +155,23 @@ def dispatch_policy_to_pcf(policy_type: str, policy_json: str) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def get_network_feedback(policy_id: str) -> str:
-    """
-    Query feedback for a policy from the monitoring side.
-    """
-    normalized_policy_id = str(policy_id or "").strip()
-    if not normalized_policy_id:
-        return json.dumps({"status": "failed", "error": "policy_id is required"}, ensure_ascii=False)
+def _fetch_network_feedback(execution_id: str) -> Dict[str, Any]:
+    normalized_execution_id = str(execution_id or '').strip()
+    if not normalized_execution_id:
+        return {'status': 'failed', 'error': 'operation_id is required'}
 
     try:
         response = requests.get(
-            f"{PCF_BASE_URL}{POLICY_EXECUTION_PATH}/{normalized_policy_id}",
+            f"{PCF_BASE_URL}{POLICY_EXECUTION_PATH}/{normalized_execution_id}",
             timeout=PCF_FEEDBACK_REQUEST_TIMEOUT_SEC,
         )
     except requests.exceptions.RequestException as exc:
-        return json.dumps(
-            {"status": "failed", "policy_id": normalized_policy_id, "error": f"monitor request failed: {exc}"},
-            ensure_ascii=False,
-        )
+        return {
+            'status': 'failed',
+            'operation_id': normalized_execution_id,
+            'phase': 'feedback',
+            'error': f'monitor request failed: {exc}',
+        }
 
     try:
         payload = response.json()
@@ -167,7 +180,7 @@ def get_network_feedback(policy_id: str) -> str:
 
     result = {
         "status": "success" if response.ok else "failed",
-        "policy_id": normalized_policy_id,
+        "operation_id": normalized_execution_id,
         "response_code": response.status_code,
     }
     if response.ok:
@@ -177,4 +190,51 @@ def get_network_feedback(policy_id: str) -> str:
             result["response"] = payload
     else:
         result["error"] = payload.get("error") if isinstance(payload, dict) else response.text
-    return json.dumps(result, ensure_ascii=False)
+    return result
+
+
+def _poll_policy_execution(
+    dispatch_payload: Dict[str, Any],
+    initial_result: Dict[str, Any],
+    *,
+    overall_deadline_sec: Optional[float],
+) -> Dict[str, Any]:
+    operation_id = str(initial_result.get('operation_id') or '').strip()
+    if not operation_id:
+        return {
+            **dispatch_payload,
+            **initial_result,
+            'status': 'failed',
+            'phase': 'dispatch_contract',
+            'error': 'pending policy execution response did not include operation_id',
+        }
+
+    deadline_seconds = (
+        PCF_POLICY_OVERALL_DEADLINE_SEC
+        if overall_deadline_sec is None
+        else max(0.01, float(overall_deadline_sec))
+    )
+    deadline = time.monotonic() + deadline_seconds
+    latest_result = dict(initial_result)
+    while True:
+        status = str(latest_result.get('status') or '').strip().lower()
+        if status in {'applied', 'failed'}:
+            return {**dispatch_payload, **latest_result}
+        if time.monotonic() >= deadline:
+            return {
+                **dispatch_payload,
+                **latest_result,
+                'status': 'pending',
+                'status_code': 202,
+                'phase': 'pda_deadline',
+                'operation_id': operation_id,
+                'message': 'PDA deadline reached; continue querying with operation_id.',
+                'error': '',
+            }
+        time.sleep(min(PCF_POLICY_POLL_INTERVAL_SEC, max(0.0, deadline - time.monotonic())))
+        latest_result = _fetch_network_feedback(operation_id)
+
+
+def get_network_feedback(execution_id: str) -> str:
+    """Query feedback for a policy operation from the monitoring side."""
+    return json.dumps(_fetch_network_feedback(execution_id), ensure_ascii=False)

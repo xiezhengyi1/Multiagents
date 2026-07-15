@@ -17,6 +17,7 @@ class OperationIntentProjector(BaseProjector):
         field("domain_resolution"),
         field("control_semantics"),
         field("mobility_intent"),
+        field("slice_migration_authorization"),
     )
     excluded = (
         exclude("open_questions", reason="Handled by artifact contracts, not LLM prompt projection"),

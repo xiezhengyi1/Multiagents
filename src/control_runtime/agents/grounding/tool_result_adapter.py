@@ -12,6 +12,7 @@ TOOL_RESULT_MARKERS: Dict[str, str] = {
     "search_sm_flow_targets": "SM Flow Target Search Retrieved:",
     "get_am_policy_context": "AM Policy Context Retrieved:",
     "search_am_policy_targets": "AM Policy Target Search Retrieved:",
+    "get_ue_slice_subscription": "UE Slice Subscription Retrieved:",
 }
 
 

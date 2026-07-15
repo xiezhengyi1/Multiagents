@@ -114,6 +114,59 @@ class ExecutionController:
         detail_flow_id = policy_details.get("flow_id") if isinstance(policy_details, dict) else ""
         return str(policy.get("flow_id") or detail_flow_id or "").strip()
 
+    @staticmethod
+    def _normalize_snssai(value: Any) -> str:
+        if isinstance(value, dict):
+            try:
+                sst = int(value.get("sst"))
+            except (TypeError, ValueError):
+                return ""
+            sd = str(value.get("sd") or "").strip().lower()
+            if not sd or len(sd) != 6 or any(char not in "0123456789abcdef" for char in sd):
+                return ""
+            return f"{sst:02x}{sd}"
+        return str(value or "").strip().lower()
+
+    @classmethod
+    def _slice_execution_error(
+        cls,
+        *,
+        policy: Dict[str, Any],
+        dispatch_result: Dict[str, Any],
+    ) -> tuple[str | None, Dict[str, Any]]:
+        policy_details = dispatch_result.get("policy_details")
+        if not isinstance(policy_details, dict):
+            policy_details = policy.get("policy_details") if isinstance(policy.get("policy_details"), dict) else {}
+        upstream_context = policy_details.get("upstreamSmPolicyContextData")
+        if not isinstance(upstream_context, dict):
+            return None, {}
+        requested_slice = cls._normalize_snssai(upstream_context.get("sliceInfo"))
+        if not requested_slice:
+            return None, {}
+
+        monitoring_data = dispatch_result.get("monitoring_data")
+        observed_allocation = monitoring_data.get("observed_allocation") if isinstance(monitoring_data, dict) else {}
+        observed_slice = cls._normalize_snssai(
+            observed_allocation.get("current_slice_snssai") if isinstance(observed_allocation, dict) else None
+        )
+        evidence = {
+            "requested_slice_snssai": requested_slice,
+            "observed_slice_snssai": observed_slice or None,
+        }
+        if not observed_slice:
+            return (
+                f"policy {policy['policy_id']} dispatch was acknowledged but ns-3 returned no observed slice state "
+                f"for requested slice {requested_slice}",
+                evidence,
+            )
+        if observed_slice != requested_slice:
+            return (
+                f"policy {policy['policy_id']} dispatch was acknowledged but ns-3 remained on slice "
+                f"{observed_slice} instead of requested slice {requested_slice}",
+                evidence,
+            )
+        return None, evidence
+
     def _is_mobility_policy(self, policy: Optional[Dict[str, Any]]) -> bool:
         return isinstance(policy, dict) and str(policy.get("policy_type") or "").strip() == self.AM_POLICY_TYPE
 
@@ -150,6 +203,24 @@ class ExecutionController:
         )
         last_result = result if isinstance(result, dict) else {"status": "failed", "error": str(result)}
         if last_result.get("status") == "success":
+            slice_error, slice_evidence = self._slice_execution_error(
+                policy=policy,
+                dispatch_result=last_result,
+            )
+            if slice_error:
+                raise ExecutionDecisionError(
+                    slice_error,
+                    feedback_payload={
+                        "phase": "dispatch",
+                        "policy_id": policy.get("policy_id"),
+                        "policy_type": policy.get("policy_type"),
+                        "flow_id": self._policy_flow_id(policy),
+                        "error": slice_error,
+                        "slice_execution": slice_evidence,
+                        "last_dispatch_result": last_result,
+                    },
+                    dispatch_attempts=1,
+                )
             return last_result, 1
         failure_message = (
             f"policy {policy['policy_id']} dispatch failed: "

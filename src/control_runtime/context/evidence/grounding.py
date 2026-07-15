@@ -4,7 +4,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ...domain.policy_plan import FlowSelector
-from ...domain.intent_encoding import normalize_domain_evidence, normalize_requested_domains, uses_am_grounding, uses_sm_grounding
+from ...domain.intent_encoding import normalize_domain_evidence, normalize_requested_domains
 from ...agents.grounding.contracts import ExplicitFlowTarget, FlowCandidateEvidence, IntentEvidence
 
 
@@ -20,14 +20,16 @@ class IntentEvidenceBuilder:
         semantic_candidates: List[Dict[str, Any]],
         am_context_payload: Optional[Dict[str, Any]] = None,
         am_policy_candidates: Optional[List[Dict[str, Any]]] = None,
+        subscription_payload: Optional[Dict[str, Any]] = None,
     ) -> IntentEvidence:
         flow_match = re.search(r"(?i)\b(flow-\d+)\b", user_input)
         app_match = re.search(r"(?i)\b(app-\d+)\b", user_input)
         requested_domains = normalize_requested_domains(main_directives.get("requested_domains"))
-        resolved_catalog_payload = dict(catalog_payload or {}) if uses_sm_grounding(requested_domains) else {}
-        resolved_semantic_candidates = list(semantic_candidates or []) if uses_sm_grounding(requested_domains) else []
-        resolved_am_context = dict(am_context_payload or {}) if uses_am_grounding(requested_domains) else {}
-        resolved_am_policy_candidates = list(am_policy_candidates or []) if uses_am_grounding(requested_domains) else []
+        resolved_catalog_payload = dict(catalog_payload or {})
+        resolved_semantic_candidates = list(semantic_candidates or [])
+        resolved_am_context = dict(am_context_payload or {})
+        resolved_am_policy_candidates = list(am_policy_candidates or [])
+        resolved_subscription_payload = dict(subscription_payload or {})
         app_catalog = resolved_catalog_payload.get("app_catalog") or []
         flow_catalog = resolved_catalog_payload.get("flow_catalog") or []
         explicit_flow_id = flow_match.group(1) if flow_match else ""
@@ -106,10 +108,12 @@ class IntentEvidenceBuilder:
             domain_evidence=normalize_domain_evidence(main_directives.get("domain_evidence")),
             am_context_summary=self._summarize_am_context(resolved_am_context),
             am_policy_candidates=self._normalize_am_policy_candidates(resolved_am_policy_candidates),
+            subscription_summary=self._summarize_subscription(resolved_subscription_payload),
             catalog_evidence_observed=bool(catalog_evidence_observed or resolved_catalog_payload),
             catalog_payload=resolved_catalog_payload,
             semantic_candidates=resolved_semantic_candidates,
             am_context_payload=resolved_am_context,
+            subscription_payload=resolved_subscription_payload,
         )
 
     @classmethod
@@ -379,6 +383,23 @@ class IntentEvidenceBuilder:
         if service_area_restriction:
             summary["service_area_restriction"] = service_area_restriction
         return summary
+
+    @staticmethod
+    def _summarize_subscription(subscription_payload: Any) -> Dict[str, Any]:
+        if not isinstance(subscription_payload, dict):
+            return {}
+        return {
+            key: subscription_payload.get(key)
+            for key in (
+                "authority",
+                "serving_plmn_id",
+                "records_found",
+                "authorized_snssais",
+                "default_snssais",
+                "dnn_availability",
+            )
+            if subscription_payload.get(key) not in (None, "", [], {})
+        }
 
     @staticmethod
     def _normalize_am_policy_candidates(candidates: Any) -> List[Dict[str, Any]]:

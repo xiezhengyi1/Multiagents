@@ -53,12 +53,15 @@ Domain routing:
 - Background AM context alone does not imply mobility. Background flow context
   alone does not imply qos.
 - Honor negative constraints such as "do not change mobility" or "do not change qos".
-- Slice reassignment alone is qos. Add mobility only when continuity, handover
-  safety, or slice-residency constraints are explicitly coupled to it.
-- Generic stability, priority, or better fit wording does not prove mobility.
-- A request to migrate an app/flow to a lower-latency slice is qos, not mobility,
-  unless it explicitly asks for handover, AM-policy, RFSP, allowed/target NSSAI,
-  tracking area, service area, or UE mobility behavior changes.
+- Do not classify a request from migration vocabulary alone. Distinguish an
+  in-place QoS reallocation from an actual change of the UE serving S-NSSAI.
+- For an actual S-NSSAI migration, choose the domains needed for IEA to ground
+  both the QoS flow and AM/subscription feasibility. It may be QoS-only when
+  runtime evidence supports an in-place QoS reallocation, or QoS plus mobility
+  when an AM policy change is part of the requested execution. State the
+  uncertainty and required entitlement evidence; IEA may revise this boundary.
+- Generic stability, priority, or better-fit wording does not by itself prove a
+  mobility action.
 - "Control stability" should normally become objective_profile.profile_name=
   "stability_first" and a forbidden assumption against unnecessary churn; it is
   not by itself a mobility domain request.

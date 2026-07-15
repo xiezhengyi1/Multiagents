@@ -21,7 +21,6 @@ Domain rules:
 - If mobility is requested, output `am_policy`.
 - If both are requested, output both and keep them consistent.
 - QoS-only requests must not call mobility tools or output `am_policy`.
-- QoS-only requests must not call `inspect_mobility_ue_policies`; slice reassignment by itself is an SM/QoS planning action, not an AM-policy action.
 - Mobility-only requests must not call QoS tools or output `sm_policies`.
 
 Grounding rules:
@@ -52,8 +51,23 @@ Hard rules:
 - Never compound QoS targets across retries. Treat OperationIntent.flows and qos_target_envelopes as the case baseline; `target_latency_ms` in executable SM policies must be >= 1.0 and backed by optimizer/runtime evidence. If a hard request would require sub-1ms latency, return partial_plan with blocked_targets/planner_conflicts instead of emitting an executable policy.
 
 QoS slice migration rules:
-- Migration wording includes: migrate, switch, move away, 迁出, 迁移, 切换, 换到. Treat those requests as QoS-only unless the user explicitly asks for AM policy, RFSP, allowed/target NSSAI, service area, registration, handover, or UE mobility-state changes.
+- Use `OperationIntent.slice_migration_authorization` as the IEA-selected
+	migration decision and entitlement contract. Its authorized S-NSSAI keys
+	originate from UDR subscription evidence, which is authoritative; AM
+	`allowedSnssais` is not a substitute for that entitlement.
 - Use `current_slice_snssai` from OperationIntent/Planning evidence as the source slice. Compare it with optimizer `qos_flow_assignments[].new_slice`; when both are present, `new_slice != current_slice_snssai` is the evidence of slice migration.
+- When IEA requires a slice change and the optimizer selects a different
+	S-NSSAI, compare that concrete target with the authorized keys before output.
+	If it is authorized, output coordinated AM+SM policy: AM `target_snssais`
+	must include the optimizer target and AM `allowed_snssais` must cover it.
+	The compiler dispatches AM before SM, so do not use SM-only to represent a
+	serving-S-NSSAI migration.
+- If the optimizer target is not subscribed, or IEA says provisioning is
+	required/evidence is missing, return `needs_upstream_reground` with an
+	explicit UDR subscription provisioning request. Do not output AM, SM, or
+	URSP policy payloads that add or bypass the missing entitlement.
+- URSP is unavailable in this deployment. Never use an URSP policy as a
+	replacement for subscription provisioning or AM+SM migration.
 - If Planning evidence or OperationIntent contains `operation_constraints[].require_slice_change=true`, keeping `new_slice == source_slice_snssai` is not a valid executable migration. Return `partial_plan` with `planner_conflicts` if the optimizer cannot produce a different grounded slice.
 - `preview_qos_optimizer` has no target-slice or exclude-current-slice argument. Do not invent such arguments. Pick objective_profile/optimization_template from the user goal and trust the returned optimizer assignment.
 - For "from current slice" or cross-slice exploration, do not first call `fetch_qos_network_status` with the flow's current `service_type_id`, because that filters candidates to the current service/SST. Fetch all slices without `service_type_id` unless you are only checking capacity of an already selected slice.

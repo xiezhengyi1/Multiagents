@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from ...context.evidence import build_slice_snssai
 from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import FlowSelector, PlanningRationale, PolicyDraft, PolicyPlanDraft
 from .planning_validation import (
@@ -127,27 +128,6 @@ class PlanningArtifactCompiler:
                 planning_request=planning_request,
             )
 
-        for spec in advisor_output.sm_policies:
-            flow_ctx = self._resolve_flow(planning_request, spec.flow_id)
-            if _normalize_app_id(spec.app_id) != _normalize_app_id(flow_ctx.app_id or ""):
-                raise ValueError(f"sm policy app_id does not match resolved flow context for flow_id={spec.flow_id}")
-            resource_keys = PlanningAdvisorValidator()._extract_qos_resource_keys(optimizer_preview, flow_id=spec.flow_id)
-            if not resource_keys:
-                raise ValueError(f"optimizer preview does not contain a grounded QoS assignment for flow_id={spec.flow_id}")
-            plan.all_policies.append(
-                PolicyDraft(
-                    recommended_actions=[],
-                    supi=str(flow_ctx.supi or planning_request.operation_intent.supi or "").strip(),
-                    app_id=_normalize_app_id(spec.app_id),
-                    flow_id=spec.flow_id,
-                    target_type="flow",
-                    policy_id=f"smp-{_normalize_app_id(spec.app_id)}-{spec.flow_id}",
-                    policy_type="SmPolicyDecision",
-                    resource_keys=resource_keys,
-                    policy_details=self._build_sm_policy_details(spec, flow_ctx),
-                )
-            )
-
         if advisor_output.am_policy is not None:
             plan.all_policies.append(
                 PolicyDraft(
@@ -165,6 +145,35 @@ class PlanningArtifactCompiler:
                         advisor_output.am_policy,
                         planning_request=planning_request,
                         mobility_context=mobility_context,
+                    ),
+                )
+            )
+
+        for spec in advisor_output.sm_policies:
+            flow_ctx = self._resolve_flow(planning_request, spec.flow_id)
+            if _normalize_app_id(spec.app_id) != _normalize_app_id(flow_ctx.app_id or ""):
+                raise ValueError(f"sm policy app_id does not match resolved flow context for flow_id={spec.flow_id}")
+            resource_keys = PlanningAdvisorValidator()._extract_qos_resource_keys(optimizer_preview, flow_id=spec.flow_id)
+            if not resource_keys:
+                raise ValueError(f"optimizer preview does not contain a grounded QoS assignment for flow_id={spec.flow_id}")
+            target_slice_snssai = self._target_slice_snssai(
+                resource_keys=resource_keys,
+                flow_id=spec.flow_id,
+            )
+            plan.all_policies.append(
+                PolicyDraft(
+                    recommended_actions=[],
+                    supi=str(flow_ctx.supi or planning_request.operation_intent.supi or "").strip(),
+                    app_id=_normalize_app_id(spec.app_id),
+                    flow_id=spec.flow_id,
+                    target_type="flow",
+                    policy_id=f"smp-{_normalize_app_id(spec.app_id)}-{spec.flow_id}",
+                    policy_type="SmPolicyDecision",
+                    resource_keys=resource_keys,
+                    policy_details=self._build_sm_policy_details(
+                        spec,
+                        flow_ctx,
+                        target_slice_snssai=target_slice_snssai,
                     ),
                 )
             )
@@ -231,7 +240,31 @@ class PlanningArtifactCompiler:
         raise ValueError(f"unknown flow_id in advisor output: {flow_id}")
 
     @staticmethod
-    def _build_sm_policy_details(spec: SmPolicySpec, flow_ctx: FlowSelector) -> Dict[str, Any]:
+    def _target_slice_snssai(*, resource_keys: List[str], flow_id: str) -> str:
+        selected_slices = {
+            str(resource_key).removeprefix("slice:").strip()
+            for resource_key in resource_keys
+            if str(resource_key).startswith("slice:") and str(resource_key).removeprefix("slice:").strip()
+        }
+        if len(selected_slices) != 1:
+            raise ValueError(
+                f"optimizer preview must provide exactly one target slice for flow_id={flow_id}; "
+                f"received {sorted(selected_slices)}"
+            )
+        target_slice_snssai = selected_slices.pop()
+        if build_slice_snssai(target_slice_snssai) is None:
+            raise ValueError(
+                f"optimizer preview returned invalid target slice S-NSSAI for flow_id={flow_id}: {target_slice_snssai}"
+            )
+        return target_slice_snssai
+
+    @staticmethod
+    def _build_sm_policy_details(
+        spec: SmPolicySpec,
+        flow_ctx: FlowSelector,
+        *,
+        target_slice_snssai: str,
+    ) -> Dict[str, Any]:
         flow_id = str(spec.flow_id or "").strip()
         if not flow_id:
             raise ValueError("SmPolicySpec requires flow_id")
@@ -263,8 +296,12 @@ class PlanningArtifactCompiler:
             qos_payload["gbrDl"] = str(gbr_dl_mbps)
         if spec.target_jitter_ms is not None:
             qos_payload["jitterReq"] = spec.target_jitter_ms
+        target_slice = build_slice_snssai(target_slice_snssai)
+        if target_slice is None:
+            raise ValueError(f"invalid target slice S-NSSAI for flow_id={flow_id}: {target_slice_snssai}")
         return {
             "_preserve_explicit_qos_values": True,
+            "upstreamSmPolicyContextData": {"sliceInfo": target_slice},
             "pccRules": {
                 pcc_id: {
                     "pccRuleId": pcc_id,

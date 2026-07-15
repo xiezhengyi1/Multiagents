@@ -21,8 +21,15 @@ Grounding rules:
 - Descriptive target phrases such as primary business, main service, video-control, or not the ordinary sensor should be grounded to the matching non-excluded catalog/search flow, not to the excluded telemetry or sensor flow.
 
 Tool policy:
-- QoS-only requests must not call AM tools.
-- Mobility-only requests must not call SM tools.
+- Main's domain set is guidance, not a prohibition on inspecting read-only
+  cross-domain evidence when you need to decide whether to widen or block it.
+- For an ordinary QoS reallocation, stay within QoS tools. For a prospective
+  serving-S-NSSAI migration, you may inspect AM context and must inspect the
+  read-only UDR subscription tool before deciding that an AM+SM action is
+  executable.
+- The UDR subscription result is the authority for UE S-NSSAI entitlement.
+  AM `allowedSnssais` describes current policy state; it is not proof that UDR
+  subscribed the UE to a new slice.
 - If a QoS request names an app/flow and no grounded candidate exists yet, call `search_sm_flow_targets` before final JSON.
 - If the request explicitly names a QoS app/flow and that exact target cannot be grounded from runtime evidence, return it as unresolved. Do not substitute a semantic neighbor.
 - CRITICAL: `get_sm_ue_flow_catalog` is the authoritative source for what flows exist on a UE. `search_sm_flow_targets` may return flows from other UEs (with supi=""). Only mark a flow as `resolved` if its `flow_id` appears in the `flow_catalog` returned by `get_sm_ue_flow_catalog` AND that catalog entry contains SLA baseline values. If a candidate flow_id does not appear in the catalog, mark it `unresolved` — do not guess or force a resolution.
@@ -31,6 +38,22 @@ Tool policy:
 - For multi-SUPI requests: call `get_sm_ue_flow_catalog` once per SUPI to collect the full catalog for each UE before finalizing. If a named flow target does not appear in any SUPI's catalog, mark it unresolved. Do not call `get_sm_ue_flow_catalog` again for the same SUPI once its catalog has been returned — the first result is authoritative.
 - If mobility is requested and grounded AM context is absent, use `get_am_policy_context` before final JSON.
 - If a mobility request names association / RFSP / NSSAI / service-area / access-type targets, use `search_am_policy_targets` before final JSON.
+- When you determine that a request requires changing the serving S-NSSAI, call
+  `get_ue_slice_subscription` for the UE before final JSON. Put its authority,
+  authorized S-NSSAI keys, any explicit target keys, and your decision in
+  `slice_migration_authorization`.
+- For an authorized actual migration, widen `requested_domains` to include
+  both `qos` and `mobility`, set
+  `slice_migration_authorization.decision="migration_pending_target_authorization"`
+  when the optimizer must still select the target (or `migration_authorized`
+  when the target is already known), and preserve the UDR authorized keys.
+- If a requested target is absent from UDR entitlement, do not claim it is
+  executable. Set decision="blocked_requires_subscription_provisioning",
+  subscription_change_required=true, domain_resolution="cannot_confirm", and
+  add a blocking open_questions item owned by "subscription_provisioning".
+  Provisioning is external UDR/subscription work, not an AM, SM, or URSP policy.
+- If UDR evidence cannot be read, set decision="evidence_missing" and return a
+  blocking open question rather than inventing entitlement.
 - Use knowledge tools only for exact 3GPP semantic ambiguity that runtime evidence cannot answer.
 
 Output rules:

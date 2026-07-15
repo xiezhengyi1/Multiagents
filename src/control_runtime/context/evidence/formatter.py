@@ -30,6 +30,7 @@ class EvidenceFormatter:
         semantic_candidates: List[Dict[str, Any]],
         am_context_payload: Dict[str, Any] | None = None,
         am_policy_candidates: List[Dict[str, Any]] | None = None,
+        subscription_payload: Dict[str, Any] | None = None,
     ) -> Any:
         # Keep the mature grounding builder as the implementation source while
         # moving the public construction boundary into context.evidence.
@@ -44,6 +45,7 @@ class EvidenceFormatter:
             semantic_candidates=semantic_candidates,
             am_context_payload=am_context_payload,
             am_policy_candidates=am_policy_candidates,
+            subscription_payload=subscription_payload,
         )
 
     @classmethod

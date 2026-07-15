@@ -105,6 +105,17 @@ class QosOperationConstraint(BaseModel):
         return self
 
 
+class SliceMigrationAuthorization(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(default="not_applicable", description="LLM-selected migration authorization decision")
+    authority: str = Field(default="", description="Authoritative subscription evidence source")
+    authorized_snssais: List[str] = Field(default_factory=list, description="Authorized S-NSSAI keys from the entitlement source")
+    target_snssais: List[str] = Field(default_factory=list, description="Known requested target S-NSSAI keys")
+    subscription_change_required: bool = Field(default=False, description="Whether external subscription provisioning is required")
+    rationale: List[str] = Field(default_factory=list, description="Evidence-backed decision rationale")
+
+
 class OperationIntent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -118,6 +129,7 @@ class OperationIntent(BaseModel):
     flows: List[FlowSelector] = Field(default_factory=list, description="Resolved flow selectors")
     qos_target_envelopes: List[QosTargetEnvelope] = Field(default_factory=list, description="IEA-owned QoS target envelopes derived from grounded baselines")
     qos_operation_constraints: List[QosOperationConstraint] = Field(default_factory=list, description="IEA/Main-owned hard QoS operation constraints")
+    slice_migration_authorization: SliceMigrationAuthorization = Field(default_factory=SliceMigrationAuthorization, description="IEA-selected authorization state for a requested slice migration")
     open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
     @model_validator(mode="after")

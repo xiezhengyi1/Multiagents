@@ -205,6 +205,25 @@ class PlanningAdvisorValidator:
         has_sm = bool(advisor_output.sm_policies)
         has_am = advisor_output.am_policy is not None
         has_ursp = bool(advisor_output.ursp_policies)
+        migration_requirements = self._required_slice_change_constraints(planning_request)
+        migration_blocked = self._migration_is_blocked_by_iea(planning_request)
+        migration_target_unauthorized = self._migration_target_is_unauthorized(
+            planning_request=planning_request,
+            optimizer_preview=self._latest_optimizer_preview(normalized_tool_evidence),
+        )
+
+        if migration_blocked:
+            if planning_status == "executable_plan":
+                errors.append("IEA marked the slice migration blocked pending subscription provisioning or evidence")
+            if has_sm or has_am or has_ursp:
+                errors.append("blocked slice migration must not include executable AM, SM, or URSP policies")
+            return errors
+        if migration_target_unauthorized:
+            if planning_status == "executable_plan":
+                errors.append("optimizer-selected slice is absent from UDR subscription entitlement")
+            if has_sm or has_am or has_ursp:
+                errors.append("unauthorized slice migration must not include executable AM, SM, or URSP policies")
+            return errors
 
         if has_sm and "qos" not in domains:
             errors.append("advisor emitted sm_policies outside qos-active planning")
@@ -214,6 +233,19 @@ class PlanningAdvisorValidator:
             errors.append("qos-active planning requires sm_policies")
         if planning_status == "executable_plan" and "mobility" in domains and not has_am:
             errors.append("mobility-active planning requires am_policy")
+        if migration_requirements and planning_status == "executable_plan":
+            if not has_sm:
+                errors.append("authorized slice migration requires an SM policy")
+            if not has_am:
+                errors.append("authorized slice migration requires an AM policy")
+            if has_am:
+                errors.extend(
+                    self._validate_am_targets_for_slice_migration(
+                        planning_request=planning_request,
+                        optimizer_preview=self._latest_optimizer_preview(normalized_tool_evidence),
+                        am_policy=advisor_output.am_policy,
+                    )
+                )
         if has_sm:
             errors.extend(
                 self._validate_sm_policy_target_bindings(
@@ -230,6 +262,7 @@ class PlanningAdvisorValidator:
                 optimizer_preview,
                 flow_ids=preserved_flow_ids,
             )
+            and not migration_target_unauthorized
             and not self._validate_required_slice_changes(
                 optimizer_preview,
                 planning_request=planning_request,
@@ -286,6 +319,83 @@ class PlanningAdvisorValidator:
                         "target-stable retry sm_policies must preserve grounded flow_ids "
                         f"{sorted(preserved_flow_ids)}; got {sorted(advisor_flow_ids)}"
                     )
+        return errors
+
+    @staticmethod
+    def _normalize_snssai_key(value: Any) -> str:
+        if isinstance(value, dict):
+            try:
+                sst = int(value.get("sst"))
+            except (TypeError, ValueError):
+                return ""
+            sd = str(value.get("sd") or "").strip().lower()
+            if not 0 <= sst <= 255 or len(sd) != 6 or any(char not in "0123456789abcdef" for char in sd):
+                return ""
+            return f"{sst:02x}{sd}"
+        text = str(value or "").strip().lower()
+        if len(text) == 8 and all(char in "0123456789abcdef" for char in text):
+            return text
+        return ""
+
+    @classmethod
+    def _migration_is_blocked_by_iea(cls, planning_request: PlanningRequest) -> bool:
+        authorization = planning_request.operation_intent.slice_migration_authorization
+        return str(authorization.decision or "").strip() in {
+            "blocked_requires_subscription_provisioning",
+            "evidence_missing",
+        }
+
+    @classmethod
+    def _migration_target_is_unauthorized(
+        cls,
+        *,
+        planning_request: PlanningRequest,
+        optimizer_preview: Dict[str, Any],
+    ) -> bool:
+        requirements = cls._required_slice_change_constraints(planning_request)
+        if not requirements:
+            return False
+        authorized = {
+            key
+            for key in (
+                cls._normalize_snssai_key(item)
+                for item in planning_request.operation_intent.slice_migration_authorization.authorized_snssais
+            )
+            if key
+        }
+        if not authorized:
+            return True
+        for requirement in requirements:
+            selected = cls._normalize_snssai_key(cls._extract_selected_slice(optimizer_preview, flow_id=requirement["flow_id"]))
+            if selected and selected != cls._normalize_snssai_key(requirement["source_slice_snssai"]) and selected not in authorized:
+                return True
+        return False
+
+    @classmethod
+    def _validate_am_targets_for_slice_migration(
+        cls,
+        *,
+        planning_request: PlanningRequest,
+        optimizer_preview: Dict[str, Any],
+        am_policy: Any,
+    ) -> List[str]:
+        target_keys = {
+            key
+            for key in (
+                cls._normalize_snssai_key(item.model_dump(mode="json") if hasattr(item, "model_dump") else item)
+                for item in (getattr(am_policy, "target_snssais", None) or [])
+            )
+            if key
+        }
+        errors: List[str] = []
+        for requirement in cls._required_slice_change_constraints(planning_request):
+            selected = cls._normalize_snssai_key(cls._extract_selected_slice(optimizer_preview, flow_id=requirement["flow_id"]))
+            source = cls._normalize_snssai_key(requirement["source_slice_snssai"])
+            if selected and selected != source and selected not in target_keys:
+                errors.append(
+                    "AM target_snssais must include the optimizer-selected slice "
+                    f"for flow_id={requirement['flow_id']}: {selected}"
+                )
         return errors
 
     @staticmethod

@@ -17,7 +17,11 @@ class IntentGroundingValidator:
         operation_intent: OperationIntent | None = None,
     ) -> List[str]:
         errors: List[str] = []
-        requested_domains = {str(item or "").strip().lower() for item in (evidence.requested_domains or []) if str(item or "").strip()}
+        requested_domains = {
+            str(item or "").strip().lower()
+            for item in ((operation_intent.requested_domains if operation_intent is not None else evidence.requested_domains) or [])
+            if str(item or "").strip()
+        }
         used_grounding_tools = {str(item or "").strip() for item in (grounding_tools or []) if str(item or "").strip()}
         if requested_domains == {"mobility"} and (used_grounding_tools & SM_GROUNDING_TOOLS):
             errors.append("mobility-only intent must not call SM grounding tools")
@@ -28,7 +32,7 @@ class IntentGroundingValidator:
                 errors.append(
                     "QoS intent with a known SUPI requires get_sm_ue_flow_catalog catalog evidence before final intent"
                 )
-        if list(evidence.requested_domains or []) == ["mobility"]:
+        if requested_domains == {"mobility"}:
             decision_has_am_context = self._operation_intent_has_grounded_am_policy(operation_intent)
             if not evidence.am_context_summary and not decision_has_am_context:
                 errors.append("mobility-only intent requires grounded AM policy context before returning final intent")
@@ -80,10 +84,14 @@ class IntentGroundingValidator:
         operation_intent: OperationIntent,
     ) -> List[str]:
         errors: List[str] = []
-        requested_domains = {str(item or "").strip().lower() for item in (evidence.requested_domains or []) if str(item or "").strip()}
         grounded_domains = {
             str(item or "").strip().lower()
             for item in (operation_intent.requested_domains or evidence.requested_domains or [])
+            if str(item or "").strip()
+        }
+        requested_domains = grounded_domains or {
+            str(item or "").strip().lower()
+            for item in (evidence.requested_domains or [])
             if str(item or "").strip()
         }
         if operation_intent.domain_resolution not in {"confirmed", "narrowed", "widened", "cannot_confirm"}:
@@ -92,6 +100,26 @@ class IntentGroundingValidator:
             errors.append("cannot_confirm domain resolution requires open_questions")
         if grounded_domains and not grounded_domains.issubset(VALID_DOMAINS):
             errors.append(f"requested_domains contains unsupported values: {sorted(grounded_domains)}")
+        requires_slice_change = any(
+            bool(constraint.require_slice_change)
+            for constraint in (operation_intent.qos_operation_constraints or [])
+        )
+        if requires_slice_change:
+            authorization = operation_intent.slice_migration_authorization
+            valid_decisions = {
+                "migration_pending_target_authorization",
+                "migration_authorized",
+                "blocked_requires_subscription_provisioning",
+                "evidence_missing",
+            }
+            if not evidence.subscription_summary:
+                errors.append("slice migration requires get_ue_slice_subscription entitlement evidence before final intent")
+            if str(authorization.decision or "").strip() not in valid_decisions:
+                errors.append("slice migration requires an explicit slice_migration_authorization decision")
+            if not str(authorization.authority or "").strip():
+                errors.append("slice migration authorization must name its evidence authority")
+            if not authorization.authorized_snssais and not authorization.subscription_change_required:
+                errors.append("slice migration authorization must preserve authorized S-NSSAI evidence or request provisioning")
         if requested_domains == {"mobility"} and operation_intent.flows:
             errors.append("Mobility-only OperationIntent must not include QoS flows.")
         if "qos" not in requested_domains:
