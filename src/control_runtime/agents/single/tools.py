@@ -9,7 +9,7 @@ from shared.runtime import AgentRuntimeContext
 from shared.tools.wrapper_think import tool_with_reason
 
 from ...context.evidence import EvidenceFormatter
-from ...domain.collaboration import PlanningContext, PlanningRequest
+from ...domain.collaboration import InitialIntentContext, PlanningContext, PlanningRequest, SharedControlContext
 from ...domain.policy_plan import FlowSelector, OperationIntent, QosTargetEnvelope
 from ...integrations.scenario.network_status import get_network_status_summary
 from ...integrations.storage import get_ue_context_by_supi, get_ue_flow_catalog_by_supi
@@ -309,11 +309,16 @@ def _build_runtime_planning_request(
             round_index=1,
             session_id=session_id,
             snapshot_id=snapshot_id,
-            snapshot_metadata={},
             active_domains=normalized_domains,
-            main_round_strategy="initial_grounding",
-            objective_profile={"profile_name": normalized_profile},
-            required_evidence=["qos_runtime_evidence"],
+            shared_context=SharedControlContext(
+                initial_intent=InitialIntentContext(
+                    requested_domains=normalized_domains,
+                    target_supis=[normalized_supi],
+                    target_names=[flow.name for flow in flows if str(flow.name or "").strip()],
+                    objective_profile={"profile_name": normalized_profile},
+                    required_evidence=["qos_runtime_evidence"],
+                ),
+            ),
         ),
     )
 

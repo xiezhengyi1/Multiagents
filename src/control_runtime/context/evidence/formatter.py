@@ -51,39 +51,15 @@ class EvidenceFormatter:
         operation_intent: OperationIntent,
         planning_context: PlanningContext,
     ) -> Dict[str, Any]:
-        flows: List[Dict[str, Any]] = []
-        for flow in operation_intent.flows:
-            flows.append(
-                {
-                    "flow_id": str(flow.flow_id or "").strip(),
-                    "app_id": normalize_app_id(flow.app_id),
-                    "name": str(flow.name or "").strip(),
-                    "priority": flow.priority,
-                    "service_type_id": flow.service_type_id,
-                    "current_slice_snssai": str(flow.current_slice_snssai or "").strip() or None,
-                }
-            )
-        qos_objectives = [
-            objective.model_dump(mode="json")
-            for objective in operation_intent.qos_target_envelopes
-        ]
         operation_constraints = _qos_operation_constraints_for_flows(
             operation_intent.model_dump(mode="json"),
             planning_context,
         )
-        return {
-            "requested_domains": list(planning_context.active_domains or []),
-            "main_retry_scope": str(planning_context.main_retry_scope or "").strip(),
-            "objective_profile": dict(planning_context.objective_profile or {}),
-            "required_evidence": list(planning_context.required_evidence or []),
-            "forbidden_assumptions": list(planning_context.forbidden_assumptions or []),
-            "revision_requests": list(planning_context.revision_requests or []),
-            "unified_constraints": dict(planning_context.unified_constraints or {}),
-            "shared_context": planning_context.shared_context.model_dump(mode="json"),
-            "flows": flows,
-            "qos_target_envelopes": qos_objectives,
-            "operation_constraints": operation_constraints,
-        }
+        return (
+            {"derived_operation_constraints": operation_constraints}
+            if operation_constraints
+            else {}
+        )
 
     @classmethod
     def for_optimizer(
@@ -122,7 +98,9 @@ class EvidenceFormatter:
             for supi in target_supis
         }
 
-        objective_profile_payload = dict(planning_request.context.objective_profile or {})
+        objective_profile_payload = dict(
+            planning_request.context.shared_context.initial_intent.objective_profile
+        )
         if not objective_profile_payload:
             raise ValueError("optimizer request requires an explicit objective_profile")
         if profile_name is not None:
@@ -244,8 +222,8 @@ def _qos_operation_constraints_for_flows(
         if constraint:
             constraints.append(constraint)
 
-    shared = planning_context.shared_context
-    for raw_constraint in shared.operation_constraints or []:
+    initial_intent = planning_context.shared_context.initial_intent
+    for raw_constraint in initial_intent.global_constraints:
         if not isinstance(raw_constraint, dict):
             continue
         if str(raw_constraint.get("type") or "").strip() != "qos_slice_migration":
@@ -265,7 +243,7 @@ def _qos_operation_constraints_for_flows(
                     "target_slice_preference": preference,
                     "no_op_allowed": bool(raw_constraint.get("no_op_allowed", False)),
                     "rationale": [
-                        "Main shared_context marked this request as a required QoS slice migration",
+                        "Initial intent requires QoS slice migration",
                     ],
                 },
                 flow_by_id,
@@ -340,7 +318,9 @@ def _resolve_qos_feasibility_mode(
     if normalized not in {"", "auto"}:
         raise ValueError("qos_feasibility_mode must be 'auto', 'hard', or 'soft'")
 
-    raw_text = str(planning_request.context.shared_context.raw_user_input or "").strip().lower()
+    raw_text = str(
+        planning_request.context.shared_context.initial_intent.request_summary
+    ).strip().lower()
     if not raw_text:
         return "soft"
 

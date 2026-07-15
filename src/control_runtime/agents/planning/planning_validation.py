@@ -196,7 +196,7 @@ class PlanningAdvisorValidator:
             if str(item).strip()
         }
         normalized_tool_evidence = dict(planning_tool_evidence or {})
-        retry_scope = str(planning_request.context.main_retry_scope or "").strip().lower()
+        retry_scope = str(planning_request.context.retry_scope or "").strip().lower()
         preserved_app_id = self._preserved_app_id(planning_request)
         preserved_flow_ids = self._preserved_flow_ids(planning_request)
         preserved_flow_app_ids = self._preserved_flow_app_ids(planning_request)
@@ -498,7 +498,7 @@ class PlanningAdvisorValidator:
                 requirements.append({"flow_id": flow_id, "source_slice_snssai": source_slice})
 
         shared_context = planning_request.context.shared_context
-        for raw_constraint in shared_context.operation_constraints or []:
+        for raw_constraint in shared_context.initial_intent.global_constraints:
             if not isinstance(raw_constraint, dict):
                 continue
             if str(raw_constraint.get("type") or "") != "qos_slice_migration":
@@ -613,7 +613,7 @@ class PlanningArtifactValidator:
             has_am_policy = any(item.policy_type == "PcfAmPolicyControlPolicyAssociation" for item in policy_plan.all_policies)
             if not has_am_policy:
                 raise ValueError("OptimizationStrategyAgent did not include an executable AM policy for a mobility-active round.")
-        retry_scope = str(planning_request.context.main_retry_scope or "").strip().lower()
+        retry_scope = str(planning_request.context.retry_scope or "").strip().lower()
         if retry_scope == "target_stable":
             preserved_app_id = PlanningAdvisorValidator._preserved_app_id(planning_request)
             preserved_flow_ids = PlanningAdvisorValidator._preserved_flow_ids(planning_request)

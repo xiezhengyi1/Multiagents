@@ -1,6 +1,6 @@
 """Domain contracts for the refactored control runtime."""
 
-from .collaboration import AgentHandoff, PlanningContext, PlanningRequest, SharedControlContext
+from .collaboration import AgentHandoff, InitialIntentContext, PlanningContext, PlanningRequest, SharedControlContext
 from .control_plane import (
     ControlDomain,
     DomainProposal,
@@ -32,6 +32,7 @@ __all__ = [
     "GlobalControlIntent",
     "JointOptimizationRequest",
     "JointOptimizationResult",
+    "InitialIntentContext",
     "MainInvestigationTarget",
     "MainRoundStrategy",
     "MainUncertaintyFlag",

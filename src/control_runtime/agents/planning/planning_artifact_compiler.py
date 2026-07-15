@@ -56,13 +56,13 @@ class PlanningArtifactCompiler:
             optimizer_result=optimizer_result,
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
-                    planning_request.context.objective_profile.get("profile_name")
+                    planning_request.context.shared_context.initial_intent.objective_profile.get("profile_name")
                     or ""
                 ).strip(),
                 decisive_evidence=[
                     item
                     for item in [
-                        "target_binding_reused" if str(planning_request.context.main_retry_scope or "").strip().lower() == "target_stable" else "",
+                        "target_binding_reused" if str(planning_request.context.retry_scope or "").strip().lower() == "target_stable" else "",
                         "tool:preview_qos_optimizer" if advisor_output.sm_policies else "",
                         "tool:inspect_mobility_ue_policies" if advisor_output.am_policy is not None else "",
                         "mediator_constraints" if planning_request.context.unified_constraints else "",
@@ -81,11 +81,15 @@ class PlanningArtifactCompiler:
                 rejected_alternatives=[
                     item
                     for item in [
-                        "target_rebinding" if str(planning_request.context.main_retry_scope or "").strip().lower() == "target_stable" else "",
+                        "target_rebinding" if str(planning_request.context.retry_scope or "").strip().lower() == "target_stable" else "",
                     ]
                     if item
                 ],
-                main_constraints=[str(item) for item in (planning_request.context.required_evidence or []) if str(item).strip()],
+                main_constraints=[
+                    str(item)
+                    for item in planning_request.context.shared_context.initial_intent.required_evidence
+                    if str(item).strip()
+                ],
                 iea_grounding_basis=[
                     str(item)
                     for item in (
@@ -451,12 +455,16 @@ class PlanningArtifactCompiler:
             planning_status="needs_upstream_reground",
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
-                    planning_request.context.objective_profile.get("profile_name")
+                    planning_request.context.shared_context.initial_intent.objective_profile.get("profile_name")
                     or ""
                 ).strip(),
                 explanation=rationale,
                 unresolved_gaps=[*missing_evidence, *blocked_targets, *upstream_requests],
-                main_constraints=[str(item) for item in (planning_request.context.required_evidence or []) if str(item).strip()],
+                main_constraints=[
+                    str(item)
+                    for item in planning_request.context.shared_context.initial_intent.required_evidence
+                    if str(item).strip()
+                ],
             ),
             missing_evidence=[str(item) for item in missing_evidence if str(item).strip()],
             blocked_targets=[str(item) for item in blocked_targets if str(item).strip()],

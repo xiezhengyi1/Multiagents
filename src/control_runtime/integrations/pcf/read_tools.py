@@ -19,6 +19,53 @@ from .helpers import _trim_am_policy_context_for_agent, _trim_sm_ue_context_for_
 logger = setup_logger(__name__)
 
 
+def _project_sm_flow_catalog_for_agent(catalog: object) -> dict:
+    """Keep only identity, SLA, binding, and policy-selector fields for IEA."""
+    if not isinstance(catalog, dict):
+        return {"supi": "", "app_catalog": [], "flow_catalog": []}
+    apps = [
+        {
+            key: item.get(key)
+            for key in ("supi", "app_id", "app_name", "flow_count")
+            if item.get(key) not in (None, "", [], {})
+        }
+        for item in (catalog.get("app_catalog") or [])
+        if isinstance(item, dict)
+    ]
+    flows = []
+    for item in catalog.get("flow_catalog") or []:
+        if not isinstance(item, dict):
+            continue
+        traffic = item.get("traffic") if isinstance(item.get("traffic"), dict) else {}
+        projected = {
+            key: item.get(key)
+            for key in ("supi", "app_id", "app_name", "flow_id", "flow_name")
+            if item.get(key) not in (None, "", [], {})
+        }
+        nested_fields = {
+            "service": ("service_type", "service_type_id"),
+            "sla": None,
+            "allocation": None,
+        }
+        for nested_key, allowed_fields in nested_fields.items():
+            nested = item.get(nested_key)
+            if isinstance(nested, dict):
+                projected[nested_key] = {
+                    key: value
+                    for key, value in nested.items()
+                    if allowed_fields is None or key in allowed_fields
+                    if value not in (None, "", [], {})
+                }
+        if traffic.get("five_tuple"):
+            projected["traffic"] = {"five_tuple": traffic.get("five_tuple")}
+        flows.append(projected)
+    return {
+        "supi": str(catalog.get("supi") or "").strip(),
+        "app_catalog": apps,
+        "flow_catalog": flows,
+    }
+
+
 def _tool_snapshot_id(runtime: ToolRuntime[AgentRuntimeContext]) -> str:
     snapshot_id = str(runtime.context.snapshot_id or "").strip() if runtime is not None and runtime.context is not None else ""
     if not snapshot_id:
@@ -133,7 +180,8 @@ def get_sm_ue_flow_catalog(
         normalized_supi,
         snapshot_id=_tool_snapshot_id(runtime),
     )
-    result = json.dumps(catalog, ensure_ascii=False, indent=2)
+    projected_catalog = _project_sm_flow_catalog_for_agent(catalog)
+    result = json.dumps(projected_catalog, ensure_ascii=False, separators=(",", ":"))
     prefix = ""
     if runtime is not None:
         ctx = runtime.context

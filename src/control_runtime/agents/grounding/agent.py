@@ -20,6 +20,7 @@ from ...integrations.pcf import (
     search_sm_flow_targets,
 )
 from ...context.projectors import project_intent_evidence_for_prompt
+from ...context.observability import measure_context_components
 from ...domain.policy_plan import OperationIntent
 from ...context.prompts import GroundingPromptBuilder, RetryPromptBuilder
 from ..common import validate_operation_intent
@@ -101,7 +102,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 "search_sm_flow_targets": 4,
             },
             tool_result_limits={
-                "get_sm_ue_flow_catalog": 32000,
+                "get_sm_ue_flow_catalog": 16000,
                 "get_sm_ue_context": 8000,
                 "search_sm_flow_targets": 8000,
                 "get_am_policy_context": 8000,
@@ -112,7 +113,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             context_policy=ContextPolicy(
                 default_tool_result_chars=8000,
                 tool_result_char_limits={
-                    "get_sm_ue_flow_catalog": 32000,
+                    "get_sm_ue_flow_catalog": 16000,
                     "get_sm_ue_context": 8000,
                     "search_sm_flow_targets": 8000,
                     "get_am_policy_context": 8000,
@@ -508,16 +509,25 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> IntentAdvisorInvocation:
         self._pending_invoke_messages = [{"role": "user", "content": prompt}]
         base_trace_metadata = dict(getattr(runtime_context, "trace_metadata", {}) or {})
+        active_advisor_agent = advisor_agent or self.advisor_agent
+        context_components = measure_context_components(
+            {
+                "system_prompt": str(getattr(active_advisor_agent, "system_prompt", "") or ""),
+                "dynamic_prompt": prompt,
+            },
+            token_counter=getattr(runtime_context, "token_counter", None),
+        )
+        log_event(self.logger, "iea_context_components", **context_components)
         invoke_payload = {
             "messages": self._pending_invoke_messages,
             "trace_write_mode": "manual",
             "trace_metadata": {
                 **base_trace_metadata,
                 "path_label": "advisor_path",
+                "context_token_components": context_components,
             },
         }
         try:
-            active_advisor_agent = advisor_agent or self.advisor_agent
             result = active_advisor_agent.invoke(invoke_payload, context=runtime_context)
         except Exception as exc:
             if isinstance(exc, ToolLoopExecutionError):

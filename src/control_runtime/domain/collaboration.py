@@ -2,25 +2,46 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .policy_plan import OperationIntent
 
 
-class SharedControlContext(BaseModel):
-    """Typed blackboard shared across agents for user-level control goals."""
+class InitialIntentContext(BaseModel):
+    """Canonical user-level intent shared across agent boundaries.
 
-    raw_user_input: str = Field(default="", description="Original user request preserved across agent boundaries")
-    main_control_semantics: Dict[str, Any] = Field(default_factory=dict, description="Main-owned staged control semantics")
-    operation_constraints: list[Dict[str, Any]] = Field(default_factory=list, description="Hard operation constraints inferred by Main")
-    shared_facts: Dict[str, Any] = Field(default_factory=dict, description="Compact cross-agent facts safe for every downstream agent")
+    This contract intentionally carries goals and scope, not upstream reasoning,
+    runtime history, snapshots, or tool payloads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_summary: str = Field(default="", description="Compact canonical user request")
+    requested_domains: list[str] = Field(default_factory=list, description="Initially requested control domains")
+    target_supis: list[str] = Field(default_factory=list, description="Explicit UE scopes named by the request")
+    target_names: list[str] = Field(default_factory=list, description="Semantic app/flow/object names named by the request")
+    objective_profile: Dict[str, Any] = Field(default_factory=dict, description="Shared optimization preference")
+    required_evidence: list[str] = Field(default_factory=list, description="Evidence required to execute the request")
+    forbidden_assumptions: list[str] = Field(default_factory=list, description="Assumptions downstream agents must not make")
+    global_constraints: list[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Only hard cross-agent constraints derived from the initial request",
+    )
+
+
+class SharedControlContext(BaseModel):
+    """Minimal canonical request context shared across agent boundaries."""
+
+    model_config = ConfigDict(extra="forbid")
+    initial_intent: InitialIntentContext = Field(default_factory=InitialIntentContext)
 
 
 class PlanningContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     round_index: int = Field(default=1, description="Closed-loop round number")
     session_id: str = Field(default="", description="Session identifier")
     snapshot_id: str = Field(default="", description="Bound planning snapshot identifier")
-    snapshot_metadata: Dict[str, Any] = Field(default_factory=dict, description="Snapshot metadata bound to this round")
     memory_context: str = Field(default="", description="Retrieved memory context for the round")
     shared_context: SharedControlContext = Field(default_factory=SharedControlContext, description="Typed cross-agent context shared by Main, IEA, OSA, and tools")
     feedback_context: str = Field(default="", description="Aggregated feedback context from previous rounds")
@@ -29,16 +50,7 @@ class PlanningContext(BaseModel):
         description="Structured handoff history from previous rounds",
     )
     active_domains: list[str] = Field(default_factory=list, description="Domains selected by Main Agent")
-    main_round_strategy: str = Field(default="", description="High-level round strategy chosen by Main Agent")
-    main_retry_scope: str = Field(default="", description="Main-selected retry scope for this round")
-    main_investigation_targets: list[str] = Field(default_factory=list, description="What Main wants downstream to inspect or re-check")
-    main_uncertainty_flags: list[str] = Field(default_factory=list, description="High-level uncertainty markers carried from Main")
-    main_routing_decision: str = Field(default="", description="Explicit routing decision declared by Main")
-    main_routing_rationale: str = Field(default="", description="Why Main selected this downstream path")
-    main_reuse_contract: Dict[str, Any] = Field(default_factory=dict, description="Explicit reuse contract declared by Main")
-    objective_profile: Dict[str, Any] = Field(default_factory=dict, description="Semantic optimization profile")
-    forbidden_assumptions: list[str] = Field(default_factory=list, description="Assumptions subagents must not make")
-    required_evidence: list[str] = Field(default_factory=list, description="Evidence subagents must collect")
+    retry_scope: str = Field(default="", description="Retry scope for this round")
     revision_requests: list[Dict[str, Any]] = Field(default_factory=list, description="Structured revision requests returned by Mediator")
     unified_constraints: Dict[str, Any] = Field(default_factory=dict, description="Structured hard constraints returned by Mediator")
 

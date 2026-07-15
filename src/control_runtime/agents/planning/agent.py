@@ -13,6 +13,7 @@ from shared.runtime import ArtifactWorkerMixin
 from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import PolicyPlanDraft
 from ...context.projectors import project_collaboration_context_for_prompt, project_operation_intent_for_prompt
+from ...context.observability import measure_context_components
 from ...context.prompts import PlanningPromptBuilder, RetryPromptBuilder
 from shared.logging import log_event, log_timing
 
@@ -256,19 +257,34 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             for flow_id in (current_stage.active_flow_ids or [])
             if str(flow_id or "").strip()
         }
-        # Mobility-only requests have no QoS flows — active_flow_ids is expected
-        # to be empty because flows are populated by IEA only for QoS targets.
+        filtered_intent = planning_request.operation_intent.model_copy(deep=True)
+        filtered_intent.control_semantics = semantics.model_copy(
+            update={
+                "current_stage": 1,
+                "stages": [
+                    current_stage.model_copy(
+                        update={"stage_index": 1},
+                        deep=True,
+                    )
+                ],
+            },
+            deep=True,
+        )
+        # Mobility-only requests have no QoS flows. They still receive only the
+        # current semantic stage instead of the complete stage history.
         is_mobility_only = (
             planning_request.operation_intent.requested_domains
             == ["mobility"]
         )
         if not active_flow_ids and is_mobility_only:
-            return planning_request
+            return planning_request.model_copy(
+                update={"operation_intent": filtered_intent},
+                deep=True,
+            )
         if not active_flow_ids:
             raise ValueError(
                 "current control stage has no grounded active_flow_ids; OSA must request upstream reground instead of expanding to all flows"
             )
-        filtered_intent = planning_request.operation_intent.model_copy(deep=True)
         filtered_intent.flows = [
             flow for flow in filtered_intent.flows
             if str(flow.flow_id or "").strip() in active_flow_ids
@@ -276,6 +292,10 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         filtered_intent.qos_target_envelopes = [
             envelope for envelope in filtered_intent.qos_target_envelopes
             if str(envelope.flow_id or "").strip() in active_flow_ids
+        ]
+        filtered_intent.qos_operation_constraints = [
+            constraint for constraint in filtered_intent.qos_operation_constraints
+            if str(constraint.flow_id or "").strip() in active_flow_ids
         ]
         return planning_request.model_copy(update={"operation_intent": filtered_intent}, deep=True)
 
@@ -332,12 +352,21 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             ),
         )
         messages = [{"role": "user", "content": prompt}]
+        context_components = measure_context_components(
+            {
+                "system_prompt": str(getattr(advisor_agent, "system_prompt", "") or ""),
+                "dynamic_prompt": prompt,
+            },
+            token_counter=getattr(runtime_context, "token_counter", None),
+        )
+        log_event(self.logger, "osa_context_components", **context_components)
         invoke_payload = {
             "messages": messages,
             "trace_write_mode": "manual",
             "trace_metadata": {
                 **(trace_metadata or {}),
                 "path_label": "strategy_advisor",
+                "context_token_components": context_components,
             },
         }
         self._pending_invoke_messages = messages

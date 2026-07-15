@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from shared.runtime import ContextPolicy
 
-from ..domain.collaboration import DomainNegotiationRequest, ExecutionReentryRequest, PlanningBlockerReport, PlanningContext, SharedControlContext
+from ..domain.collaboration import DomainNegotiationRequest, ExecutionReentryRequest, InitialIntentContext, PlanningBlockerReport, PlanningContext, SharedControlContext
 from ..domain.control_plane import GlobalControlIntent
 from ..domain.policy_plan import OperationIntent
 from .projectors import project_global_intent_for_prompt
@@ -17,12 +17,6 @@ def get_snapshot_data_by_id(snapshot_id: str) -> Dict[str, Any]:
     from ..integrations.storage import get_snapshot_data_by_id as _get_snapshot_data_by_id
 
     return _get_snapshot_data_by_id(snapshot_id) or {}
-
-
-def get_latest_snapshot_metadata() -> Dict[str, Any]:
-    from ..integrations.storage import get_latest_snapshot_metadata as _get_latest_snapshot_metadata
-
-    return _get_latest_snapshot_metadata() or {}
 
 
 @dataclass
@@ -118,26 +112,16 @@ def build_planning_context(
         round_index=round_index,
         session_id=session_id,
         snapshot_id=snapshot_id,
-        snapshot_metadata={**(get_latest_snapshot_metadata() or {}), "snapshot_id": snapshot_id},
         memory_context=memory_context,
         shared_context=shared_context,
         feedback_context=feedback_context,
         handoff_history=list(handoff_history or [])[-2:],
         active_domains=list(active_domains or [item.value for item in global_intent.requested_domains]),
-        main_round_strategy=global_intent.round_strategy.value,
-        main_retry_scope=(
+        retry_scope=(
             global_intent.retry_scope.value
             if getattr(global_intent, "retry_scope", None) is not None and hasattr(global_intent.retry_scope, "value")
             else str(getattr(global_intent, "retry_scope", "") or "").strip()
         ),
-        main_investigation_targets=[item.value for item in global_intent.investigation_targets],
-        main_uncertainty_flags=[item.value for item in global_intent.uncertainty_flags],
-        main_routing_decision=str(global_intent.routing_decision or "").strip(),
-        main_routing_rationale=str(global_intent.routing_rationale or "").strip(),
-        main_reuse_contract=global_intent.reuse_contract.model_dump(mode="json"),
-        objective_profile=global_intent.objective_profile.model_dump(mode="json"),
-        forbidden_assumptions=list(global_intent.forbidden_assumptions or []),
-        required_evidence=list(global_intent.required_evidence or []),
         revision_requests=list(revision_requests or []),
         unified_constraints=dict(unified_constraints or {}),
     )
@@ -161,14 +145,34 @@ def _build_shared_control_context(global_intent: GlobalControlIntent) -> SharedC
                 "semantic_cues": _slice_migration_cues(raw_input, semantics),
             }
         )
+    target_supis: List[str] = []
+    target_names: List[str] = []
+    if str(global_intent.supi or "").strip():
+        target_supis.append(str(global_intent.supi).strip())
+    for stage in semantics.get("stages") or []:
+        if not isinstance(stage, dict):
+            continue
+        for target in stage.get("targets") or []:
+            if not isinstance(target, dict):
+                continue
+            target_supi = str(target.get("supi") or "").strip()
+            target_name = str(target.get("semantic_name") or "").strip()
+            if target_supi and target_supi not in target_supis:
+                target_supis.append(target_supi)
+            if target_name and target_name not in target_names:
+                target_names.append(target_name)
+    requested_domains = [item.value for item in global_intent.requested_domains]
     return SharedControlContext(
-        raw_user_input=raw_input,
-        main_control_semantics=semantics,
-        operation_constraints=constraints,
-        shared_facts={
-            "requested_domains": [item.value for item in global_intent.requested_domains],
-            "objective_profile": global_intent.objective_profile.model_dump(mode="json"),
-        },
+        initial_intent=InitialIntentContext(
+            request_summary=raw_input,
+            requested_domains=requested_domains,
+            target_supis=target_supis,
+            target_names=target_names,
+            objective_profile=global_intent.objective_profile.model_dump(mode="json"),
+            required_evidence=list(global_intent.required_evidence or []),
+            forbidden_assumptions=list(global_intent.forbidden_assumptions or []),
+            global_constraints=constraints,
+        )
     )
 
 
@@ -495,29 +499,69 @@ def rerank_by_context_hints(items: List[Any], diagnosis_hint: str = "", routing_
 def build_intent_encoding_context(
     *,
     global_intent: Dict[str, Any],
-    snapshot_id: str,
     round_index: int,
     diagnosis: Dict[str, Any],
     feedback_context: str,
 ) -> str:
-    snapshot = get_snapshot_data_by_id(snapshot_id) or {}
-    projected_global_intent = project_global_intent_for_prompt(global_intent)
-    return (
-        "## Guidance\n"
-        f"- round_index: {round_index}\n"
-        f"- intent_encoding_guidance: {global_intent.get('intent_encoding_guidance', '') or 'N/A'}\n"
-        f"- retry_scope: {global_intent.get('retry_scope') or 'N/A'}\n"
-        f"- routing_decision: {global_intent.get('routing_decision') or 'N/A'}\n"
-        f"- routing_rationale: {global_intent.get('routing_rationale') or 'N/A'}\n\n"
-        "## Evidence\n"
-        f"- main_intent: {json.dumps(projected_global_intent, ensure_ascii=False)}\n"
-        f"- snapshot_summary: {json.dumps(_build_snapshot_summary(snapshot) if snapshot else {}, ensure_ascii=False)}\n"
-        "\n"
-        "## Previous Diagnosis\n"
-        f"{json.dumps(diagnosis or {}, ensure_ascii=False)}\n\n"
-        "## Feedback\n"
-        f"{feedback_context or 'N/A'}"
+    payload: Dict[str, Any] = {
+        "round_index": round_index,
+        "main_intent": _project_iea_routing_contract(global_intent),
+    }
+    retry_delta = _project_iea_retry_delta(
+        diagnosis=diagnosis,
+        feedback_context=feedback_context,
     )
+    if int(round_index or 1) > 1 and retry_delta:
+        payload["retry_delta"] = retry_delta
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _project_iea_routing_contract(global_intent: Dict[str, Any]) -> Dict[str, Any]:
+    projected = project_global_intent_for_prompt(global_intent)
+    return {
+        key: projected[key]
+        for key in (
+            "supi",
+            "requested_domains",
+            "domain_evidence",
+            "control_semantics",
+            "retry_scope",
+            "required_evidence",
+            "forbidden_assumptions",
+            "intent_encoding_guidance",
+        )
+        if projected.get(key) not in (None, "", [], {})
+    }
+
+
+def _project_iea_retry_delta(
+    *,
+    diagnosis: Dict[str, Any],
+    feedback_context: str,
+) -> Dict[str, Any]:
+    diagnosis_payload = dict(diagnosis or {})
+    compact_diagnosis = {
+        key: diagnosis_payload[key]
+        for key in (
+            "root_cause_category",
+            "reason_summary",
+            "root_cause",
+            "affected_flow_ids",
+            "recommended_actions",
+        )
+        if diagnosis_payload.get(key) not in (None, "", [], {})
+    }
+    feedback = str(feedback_context or "").strip()
+    if len(feedback) > 1800:
+        feedback = "... [older feedback omitted]\n" + feedback[-1800:].lstrip()
+    return {
+        key: value
+        for key, value in {
+            "diagnosis": compact_diagnosis,
+            "feedback_summary": feedback,
+        }.items()
+        if value not in (None, "", [], {})
+    }
 
 
 def scope_global_intent_for_intent_encoding(
@@ -1007,7 +1051,6 @@ __all__ = [
     "build_planning_failure_payload",
     "build_reentry_report_payload",
     "build_round_feedback_block",
-    "get_latest_snapshot_metadata",
     "get_snapshot_data_by_id",
     "has_supi_scope",
     "parse_pda_metrics",

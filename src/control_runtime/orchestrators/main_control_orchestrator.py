@@ -233,7 +233,6 @@ class MainControlOrchestrator:
                 user_input=user_input,
                 context=build_intent_encoding_context(
                     global_intent=ie_scoped_intent.model_dump(mode="json"),
-                    snapshot_id=snapshot_id,
                     round_index=round_index,
                     diagnosis=previous_diagnosis,
                     feedback_context=feedback_context,

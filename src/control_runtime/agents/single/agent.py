@@ -15,10 +15,9 @@ from shared.runtime import ArtifactWorkerMixin, ContextPolicy, ToolLoopExecution
 from shared.logging import log_event, log_timing
 
 from ...context.prompts import SinglePromptBuilder
-from ...domain.collaboration import PlanningContext, SharedControlContext
+from ...domain.collaboration import InitialIntentContext, PlanningContext, SharedControlContext
 from ...domain.control_plane import ControlDomain
 from ...domain.policy_plan import FlowSelector, PlanningRationale, PolicyDraft, PolicyPlanDraft
-from ...integrations.storage import get_latest_snapshot_metadata
 from ..planning.planning_validation import normalize_policy_plan_draft
 from ..planning.compiler import OptimizationStrategyCompiler
 from ..planning.tool_result_adapter import extract_planning_tool_evidence
@@ -882,7 +881,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         planning_metadata = {
             "planning_mode": "single_agent_direct_pcf",
             "requested_domains": list(planning_context.active_domains or []),
-            "main_retry_scope": str(planning_context.main_retry_scope or "").strip(),
+            "retry_scope": str(planning_context.retry_scope or "").strip(),
             "objective_breakdown": dict(optimizer_preview.get("objective_breakdown") or {}) if isinstance(optimizer_preview, dict) else {},
             "revision_requests": planning_context.revision_requests or [],
             "unified_constraints": planning_context.unified_constraints or {},
@@ -900,7 +899,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             planning_metadata=planning_metadata,
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
-                    planning_context.objective_profile.get("profile_name")
+                    planning_context.shared_context.initial_intent.objective_profile.get("profile_name")
                     or decision.objective_profile_hint
                     or ""
                 ).strip(),
@@ -1286,27 +1285,22 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         ]
         objective_profile_hint = str(decision.objective_profile_hint or "").strip()
         objective_profile = {"profile_name": objective_profile_hint} if objective_profile_hint else {}
+        required_evidence = SingleControlAgent._required_evidence_from_domains(active_domains)
         return PlanningContext(
             round_index=round_index,
             session_id=session_id,
             snapshot_id=snapshot_id,
-            snapshot_metadata=get_latest_snapshot_metadata() or {},
             shared_context=SharedControlContext(
-                raw_user_input=str(user_input or "").strip(),
-                shared_facts={
-                    "source_agent": "single_control",
-                    "single_agent_direct_plan": True,
-                },
+                initial_intent=InitialIntentContext(
+                    request_summary=str(user_input or "").strip(),
+                    requested_domains=active_domains,
+                    objective_profile=objective_profile,
+                    required_evidence=required_evidence,
+                ),
             ),
             feedback_context=feedback_context,
             handoff_history=round_traces[-2:],
             active_domains=active_domains,
-            main_round_strategy="single_control",
-            main_routing_decision="single_control_direct_plan",
-            main_routing_rationale="Single agent produced the executable planning artifact directly.",
-            objective_profile=objective_profile,
-            forbidden_assumptions=[],
-            required_evidence=SingleControlAgent._required_evidence_from_domains(active_domains),
             revision_requests=list((previous_mediator_decision or {}).get("revision_requests") or []),
             unified_constraints=dict((previous_mediator_decision or {}).get("unified_constraints") or {}),
         )

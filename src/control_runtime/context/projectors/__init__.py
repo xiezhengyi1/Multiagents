@@ -15,6 +15,7 @@ from .planning_context import PlanningContextProjector
 from .policy_plan import PolicyPlanDraftProjector
 from .qos_envelope import QosTargetEnvelopeProjector
 from .registry import ProjectorRegistry
+from .shared_context import SharedControlContextProjector
 
 __all__ = [
     "BaseProjector",
@@ -27,6 +28,7 @@ __all__ = [
     "PolicyPlanDraftProjector",
     "ProjectorRegistry",
     "QosTargetEnvelopeProjector",
+    "SharedControlContextProjector",
     "exclude",
     "field",
     "project_collaboration_context_for_prompt",

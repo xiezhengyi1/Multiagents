@@ -15,7 +15,6 @@ from .control_loop import (
     build_planning_failure_payload,
     build_reentry_report_payload,
     build_round_feedback_block,
-    get_latest_snapshot_metadata,
     get_snapshot_data_by_id,
     has_supi_scope,
     parse_pda_metrics,
@@ -24,6 +23,7 @@ from .control_loop import (
     should_reuse_operation_intent,
 )
 from .evidence import EvidenceFormatter, build_slice_snssai, normalize_app_id
+from .observability import measure_context_components
 from .projectors import (
     BaseProjector,
     ExcludeSpec,
@@ -35,6 +35,7 @@ from .projectors import (
     PolicyPlanDraftProjector,
     ProjectorRegistry,
     QosTargetEnvelopeProjector,
+    SharedControlContextProjector,
     exclude,
     field,
     project_collaboration_context_for_prompt,
@@ -74,6 +75,7 @@ __all__ = [
     "PromptBuilder",
     "PromptEngine",
     "QosTargetEnvelopeProjector",
+    "SharedControlContextProjector",
     "RetryPromptBuilder",
     "SinglePromptBuilder",
     "TokenBudget",
@@ -91,10 +93,10 @@ __all__ = [
     "build_slice_snssai",
     "exclude",
     "field",
-    "get_latest_snapshot_metadata",
     "get_snapshot_data_by_id",
     "has_supi_scope",
     "normalize_app_id",
+    "measure_context_components",
     "parse_pda_metrics",
     "project_collaboration_context_for_prompt",
     "project_global_intent_for_prompt",

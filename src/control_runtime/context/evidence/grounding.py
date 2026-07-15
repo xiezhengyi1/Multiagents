@@ -27,12 +27,6 @@ class IntentEvidenceBuilder:
         resolved_semantic_candidates = list(semantic_candidates or []) if uses_sm_grounding(requested_domains) else []
         resolved_am_context = dict(am_context_payload or {}) if uses_am_grounding(requested_domains) else {}
         resolved_am_policy_candidates = list(am_policy_candidates or []) if uses_am_grounding(requested_domains) else []
-        upstream_candidate_flows = [
-            dict(item)
-            for item in (main_directives.get("candidate_flows") or [])
-            if isinstance(item, dict)
-        ]
-
         app_catalog = resolved_catalog_payload.get("app_catalog") or []
         flow_catalog = resolved_catalog_payload.get("flow_catalog") or []
         explicit_flow_id = flow_match.group(1) if flow_match else ""
@@ -72,9 +66,6 @@ class IntentEvidenceBuilder:
             for item in flow_catalog:
                 if str(item.get("flow_id") or "").strip().lower() == explicit_flow_id.lower():
                     candidate_flows.append(self._flow_candidate_from_catalog(item, score=1.0))
-            for item in upstream_candidate_flows:
-                if str(item.get("flow_id") or "").strip().lower() == explicit_flow_id.lower():
-                    candidate_flows.append(self._flow_candidate_from_catalog(item, score=1.0))
         else:
             explicit_target_names = {
                 str(item.flow_name or "").strip()
@@ -84,10 +75,6 @@ class IntentEvidenceBuilder:
             if exact_flow is not None and not explicit_target_names:
                 candidate_flows.append(self._flow_candidate_from_catalog(exact_flow, score=1.0))
             for item in flow_catalog:
-                flow_name = str(item.get("flow_name") or "").strip()
-                if flow_name and flow_name in explicit_target_names:
-                    candidate_flows.append(self._flow_candidate_from_catalog(item, score=1.0))
-            for item in upstream_candidate_flows:
                 flow_name = str(item.get("flow_name") or "").strip()
                 if flow_name and flow_name in explicit_target_names:
                     candidate_flows.append(self._flow_candidate_from_catalog(item, score=1.0))
