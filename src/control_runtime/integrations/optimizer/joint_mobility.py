@@ -276,7 +276,7 @@ def build_mobility_draft(
             except Exception:
                 continue
     else:
-        for trigger in request.operation_intent.get("mobility_triggers", []) if isinstance(request.operation_intent, dict) else []:
+        for trigger in request.grounding_decision.get("mobility_triggers", []) if isinstance(request.grounding_decision, dict) else []:
             try:
                 enum_trigger = PcfAmPolicyControlRequestTrigger(trigger)
             except Exception:
@@ -297,7 +297,7 @@ def build_mobility_draft(
     else:
         total_ul = 0.0
         total_dl = 0.0
-        for flow in request.operation_intent.get("flows", []) if isinstance(request.operation_intent, dict) else []:
+        for flow in request.grounding_decision.get("flows", []) if isinstance(request.grounding_decision, dict) else []:
             if not isinstance(flow, dict):
                 continue
             total_ul += float(flow.get("bw_ul") or 0.0)

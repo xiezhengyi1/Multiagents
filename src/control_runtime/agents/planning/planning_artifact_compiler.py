@@ -15,6 +15,25 @@ from .planning_validation import (
 from .response_models import AmPolicySpec, OsaAdvisorOutput, SmPolicySpec, UrspPolicySpec
 
 
+def _planning_supi(planning_request: PlanningRequest) -> str:
+    main_supi = str(planning_request.context.shared_context.main_intent.supi or "").strip()
+    if main_supi:
+        return main_supi
+    return next(
+        (
+            str(flow.supi or "").strip()
+            for flow in (planning_request.grounding_decision.flows or [])
+            if str(flow.supi or "").strip()
+        ),
+        "",
+    )
+
+
+def _main_retry_scope(planning_request: PlanningRequest) -> str:
+    retry_scope = planning_request.context.shared_context.main_intent.retry_scope
+    return str(getattr(retry_scope, "value", retry_scope) or "").strip().lower()
+
+
 class PlanningArtifactCompiler:
     def __init__(self, *, validator: PlanningArtifactValidator | None = None) -> None:
         self.validator = validator or PlanningArtifactValidator()
@@ -50,20 +69,20 @@ class PlanningArtifactCompiler:
         }
 
         plan = PolicyPlanDraft(
-            supi=str(planning_request.operation_intent.supi or "").strip(),
+            supi=_planning_supi(planning_request),
             session_id=str(planning_request.context.session_id or "").strip(),
             snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
             planning_status=planning_status,
             optimizer_result=optimizer_result,
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
-                    planning_request.context.shared_context.initial_intent.objective_profile.get("profile_name")
+                    planning_request.context.shared_context.main_intent.objective_profile.profile_name
                     or ""
                 ).strip(),
                 decisive_evidence=[
                     item
                     for item in [
-                        "target_binding_reused" if str(planning_request.context.retry_scope or "").strip().lower() == "target_stable" else "",
+                        "target_binding_reused" if _main_retry_scope(planning_request) == "target_stable" else "",
                         "tool:preview_qos_optimizer" if advisor_output.sm_policies else "",
                         "tool:inspect_mobility_ue_policies" if advisor_output.am_policy is not None else "",
                         "mediator_constraints" if planning_request.context.unified_constraints else "",
@@ -82,22 +101,22 @@ class PlanningArtifactCompiler:
                 rejected_alternatives=[
                     item
                     for item in [
-                        "target_rebinding" if str(planning_request.context.retry_scope or "").strip().lower() == "target_stable" else "",
+                        "target_rebinding" if _main_retry_scope(planning_request) == "target_stable" else "",
                     ]
                     if item
                 ],
                 main_constraints=[
                     str(item)
-                    for item in planning_request.context.shared_context.initial_intent.required_evidence
+                    for item in planning_request.context.shared_context.main_intent.required_evidence
                     if str(item).strip()
                 ],
                 iea_grounding_basis=[
                     str(item)
                     for item in (
-                        list((planning_request.operation_intent.grounding_evidence.evidence_sources or {}).keys())
+                        list((planning_request.grounding_decision.grounding_evidence.evidence_sources or {}).keys())
                         + [
                             str(item.get("flow_id") or "").strip()
-                            for item in (planning_request.operation_intent.grounding_evidence.grounded_flows or [])
+                            for item in (planning_request.grounding_decision.grounding_evidence.grounded_flows or [])
                             if str(item.get("flow_id") or "").strip()
                         ]
                     )
@@ -132,7 +151,7 @@ class PlanningArtifactCompiler:
             plan.all_policies.append(
                 PolicyDraft(
                     recommended_actions=[],
-                    supi=str(planning_request.operation_intent.supi or "").strip(),
+                    supi=_planning_supi(planning_request),
                     app_id="",
                     flow_id=None,
                     target_type="ue",
@@ -163,7 +182,7 @@ class PlanningArtifactCompiler:
             plan.all_policies.append(
                 PolicyDraft(
                     recommended_actions=[],
-                    supi=str(flow_ctx.supi or planning_request.operation_intent.supi or "").strip(),
+                    supi=str(flow_ctx.supi or _planning_supi(planning_request)).strip(),
                     app_id=_normalize_app_id(spec.app_id),
                     flow_id=spec.flow_id,
                     target_type="flow",
@@ -187,7 +206,7 @@ class PlanningArtifactCompiler:
             plan.all_policies.append(
                 PolicyDraft(
                     recommended_actions=[],
-                    supi=str((flow_ctx.supi if flow_ctx is not None else "") or planning_request.operation_intent.supi or "").strip(),
+                    supi=str((flow_ctx.supi if flow_ctx is not None else "") or _planning_supi(planning_request)).strip(),
                     app_id=_normalize_app_id(spec.app_id),
                     flow_id=spec.flow_id,
                     target_type=spec.target_type,
@@ -234,7 +253,7 @@ class PlanningArtifactCompiler:
     @staticmethod
     def _resolve_flow(planning_request: PlanningRequest, flow_id: str) -> FlowSelector:
         target = str(flow_id or "").strip()
-        for flow in planning_request.operation_intent.flows:
+        for flow in planning_request.grounding_decision.flows:
             if str(flow.flow_id or "").strip() == target:
                 return flow
         raise ValueError(f"unknown flow_id in advisor output: {flow_id}")
@@ -377,7 +396,7 @@ class PlanningArtifactCompiler:
 
         request_payload = _json_friendly(request_payload)
         policy_payload = _json_friendly(policy_payload)
-        request_payload["supi"] = str(planning_request.operation_intent.supi or "").strip()
+        request_payload["supi"] = _planning_supi(planning_request)
         request_payload["allowedSnssais"] = [item.model_dump(mode="json") for item in spec.allowed_snssais]
         request_payload["targetSnssais"] = [item.model_dump(mode="json") for item in spec.target_snssais]
         request_payload["rfsp"] = int(spec.rfsp)
@@ -455,7 +474,7 @@ class PlanningArtifactCompiler:
             drafts.append(
                 PolicyDraft(
                     recommended_actions=[],
-                    supi=str(item.get("supi") or planning_request.operation_intent.supi or "").strip(),
+                    supi=str(item.get("supi") or _planning_supi(planning_request)).strip(),
                     app_id=_normalize_app_id(item.get("app_id") or item.get("appId") or ""),
                     flow_id=str(item.get("flow_id") or item.get("flowId") or "").strip() or None,
                     target_type=str(item.get("target_type") or item.get("targetType") or "flow").strip() or "flow",
@@ -486,20 +505,20 @@ class PlanningArtifactCompiler:
         if not upstream_requests:
             upstream_requests = [reason] if str(reason or "").strip() else []
         return PolicyPlanDraft(
-            supi=str(planning_request.operation_intent.supi or "").strip(),
+            supi=_planning_supi(planning_request),
             session_id=str(planning_request.context.session_id or "").strip(),
             snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
             planning_status="needs_upstream_reground",
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
-                    planning_request.context.shared_context.initial_intent.objective_profile.get("profile_name")
+                    planning_request.context.shared_context.main_intent.objective_profile.profile_name
                     or ""
                 ).strip(),
                 explanation=rationale,
                 unresolved_gaps=[*missing_evidence, *blocked_targets, *upstream_requests],
                 main_constraints=[
                     str(item)
-                    for item in planning_request.context.shared_context.initial_intent.required_evidence
+                    for item in planning_request.context.shared_context.main_intent.required_evidence
                     if str(item).strip()
                 ],
             ),

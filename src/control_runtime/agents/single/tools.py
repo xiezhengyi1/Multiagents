@@ -9,8 +9,9 @@ from shared.runtime import AgentRuntimeContext
 from shared.tools.wrapper_think import tool_with_reason
 
 from ...context.evidence import EvidenceFormatter
-from ...domain.collaboration import InitialIntentContext, PlanningContext, PlanningRequest, SharedControlContext
-from ...domain.policy_plan import FlowSelector, OperationIntent, QosTargetEnvelope
+from ...domain.collaboration import PlanningContext, PlanningRequest, SharedControlContext
+from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
+from ...domain.policy_plan import FlowSelector, GroundingDecision
 from ...integrations.scenario.network_status import get_network_status_summary
 from ...integrations.storage import get_ue_context_by_supi, get_ue_flow_catalog_by_supi
 from ..planning.tools import _serialize_optimizer_result, _summarize_optimizer_result
@@ -49,7 +50,7 @@ NETWORK_APP_KEYS = ("app_id", "app_name", "flow_count", "total_bw_mbps")
 def _normalize_domains(requested_domains: Optional[List[str]]) -> List[str]:
     normalized: List[str] = []
     for item in requested_domains or []:
-        text = str(item or "").strip().lower()
+        text = str(item.value if hasattr(item, "value") else item or "").strip().lower()
         if text and text not in normalized:
             normalized.append(text)
     if not normalized:
@@ -241,43 +242,6 @@ def _derive_strictest_bandwidth(
     return round(max(baseline * factor, 0.0), 3)
 
 
-def _build_qos_target_envelopes(flows: List[FlowSelector], objective_profile: str) -> List[QosTargetEnvelope]:
-    normalized_profile = str(objective_profile or "").strip()
-    if not normalized_profile:
-        raise ValueError("objective_profile must not be empty")
-    request_signals = _profile_request_signals(objective_profile)
-    envelopes: List[QosTargetEnvelope] = []
-    for flow in flows:
-        flow_id = str(flow.flow_id or "").strip()
-        if not flow_id:
-            continue
-        envelopes.append(
-            QosTargetEnvelope(
-                flow_id=flow_id,
-                app_id=str(flow.app_id or "").strip(),
-                flow_name=str(flow.name or flow_id).strip(),
-                baseline_priority=flow.priority,
-                baseline_latency_ms=flow.lat,
-                baseline_jitter_ms=flow.jitter_req,
-                baseline_packet_error_rate=flow.loss_req,
-                baseline_max_br_ul_mbps=flow.bw_ul,
-                baseline_max_br_dl_mbps=flow.bw_dl,
-                baseline_gbr_ul_mbps=flow.gbr_ul,
-                baseline_gbr_dl_mbps=flow.gbr_dl,
-                strictest_priority=flow.priority,
-                strictest_latency_ms=_derive_strictest_latency(flow.lat, request_signals),
-                strictest_jitter_ms=_derive_strictest_jitter(flow.jitter_req, request_signals),
-                strictest_packet_error_rate=_derive_strictest_loss(flow.loss_req, request_signals),
-                strictest_max_br_ul_mbps=_derive_strictest_bandwidth(flow.bw_ul, request_signals, direction="ul"),
-                strictest_max_br_dl_mbps=_derive_strictest_bandwidth(flow.bw_dl, request_signals, direction="dl"),
-                strictest_gbr_ul_mbps=_derive_strictest_bandwidth(flow.gbr_ul, request_signals, direction="ul"),
-                strictest_gbr_dl_mbps=_derive_strictest_bandwidth(flow.gbr_dl, request_signals, direction="dl"),
-                rationale=[f"grounded_from_flow:{flow_id}", f"objective_profile:{normalized_profile}"],
-            )
-        )
-    return envelopes
-
-
 def _build_runtime_planning_request(
     *,
     supi: str,
@@ -296,29 +260,21 @@ def _build_runtime_planning_request(
         raise ValueError("objective_profile must not be empty")
     flow_rows = _resolve_flow_catalog_rows(normalized_supi, flow_ids, snapshot_id)
     flows = [_flow_selector_from_catalog(item, normalized_supi) for item in flow_rows]
-    operation_intent = OperationIntent(
+    main_intent = GlobalControlIntent(
         supi=normalized_supi,
-        resolution_status="resolved",
-        requested_domains=normalized_domains,
-        flows=flows,
-        qos_target_envelopes=_build_qos_target_envelopes(flows, normalized_profile),
+        next_agent="optimization_strategy",
+        round_strategy=MainRoundStrategy.INITIAL_GROUNDING,
+        requested_domains=[ControlDomain(item) for item in normalized_domains],
+        objective_profile=ObjectiveProfile(profile_name=normalized_profile),
+        required_evidence=["qos_runtime_evidence"],
     )
     return PlanningRequest(
-        operation_intent=operation_intent,
+        grounding_decision=GroundingDecision(flows=flows),
         context=PlanningContext(
             round_index=1,
             session_id=session_id,
             snapshot_id=snapshot_id,
-            active_domains=normalized_domains,
-            shared_context=SharedControlContext(
-                initial_intent=InitialIntentContext(
-                    requested_domains=normalized_domains,
-                    target_supis=[normalized_supi],
-                    target_names=[flow.name for flow in flows if str(flow.name or "").strip()],
-                    objective_profile={"profile_name": normalized_profile},
-                    required_evidence=["qos_runtime_evidence"],
-                ),
-            ),
+            shared_context=SharedControlContext(main_intent=main_intent),
         ),
     )
 

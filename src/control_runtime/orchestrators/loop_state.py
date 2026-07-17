@@ -11,7 +11,7 @@ from ..integrations.storage import create_session_context, get_latest_snapshot_m
 class ControlRoundSnapshot:
     round_index: int
     global_intent: Dict[str, Any]
-    operation_intent: Dict[str, Any]
+    grounding_decision: Dict[str, Any]
     policy_plan: Dict[str, Any]
     diagnosis: Dict[str, Any]
     feedback_added: str = ""
@@ -29,7 +29,7 @@ class ControlRoundSnapshot:
         return cls(
             round_index=int(trace_payload.get("round_index") or 0),
             global_intent=dict(trace_payload.get("global_intent") or {}),
-            operation_intent=dict(trace_payload.get("operation_intent") or {}),
+            grounding_decision=dict(trace_payload.get("grounding_decision") or {}),
             policy_plan=dict(trace_payload.get("policy_plan") or {}),
             diagnosis=dict(trace_payload.get("diagnosis") or {}),
             feedback_added=str(feedback_added or ""),
@@ -51,7 +51,7 @@ class ControlRoundSnapshot:
         return {
             "round_index": self.round_index,
             "global_intent": dict(self.global_intent),
-            "operation_intent": dict(self.operation_intent),
+            "grounding_decision": dict(self.grounding_decision),
             "policy_plan": dict(self.policy_plan),
             "domain_verdicts": [dict(item) for item in self.domain_verdicts],
             "pda_feedback": dict(self.pda_feedback),

@@ -15,8 +15,8 @@ from shared.runtime import ArtifactWorkerMixin, ContextPolicy, ToolLoopExecution
 from shared.logging import log_event, log_timing
 
 from ...context.prompts import SinglePromptBuilder
-from ...domain.collaboration import InitialIntentContext, PlanningContext, SharedControlContext
-from ...domain.control_plane import ControlDomain
+from ...domain.collaboration import PlanningContext, SharedControlContext
+from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
 from ...domain.policy_plan import FlowSelector, PlanningRationale, PolicyDraft, PolicyPlanDraft
 from ..planning.planning_validation import normalize_policy_plan_draft
 from ..planning.compiler import OptimizationStrategyCompiler
@@ -868,9 +868,9 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         mobility_context = self.plan_compiler.advisor_validator._latest_mobility_context(planning_tool_evidence)
 
         active_domains = {
-            str(item).strip().lower()
-            for item in (planning_context.active_domains or [])
-            if str(item).strip()
+            str(item.value if hasattr(item, "value") else item or "").strip().lower()
+            for item in (planning_context.shared_context.main_intent.requested_domains or [])
+            if str(item.value if hasattr(item, "value") else item or "").strip()
         }
         self._validate_policy_presence(decision=decision, active_domains=active_domains)
         if ControlDomain.QOS.value in active_domains:
@@ -880,8 +880,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
 
         planning_metadata = {
             "planning_mode": "single_agent_direct_pcf",
-            "requested_domains": list(planning_context.active_domains or []),
-            "retry_scope": str(planning_context.retry_scope or "").strip(),
+            "requested_domains": [item.value for item in planning_context.shared_context.main_intent.requested_domains],
+            "retry_scope": str(getattr(planning_context.shared_context.main_intent.retry_scope, "value", planning_context.shared_context.main_intent.retry_scope) or "").strip(),
             "objective_breakdown": dict(optimizer_preview.get("objective_breakdown") or {}) if isinstance(optimizer_preview, dict) else {},
             "revision_requests": planning_context.revision_requests or [],
             "unified_constraints": planning_context.unified_constraints or {},
@@ -899,7 +899,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             planning_metadata=planning_metadata,
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
-                    planning_context.shared_context.initial_intent.objective_profile.get("profile_name")
+                    planning_context.shared_context.main_intent.objective_profile.profile_name
                     or decision.objective_profile_hint
                     or ""
                 ).strip(),
@@ -1291,16 +1291,17 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             session_id=session_id,
             snapshot_id=snapshot_id,
             shared_context=SharedControlContext(
-                initial_intent=InitialIntentContext(
-                    request_summary=str(user_input or "").strip(),
-                    requested_domains=active_domains,
-                    objective_profile=objective_profile,
+                main_intent=GlobalControlIntent(
+                    raw_input=str(user_input or "").strip(),
+                    next_agent="optimization_strategy",
+                    round_strategy=MainRoundStrategy.INITIAL_GROUNDING,
+                    requested_domains=[ControlDomain(item) for item in active_domains],
+                    objective_profile=ObjectiveProfile.model_validate(objective_profile or {"profile_name": "balanced"}),
                     required_evidence=required_evidence,
                 ),
             ),
             feedback_context=feedback_context,
             handoff_history=round_traces[-2:],
-            active_domains=active_domains,
             revision_requests=list((previous_mediator_decision or {}).get("revision_requests") or []),
             unified_constraints=dict((previous_mediator_decision or {}).get("unified_constraints") or {}),
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -250,13 +251,76 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
     def _validate_global_intent_result(result: Dict[str, Any]) -> GlobalControlIntent:
         try:
             intent = coerce_structured_response(
-                result,
+                MainControlAgent._repair_global_intent_payload(result),
                 GlobalControlIntent,
                 error_message="Main Agent returned no structured_response",
             )
             return intent
         except Exception as exc:
             raise RuntimeError(f"Main Agent returned invalid GlobalControlIntent payload: {exc}") from exc
+
+    @staticmethod
+    def _repair_global_intent_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+        """Recover known Main/IEA ownership leaks before strict validation.
+
+        The Main agent sometimes places IEA-owned flow fields on a semantic
+        target or confuses uncertainty flags with investigation targets.  Both
+        are lossy presentation errors: the target name/SUPI and uncertainty
+        flag remain intact, while IEA still grounds all concrete identifiers.
+        """
+        structured = result.get("structured_response")
+        if isinstance(structured, GlobalControlIntent) or not isinstance(structured, (dict, str)):
+            return result
+        if isinstance(structured, str):
+            try:
+                structured = json.loads(structured)
+            except json.JSONDecodeError:
+                return result
+        if not isinstance(structured, dict):
+            return result
+
+        repaired = deepcopy(structured)
+        for stage in (repaired.get("control_semantics") or {}).get("stages") or []:
+            if not isinstance(stage, dict):
+                continue
+            for target in stage.get("targets") or []:
+                if not isinstance(target, dict):
+                    continue
+                for field_name in ("app_id", "flow_id", "matched_flow_ids", "resolution_status"):
+                    target.pop(field_name, None)
+
+        investigation_aliases = {
+            "domain_ambiguous": "domain_boundary",
+            "identifier_risk": "ue_binding",
+            "runtime_evidence_missing": "assurance_gap",
+            "execution_feedback_incomplete": "assurance_gap",
+            "conflict_signal_present": "cross_domain_consistency",
+        }
+        allowed_investigations = {
+            "domain_boundary",
+            "ue_binding",
+            "qos_flow_binding",
+            "mobility_target_binding",
+            "policy_feasibility",
+            "cross_domain_consistency",
+            "assurance_gap",
+        }
+        investigations = repaired.get("investigation_targets")
+        if isinstance(investigations, list):
+            repaired["investigation_targets"] = list(
+                dict.fromkeys(
+                    normalized
+                    for item in investigations
+                    if (
+                        normalized := investigation_aliases.get(str(item or "").strip(), str(item or "").strip())
+                    )
+                    in allowed_investigations
+                )
+            )
+
+        normalized_result = dict(result)
+        normalized_result["structured_response"] = repaired
+        return normalized_result
 
     @staticmethod
     def _validate_global_intent(
@@ -378,7 +442,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             except Exception:
                 bindings = []
             if isinstance(bindings, list):
-                payload["previous_operation_intent"] = {"flow_bindings": bindings}
+                payload["previous_grounding_decision"] = {"flow_bindings": bindings}
         return payload
 
     @staticmethod
@@ -405,12 +469,12 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
         if any(marker in context_text for marker in unstable_markers):
             return False
-        previous_intent = (
-            parsed_context.get("previous_operation_intent")
-            if isinstance(parsed_context.get("previous_operation_intent"), dict)
+        previous_grounding_decision = (
+            parsed_context.get("previous_grounding_decision")
+            if isinstance(parsed_context.get("previous_grounding_decision"), dict)
             else {}
         )
-        bindings = previous_intent.get("flow_bindings") if isinstance(previous_intent.get("flow_bindings"), list) else []
+        bindings = previous_grounding_decision.get("flow_bindings") if isinstance(previous_grounding_decision.get("flow_bindings"), list) else []
         return any(
             isinstance(item, dict)
             and str(item.get("resolution_status") or "").strip().lower() == "resolved"

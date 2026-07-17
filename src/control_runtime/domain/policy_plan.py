@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from .control_plane import (
-    ControlSemantics,
     OpenQuestion,
 )
 
@@ -61,29 +60,6 @@ class GroundingEvidenceBundle(BaseModel):
     evidence_sources: Dict[str, List[str]] = Field(default_factory=dict, description="Evidence grouped by source")
 
 
-class QosTargetEnvelope(BaseModel):
-    flow_id: str = Field(default="", description="Grounded flow identifier")
-    app_id: str = Field(default="", description="Grounded application identifier")
-    flow_name: str = Field(default="", description="Grounded flow name")
-    baseline_priority: Optional[int] = Field(default=None, description="Grounded priority baseline")
-    baseline_latency_ms: Optional[float] = Field(default=None, description="Grounded latency baseline in ms")
-    baseline_jitter_ms: Optional[float] = Field(default=None, description="Grounded jitter baseline in ms")
-    baseline_packet_error_rate: Optional[float] = Field(default=None, description="Grounded packet error rate baseline")
-    baseline_max_br_ul_mbps: Optional[float] = Field(default=None, description="Grounded uplink MBR baseline in Mbps")
-    baseline_max_br_dl_mbps: Optional[float] = Field(default=None, description="Grounded downlink MBR baseline in Mbps")
-    baseline_gbr_ul_mbps: Optional[float] = Field(default=None, description="Grounded uplink GBR baseline in Mbps")
-    baseline_gbr_dl_mbps: Optional[float] = Field(default=None, description="Grounded downlink GBR baseline in Mbps")
-    strictest_priority: Optional[int] = Field(default=None, description="Smallest priority number OSA may request")
-    strictest_latency_ms: Optional[float] = Field(default=None, description="Smallest latency target OSA may request")
-    strictest_jitter_ms: Optional[float] = Field(default=None, description="Smallest jitter target OSA may request")
-    strictest_packet_error_rate: Optional[float] = Field(default=None, description="Smallest packet error rate OSA may request")
-    strictest_max_br_ul_mbps: Optional[float] = Field(default=None, description="Largest uplink MBR OSA may request")
-    strictest_max_br_dl_mbps: Optional[float] = Field(default=None, description="Largest downlink MBR OSA may request")
-    strictest_gbr_ul_mbps: Optional[float] = Field(default=None, description="Largest uplink GBR OSA may request")
-    strictest_gbr_dl_mbps: Optional[float] = Field(default=None, description="Largest downlink GBR OSA may request")
-    rationale: List[str] = Field(default_factory=list, description="Deterministic reasons for the envelope")
-
-
 class QosOperationConstraint(BaseModel):
     flow_id: str = Field(default="", description="Grounded flow identifier")
     app_id: str = Field(default="", description="Grounded application identifier")
@@ -116,24 +92,25 @@ class SliceMigrationAuthorization(BaseModel):
     rationale: List[str] = Field(default_factory=list, description="Evidence-backed decision rationale")
 
 
-class OperationIntent(BaseModel):
+class GroundingDecision(BaseModel):
+    """IEA output: facts and operation constraints for Main's active stage only.
+
+    Main owns user scope, requested domains, stage ordering, and semantic
+    targets.  The IEA never repeats or edits those decisions; it returns only
+    bindings and constraints that are needed by OSA for this stage.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    supi: str = Field(default="", description="UE identifier")
-    resolution_status: str = Field(default="", description="Top-level resolution status")
-    requested_domains: List[str] = Field(default_factory=list, description="Requested control domains inferred from intent")
-    domain_resolution: str = Field(default="confirmed", description="confirmed, narrowed, widened, or cannot_confirm")
-    control_semantics: ControlSemantics = Field(default_factory=ControlSemantics, description="Structured staged control semantics derived from the user intent")
-    mobility_intent: Dict[str, Any] = Field(default_factory=dict, description="Mobility / AM policy goals extracted from the user request")
-    grounding_evidence: GroundingEvidenceBundle = Field(default_factory=GroundingEvidenceBundle, description="Structured grounding evidence carried forward for traceability")
     flows: List[FlowSelector] = Field(default_factory=list, description="Resolved flow selectors")
-    qos_target_envelopes: List[QosTargetEnvelope] = Field(default_factory=list, description="IEA-owned QoS target envelopes derived from grounded baselines")
-    qos_operation_constraints: List[QosOperationConstraint] = Field(default_factory=list, description="IEA/Main-owned hard QoS operation constraints")
+    mobility_intent: Dict[str, Any] = Field(default_factory=dict, description="Grounded mobility / AM-policy state needed for this stage")
+    grounding_evidence: GroundingEvidenceBundle = Field(default_factory=GroundingEvidenceBundle, description="Grounding provenance needed for planning and audit")
+    qos_operation_constraints: List[QosOperationConstraint] = Field(default_factory=list, description="IEA-owned hard QoS constraints for grounded flows")
     slice_migration_authorization: SliceMigrationAuthorization = Field(default_factory=SliceMigrationAuthorization, description="IEA-selected authorization state for a requested slice migration")
     open_questions: List[OpenQuestion] = Field(default_factory=list, description="Structured unresolved questions")
 
     @model_validator(mode="after")
-    def _validate_grounded_qos_flows(self) -> "OperationIntent":
+    def _validate_grounded_qos_flows(self) -> "GroundingDecision":
         for index, flow in enumerate(self.flows or []):
             resolution_status = str(flow.resolution_status or "").strip().lower()
             if resolution_status != "resolved":

@@ -78,41 +78,12 @@ def _normalize_snssai_refs(values: Any) -> List[str]:
     return normalized
 
 
-def _resolve_target_app_payload(request: JointOptimizationRequest) -> Optional[Dict[str, Any]]:
-    operation_intent = request.operation_intent or {}
-    traffic_state = request.traffic_state or {}
-    if isinstance(operation_intent, dict) and operation_intent.get("flows"):
-        return {
-            "app_id": operation_intent.get("app_id"),
-            "name": operation_intent.get("app_name"),
-            "supi": operation_intent.get("supi"),
-            "flows": operation_intent.get("flows"),
-        }
-
-    apps = traffic_state.get("apps")
-    if not isinstance(apps, list):
-        return None
-
-    target_supi = str((request.target_ues or [""])[0] or "").strip()
-    target_app_id = str(operation_intent.get("app_id") or "").strip()
-    for app in apps:
-        if not isinstance(app, dict):
-            continue
-        if target_app_id and str(app.get("id") or "").strip() == target_app_id:
-            return app
-        if target_supi and str(app.get("supi") or "").strip() == target_supi:
-            return app
-    return apps[0] if apps else None
-
-
-def _build_optimizer_target_app_from_operation_intent(
-    operation_intent: Dict[str, Any],
-    *,
-    qos_relaxation_ratio: float,
+def _build_optimizer_target_app_from_grounding_decision(
+    grounding_decision: Dict[str, Any],
 ) -> Dict[str, Any]:
-    raw_flows = operation_intent.get("flows")
+    raw_flows = grounding_decision.get("flows")
     if not isinstance(raw_flows, list) or not raw_flows:
-        raise ValueError("operation_intent.flows must be a non-empty list for QoS optimization")
+        raise ValueError("grounding_decision.flows must be a non-empty list for QoS optimization")
 
     flow_by_id: Dict[str, Dict[str, Any]] = {}
     for item in raw_flows:
@@ -122,55 +93,19 @@ def _build_optimizer_target_app_from_operation_intent(
         if flow_id:
             flow_by_id[flow_id] = dict(item)
 
-    envelopes = operation_intent.get("qos_target_envelopes")
-    if not isinstance(envelopes, list) or not envelopes:
-        raise ValueError("QoS optimization requires non-empty operation_intent.qos_target_envelopes")
-
     target_flows: List[Dict[str, Any]] = []
-    matched_flow_ids: set[str] = set()
-    for envelope in envelopes:
-        if not isinstance(envelope, dict):
-            continue
-        flow_id = str(envelope.get("flow_id") or "").strip()
-        if not flow_id:
-            continue
-        base_flow = flow_by_id.get(flow_id)
-        if base_flow is None:
-            raise ValueError(f"QoS target envelope references unknown flow_id={flow_id}")
-        matched_flow_ids.add(flow_id)
-        flow_payload = dict(base_flow)
-        if envelope.get("strictest_priority") is not None:
-            flow_payload["priority"] = envelope.get("strictest_priority")
-        if envelope.get("strictest_latency_ms") is not None:
-            flow_payload["lat"] = _relax_upper_bound(envelope.get("strictest_latency_ms"), qos_relaxation_ratio)
-        if envelope.get("strictest_jitter_ms") is not None:
-            flow_payload["jitter_req"] = _relax_upper_bound(envelope.get("strictest_jitter_ms"), qos_relaxation_ratio)
-        if envelope.get("strictest_packet_error_rate") is not None:
-            flow_payload["loss_req"] = _relax_upper_bound(envelope.get("strictest_packet_error_rate"), qos_relaxation_ratio)
-        if envelope.get("strictest_max_br_ul_mbps") is not None:
-            flow_payload["bw_ul"] = _relax_lower_bound(envelope.get("strictest_max_br_ul_mbps"), qos_relaxation_ratio)
-        if envelope.get("strictest_max_br_dl_mbps") is not None:
-            flow_payload["bw_dl"] = _relax_lower_bound(envelope.get("strictest_max_br_dl_mbps"), qos_relaxation_ratio)
-        if envelope.get("strictest_gbr_ul_mbps") is not None:
-            flow_payload["gbr_ul"] = _relax_lower_bound(envelope.get("strictest_gbr_ul_mbps"), qos_relaxation_ratio)
-        if envelope.get("strictest_gbr_dl_mbps") is not None:
-            flow_payload["gbr_dl"] = _relax_lower_bound(envelope.get("strictest_gbr_dl_mbps"), qos_relaxation_ratio)
-        target_flows.append(flow_payload)
+    for flow_id, flow in flow_by_id.items():
+        target_flows.append(dict(flow))
 
     if not target_flows:
-        raise ValueError("QoS target envelopes produced no optimizer target flows")
+        raise ValueError("grounding decision produced no resolved QoS flows")
 
-    for item in raw_flows:
-        if not isinstance(item, dict):
-            continue
-        flow_id = str(item.get("flow_id") or "").strip()
-        if flow_id and flow_id not in matched_flow_ids:
-            target_flows.append(dict(item))
+    first_flow = target_flows[0]
 
     return {
-        "app_id": operation_intent.get("app_id"),
-        "name": operation_intent.get("app_name"),
-        "supi": operation_intent.get("supi"),
+        "app_id": first_flow.get("app_id"),
+        "name": first_flow.get("app_name"),
+        "supi": first_flow.get("supi"),
         "flows": target_flows,
     }
 
@@ -183,17 +118,11 @@ def _run_qos_subproblem(
     am_policy_state: Optional[AMPolicyState] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     try:
-        target_app = _build_optimizer_target_app_from_operation_intent(
-            request.operation_intent or {},
-            qos_relaxation_ratio=problem_config.qos_relaxation_ratio,
+        target_app = _build_optimizer_target_app_from_grounding_decision(
+            request.grounding_decision or {},
         )
     except Exception as exc:
         return {}, [str(exc)]
-    if target_app is None:
-        target_app = _resolve_target_app_payload(request)
-    if target_app is None:
-        return {}, ["missing target app payload for QoS optimization"]
-
     if "slice_assignment" not in problem_config.decision_variables:
         return {}, ["QoS optimization disabled by problem configuration"]
 

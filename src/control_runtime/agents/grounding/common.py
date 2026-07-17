@@ -3,39 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
-from ...domain.policy_plan import FlowSelector, QosTargetEnvelope
 from .contracts import IntentEvidence
-
-class QosEnvelopeBuilder:
-    def build(
-        self,
-        *,
-        flows: List[FlowSelector],
-    ) -> List[QosTargetEnvelope]:
-        if not flows:
-            return []
-        envelopes: List[QosTargetEnvelope] = []
-        for flow in flows:
-            flow_id = str(flow.flow_id or "").strip()
-            if not flow_id or str(flow.resolution_status or "").strip().lower() != "resolved":
-                continue
-            envelopes.append(
-                QosTargetEnvelope(
-                    flow_id=flow_id,
-                    app_id=str(flow.app_id or "").strip(),
-                    flow_name=str(flow.name or flow_id).strip(),
-                    baseline_priority=flow.priority,
-                    baseline_latency_ms=flow.lat,
-                    baseline_jitter_ms=flow.jitter_req,
-                    baseline_packet_error_rate=flow.loss_req,
-                    baseline_max_br_ul_mbps=flow.bw_ul,
-                    baseline_max_br_dl_mbps=flow.bw_dl,
-                    baseline_gbr_ul_mbps=flow.gbr_ul,
-                    baseline_gbr_dl_mbps=flow.gbr_dl,
-                    rationale=[f"grounded_from_flow:{flow_id}"],
-                )
-            )
-        return envelopes
 
 
 def extract_requested_supis(*texts: str) -> List[str]:

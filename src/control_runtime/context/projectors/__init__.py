@@ -8,12 +8,11 @@ from .memory import (
     project_global_intent_for_prompt,
     project_intent_evidence_for_prompt,
     project_memory_payload,
-    project_operation_intent_for_prompt,
+    project_grounding_decision_for_prompt,
 )
-from .operation_intent import OperationIntentProjector
+from .grounding_decision import GroundingDecisionProjector
 from .planning_context import PlanningContextProjector
 from .policy_plan import PolicyPlanDraftProjector
-from .qos_envelope import QosTargetEnvelopeProjector
 from .registry import ProjectorRegistry
 from .shared_context import SharedControlContextProjector
 
@@ -23,11 +22,10 @@ __all__ = [
     "FieldSpec",
     "FlowSelectorProjector",
     "GlobalControlIntentProjector",
-    "OperationIntentProjector",
+    "GroundingDecisionProjector",
     "PlanningContextProjector",
     "PolicyPlanDraftProjector",
     "ProjectorRegistry",
-    "QosTargetEnvelopeProjector",
     "SharedControlContextProjector",
     "exclude",
     "field",
@@ -35,5 +33,5 @@ __all__ = [
     "project_global_intent_for_prompt",
     "project_intent_evidence_for_prompt",
     "project_memory_payload",
-    "project_operation_intent_for_prompt",
+    "project_grounding_decision_for_prompt",
 ]

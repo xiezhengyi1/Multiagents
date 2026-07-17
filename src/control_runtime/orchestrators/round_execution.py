@@ -18,7 +18,7 @@ from ..domain.control_loop import (
     verdicts_from_conflict_result,
 )
 from ..domain.control_plane import ControlDomain, DomainStatus, DomainVerdict, GlobalControlIntent, UnifiedControlPlan
-from ..domain.policy_plan import OperationIntent, PolicyPlanDraft
+from ..domain.policy_plan import GroundingDecision, PolicyPlanDraft
 from ..integrations.storage import get_snapshot_data_by_id, get_ue_context_by_supi
 from .contracts import ControlRoundTrace
 
@@ -91,31 +91,27 @@ def _global_intent_payload(global_intent: Optional[GlobalControlIntent]) -> Dict
     return global_intent.model_dump(mode="json") if global_intent is not None else {}
 
 
-def _operation_intent_payload(operation_intent: Optional[OperationIntent]) -> Dict[str, Any]:
-    return operation_intent.model_dump(mode="json") if operation_intent is not None else {}
+def _grounding_decision_payload(grounding_decision: Optional[GroundingDecision]) -> Dict[str, Any]:
+    return grounding_decision.model_dump(mode="json") if grounding_decision is not None else {}
 
 
 def _effective_supi(
     global_intent: Optional[GlobalControlIntent],
-    operation_intent: Optional[OperationIntent],
+    grounding_decision: Optional[GroundingDecision],
     policy_plan: PolicyPlanDraft,
 ) -> str:
     if global_intent is not None and str(global_intent.supi or "").strip():
         return str(global_intent.supi or "").strip()
-    if operation_intent is not None and str(operation_intent.supi or "").strip():
-        return str(operation_intent.supi or "").strip()
+    if grounding_decision is not None:
+        for flow in grounding_decision.flows or []:
+            if str(flow.supi or "").strip():
+                return str(flow.supi).strip()
     return str(policy_plan.supi or "").strip()
 
 
-def _requested_domains(operation_intent: Optional[OperationIntent], policy_plan: PolicyPlanDraft) -> List[str]:
-    if operation_intent is not None:
-        domains = [
-            str(item or "").strip().lower()
-            for item in (operation_intent.requested_domains or [])
-            if str(item or "").strip()
-        ]
-        if domains:
-            return domains
+def _requested_domains(global_intent: Optional[GlobalControlIntent], policy_plan: PolicyPlanDraft) -> List[str]:
+    if global_intent is not None and global_intent.requested_domains:
+        return [item.value for item in global_intent.requested_domains]
     inferred: List[str] = []
     for item in policy_plan.all_policies or policy_plan.partial_policies or []:
         domain = "mobility" if item.policy_type == AM_POLICY_TYPE else "qos"
@@ -124,10 +120,10 @@ def _requested_domains(operation_intent: Optional[OperationIntent], policy_plan:
     return inferred
 
 
-def _open_questions(operation_intent: Optional[OperationIntent], policy_plan: PolicyPlanDraft) -> List[Any]:
-    if operation_intent is None:
+def _open_questions(grounding_decision: Optional[GroundingDecision], policy_plan: PolicyPlanDraft) -> List[Any]:
+    if grounding_decision is None:
         return list(policy_plan.open_questions)
-    return list(operation_intent.open_questions + policy_plan.open_questions)
+    return list(grounding_decision.open_questions + policy_plan.open_questions)
 
 
 def _objective_breakdown(policy_plan: PolicyPlanDraft, global_intent: Optional[GlobalControlIntent]) -> Dict[str, Any]:
@@ -145,7 +141,7 @@ def _planning_source_agent(global_intent: Optional[GlobalControlIntent]) -> str:
 def _agent_contributions(
     *,
     global_intent: Optional[GlobalControlIntent],
-    operation_intent: Optional[OperationIntent],
+    grounding_decision: Optional[GroundingDecision],
     policy_plan: PolicyPlanDraft,
 ) -> List[Dict[str, Any]]:
     if global_intent is None:
@@ -156,40 +152,22 @@ def _agent_contributions(
                 "payload": {"policy_plan": policy_plan.model_dump(mode="json")},
             }
         ]
-    operation_payload = _operation_intent_payload(operation_intent)
+    grounding_payload = _grounding_decision_payload(grounding_decision)
     return [
         {"agent": "main_control", "summary": str(global_intent.routing_rationale or "").strip(), "payload": global_intent.model_dump(mode="json")},
         {
             "agent": "intent_encoding",
-            "summary": str((operation_intent.domain_resolution if operation_intent is not None else "") or "").strip(),
-            "payload": operation_payload,
+            "summary": f"grounded_flows={len(grounding_decision.flows) if grounding_decision is not None else 0}",
+            "payload": grounding_payload,
         },
         {"agent": "optimization_strategy", "summary": str(policy_plan.planning_rationale.explanation or "").strip(), "payload": policy_plan.model_dump(mode="json")},
-    ]
-
-
-def _agent_conflicts(
-    *,
-    global_intent: Optional[GlobalControlIntent],
-    operation_intent: Optional[OperationIntent],
-) -> List[Dict[str, Any]]:
-    if global_intent is None or operation_intent is None:
-        return []
-    if str(operation_intent.domain_resolution or "confirmed").strip() == "confirmed":
-        return []
-    return [
-        {
-            "agents": ["main_control", "intent_encoding"],
-            "summary": str(operation_intent.domain_resolution or "").strip(),
-            "impact": str(operation_intent.domain_resolution or "").strip(),
-        }
     ]
 
 
 def _handoff_records(
     *,
     global_intent: Optional[GlobalControlIntent],
-    operation_intent: Optional[OperationIntent],
+    grounding_decision: Optional[GroundingDecision],
     policy_plan: PolicyPlanDraft,
 ) -> List[Dict[str, Any]]:
     if global_intent is None:
@@ -203,7 +181,7 @@ def _handoff_records(
         ]
     return [
         {"source_agent": "main_control", "target_agent": "intent_encoding", "artifact_type": "GlobalControlIntent", "summary": str(global_intent.routing_decision or "").strip()},
-        {"source_agent": "intent_encoding", "target_agent": "optimization_strategy", "artifact_type": "OperationIntent", "summary": str((operation_intent.domain_resolution if operation_intent is not None else "") or "").strip()},
+        {"source_agent": "intent_encoding", "target_agent": "optimization_strategy", "artifact_type": "GroundingDecision", "summary": f"grounded_flows={len(grounding_decision.flows) if grounding_decision is not None else 0}"},
     ]
 
 
@@ -216,7 +194,7 @@ def execute_planned_round(
     cr_tool: ConflictResolutionTool,
     pd_agent: PolicyDispatchAgent,
     ad_tool: AssuranceDiagnosisTool,
-    operation_intent: Optional[OperationIntent] = None,
+    grounding_decision: Optional[GroundingDecision] = None,
     global_intent: Optional[GlobalControlIntent] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
 ) -> RoundExecutionArtifacts:
@@ -224,7 +202,8 @@ def execute_planned_round(
     if not snapshot_data:
         raise LookupError(f"bound snapshot not found: snapshot_id={snapshot_id}")
     planning_status = str(policy_plan.planning_status or "").strip().lower()
-    if planning_status != "executable_plan":
+    dispatchable_partial_plan = planning_status == "partial_plan" and bool(policy_plan.all_policies)
+    if planning_status != "executable_plan" and not dispatchable_partial_plan:
         blocker = PlanningBlockerReport(
             round_index=round_index,
             source_agent=_planning_source_agent(global_intent),
@@ -255,17 +234,17 @@ def execute_planned_round(
         unified_plan = UnifiedControlPlan(
             session_id=session_id,
             snapshot_id=snapshot_id,
-            supi=_effective_supi(global_intent, operation_intent, policy_plan),
+            supi=_effective_supi(global_intent, grounding_decision, policy_plan),
             global_intent=global_intent,
             domain_verdicts=[],
-            blocked_domains=[ControlDomain(item) for item in _requested_domains(operation_intent, policy_plan) if item in {ControlDomain.QOS.value, ControlDomain.MOBILITY.value}],
+            blocked_domains=[ControlDomain(item) for item in _requested_domains(global_intent, policy_plan) if item in {ControlDomain.QOS.value, ControlDomain.MOBILITY.value}],
             objective_breakdown=_objective_breakdown(policy_plan, global_intent),
-            open_questions=_open_questions(operation_intent, policy_plan),
+            open_questions=_open_questions(grounding_decision, policy_plan),
         )
         trace = ControlRoundTrace(
             round_index=round_index,
             global_intent=_global_intent_payload(global_intent),
-            operation_intent=_operation_intent_payload(operation_intent),
+            grounding_decision=_grounding_decision_payload(grounding_decision),
             policy_plan=policy_plan.model_dump(mode="json"),
             domain_verdicts=[],
             pda_feedback={},
@@ -299,7 +278,7 @@ def execute_planned_round(
             snapshot_id=snapshot_id,
             **build_conflict_request_payload(
                 policy_plan=policy_plan,
-                ue_context=get_ue_context_by_supi(_effective_supi(global_intent, operation_intent, policy_plan), snapshot_id=snapshot_id),
+                ue_context=get_ue_context_by_supi(_effective_supi(global_intent, grounding_decision, policy_plan), snapshot_id=snapshot_id),
                 snapshot_data=snapshot_data,
             ),
         )
@@ -316,6 +295,35 @@ def execute_planned_round(
 
     if str(conflict_result.mediator_status or "").strip().lower() == "approved":
         report = pd_agent.execute_and_evaluate(policy_plan, trace_metadata=trace_metadata)
+        if planning_status == "partial_plan" and report.execution_status == "Success":
+            intent_blockers = list(
+                policy_plan.blocked_targets
+                or policy_plan.planner_conflicts
+                or policy_plan.missing_evidence
+            )
+            partial_summary = (
+                "Policy dispatch succeeded, but the requested intent is only partially satisfied: "
+                + "; ".join(intent_blockers or ["a constrained best-effort policy was delivered"])
+            )
+            prior_details = str(report.violation_details or "").strip()
+            if prior_details and prior_details.lower() != "none":
+                partial_summary = f"{prior_details}; {partial_summary}"
+            feedback_payload = dict(report.feedback_payload or {})
+            feedback_payload.update(
+                {
+                    "intent_status": "partially_satisfied",
+                    "intent_blockers": intent_blockers,
+                    "upstream_requests": list(policy_plan.upstream_requests or []),
+                    "planning_status": "partial_plan",
+                }
+            )
+            report = report.model_copy(
+                update={
+                    "intent_status": "partially_satisfied",
+                    "violation_details": partial_summary,
+                    "feedback_payload": feedback_payload,
+                }
+            )
         dispatch_receipts, assurance_verdicts = _parse_pda_metrics(report)
         qos_feedback, mobility_feedback = build_domain_feedback(
             report,
@@ -353,30 +361,42 @@ def execute_planned_round(
         snapshot_id=snapshot_id,
         upstream_context={
             "global_intent": _global_intent_payload(global_intent),
-            "operation_intent": _operation_intent_payload(operation_intent),
+            "grounding_decision": _grounding_decision_payload(grounding_decision),
             "conflict_result": conflict_result.model_dump(mode="json"),
         },
     )
     diagnosis = ad_tool.run(diagnosis_request).model_dump(mode="json")
+    if report is not None and report.intent_status == "partially_satisfied":
+        partial_summary = str(report.violation_details or "").strip()
+        diagnosis.update(
+            {
+                "root_cause_category": "intent_partially_satisfied",
+                "root_cause": "; ".join(policy_plan.blocked_targets or policy_plan.planner_conflicts),
+                "reason_summary": partial_summary,
+                "recommended_actions": list(policy_plan.upstream_requests or []),
+                "intent_status": "partially_satisfied",
+            }
+        )
     execution_reentry = None
     if report is not None and report.execution_status != "Success":
         feedback_payload = report.feedback_payload if isinstance(report.feedback_payload, dict) else {}
-        execution_reentry = ExecutionReentryRequest(
-            round_index=round_index,
-            source_agent="policy_dispatch",
-            recommended_consumers=[],
-            target_bindings_at_risk=list(feedback_payload.get("target_bindings_at_risk") or []),
-            policy_objects_at_risk=list(feedback_payload.get("policy_objects_at_risk") or []),
-            reason_by_domain=dict(feedback_payload.get("reason_by_domain") or {}),
-            failure_scope=str(report.failure_scope or "none"),
-            failures=list(feedback_payload.get("failures") or []),
-            summary=str(report.violation_details or diagnosis.get("reason_summary") or "").strip(),
-        )
+        if not bool(feedback_payload.get("retry_forbidden")):
+            execution_reentry = ExecutionReentryRequest(
+                round_index=round_index,
+                source_agent="policy_dispatch",
+                recommended_consumers=[],
+                target_bindings_at_risk=list(feedback_payload.get("target_bindings_at_risk") or []),
+                policy_objects_at_risk=list(feedback_payload.get("policy_objects_at_risk") or []),
+                reason_by_domain=dict(feedback_payload.get("reason_by_domain") or {}),
+                failure_scope=str(report.failure_scope or "none"),
+                failures=list(feedback_payload.get("failures") or []),
+                summary=str(report.violation_details or diagnosis.get("reason_summary") or "").strip(),
+            )
 
     unified_plan = UnifiedControlPlan(
         session_id=session_id,
         snapshot_id=snapshot_id,
-        supi=_effective_supi(global_intent, operation_intent, policy_plan),
+        supi=_effective_supi(global_intent, grounding_decision, policy_plan),
         global_intent=global_intent,
         qos_proposal=qos_proposal,
         mobility_proposal=mobility_proposal,
@@ -392,18 +412,18 @@ def execute_planned_round(
         ],
         objective_breakdown=_objective_breakdown(policy_plan, global_intent),
         control_churn_count=len(approved_policies(report)),
-        agent_contributions=_agent_contributions(global_intent=global_intent, operation_intent=operation_intent, policy_plan=policy_plan),
-        agent_conflicts=_agent_conflicts(global_intent=global_intent, operation_intent=operation_intent),
-        handoff_records=_handoff_records(global_intent=global_intent, operation_intent=operation_intent, policy_plan=policy_plan),
+        agent_contributions=_agent_contributions(global_intent=global_intent, grounding_decision=grounding_decision, policy_plan=policy_plan),
+        agent_conflicts=[],
+        handoff_records=_handoff_records(global_intent=global_intent, grounding_decision=grounding_decision, policy_plan=policy_plan),
         open_questions=[
             item.model_dump(mode="json") if hasattr(item, "model_dump") else item
-            for item in _open_questions(operation_intent, policy_plan)
+            for item in _open_questions(grounding_decision, policy_plan)
         ],
     )
     trace = ControlRoundTrace(
         round_index=round_index,
         global_intent=_global_intent_payload(global_intent),
-        operation_intent=_operation_intent_payload(operation_intent),
+        grounding_decision=_grounding_decision_payload(grounding_decision),
         policy_plan=policy_plan.model_dump(mode="json"),
         domain_verdicts=[item.model_dump(mode="json") for item in domain_verdicts],
         pda_feedback=report.model_dump(mode="json") if report is not None else {},

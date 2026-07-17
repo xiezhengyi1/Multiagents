@@ -530,7 +530,7 @@ class JointOptimizationRequest(BaseModel):
     snapshot_id: str = ""
     target_ues: List[str] = Field(default_factory=list)
     requested_domains: List[ControlDomain] = Field(default_factory=list)
-    operation_intent: Dict[str, Any] = Field(default_factory=dict)
+    grounding_decision: Dict[str, Any] = Field(default_factory=dict)
     traffic_state: Dict[str, Any] = Field(default_factory=dict)
     resource_state: Dict[str, Any] = Field(default_factory=dict)
     mobility_state: Dict[str, Any] = Field(default_factory=dict)

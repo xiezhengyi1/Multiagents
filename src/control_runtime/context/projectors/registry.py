@@ -34,18 +34,16 @@ class ProjectorRegistry:
     def _discover(cls) -> None:
         from .flow_selector import FlowSelectorProjector
         from .global_intent import GlobalControlIntentProjector
-        from .operation_intent import OperationIntentProjector
+        from .grounding_decision import GroundingDecisionProjector
         from .planning_context import PlanningContextProjector
         from .policy_plan import PolicyPlanDraftProjector
-        from .qos_envelope import QosTargetEnvelopeProjector
 
         for projector in (
             FlowSelectorProjector,
             GlobalControlIntentProjector,
-            OperationIntentProjector,
+            GroundingDecisionProjector,
             PlanningContextProjector,
             PolicyPlanDraftProjector,
-            QosTargetEnvelopeProjector,
         ):
             if projector.model is not None:
                 cls._by_model[projector.model] = projector

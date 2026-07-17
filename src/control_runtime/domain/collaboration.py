@@ -4,36 +4,15 @@ from typing import Any, Dict
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .policy_plan import OperationIntent
-
-
-class InitialIntentContext(BaseModel):
-    """Canonical user-level intent shared across agent boundaries.
-
-    This contract intentionally carries goals and scope, not upstream reasoning,
-    runtime history, snapshots, or tool payloads.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    request_summary: str = Field(default="", description="Compact canonical user request")
-    requested_domains: list[str] = Field(default_factory=list, description="Initially requested control domains")
-    target_supis: list[str] = Field(default_factory=list, description="Explicit UE scopes named by the request")
-    target_names: list[str] = Field(default_factory=list, description="Semantic app/flow/object names named by the request")
-    objective_profile: Dict[str, Any] = Field(default_factory=dict, description="Shared optimization preference")
-    required_evidence: list[str] = Field(default_factory=list, description="Evidence required to execute the request")
-    forbidden_assumptions: list[str] = Field(default_factory=list, description="Assumptions downstream agents must not make")
-    global_constraints: list[Dict[str, Any]] = Field(
-        default_factory=list,
-        description="Only hard cross-agent constraints derived from the initial request",
-    )
+from .control_plane import GlobalControlIntent
+from .policy_plan import GroundingDecision
 
 
 class SharedControlContext(BaseModel):
-    """Minimal canonical request context shared across agent boundaries."""
+    """The Main decision shared with downstream stages without re-generation."""
 
     model_config = ConfigDict(extra="forbid")
-    initial_intent: InitialIntentContext = Field(default_factory=InitialIntentContext)
+    main_intent: GlobalControlIntent = Field(description="Canonical Main decision; Main is its sole producer")
 
 
 class PlanningContext(BaseModel):
@@ -43,20 +22,18 @@ class PlanningContext(BaseModel):
     session_id: str = Field(default="", description="Session identifier")
     snapshot_id: str = Field(default="", description="Bound planning snapshot identifier")
     memory_context: str = Field(default="", description="Retrieved memory context for the round")
-    shared_context: SharedControlContext = Field(default_factory=SharedControlContext, description="Typed cross-agent context shared by Main, IEA, OSA, and tools")
+    shared_context: SharedControlContext = Field(description="Typed Main-owned context shared by IEA, OSA, and tools")
     feedback_context: str = Field(default="", description="Aggregated feedback context from previous rounds")
     handoff_history: list[Dict[str, Any]] = Field(
         default_factory=list,
         description="Structured handoff history from previous rounds",
     )
-    active_domains: list[str] = Field(default_factory=list, description="Domains selected by Main Agent")
-    retry_scope: str = Field(default="", description="Retry scope for this round")
     revision_requests: list[Dict[str, Any]] = Field(default_factory=list, description="Structured revision requests returned by Mediator")
     unified_constraints: Dict[str, Any] = Field(default_factory=dict, description="Structured hard constraints returned by Mediator")
 
 
 class PlanningRequest(BaseModel):
-    operation_intent: OperationIntent = Field(description="Resolved operation intent produced by IEA")
+    grounding_decision: GroundingDecision = Field(description="IEA bindings and constraints for Main's active stage")
     context: PlanningContext = Field(description="Collaboration context for downstream planning agents")
 
 
@@ -84,8 +61,6 @@ class CoordinationIssue(BaseModel):
 class DomainNegotiationRequest(BaseModel):
     round_index: int = Field(default=1)
     source_agent: str = Field(default="intent_encoding")
-    requested_domains: list[str] = Field(default_factory=list)
-    domain_resolution: str = Field(default="cannot_confirm")
     requires_domain_review: bool = False
     issues: list[CoordinationIssue] = Field(default_factory=list)
     recommended_consumers: list[str] = Field(default_factory=list)

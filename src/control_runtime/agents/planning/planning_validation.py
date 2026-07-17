@@ -180,6 +180,11 @@ _json_friendly = json_friendly
 _normalize_app_id = normalize_app_id
 
 
+def _main_retry_scope(planning_request: PlanningRequest) -> str:
+    retry_scope = planning_request.context.shared_context.main_intent.retry_scope
+    return str(getattr(retry_scope, "value", retry_scope) or "").strip().lower()
+
+
 class PlanningAdvisorValidator:
     def validate_advisor_output(
         self,
@@ -191,12 +196,12 @@ class PlanningAdvisorValidator:
     ) -> List[str]:
         errors: List[str] = []
         domains = {
-            str(item).strip().lower()
-            for item in (planning_request.context.active_domains or [])
-            if str(item).strip()
+            str(item.value if hasattr(item, "value") else item or "").strip().lower()
+            for item in (planning_request.context.shared_context.main_intent.requested_domains or [])
+            if str(item.value if hasattr(item, "value") else item or "").strip()
         }
         normalized_tool_evidence = dict(planning_tool_evidence or {})
-        retry_scope = str(planning_request.context.retry_scope or "").strip().lower()
+        retry_scope = _main_retry_scope(planning_request)
         preserved_app_id = self._preserved_app_id(planning_request)
         preserved_flow_ids = self._preserved_flow_ids(planning_request)
         preserved_flow_app_ids = self._preserved_flow_app_ids(planning_request)
@@ -207,20 +212,31 @@ class PlanningAdvisorValidator:
         has_ursp = bool(advisor_output.ursp_policies)
         migration_requirements = self._required_slice_change_constraints(planning_request)
         migration_blocked = self._migration_is_blocked_by_iea(planning_request)
+        optimizer_preview = self._latest_optimizer_preview(normalized_tool_evidence)
         migration_target_unauthorized = self._migration_target_is_unauthorized(
             planning_request=planning_request,
-            optimizer_preview=self._latest_optimizer_preview(normalized_tool_evidence),
+            optimizer_preview=optimizer_preview,
         )
 
         if migration_blocked:
+            if planning_status != "partial_plan":
+                errors.append(
+                    "IEA blocked target slice migration; return partial_plan for entitlement-limited best-effort delivery"
+                )
+            if has_am or has_ursp:
+                errors.append(
+                    "blocked slice migration may deliver QoS-only SM policies but must not include AM or URSP policies"
+                )
+            if has_sm:
+                errors.extend(
+                    self._validate_entitlement_limited_qos_delivery(
+                        optimizer_preview,
+                        planning_request=planning_request,
+                    )
+                )
+        if migration_target_unauthorized and not migration_blocked:
             if planning_status == "executable_plan":
-                errors.append("IEA marked the slice migration blocked pending subscription provisioning or evidence")
-            if has_sm or has_am or has_ursp:
-                errors.append("blocked slice migration must not include executable AM, SM, or URSP policies")
-            return errors
-        if migration_target_unauthorized:
-            if planning_status == "executable_plan":
-                errors.append("optimizer-selected slice is absent from UDR subscription entitlement")
+                errors.append("optimizer-selected slice is absent from subscription entitlement evidence")
             if has_sm or has_am or has_ursp:
                 errors.append("unauthorized slice migration must not include executable AM, SM, or URSP policies")
             return errors
@@ -233,7 +249,7 @@ class PlanningAdvisorValidator:
             errors.append("qos-active planning requires sm_policies")
         if planning_status == "executable_plan" and "mobility" in domains and not has_am:
             errors.append("mobility-active planning requires am_policy")
-        if migration_requirements and planning_status == "executable_plan":
+        if migration_requirements and planning_status == "executable_plan" and not migration_blocked:
             if not has_sm:
                 errors.append("authorized slice migration requires an SM policy")
             if not has_am:
@@ -253,7 +269,6 @@ class PlanningAdvisorValidator:
                     planning_request=planning_request,
                 )
             )
-        optimizer_preview = self._latest_optimizer_preview(normalized_tool_evidence)
         mobility_context = self._latest_mobility_context(normalized_tool_evidence)
         if (
             "qos" in domains
@@ -263,6 +278,7 @@ class PlanningAdvisorValidator:
                 flow_ids=preserved_flow_ids,
             )
             and not migration_target_unauthorized
+            and not migration_blocked
             and not self._validate_required_slice_changes(
                 optimizer_preview,
                 planning_request=planning_request,
@@ -287,12 +303,13 @@ class PlanningAdvisorValidator:
                         errors.append(
                             f"optimizer preview does not contain a grounded QoS assignment for flow_id={spec.flow_id}"
                         )
-                errors.extend(
-                    self._validate_required_slice_changes(
-                        optimizer_preview,
-                        planning_request=planning_request,
+                if not migration_blocked:
+                    errors.extend(
+                        self._validate_required_slice_changes(
+                            optimizer_preview,
+                            planning_request=planning_request,
+                        )
                     )
-                )
         if has_am and not mobility_context:
             errors.append("am_policy requires a parseable mobility context payload")
         if retry_scope == "target_stable":
@@ -339,8 +356,9 @@ class PlanningAdvisorValidator:
 
     @classmethod
     def _migration_is_blocked_by_iea(cls, planning_request: PlanningRequest) -> bool:
-        authorization = planning_request.operation_intent.slice_migration_authorization
+        authorization = planning_request.grounding_decision.slice_migration_authorization
         return str(authorization.decision or "").strip() in {
+            "blocked_by_subscription_entitlement",
             "blocked_requires_subscription_provisioning",
             "evidence_missing",
         }
@@ -359,7 +377,7 @@ class PlanningAdvisorValidator:
             key
             for key in (
                 cls._normalize_snssai_key(item)
-                for item in planning_request.operation_intent.slice_migration_authorization.authorized_snssais
+                for item in planning_request.grounding_decision.slice_migration_authorization.authorized_snssais
             )
             if key
         }
@@ -370,6 +388,45 @@ class PlanningAdvisorValidator:
             if selected and selected != cls._normalize_snssai_key(requirement["source_slice_snssai"]) and selected not in authorized:
                 return True
         return False
+
+    @classmethod
+    def _validate_entitlement_limited_qos_delivery(
+        cls,
+        optimizer_preview: Dict[str, Any],
+        *,
+        planning_request: PlanningRequest,
+    ) -> List[str]:
+        """Allow only QoS tuning that remains on a subscribed serving slice."""
+        errors: List[str] = []
+        authorized = {
+            key
+            for key in (
+                cls._normalize_snssai_key(item)
+                for item in planning_request.grounding_decision.slice_migration_authorization.authorized_snssais
+            )
+            if key
+        }
+        for requirement in cls._required_slice_change_constraints(planning_request):
+            flow_id = requirement["flow_id"]
+            source = cls._normalize_snssai_key(requirement["source_slice_snssai"])
+            selected = cls._normalize_snssai_key(
+                cls._extract_selected_slice(optimizer_preview, flow_id=flow_id)
+            )
+            if not selected:
+                errors.append(
+                    f"entitlement-limited QoS delivery requires a grounded serving-slice assignment for flow_id={flow_id}"
+                )
+            elif selected != source:
+                errors.append(
+                    "entitlement-limited QoS delivery must preserve the serving slice: "
+                    f"flow_id={flow_id}, source_slice_snssai={source}, selected_slice={selected}"
+                )
+            elif authorized and selected not in authorized:
+                errors.append(
+                    "entitlement-limited QoS delivery selected a serving slice absent from subscription entitlement evidence: "
+                    f"flow_id={flow_id}, selected_slice={selected}"
+                )
+        return errors
 
     @classmethod
     def _validate_am_targets_for_slice_migration(
@@ -430,7 +487,7 @@ class PlanningAdvisorValidator:
     ) -> List[str]:
         allowed_flow_app_ids = {
             str(flow.flow_id or "").strip(): _normalize_app_id(flow.app_id or "")
-            for flow in (planning_request.operation_intent.flows or [])
+            for flow in (planning_request.grounding_decision.flows or [])
             if str(flow.flow_id or "").strip()
         }
         if not allowed_flow_app_ids:
@@ -442,13 +499,13 @@ class PlanningAdvisorValidator:
             expected_app_id = allowed_flow_app_ids.get(flow_id)
             if expected_app_id is None:
                 errors.append(
-                    f"sm_policies[{index}].flow_id={flow_id or '<empty>'} is outside OperationIntent flows "
+                    f"sm_policies[{index}].flow_id={flow_id or '<empty>'} is outside GroundingDecision flows "
                     f"{sorted(allowed_flow_app_ids)}"
                 )
                 continue
             if expected_app_id and app_id != expected_app_id:
                 errors.append(
-                    f"sm_policies[{index}].app_id must preserve OperationIntent app_id={expected_app_id} "
+                    f"sm_policies[{index}].app_id must preserve GroundingDecision app_id={expected_app_id} "
                     f"for flow_id={flow_id}; got {app_id or '<empty>'}"
                 )
         return errors
@@ -567,11 +624,11 @@ class PlanningAdvisorValidator:
     def _required_slice_change_constraints(planning_request: PlanningRequest) -> List[Dict[str, str]]:
         flow_source_slice = {
             str(flow.flow_id or "").strip(): str(flow.current_slice_snssai or "").strip()
-            for flow in (planning_request.operation_intent.flows or [])
+            for flow in (planning_request.grounding_decision.flows or [])
             if str(flow.flow_id or "").strip()
         }
         requirements: List[Dict[str, str]] = []
-        for constraint in planning_request.operation_intent.qos_operation_constraints or []:
+        for constraint in planning_request.grounding_decision.qos_operation_constraints or []:
             if not constraint.require_slice_change:
                 continue
             flow_id = str(constraint.flow_id or "").strip()
@@ -579,17 +636,9 @@ class PlanningAdvisorValidator:
             if flow_id and source_slice:
                 requirements.append({"flow_id": flow_id, "source_slice_snssai": source_slice})
 
-        shared_context = planning_request.context.shared_context
-        for raw_constraint in shared_context.initial_intent.global_constraints:
-            if not isinstance(raw_constraint, dict):
-                continue
-            if str(raw_constraint.get("type") or "") != "qos_slice_migration":
-                continue
-            if not bool(raw_constraint.get("required", True)):
-                continue
-            for flow_id, source_slice in flow_source_slice.items():
-                if flow_id and source_slice and not any(item["flow_id"] == flow_id for item in requirements):
-                    requirements.append({"flow_id": flow_id, "source_slice_snssai": source_slice})
+        # Global constraints are Main-level routing cues. They do not identify
+        # a resolved flow or override IEA's explicit per-flow decision about a
+        # serving-S-NSSAI migration.
         return requirements
 
     @staticmethod
@@ -631,7 +680,7 @@ class PlanningAdvisorValidator:
 
     @staticmethod
     def _preserved_app_id(planning_request: PlanningRequest) -> str:
-        for flow in planning_request.operation_intent.flows or []:
+        for flow in planning_request.grounding_decision.flows or []:
             app_id = _normalize_app_id(flow.app_id or "")
             if app_id:
                 return app_id
@@ -641,14 +690,14 @@ class PlanningAdvisorValidator:
     def _preserved_flow_ids(planning_request: PlanningRequest) -> set[str]:
         return {
             str(flow.flow_id or "").strip()
-            for flow in (planning_request.operation_intent.flows or [])
+            for flow in (planning_request.grounding_decision.flows or [])
             if str(flow.flow_id or "").strip()
         }
 
     @staticmethod
     def _preserved_flow_app_ids(planning_request: PlanningRequest) -> Dict[str, str]:
         mapping: Dict[str, str] = {}
-        for flow in planning_request.operation_intent.flows or []:
+        for flow in planning_request.grounding_decision.flows or []:
             flow_id = str(flow.flow_id or "").strip()
             app_id = _normalize_app_id(flow.app_id or "")
             if flow_id and app_id:
@@ -657,7 +706,7 @@ class PlanningAdvisorValidator:
 
     @staticmethod
     def _preserved_association_id(planning_request: PlanningRequest) -> str:
-        mobility_targets = planning_request.operation_intent.grounding_evidence.grounded_mobility_targets
+        mobility_targets = planning_request.grounding_decision.grounding_evidence.grounded_mobility_targets
         if isinstance(mobility_targets, dict):
             summary = mobility_targets.get("summary")
             if isinstance(summary, dict):
@@ -683,9 +732,9 @@ class PlanningArtifactValidator:
             raise ValueError("OptimizationStrategyAgent produced no policies for the requested domain.")
 
         active_domains = {
-            str(item).strip().lower()
-            for item in (planning_request.context.active_domains or [])
-            if str(item).strip()
+            str(item.value if hasattr(item, "value") else item or "").strip().lower()
+            for item in (planning_request.context.shared_context.main_intent.requested_domains or [])
+            if str(item.value if hasattr(item, "value") else item or "").strip()
         }
         if ControlDomain.QOS.value in active_domains:
             has_sm_policy = any(item.policy_type == "SmPolicyDecision" for item in policy_plan.all_policies)
@@ -695,7 +744,7 @@ class PlanningArtifactValidator:
             has_am_policy = any(item.policy_type == "PcfAmPolicyControlPolicyAssociation" for item in policy_plan.all_policies)
             if not has_am_policy:
                 raise ValueError("OptimizationStrategyAgent did not include an executable AM policy for a mobility-active round.")
-        retry_scope = str(planning_request.context.retry_scope or "").strip().lower()
+        retry_scope = _main_retry_scope(planning_request)
         if retry_scope == "target_stable":
             preserved_app_id = PlanningAdvisorValidator._preserved_app_id(planning_request)
             preserved_flow_ids = PlanningAdvisorValidator._preserved_flow_ids(planning_request)

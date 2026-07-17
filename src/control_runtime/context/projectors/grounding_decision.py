@@ -2,26 +2,20 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...domain.policy_plan import OperationIntent
+from ...domain.policy_plan import GroundingDecision
 from .base import BaseProjector, exclude, field, json_mapping, without_empty_values
 from .flow_selector import FlowSelectorProjector
-from .qos_envelope import QosTargetEnvelopeProjector
 
 
-class OperationIntentProjector(BaseProjector):
-    model = OperationIntent
+class GroundingDecisionProjector(BaseProjector):
+    model = GroundingDecision
     visible = (
-        field("supi"),
-        field("resolution_status"),
-        field("requested_domains"),
-        field("domain_resolution"),
-        field("control_semantics"),
         field("mobility_intent"),
         field("slice_migration_authorization"),
     )
     excluded = (
-        exclude("open_questions", reason="Handled by artifact contracts, not LLM prompt projection"),
-        exclude("grounding_evidence", reason="Traceability payload, too verbose for OSA prompt"),
+        exclude("open_questions", reason="Handled by artifact contracts, not the OSA prompt"),
+        exclude("grounding_evidence", reason="Traceability payload, too verbose for the OSA prompt"),
     )
 
     @classmethod
@@ -35,13 +29,6 @@ class OperationIntentProjector(BaseProjector):
         ]
         if flows:
             projected["flows"] = flows
-        envelopes = [
-            QosTargetEnvelopeProjector.project(envelope)
-            for envelope in (raw.get("qos_target_envelopes") or [])
-            if isinstance(envelope, dict)
-        ]
-        if envelopes:
-            projected["qos_target_envelopes"] = envelopes
         constraints = [
             without_empty_values(dict(constraint))
             for constraint in (raw.get("qos_operation_constraints") or [])
@@ -50,3 +37,6 @@ class OperationIntentProjector(BaseProjector):
         if constraints:
             projected["qos_operation_constraints"] = constraints
         return without_empty_values(projected)
+
+
+__all__ = ["GroundingDecisionProjector"]

@@ -11,7 +11,7 @@ from ...domain.intent_encoding import (
     uses_am_grounding,
     uses_sm_grounding,
 )
-from ...domain.policy_plan import OperationIntent
+from ...domain.policy_plan import GroundingDecision
 from .contracts import IntentEvidence
 from .validator import IntentGroundingValidator
 
@@ -46,6 +46,7 @@ class IntentCompiler:
         semantic_candidates: List[Dict[str, Any]],
         am_context_payload: Optional[Dict[str, Any]] = None,
         am_policy_candidates: Optional[List[Dict[str, Any]]] = None,
+        subscription_payload: Optional[Dict[str, Any]] = None,
     ) -> IntentEvidence:
         return EvidenceFormatter.for_iea(
             user_input=user_input,
@@ -56,6 +57,7 @@ class IntentCompiler:
             semantic_candidates=semantic_candidates,
             am_context_payload=am_context_payload,
             am_policy_candidates=am_policy_candidates,
+            subscription_payload=subscription_payload,
         )
 
     def validate_intent_grounding(
@@ -63,21 +65,21 @@ class IntentCompiler:
         *,
         evidence: IntentEvidence,
         grounding_tools: List[str],
-        operation_intent: OperationIntent | None = None,
+        grounding_decision: GroundingDecision | None = None,
     ) -> List[str]:
         return self.validator.validate_intent_grounding(
             evidence=evidence,
             grounding_tools=grounding_tools,
-            operation_intent=operation_intent,
+            grounding_decision=grounding_decision,
         )
 
-    def validate_operation_intent(
+    def validate_grounding_decision(
         self,
         *,
         evidence: IntentEvidence,
-        operation_intent: OperationIntent,
+        grounding_decision: GroundingDecision,
     ) -> List[str]:
-        return self.validator.validate_operation_intent(
+        return self.validator.validate_grounding_decision(
             evidence=evidence,
-            operation_intent=operation_intent,
+            grounding_decision=grounding_decision,
         )

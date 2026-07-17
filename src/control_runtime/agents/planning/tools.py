@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -136,17 +137,34 @@ def _serialize_optimizer_result(result: Any) -> Dict[str, Any]:
     return payload
 
 
-def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], Dict[str, Any]]:
+def build_request_tools(
+    planning_request: PlanningRequest,
+    *,
+    cached_tool_evidence: Optional[Dict[str, Any]] = None,
+) -> tuple[List[Any], Dict[str, Any]]:
     from ...integrations.optimizer import run_joint_control_optimizer as run_optimizer
-    _results_cache: Dict[str, Any] = {}
+    _results_cache: Dict[str, Any] = {
+        str(key): copy.deepcopy(value)
+        for key, value in (cached_tool_evidence or {}).items()
+        if value not in (None, "", [], {})
+    }
     active_domains = {
         str(item.value if hasattr(item, "value") else item or "").strip().lower()
-        for item in (planning_request.context.active_domains or planning_request.operation_intent.requested_domains or [])
+        for item in (planning_request.context.shared_context.main_intent.requested_domains or [])
         if str(item.value if hasattr(item, "value") else item or "").strip()
     }
 
     def _require_target_supi(candidate: Optional[str]) -> str:
-        target = str(candidate or "").strip() or str(planning_request.operation_intent.supi or "").strip()
+        target = str(candidate or "").strip() or str(planning_request.context.shared_context.main_intent.supi or "").strip()
+        if not target:
+            target = next(
+                (
+                    str(flow.supi or "").strip()
+                    for flow in (planning_request.grounding_decision.flows or [])
+                    if str(flow.supi or "").strip()
+                ),
+                "",
+            )
         if not target:
             raise ValueError("inspect_mobility_ue_policies requires a SUPI in the tool args or planning request")
         return target
@@ -181,6 +199,14 @@ def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], D
         qos_feasibility_mode: str = "auto",
     ) -> str:
         """Run the joint optimizer for executable planning evidence and return result plus summary."""
+        cached_preview = _results_cache.get("latest_optimizer_preview")
+        if isinstance(cached_preview, dict) and cached_preview:
+            # A retry must use the already-grounded optimizer result rather
+            # than rerun an expensive solve after a response-schema failure.
+            return json.dumps(
+                {"summary": _summarize_optimizer_result(cached_preview)},
+                ensure_ascii=False,
+            )
         request = EvidenceFormatter.for_optimizer(
             planning_request,
             profile_name=str(objective_profile or "balanced").strip().lower(),
@@ -195,7 +221,7 @@ def build_request_tools(planning_request: PlanningRequest) -> tuple[List[Any], D
         summary = _summarize_optimizer_result(full_payload)
         current_slice_by_flow_id = {
             str(flow.flow_id or "").strip(): str(flow.current_slice_snssai or "").strip()
-            for flow in (planning_request.operation_intent.flows or [])
+            for flow in (planning_request.grounding_decision.flows or [])
             if str(flow.flow_id or "").strip() and str(flow.current_slice_snssai or "").strip()
         }
         for assignment in summary.get("qos_flow_assignments") or []:

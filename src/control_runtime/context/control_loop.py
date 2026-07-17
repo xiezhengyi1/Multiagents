@@ -17,7 +17,7 @@ def build_main_context(
     external_routing_hint: Optional[Dict[str, Any]] = None,
     previous_diagnosis: Optional[Dict[str, Any]] = None,
     previous_execution_feedback: Optional[Dict[str, Any]] = None,
-    previous_operation_intent: Optional[Dict[str, Any]] = None,
+    previous_grounding_decision: Optional[Dict[str, Any]] = None,
     previous_negotiation_request: Optional[Dict[str, Any]] = None,
     previous_planning_blocker: Optional[Dict[str, Any]] = None,
     previous_execution_reentry: Optional[Dict[str, Any]] = None,
@@ -34,8 +34,8 @@ def build_main_context(
         f"{_render_snapshot_summary(_build_snapshot_summary(snapshot))}\n\n"
         "## Previous Round Diagnosis\n"
         f"{_render_mapping(previous_diagnosis or {})}\n\n"
-        "## Previous Operation Intent\n"
-        f"{_render_mapping(_build_previous_operation_intent_summary(previous_operation_intent or {}))}\n\n"
+        "## Previous Grounding Decision\n"
+        f"{_render_mapping(_build_previous_grounding_decision_summary(previous_grounding_decision or {}))}\n\n"
         "## Retry Hints\n"
         f"{_render_json_list(_build_execution_retry_hints(retry_source))}\n\n"
         "## Conflict And Assurance Signals\n"
@@ -90,7 +90,6 @@ def build_round_feedback_block(
     if negotiation_request:
         blocks.append(
             "[Negotiation]\n"
-            f"domain_resolution: {negotiation_request.get('domain_resolution', '')}\n"
             f"summary: {negotiation_request.get('summary', '')}\n"
             f"recommended_consumers: {json.dumps(negotiation_request.get('recommended_consumers') or [], ensure_ascii=False)}\n"
         )
@@ -535,15 +534,11 @@ def _build_snapshot_summary(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _build_previous_operation_intent_summary(previous_operation_intent: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(previous_operation_intent, dict):
+def _build_previous_grounding_decision_summary(previous_grounding_decision: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(previous_grounding_decision, dict):
         return {}
-    flows = previous_operation_intent.get("flows") if isinstance(previous_operation_intent.get("flows"), list) else []
+    flows = previous_grounding_decision.get("flows") if isinstance(previous_grounding_decision.get("flows"), list) else []
     return {
-        "supi": str(previous_operation_intent.get("supi") or "").strip(),
-        "requested_domains": list(previous_operation_intent.get("requested_domains") or []),
-        "domain_resolution": str(previous_operation_intent.get("domain_resolution") or "").strip(),
-        "control_semantics": previous_operation_intent.get("control_semantics") or {},
         "flow_bindings": [
             {
                 "flow_id": str(item.get("flow_id") or "").strip(),

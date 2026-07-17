@@ -32,6 +32,12 @@ def resolve_problem_config(request: JointOptimizationRequest) -> Tuple[Optimizat
     else:
         config.solver_mode = config.solver_mode or "incremental"
 
+    if bool((request.grounding_decision or {}).get("preserve_current_slice", False)):
+        # IEA subscription evidence prohibits a migration. Keep the serving
+        # slice fixed, but let the hybrid optimizer find the best QoS envelope
+        # that can still be delivered on that entitlement.
+        config.solver_mode = "hybrid"
+
     return config, profile
 
 

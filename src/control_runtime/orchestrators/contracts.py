@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 class ControlRoundTrace:
     round_index: int
     global_intent: Dict[str, Any] = field(default_factory=dict)
-    operation_intent: Dict[str, Any] = field(default_factory=dict)
+    grounding_decision: Dict[str, Any] = field(default_factory=dict)
     policy_plan: Dict[str, Any] = field(default_factory=dict)
     domain_verdicts: List[Dict[str, Any]] = field(default_factory=list)
     pda_feedback: Dict[str, Any] = field(default_factory=dict)
@@ -38,6 +38,7 @@ class ControlRoundResult:
     round_count: int = 1
     retry_count: int = 0
     round_traces: List[Dict[str, Any]] = field(default_factory=list)
+    agent_elapsed_ms: Dict[str, float] = field(default_factory=dict)
 
 
 __all__ = ["ControlRoundResult", "ControlRoundTrace"]

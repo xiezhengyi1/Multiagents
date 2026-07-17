@@ -5,13 +5,13 @@ from typing import Any
 from .base import json_mapping, without_empty_values
 from .evidence import IntentEvidenceProjector
 from .global_intent import GlobalControlIntentProjector
-from .operation_intent import OperationIntentProjector
+from .grounding_decision import GroundingDecisionProjector
 from .planning_context import PlanningContextProjector
 from .policy_plan import PolicyPlanDraftProjector
 
 
-def project_operation_intent_for_prompt(operation_intent: Any) -> dict[str, Any]:
-    return OperationIntentProjector.project(operation_intent)
+def project_grounding_decision_for_prompt(grounding_decision: Any) -> dict[str, Any]:
+    return GroundingDecisionProjector.project(grounding_decision)
 
 
 def project_global_intent_for_prompt(global_intent: Any) -> dict[str, Any]:
@@ -29,7 +29,7 @@ def project_intent_evidence_for_prompt(evidence: Any) -> dict[str, Any]:
 def project_memory_payload(role: str, payload: Any) -> dict[str, Any]:
     normalized_role = str(role or "").strip().upper()
     if normalized_role == "IEA":
-        return project_operation_intent_for_prompt(payload)
+        return project_grounding_decision_for_prompt(payload)
     if normalized_role == "MAIN":
         return project_global_intent_for_prompt(payload)
     if normalized_role == "OSA":

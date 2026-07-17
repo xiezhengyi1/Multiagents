@@ -18,7 +18,7 @@ class OptimizationStrategyCompiler:
 
     def build_planning_evidence(self, planning_request: PlanningRequest) -> Dict[str, Any]:
         return EvidenceFormatter.for_osa(
-            operation_intent=planning_request.operation_intent,
+            grounding_decision=planning_request.grounding_decision,
             planning_context=planning_request.context,
         )
 
@@ -62,6 +62,5 @@ class OptimizationStrategyCompiler:
             reason=reason,
             advisor_output=advisor_output,
         )
-
 
 __all__ = ["OptimizationStrategyCompiler", "build_slice_snssai"]

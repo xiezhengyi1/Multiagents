@@ -110,15 +110,61 @@ Example — Infeasible optimizer, must NOT return executable_plan:
 }"""
 
 
+_BLOCKED_MIGRATION_EXAMPLE = """
+Example — IEA-blocked migration, entitlement-limited best-effort delivery:
+{
+  "planning_status": "partial_plan",
+  "rationale": "Read-only entitlement evidence blocks the requested target migration; the optimizer preserved the catalog-confirmed entitled serving slice and produced the best available QoS policy.",
+  "missing_evidence": ["authorized target S-NSSAI"],
+  "blocked_targets": ["flow-9649 target slice migration"],
+  "upstream_requests": [],
+  "planner_conflicts": ["Requested slice change is blocked by subscription entitlement; current-slice QoS tuning is being delivered."],
+  "sm_policies": [
+    {
+      "flow_id": "flow-9649",
+      "app_id": "app-remote-drive",
+      "priority": 3,
+      "target_latency_ms": 10.0,
+      "packet_error_rate": 0.001,
+      "max_br_ul_mbps": 20.0,
+      "max_br_dl_mbps": 80.0,
+      "gbr_ul_mbps": 10.0,
+      "gbr_dl_mbps": 40.0,
+      "target_jitter_ms": 5.0
+    }
+  ],
+  "am_policy": null,
+  "ursp_policies": [],
+  "partial_policies": []
+}"""
+
+
+_UNENTITLED_PREVIEW_BLOCK_EXAMPLE = """
+Example — blocked migration and optimizer selected an unentitled target:
+{
+  "planning_status": "partial_plan",
+  "rationale": "IEA forbids target-slice migration and the only optimizer preview selects an unentitled target, so no executable policy is emitted.",
+  "missing_evidence": [],
+  "blocked_targets": ["flow-9649 target slice migration"],
+  "upstream_requests": [],
+  "planner_conflicts": ["Optimizer did not provide a current-slice assignment allowed by the subscription evidence."],
+  "sm_policies": [],
+  "am_policy": null,
+  "ursp_policies": [],
+  "partial_policies": [{"policy_type": "SmPolicyDecision", "policy_id": "partial-sm-flow-9649", "flow_id": "flow-9649", "app_id": "app-remote-drive", "target_type": "flow", "blocked_reason": "Selected target slice is not entitled."}]
+}"""
+
+
 OSA_OUTPUT_FORMAT_RULES = """
 Output contract (violations are rejected):
 - Return raw JSON: exactly one OsaAdvisorOutput object; never markdown or `planning_metadata`. Never add top-level keys outside the OsaAdvisorOutput schema.
 - Required root fields: planning_status, rationale, missing_evidence, blocked_targets, upstream_requests, planner_conflicts, sm_policies, am_policy, ursp_policies, partial_policies.
-- `rationale` MUST be a string. Lists are `[]` when empty; `am_policy` is `null` only when mobility is inactive. Never emit `{}` as an optional policy value.
+- `rationale` MUST be a string. Every collection field (`sm_policies`, `ursp_policies`, `partial_policies`, blocker lists) is `[]` when empty, never `null`; `am_policy` is `null` only when mobility is inactive. Never emit `{}` as an optional policy value.
+- `missing_evidence`, `blocked_targets`, `upstream_requests`, and `planner_conflicts` are `List[str]`: every item is one concise string, never an object with reason/request metadata.
 - Never return a bare policy object like `{\"flow_id\":...}` outside the sm_policies array.
-- Every SmPolicySpec has an exact OperationIntent flow_id/app_id, priority 1-15, target_latency_ms >= 1.0, packet_error_rate 0-1, max_br_ul_mbps, and max_br_dl_mbps. Optional GBR cannot exceed maxBR.
+- Every SmPolicySpec has an exact GroundingDecision flow_id/app_id, priority 1-15, target_latency_ms >= 1.0, packet_error_rate 0-1, max_br_ul_mbps, and max_br_dl_mbps. Optional GBR cannot exceed maxBR.
 - Optimizer output is evidence, not an SmPolicySpec. Never copy `new_slice`, `current_slice`, `slice_snssai`, `jitter_ms`, or other allocation metadata into sm_policies. The compiler retains the optimizer assignment and generates the executable policy_id; `policy_id` belongs only in partial_policies. When jitter is needed in an SM policy, use the exact key `target_jitter_ms`.
-- Every AmPolicySpec has non-empty triggers, rfsp >= 1, non-empty allowed_snssais, and target_snssais contained in allowed_snssais.
+- Every AmPolicySpec has ONLY triggers, rfsp, allowed_snssais, target_snssais, optional ue_ambr_ul_mbps, optional ue_ambr_dl_mbps, and optional serv_area_res. SUPI/session/policy IDs are code-owned and must not appear inside am_policy. It has non-empty triggers, rfsp >= 1, non-empty allowed_snssais, and target_snssais contained in allowed_snssais.
 - Every UrspPolicySpec uses target_type `flow` or `app`, app_id, relat_precedence >= 1, and non-empty route_sel_param_sets; a flow target also needs flow_id and traffic_desc.
 - Partial policy items MUST include: policy_type, policy_id, and grounded flow_id/app_id/target_type plus blocked_reason when available.
 
@@ -183,6 +229,13 @@ def build_validation_retry_prompt(
             "never a bare array or a bare policy item.\n\n"
             + _QOS_EXAMPLE
         )
+    elif "am_policy.supi" in joined or ("ursp_policies" in joined and "valid list" in joined):
+        correction = (
+            "Repair the exact OSA schema shape. am_policy must not contain supi, session_id, snapshot_id, policy_id, or policy_type; "
+            "those are code-owned. ursp_policies is [] when unused, never null. "
+            "Keep every required top-level field and return one OsaAdvisorOutput object.\n\n"
+            + _MOBILITY_EXAMPLE
+        )
     elif "extra inputs are not permitted" in joined:
         correction = (
             "Your previous answer included fields not in the OsaAdvisorOutput schema. "
@@ -193,6 +246,24 @@ def build_validation_retry_prompt(
             "max_br_ul_mbps, max_br_dl_mbps, optional gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, flow_description. "
             "Only emit the defined OsaAdvisorOutput fields.\n\n"
             + _QOS_EXAMPLE
+        )
+    elif (
+        "target slice migration" in joined
+        or "entitlement-limited qos delivery" in joined
+        or "blocked slice migration may deliver" in joined
+        or "blocked_targets.0" in joined
+        or "upstream_requests.0" in joined
+    ):
+        correction = (
+            "IEA has blocked only the target S-NSSAI migration, not the QoS objective. "
+            "If the optimizer preview preserves the current authorized slice, return planning_status=\"partial_plan\" and deliver that optimizer-backed SM policy. "
+            "If the preview selects an unentitled slice, do not emit any SM policy from it: return partial_plan with one non-executable partial_policies descriptor instead. "
+            "If the preview is Infeasible or has no grounded assignment, likewise emit no SM policy and return only that non-executable partial descriptor. "
+            "Do not emit AM or URSP policies, because they could bypass the subscription boundary. "
+            "For blocked_by_subscription_entitlement, do not request subscription provisioning. Keep blocker arrays as plain strings, never objects.\n\n"
+            + _BLOCKED_MIGRATION_EXAMPLE
+            + "\n\n"
+            + _UNENTITLED_PREVIEW_BLOCK_EXAMPLE
         )
     elif "partial_policies" in joined or "rationale" in joined or "valid string" in joined:
         correction = (
@@ -228,17 +299,17 @@ def build_validation_retry_prompt(
             "contract validation errors about flow_id, app_id, optimizer assignments, local slice labels, or target-stable preservation. "
             "Those errors are caused by your output not matching the optimizer evidence — not by missing 3GPP knowledge. "
             "Fix: align your sm_policies exactly with the optimizer preview. "
-            "Never add a flow_id that is absent from OperationIntent.flows or from the optimizer QoS assignment. "
+            "Never add a flow_id that is absent from GroundingDecision.flows or from the optimizer QoS assignment. "
             "On target-stable retries, preserve the exact flow_ids and app_ids from the upstream request. "
             "If the optimizer preview is incomplete, return partial_plan with planner_conflicts.\n\n"
             + _QOS_EXAMPLE
         )
     elif "outside operationintent flows" in joined:
         correction = (
-            "Your previous SM policy drifted to a flow outside OperationIntent.flows. "
-            "You must preserve the exact flow_id/app_id from OperationIntent.flows. "
+            "Your previous SM policy drifted to a flow outside GroundingDecision.flows. "
+            "You must preserve the exact flow_id/app_id from GroundingDecision.flows. "
             "Do not substitute a semantically similar optimizer flow. "
-            "If the optimizer preview does not contain an assignment for the OperationIntent flow, return partial_plan with blocked_targets and planner_conflicts.\n\n"
+            "If the optimizer preview does not contain an assignment for the GroundingDecision flow, return partial_plan with blocked_targets and planner_conflicts.\n\n"
             + _INFEASIBLE_EXAMPLE
         )
     elif "inspect_mobility_ue_policies" in joined or "not callable" in joined or "unknown tool" in joined:

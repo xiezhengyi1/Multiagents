@@ -41,11 +41,14 @@ class RetryPromptBuilder:
             "control_semantics.targets[].target_type must be one of flow, app, scope, named_object.\n"
             "UE/user-equipment/AM-policy targets must use scope; never use target_type=ue.\n"
             "control_semantics.targets[].goal must be one of protect, deprioritize, defer, observe.\n"
-            "degrade/throttle/constrain must be rewritten as deprioritize.\n"
+            "degrade/throttle/constrain must be rewritten as deprioritize; optimize/improve/boost must be rewritten as protect.\n"
+            "The literal value optimize is forbidden in control_semantics.targets[].goal; retain it only in note or routing_rationale.\n"
             "control_semantics.stages[].trigger must be one of initial, on_previous_failure, after_previous_stage, retry.\n"
             "For staged priority, stage_index=1 uses initial; stage_index>1 uses after_previous_stage.\n"
             "GlobalControlIntent control_semantics targets contain only semantic_name, target_type, goal, metric_focus, note, and supi; IEA owns resolved identifiers.\n"
+            "GlobalControlIntent control_semantics is Main-owned; IEA never outputs it.\n"
             "For multi-SUPI requests, leave top-level supi empty and set each target.supi separately; never comma-join SUPIs.\n"
+            "For exactly one explicit imsi-... in the user request, top-level supi and every semantic target.supi must equal that exact identifier; never leave either empty.\n"
             "If validation says execution_failure with stable bindings, route to optimization_strategy, set round_strategy=policy_revision, retry_scope=target_stable, and set reuse_contract.allowed=true.\n"
             "If a previous draft was a list, convert the intended route into the top-level GlobalControlIntent object.\n"
             "If a previous draft only contained reuse_contract fields, keep those fields nested under reuse_contract and add all missing routing fields.\n\n"
@@ -68,12 +71,11 @@ class RetryPromptBuilder:
         if grounding_validation_errors:
             issues.extend(grounding_validation_errors)
         repair_rules: List[str] = [
-            "Return one corrected OperationIntent JSON object only.",
-            "Do not guess missing identifiers, and do not rely on downstream code to fill OperationIntent fields.",
+            "Return one corrected GroundingDecision JSON object only.",
+            "Do not guess identifiers. Code materializes catalog SLA facts after parsing; select only catalog-grounded flow identities.",
             "Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
-            "`domain_resolution` must be a scalar string, not an object.",
             "`open_questions` must be an array of objects with owner_agent, question, blocking, and related_domains; never emit question strings.",
-            "Semantic target identifier fields are strings, never null. For unresolved targets use app_id='', flow_id='', matched_flow_ids=[], and resolution_status='unresolved'.",
+            "For unresolved targets use app_id='', flow_id='', and resolution_status='unresolved'.",
         ]
         joined = " | ".join(issues)
 
@@ -89,7 +91,7 @@ class RetryPromptBuilder:
                     "Use at most 1 additional tool call if absolutely required; then finalize.",
                 ]
             )
-        if "QoS OperationIntent must include grounded target flows." in joined:
+        if "QoS GroundingDecision must include grounded target flows." in joined:
             repair_rules.extend(
                 [
                     "This retry is specifically failing because your previous JSON omitted flows.",
@@ -97,7 +99,6 @@ class RetryPromptBuilder:
                     "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
                     "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
                     "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return an explicitly unresolved flow entry: {\"supi\":\"<known SUPI>\",\"name\":\"<target>\",\"resolution_status\":\"unresolved\"}.",
-                    "An unresolved flow does not require domain_resolution='cannot_confirm' when the QoS domain is known.",
                     "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
                 ]
             )
@@ -109,18 +110,18 @@ class RetryPromptBuilder:
                     "If that catalog is empty or lacks the named target, preserve the target as an unresolved flows entry instead of omitting it.",
                 ]
             )
-        if "domain_resolution must be confirmed, narrowed, widened, or cannot_confirm" in joined:
+        if (
+            "slice_migration_authorization." in joined
+            and "Extra inputs are not permitted" in joined
+        ):
             repair_rules.extend(
                 [
-                    "Set `domain_resolution` to exactly one of: confirmed, narrowed, widened, cannot_confirm.",
-                    "Do not output a nested object under `domain_resolution`.",
-                ]
-            )
-        if "cannot_confirm domain resolution requires open_questions" in joined:
-            repair_rules.extend(
-                [
-                    "If you set `domain_resolution` to `cannot_confirm`, add a non-empty `open_questions` item.",
-                    "If you can confirm the domain boundary from evidence, use `confirmed` instead.",
+                    "Your previous JSON placed fields in the strict `slice_migration_authorization` object that do not belong there.",
+                    "That object may contain ONLY: decision, authority, authorized_snssais, target_snssais, subscription_change_required, rationale.",
+                    "Keep open_questions at the top level of GroundingDecision.",
+                    "Move source_slice_snssai and target_slice_preference to qos_operation_constraints[].",
+                    "Replace explicit_target_keys with target_snssais, and replace reason with rationale as an array of strings.",
+                    "Do not place any other fields under slice_migration_authorization, even when explaining why migration is blocked.",
                 ]
             )
         if (
@@ -132,7 +133,9 @@ class RetryPromptBuilder:
         ):
             repair_rules.extend(
                 [
-                    "For each explicitly named QoS flow, either ground it via catalog/search evidence or leave it unresolved.",
+                    "For each explicitly named QoS flow, including a do-not-change or do-not-switch name, include exactly one flows entry.",
+                    "For an excluded name, use the audit-only entry {\"name\":\"<excluded name>\",\"resolution_status\":\"unresolved\"}.",
+                    "For each active name, either ground it via catalog/search evidence or leave it unresolved.",
                     "When a flow is resolved, set `flows[].name` to the explicit flow name that the resolved binding satisfies.",
                     "Do not return a resolved flow binding for any name that is missing from catalog/search evidence.",
                 ]
@@ -158,13 +161,17 @@ class RetryPromptBuilder:
         ):
             repair_rules.extend(
                 [
-                    "The previous attempt resolved a flow to a flow_id that does not have SLA baseline data in the catalog.",
-                    "This usually means the resolved flow_id does not exist in the UE's flow catalog.",
-                    "You must call get_sm_ue_flow_catalog and ONLY resolve flows whose flow_ids appear in the returned catalog.",
-                    "Flows returned by search_sm_flow_targets carry identifiers but NOT SLA baselines — those must come from get_sm_ue_flow_catalog.",
-                    "For every resolved QoS flow, copy complete catalog baseline fields into flows[]: service_type_id, bw_ul, bw_dl, gbr_ul, gbr_dl, lat, loss_req, jitter_req, priority, and current_slice_snssai.",
-                    "For every resolved QoS flow, copy complete baseline fields into qos_target_envelopes[]: baseline_priority, baseline_latency_ms, baseline_jitter_ms, baseline_packet_error_rate, baseline_max_br_ul_mbps, baseline_max_br_dl_mbps, baseline_gbr_ul_mbps, and baseline_gbr_dl_mbps.",
-                    "If the catalog does not contain a flow matching the user's intent, mark the flow as unresolved instead of forcing a resolution.",
+                    "Your resolved flow is not backed by the authoritative UE flow catalog.",
+                    "Call get_sm_ue_flow_catalog if needed, then resolve only a returned flow_id; code will fill its SLA and envelope facts.",
+                    "If no catalog flow matches the user's intent, return that target as unresolved instead of forcing a resolution.",
+                ]
+            )
+        if "subscription provisioning" in joined or "unverified slice migration is blocked" in joined:
+            repair_rules.extend(
+                [
+                    "The user did not explicitly request a subscription add/change. Do NOT request provisioning and do NOT set subscription_change_required=true.",
+                    "Keep the requested target migration blocked with decision=\"blocked_by_subscription_entitlement\", authority=\"postgresql_ue_context\", the observed authorized_snssais, subscription_change_required=false, and a rationale that the entitlement is absent.",
+                    "Do not invent a target S-NSSAI or an AM/SM/URSP policy. Preserve only the grounded QoS intent for entitlement-limited best-effort planning.",
                 ]
             )
 

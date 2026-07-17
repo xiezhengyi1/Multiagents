@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import json_mapping, without_empty_values
+from .base import json_mapping
+from .global_intent import GlobalControlIntentProjector
 
 
 class SharedControlContextProjector:
@@ -11,8 +12,12 @@ class SharedControlContextProjector:
     @classmethod
     def project(cls, instance: Any) -> dict[str, Any]:
         raw = json_mapping(instance)
-        initial_intent = without_empty_values(json_mapping(raw.get("initial_intent")))
-        return {"initial_intent": initial_intent} if initial_intent else {}
+        main_intent = raw.get("main_intent")
+        return (
+            {"main_intent": GlobalControlIntentProjector.project(main_intent)}
+            if main_intent is not None
+            else {}
+        )
 
 
 __all__ = ["SharedControlContextProjector"]

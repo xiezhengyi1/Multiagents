@@ -1,6 +1,6 @@
 """Domain contracts for the refactored control runtime."""
 
-from .collaboration import AgentHandoff, InitialIntentContext, PlanningContext, PlanningRequest, SharedControlContext
+from .collaboration import AgentHandoff, PlanningContext, PlanningRequest, SharedControlContext
 from .control_plane import (
     ControlDomain,
     DomainProposal,
@@ -18,7 +18,7 @@ from .control_plane import (
 )
 from .policy_compiler import CompiledStrategyPlan, PolicyCompiler
 from .policy_guard import PolicyGuard
-from .policy_plan import AssuranceVerdict, FlowSelector, OperationIntent, PolicyDraft, PolicyPlan, PolicyPlanDraft, QosOperationConstraint, QosTargetEnvelope
+from .policy_plan import AssuranceVerdict, FlowSelector, GroundingDecision, PolicyDraft, PolicyPlan, PolicyPlanDraft, QosOperationConstraint
 
 __all__ = [
     "AgentHandoff",
@@ -32,13 +32,12 @@ __all__ = [
     "GlobalControlIntent",
     "JointOptimizationRequest",
     "JointOptimizationResult",
-    "InitialIntentContext",
     "MainInvestigationTarget",
     "MainRoundStrategy",
     "MainUncertaintyFlag",
     "MediatorDecision",
     "ObjectiveProfile",
-    "OperationIntent",
+    "GroundingDecision",
     "PlanningContext",
     "PlanningRequest",
     "PolicyCompiler",
@@ -47,7 +46,6 @@ __all__ = [
     "PolicyPlan",
     "PolicyPlanDraft",
     "QosOperationConstraint",
-    "QosTargetEnvelope",
     "SharedControlContext",
     "UnifiedControlPlan",
 ]

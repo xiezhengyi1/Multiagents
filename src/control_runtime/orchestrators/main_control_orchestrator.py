@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 from control_runtime.tool_capabilities import register  # noqa: F401 — side-effect: registers 6G tool aliases
@@ -39,18 +40,17 @@ from ..domain.collaboration import (
     PlanningRequest,
 )
 from ..domain.control_plane import GlobalControlIntent
-from ..domain.policy_plan import OperationIntent
+from ..domain.policy_plan import GroundingDecision
 from .contracts import ControlRoundResult
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
 from .round_execution import execute_planned_round
 from .round_transitions import (
-    activate_control_stage,
     build_negotiation_diagnosis,
     build_negotiation_request,
     build_planning_failure_payload,
     build_reentry_report_payload,
     has_supi_scope,
-    should_reuse_operation_intent,
+    should_reuse_grounding_decision,
 )
 from shared.logging import log_event
 
@@ -144,7 +144,7 @@ class MainControlOrchestrator:
             content = payload
         else:
             content = json.dumps(project_memory_payload(role, payload), ensure_ascii=False)
-        if role == "IEA":
+        if role == "MAIN":
             try:
                 parsed = json.loads(content)
             except Exception:
@@ -170,36 +170,41 @@ class MainControlOrchestrator:
         previous_diagnosis: Dict[str, Any],
         previous_report_payload: Dict[str, Any],
         previous_mediator_decision: Optional[Dict[str, Any]],
-        previous_operation_intent: Optional[OperationIntent],
+        previous_grounding_decision: Optional[GroundingDecision],
         previous_negotiation_request: Dict[str, Any],
         previous_planning_blocker: Dict[str, Any],
         previous_execution_reentry: Dict[str, Any],
         round_traces: List[Dict[str, Any]],
-    ) -> tuple[GlobalControlIntent, Optional[OperationIntent], Optional[Any], Optional[DomainNegotiationRequest]]:
+        agent_elapsed_ms: Dict[str, float],
+    ) -> tuple[GlobalControlIntent, Optional[GroundingDecision], Optional[Any], Optional[DomainNegotiationRequest]]:
         trace_metadata = self._trace_metadata(scenario_id=scenario_id, scenario_tags=scenario_tags)
-        global_intent = self.main_agent.analyze_global_intent(
-            user_input=user_input,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            context=build_main_context(
-                snapshot_id,
-                round_index=round_index,
-                memory_context=memory_context,
-                feedback_context=feedback_context,
-                previous_diagnosis=previous_diagnosis,
-                previous_execution_feedback=previous_report_payload,
-                previous_operation_intent=(
-                    previous_operation_intent.model_dump(mode="json")
-                    if previous_operation_intent is not None
-                    else {}
+        agent_started_at = time.perf_counter()
+        try:
+            global_intent = self.main_agent.analyze_global_intent(
+                user_input=user_input,
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                context=build_main_context(
+                    snapshot_id,
+                    round_index=round_index,
+                    memory_context=memory_context,
+                    feedback_context=feedback_context,
+                    previous_diagnosis=previous_diagnosis,
+                    previous_execution_feedback=previous_report_payload,
+                    previous_grounding_decision=(
+                        previous_grounding_decision.model_dump(mode="json")
+                        if previous_grounding_decision is not None
+                        else {}
+                    ),
+                    previous_negotiation_request=previous_negotiation_request,
+                    previous_planning_blocker=previous_planning_blocker,
+                    previous_execution_reentry=previous_execution_reentry,
+                    external_routing_hint=routing_hint,
                 ),
-                previous_negotiation_request=previous_negotiation_request,
-                previous_planning_blocker=previous_planning_blocker,
-                previous_execution_reentry=previous_execution_reentry,
-                external_routing_hint=routing_hint,
-            ),
-            trace_metadata=trace_metadata,
-        )
+                trace_metadata=trace_metadata,
+            )
+        finally:
+            agent_elapsed_ms["main"] = round((time.perf_counter() - agent_started_at) * 1000.0, 3)
         if not global_intent.requested_domains:
             raise RuntimeError("Main Agent returned no requested_domains; refusing to infer domains outside the agent.")
         if not has_supi_scope(global_intent):
@@ -207,18 +212,18 @@ class MainControlOrchestrator:
         self._remember("MAIN", global_intent)
 
         selected_next_agent = str(global_intent.next_agent or "").strip().lower()
-        reuse_operation_intent = (
+        reuse_grounding_decision = (
             round_index > 1
-            and should_reuse_operation_intent(
+            and should_reuse_grounding_decision(
                 global_intent=global_intent,
-                previous_operation_intent=previous_operation_intent,
+                previous_grounding_decision=previous_grounding_decision,
                 previous_report_payload=previous_report_payload,
                 previous_mediator_decision=previous_mediator_decision,
             )
         )
 
-        if reuse_operation_intent:
-            operation_intent = previous_operation_intent.model_copy(deep=True)
+        if reuse_grounding_decision:
+            grounding_decision = previous_grounding_decision.model_copy(deep=True)
             log_event(
                 self.main_agent.logger,
                 "control_round_resume",
@@ -232,37 +237,35 @@ class MainControlOrchestrator:
                 global_intent=global_intent,
                 round_index=round_index,
             )
-            operation_intent = self.ie_agent.analyze_operation_intent(
-                user_input=user_input,
-                context=self.intent_context_builder.build_intent_encoding_context(
-                    global_intent=ie_scoped_intent.model_dump(mode="json"),
-                    round_index=round_index,
-                    diagnosis=previous_diagnosis,
-                    feedback_context=feedback_context,
-                ),
-                session_id=session_id,
-                snapshot_id=snapshot_id,
-                trace_metadata=trace_metadata,
-            )
-            self._remember("IEA", operation_intent)
-            if str(operation_intent.domain_resolution or "").strip().lower() == "cannot_confirm":
-                return global_intent, operation_intent, None, build_negotiation_request(
-                    operation_intent,
+            agent_started_at = time.perf_counter()
+            try:
+                grounding_decision = self.ie_agent.analyze_grounding_decision(
+                    user_input=user_input,
+                    context=self.intent_context_builder.build_intent_encoding_context(
+                        global_intent=ie_scoped_intent.model_dump(mode="json"),
+                        round_index=round_index,
+                        diagnosis=previous_diagnosis,
+                        feedback_context=feedback_context,
+                    ),
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    trace_metadata=trace_metadata,
+                )
+            finally:
+                agent_elapsed_ms["iea"] = round((time.perf_counter() - agent_started_at) * 1000.0, 3)
+            self._remember("IEA", grounding_decision)
+            if grounding_decision.open_questions:
+                return global_intent, grounding_decision, None, build_negotiation_request(
+                    grounding_decision,
                     round_index=round_index,
                 )
 
-        operation_intent = activate_control_stage(
-            operation_intent=operation_intent,
-            round_index=round_index,
-        )
-
         planning_request = PlanningRequest(
-            operation_intent=operation_intent,
+            grounding_decision=grounding_decision,
             context=self.intent_context_builder.build_planning_context(
                 global_intent,
                 session_id,
                 snapshot_id,
-                active_domains=list(operation_intent.requested_domains or []),
                 round_index=round_index,
                 memory_context=memory_context,
                 feedback_context=feedback_context,
@@ -271,9 +274,13 @@ class MainControlOrchestrator:
                 unified_constraints=(previous_mediator_decision or {}).get("unified_constraints") if isinstance(previous_mediator_decision, dict) else None,
             ),
         )
-        policy_plan = self.os_agent.generate_strategy(planning_request, trace_metadata=trace_metadata)
+        agent_started_at = time.perf_counter()
+        try:
+            policy_plan = self.os_agent.generate_strategy(planning_request, trace_metadata=trace_metadata)
+        finally:
+            agent_elapsed_ms["osa"] = round((time.perf_counter() - agent_started_at) * 1000.0, 3)
         self._remember("OSA", policy_plan)
-        return global_intent, operation_intent, policy_plan, None
+        return global_intent, grounding_decision, policy_plan, None
 
     def run(
         self,
@@ -289,7 +296,8 @@ class MainControlOrchestrator:
         self._token_budget = TokenBudget()
         self._inject_token_context()
         state = OrchestratorLoopState()
-        previous_operation_intent: Optional[OperationIntent] = None
+        previous_grounding_decision: Optional[GroundingDecision] = None
+        agent_elapsed_totals = {"main": 0.0, "iea": 0.0, "osa": 0.0}
 
         for round_index in range(1, self.max_rounds + 1):
             log_event(
@@ -318,8 +326,9 @@ class MainControlOrchestrator:
                 summarizer_llm=getattr(self.memory_manager, "summarizer_llm", None),
             )
             trace_metadata = self._trace_metadata(scenario_id=scenario_id, scenario_tags=scenario_tags)
+            round_agent_elapsed_ms: Dict[str, float] = {}
             try:
-                global_intent, operation_intent, policy_plan, negotiation_request = self._plan_round(
+                global_intent, grounding_decision, policy_plan, negotiation_request = self._plan_round(
                     user_input=user_input,
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -332,13 +341,16 @@ class MainControlOrchestrator:
                     previous_diagnosis=state.previous_diagnosis,
                     previous_report_payload=state.previous_report_payload,
                     previous_mediator_decision=state.previous_mediator_decision,
-                    previous_operation_intent=previous_operation_intent,
+                    previous_grounding_decision=previous_grounding_decision,
                     previous_negotiation_request=state.previous_negotiation_request,
                     previous_planning_blocker=state.previous_planning_blocker,
                     previous_execution_reentry=state.previous_execution_reentry,
                     round_traces=state.round_traces,
+                    agent_elapsed_ms=round_agent_elapsed_ms,
                 )
             except Exception as exc:
+                for agent_name, elapsed_ms in round_agent_elapsed_ms.items():
+                    agent_elapsed_totals[agent_name] += elapsed_ms
                 state.completed = False
                 debug_context = {
                     "intent_encoding": getattr(self.ie_agent, "last_failure_debug", {}) or {},
@@ -352,7 +364,7 @@ class MainControlOrchestrator:
                 trace_payload = {
                     "round_index": round_index,
                     "global_intent": {},
-                    "operation_intent": {},
+                    "grounding_decision": {},
                     "policy_plan": {},
                     "domain_verdicts": [],
                     "pda_feedback": report_payload,
@@ -362,6 +374,7 @@ class MainControlOrchestrator:
                     "negotiation_request": {},
                     "planning_blocker": {},
                     "execution_reentry": {},
+                    "agent_elapsed_ms": dict(round_agent_elapsed_ms),
                 }
                 feedback_added = build_round_feedback_block(
                     pda_feedback=report_payload,
@@ -411,13 +424,15 @@ class MainControlOrchestrator:
                     recommended_consumers="<none>",
                 )
                 continue
+            for agent_name, elapsed_ms in round_agent_elapsed_ms.items():
+                agent_elapsed_totals[agent_name] += elapsed_ms
             if negotiation_request is not None:
                 diagnosis = build_negotiation_diagnosis(negotiation_request)
                 negotiation_payload = negotiation_request.model_dump(mode="json")
                 trace_payload = {
                     "round_index": round_index,
                     "global_intent": global_intent.model_dump(mode="json"),
-                    "operation_intent": operation_intent.model_dump(mode="json") if operation_intent is not None else {},
+                    "grounding_decision": grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
                     "policy_plan": {},
                     "domain_verdicts": [],
                     "pda_feedback": {},
@@ -427,6 +442,7 @@ class MainControlOrchestrator:
                     "negotiation_request": negotiation_payload,
                     "planning_blocker": {},
                     "execution_reentry": {},
+                    "agent_elapsed_ms": dict(round_agent_elapsed_ms),
                 }
                 feedback_added = build_round_feedback_block(
                     diagnosis=diagnosis,
@@ -452,16 +468,16 @@ class MainControlOrchestrator:
                 )
                 continue
 
-            if operation_intent is None or policy_plan is None:
+            if grounding_decision is None or policy_plan is None:
                 raise RuntimeError("main control planning round produced no executable planning artifacts")
-            previous_operation_intent = operation_intent.model_copy(deep=True)
+            previous_grounding_decision = grounding_decision.model_copy(deep=True)
 
             round_execution = execute_planned_round(
                 session_id=session_id,
                 snapshot_id=snapshot_id,
                 round_index=round_index,
                 global_intent=global_intent,
-                operation_intent=operation_intent,
+                grounding_decision=grounding_decision,
                 policy_plan=policy_plan,
                 cr_tool=self.cr_tool,
                 pd_agent=self.pd_agent,
@@ -509,13 +525,25 @@ class MainControlOrchestrator:
                 execution_status=report.execution_status if report is not None else "blocked",
             )
             if state.completed:
+                completed_trace_payload = json.loads(
+                    json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False)
+                )
+                completed_trace_payload["agent_elapsed_ms"] = dict(round_agent_elapsed_ms)
                 append_round_trace(
                     state,
-                    trace_payload=json.loads(json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
+                    trace_payload=completed_trace_payload,
                 )
                 break
 
-            if round_execution.execution_reentry is not None:
+            retry_forbidden = bool(
+                report is not None
+                and isinstance(report.feedback_payload, dict)
+                and report.feedback_payload.get("retry_forbidden")
+            )
+
+            if retry_forbidden and report is not None:
+                report_payload = report.model_dump(mode="json")
+            elif round_execution.execution_reentry is not None:
                 report_payload = build_reentry_report_payload(round_execution.execution_reentry)
             elif round_execution.planning_blocker is not None:
                 report_payload = {
@@ -546,6 +574,7 @@ class MainControlOrchestrator:
                 else {}
             )
             trace_payload = json.loads(json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False))
+            trace_payload["agent_elapsed_ms"] = dict(round_agent_elapsed_ms)
             trace_payload["pda_feedback"] = dict(report_payload)
             trace_payload["mediator_decision"] = dict(round_execution.mediator_decision_payload)
             trace_payload["planning_blocker"] = previous_planning_blocker
@@ -560,6 +589,15 @@ class MainControlOrchestrator:
                 round_index=round_index,
             )
             append_round_trace(state, trace_payload=trace_payload, feedback_added=feedback_added)
+            if retry_forbidden:
+                log_event(
+                    self.main_agent.logger,
+                    "control_round_terminated",
+                    session_id=session_id,
+                    round_index=round_index,
+                    reason="retry_forbidden_execution_feedback",
+                )
+                break
             log_event(
                 self.main_agent.logger,
                 "control_round_retry_scheduled",
@@ -572,6 +610,11 @@ class MainControlOrchestrator:
         finish_control_session(session_id=session_id, snapshot_id=snapshot_id, state=state)
         if state.latest_result is None:
             raise RuntimeError("main control orchestrator produced no result")
+        agent_elapsed_totals["total"] = round(sum(agent_elapsed_totals.values()), 3)
+        state.latest_result.agent_elapsed_ms = {
+            agent_name: round(elapsed_ms, 3)
+            for agent_name, elapsed_ms in agent_elapsed_totals.items()
+        }
         return state.latest_result
 
 

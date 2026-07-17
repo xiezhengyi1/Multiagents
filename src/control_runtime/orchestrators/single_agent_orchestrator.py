@@ -218,7 +218,7 @@ class SingleAgentOrchestrator:
             trace = ControlRoundTrace(
                 round_index=round_index,
                 global_intent={},
-                operation_intent={},
+                grounding_decision={},
                 policy_plan=policy_plan.model_dump(mode="json") if policy_plan is not None else {},
                 domain_verdicts=domain_verdicts,
                 pda_feedback=report.model_dump(mode="json") if report is not None else exception_feedback if diagnosis.get("root_cause_category") == "single_control_round_exception" else {},

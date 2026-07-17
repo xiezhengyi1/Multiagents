@@ -16,8 +16,6 @@ class PlanningContextProjector(BaseProjector):
     visible = (
         field("round_index"),
         field("shared_context"),
-        field("active_domains"),
-        field("retry_scope"),
     )
     nested = {"shared_context": SharedControlContextProjector}
 

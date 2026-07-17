@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -22,9 +21,10 @@ from ...integrations.pcf import (
 )
 from ...context.projectors import project_intent_evidence_for_prompt
 from ...context.observability import measure_context_components
-from ...domain.policy_plan import OperationIntent
+from ...context.evidence.grounding import IntentEvidenceBuilder
+from ...domain.policy_plan import GroundingDecision
 from ...context.prompts import GroundingPromptBuilder, RetryPromptBuilder
-from ..common import validate_operation_intent
+from ..common import validate_grounding_decision
 from shared.logging import log_event, log_timing
 
 from .compiler import IntentCompiler
@@ -44,13 +44,13 @@ class IntentAdvisorInvocation:
     def write_final_trace(
         self,
         *,
-        operation_intent: OperationIntent | None,
+        grounding_decision: GroundingDecision | None,
         status: str,
         error: str | None = None,
     ) -> None:
         payload = dict(self.trace_payload)
         metadata = dict(payload.get("trace_metadata") or {})
-        metadata["operation_intent"] = None if operation_intent is None else operation_intent.model_dump(mode="json")
+        metadata["grounding_decision"] = None if grounding_decision is None else grounding_decision.model_dump(mode="json")
         payload["trace_metadata"] = metadata
         self.trace_agent.write_trace(
             payload=payload,
@@ -58,7 +58,7 @@ class IntentAdvisorInvocation:
             result=self.advisor_result,
             status=status,
             error=error,
-            structured_response_override=metadata["operation_intent"],
+            structured_response_override=metadata["grounding_decision"],
         )
 
 
@@ -97,7 +97,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         return self.create_json_agent(
             tools=tools,
             system_prompt=GroundingPromptBuilder().system_prompt(),
-            response_model=OperationIntent,
+            response_model=GroundingDecision,
             max_iterations=14,
             max_calls_per_tool=3,
             tool_call_limits={
@@ -135,12 +135,34 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
     @classmethod
-    def _filter_tools_for_domains(cls, tools: List[Any], requested_domains: List[str] | None) -> List[Any]:
-        return list(tools)
+    def _filter_tools_for_domains(
+        cls,
+        tools: List[Any],
+        requested_domains: List[str] | None,
+    ) -> List[Any]:
+        domains = {
+            str(item or "").strip().lower()
+            for item in (requested_domains or [])
+            if str(item or "").strip()
+        }
+        if not domains:
+            return list(tools)
 
-    def handle_artifact(self, envelope: ArtifactEnvelope) -> OperationIntent:
+        allowed = {"search_semantic_knowledge", "get_knowledge_by_key"}
+        if "qos" in domains:
+            allowed |= cls.SM_GROUNDING_TOOLS
+            # Tool availability is a factual capability boundary, not an
+            # operation classifier. IEA decides whether migration semantics
+            # need this evidence; code later requires it only when IEA emits a
+            # serving-slice change constraint.
+            allowed |= cls.SUBSCRIPTION_GROUNDING_TOOLS
+        if "mobility" in domains:
+            allowed |= cls.AM_GROUNDING_TOOLS
+        return [tool for tool in tools if str(getattr(tool, "name", "") or "").strip() in allowed]
+
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> GroundingDecision:
         payload = envelope.payload or {}
-        return self.analyze_operation_intent(
+        return self.analyze_grounding_decision(
             user_input=str(payload.get("user_input") or ""),
             context=str(payload.get("context") or ""),
             conversation_messages=payload.get("messages"),
@@ -161,7 +183,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         snapshot_id: str,
     ) -> ArtifactEnvelope:
         return self.cache_received_artifact(
-            artifact_type="OperationIntentRequest",
+            artifact_type="GroundingDecisionRequest",
             payload={
                 "user_input": str(user_input),
                 "context": str(context or ""),
@@ -176,15 +198,15 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         self,
         *,
         request_envelope: ArtifactEnvelope,
-        operation_intent: OperationIntent,
+        grounding_decision: GroundingDecision,
     ) -> None:
         self.cache_produced_artifact(
-            artifact_type="OperationIntent",
+            artifact_type="GroundingDecision",
             request_envelope=request_envelope,
-            payload=operation_intent,
+            payload=grounding_decision,
         )
 
-    def analyze_operation_intent(
+    def analyze_grounding_decision(
         self,
         user_input: str,
         context: str = "",
@@ -195,7 +217,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         allow_user_interaction: bool = False,
         request_envelope: ArtifactEnvelope | None = None,
         trace_metadata: Dict[str, Any] | None = None,
-    ) -> OperationIntent:
+    ) -> GroundingDecision:
         self.ensure_worker_runtime_initialized()
         if request_envelope is None:
             request_envelope = self._cache_received_request(
@@ -214,16 +236,16 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             "allow_user_interaction": allow_user_interaction,
         }
 
-        operation_intent = self.analyze_intent(
+        grounding_decision = self.analyze_intent(
             user_input,
             **analyze_kwargs,
             trace_metadata=trace_metadata,
         )
         self._cache_produced_result(
             request_envelope=request_envelope,
-            operation_intent=operation_intent,
+            grounding_decision=grounding_decision,
         )
-        return operation_intent
+        return grounding_decision
 
     def analyze_intent(
         self,
@@ -234,7 +256,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         snapshot_id: str = "",
         allow_user_interaction: bool = False,
         trace_metadata: Dict[str, Any] | None = None,
-    ) -> OperationIntent:
+    ) -> GroundingDecision:
         self.ensure_worker_runtime_initialized()
         total_start = time.perf_counter()
         log_event(self.logger, "iea_analyze_start")
@@ -260,10 +282,13 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 trace_metadata=trace_metadata,
             )
             request_advisor_agent = self._create_advisor_agent(
-                self._filter_tools_for_domains(self.tools, evidence.requested_domains)
+                self._filter_tools_for_domains(
+                    self.tools,
+                    evidence.requested_domains,
+                )
             )
             advisor_prompt = self._build_advisor_prompt(evidence=evidence, context=context)
-            operation_intent = None
+            grounding_decision = None
             grounding_tools: List[str] = []
             validation_errors: List[str] = []
             advisor_validation_errors: List[str] = []
@@ -300,9 +325,9 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     )
                     continue
                 advisor_result = advisor_invocation.advisor_result
-                operation_intent = coerce_structured_response(
+                grounding_decision = coerce_structured_response(
                     advisor_result,
-                    OperationIntent,
+                    GroundingDecision,
                     error_message="IEA advisor returned no structured_response",
                 )
                 grounding_tools = extract_grounding_tool_names(advisor_result, self.GROUNDING_TOOLS)
@@ -312,21 +337,25 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     main_directives=main_directives,
                     snapshot_id=snapshot_id,
                 )
-                operation_intent = self._attach_subscription_evidence(
-                    operation_intent=operation_intent,
+                grounding_decision = self._attach_subscription_evidence(
+                    grounding_decision=grounding_decision,
                     evidence=refreshed_evidence,
                 )
-                advisor_validation_errors, validation_errors, _ = validate_operation_intent(
+                grounding_decision = self._materialize_catalog_facts(
+                    grounding_decision=grounding_decision,
+                    evidence=refreshed_evidence,
+                )
+                advisor_validation_errors, validation_errors, _ = validate_grounding_decision(
                     compiler=self.compiler,
                     evidence=refreshed_evidence,
-                    operation_intent=operation_intent,
+                    grounding_decision=grounding_decision,
                     grounding_tools=grounding_tools,
                 )
                 self.last_failure_debug = {
                     "phase": "intent_encoding",
                     "attempt_index": attempt_index + 1,
                     "grounding_tools": list(grounding_tools or []),
-                    "operation_intent": operation_intent.model_dump(mode="json"),
+                    "grounding_decision": grounding_decision.model_dump(mode="json"),
                     "advisor_validation_errors": list(advisor_validation_errors or []),
                     "grounding_validation_errors": list(validation_errors or []),
                     "evidence_snapshot": refreshed_evidence.model_dump(mode="json"),
@@ -348,31 +377,31 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     grounding_validation_errors=validation_errors,
                     invocation_error="",
                 )
-            if operation_intent is None:
-                raise RuntimeError("IEA advisor returned no OperationIntent payload")
-            _, _, validated_intent = validate_operation_intent(
+            if grounding_decision is None:
+                raise RuntimeError("IEA advisor returned no GroundingDecision payload")
+            _, _, validated_intent = validate_grounding_decision(
                 compiler=self.compiler,
                 evidence=evidence,
-                operation_intent=operation_intent,
+                grounding_decision=grounding_decision,
                 grounding_tools=grounding_tools,
             )
             if validated_intent is None:
-                raise RuntimeError("IEA OperationIntent failed validation after retry loop")
+                raise RuntimeError("IEA GroundingDecision failed validation after retry loop")
             advisor_invocation.write_final_trace(
-                operation_intent=validated_intent,
+                grounding_decision=validated_intent,
                 status="success",
             )
             log_timing(self.logger, "iea_total", time.perf_counter() - total_start, status="success")
             self.last_failure_debug = {}
             return validated_intent
         except Exception as exc:
-            if "advisor_invocation" in locals() and "operation_intent" in locals():
+            if "advisor_invocation" in locals() and "grounding_decision" in locals():
                 advisor_invocation.write_final_trace(
-                    operation_intent=operation_intent,
+                    grounding_decision=grounding_decision,
                     status="error",
                     error=str(exc),
                 )
-            self.logger.error(f"Failed to analyze operation intent: {exc}")
+            self.logger.error(f"Failed to analyze grounding decision: {exc}")
             log_timing(self.logger, "iea_total", time.perf_counter() - total_start, status="error")
             raise
         finally:
@@ -388,37 +417,36 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         domain_specific_rules: List[str] = [
             f"- Domain mode for this request: {domain_mode}.",
             "- Final answer must be exactly one raw JSON object with no markdown fence and no surrounding prose.",
-            "- `domain_resolution` must be one scalar string value, never an object.",
-            "- `open_questions` is optional. When present, every item must be an object with owner_agent, question, blocking, and related_domains; never emit a bare question string.",
-            "- Use JSON strings, never null, for control_semantics target identifiers. Unresolved targets use app_id='', flow_id='', matched_flow_ids=[], and resolution_status='unresolved'.",
+            "- Main already selected the domain scope, semantic targets, and active stage. Return only grounded bindings and operation constraints for that stage.",
+            "- `open_questions`, when needed, contains objects with owner_agent, question, blocking, and related_domains.",
         ]
         if qos_required:
             domain_specific_rules.extend(
                 [
-                    "- This request includes QoS grounding. Final JSON must contain a non-empty flows array.",
-                    "- With a known SUPI, call get_sm_ue_flow_catalog before final JSON, even if the target will remain unresolved.",
-                    "- Every resolved QoS flow must include grounded app_id and grounded flow_id.",
-                    "- If the current evidence does not already ground the QoS target, keep using SM grounding tools until flows is populated or the target is explicitly unresolved.",
-                    "- The grounded binding must appear inside flows.",
-                    "- A missing flow binding does not make the QoS domain uncertain: keep domain_resolution='confirmed' when QoS is still the confirmed domain, then return one unresolved flow entry with name and resolution_status='unresolved'.",
+                    "- For each named QoS flow with a known SUPI, call get_sm_ue_flow_catalog before final JSON; when no exact candidate is already grounded, call search_sm_flow_targets first. Return a non-empty flows array.",
+                    "- Mark a flow resolved only when its flow_id is in that catalog; otherwise preserve the named target as unresolved.",
+                    "- A missing flow binding does not change Main's domain scope; preserve the named target as unresolved.",
+                ]
+            )
+            domain_specific_rules.extend(
+                [
+                    "- Decide from the request and evidence whether a serving-S-NSSAI change is part of the operation. Only after flow grounding, if it is, call get_ue_slice_subscription once per target SUPI and return slice_migration_authorization.",
+                    "- If you decide the operation is prioritization, deferment, congestion relief, or same-slice QoS tuning, do not call get_ue_slice_subscription and do not set require_slice_change=true.",
+                    "- A target S-NSSAI may be used only when it is present in get_ue_slice_subscription.authorized_snssais. Do not invent authorization.",
+                    "- If the requested target is not authorized and the user did not explicitly ask to add/change a subscription, block the migration and keep the serving slice; never emit an executable migration policy.",
+                    "- Set subscription_change_required=true only when the user explicitly requests subscription provisioning or a subscription change.",
                 ]
             )
             if evidence.candidate_flows:
                 domain_specific_rules.extend(
                     [
-                        "- Current evidence already contains candidate_flows with grounded identifiers (flow_id, app_id). Use those identifiers in flows ONLY if the same flow_id is confirmed by get_sm_ue_flow_catalog output.",
-                        "- Do not call search_sm_flow_targets or get_sm_ue_context again to reconfirm an already unique exact candidate.",
-                        "- Do not leave flows empty when candidate_flows already contains at least one candidate that is confirmed by the catalog.",
-                        "- IMPORTANT: candidate_flows only carries identifiers, NOT SLA parameters (latency, bandwidth). You must call get_sm_ue_flow_catalog to fetch the SLA baseline before finalizing.",
-                        "- If get_sm_ue_flow_catalog returns a catalog that does not contain a candidate flow_id, mark that flow as unresolved.",
+                        "- candidate_flows contains a possible binding. Reuse an exact candidate after catalog confirmation; do not re-search it for reassurance.",
                     ]
                 )
             elif str(evidence.explicit_flow_name or "").strip():
                 domain_specific_rules.extend(
                     [
-                        f"- No grounded candidate_flows currently exist for the explicit QoS target '{evidence.explicit_flow_name}'.",
-                        "- Call search_sm_flow_targets for that explicit flow target, then call get_sm_ue_flow_catalog for the SUPI.",
-                        "- Resolve only when the catalog confirms the searched app_id + flow_id and supplies its SLA baseline; otherwise return that target unresolved.",
+                        f"- No candidate exists for '{evidence.explicit_flow_name}'; search that exact target, then confirm it in the catalog.",
                     ]
                 )
             explicit_target_names = [
@@ -438,21 +466,13 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 ]
                 domain_specific_rules.extend(
                     [
-                        "- This request names multiple QoS flow targets.",
-                        f"- Explicit QoS targets in this request: {json.dumps(explicit_target_names, ensure_ascii=False)}.",
-                        "- Every resolved flow in `flows` must correspond to one of those explicit targets and be grounded by catalog/search evidence for that exact target.",
-                        "- When a resolved flow corresponds to an explicit target, keep `flows[].name` equal to that explicit flow name.",
-                        "- If candidate_flows does not already cover all explicit targets, search unresolved explicit targets individually before finalizing.",
-                        "- If any explicit target remains ungrounded, do not substitute a nearby flow name.",
+                        f"- Explicit QoS targets: {json.dumps(explicit_target_names, ensure_ascii=False)}. Return each as its exact resolved or unresolved entry; never substitute a neighbor.",
                     ]
                 )
                 if grounded_explicit_target_names and unresolved_explicit_target_names:
                     domain_specific_rules.extend(
                         [
-                            f"- Evidence already grounds these explicit QoS targets: {json.dumps(sorted(grounded_explicit_target_names), ensure_ascii=False)}.",
-                            f"- These explicit QoS targets are still unresolved in current evidence: {json.dumps(unresolved_explicit_target_names, ensure_ascii=False)}.",
-                            "- The next answer must return a mixed flows array: resolved entries for grounded explicit targets, plus unresolved entries for still-unresolved explicit targets.",
-                            "- Never leave flows empty when at least one explicit target is already grounded.",
+                            f"- Already grounded: {json.dumps(sorted(grounded_explicit_target_names), ensure_ascii=False)}; unresolved: {json.dumps(unresolved_explicit_target_names, ensure_ascii=False)}. Return both sets.",
                         ]
                     )
         if mobility_only:
@@ -472,15 +492,10 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             f"{context or 'N/A'}\n\n"
             f"{IEA_DYNAMIC_RULES.strip()}\n\n"
             "Task:\n"
-            "- Resolve only the semantic choices that remain ambiguous.\n"
-            "- Use tools only when the structured evidence does not already ground the required target.\n"
-            "- You may revise Main's requested domain boundary when grounding evidence proves it is too narrow, too wide, or cannot be confirmed.\n"
-            "- If you revise the domain boundary, set requested_domains to the grounded domain set, set domain_resolution, and add open_questions when confirmation is impossible.\n"
-            "- For every QoS flow with resolution_status='resolved', include grounded flow_id and app_id in the final JSON.\n"
-            "- If a QoS target is not fully grounded to flow_id + app_id, do not mark it resolved.\n"
-            "- If the structured evidence already contains the grounded answer, finalize from that evidence without extra tool calls.\n"
+            "- Resolve only choices that remain ambiguous; use already-grounded evidence directly.\n"
+            "- Do not guess identifiers. An unresolved QoS target still appears in flows with its name and resolution_status='unresolved'.\n"
             f"{chr(10).join(domain_specific_rules)}\n"
-            "- Return one OperationIntent JSON object only."
+            "- Return one GroundingDecision JSON object only."
         )
 
     @staticmethod
@@ -629,21 +644,51 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
     @staticmethod
+    def _materialize_catalog_facts(
+        *,
+        grounding_decision: GroundingDecision,
+        evidence: IntentEvidence,
+    ) -> GroundingDecision:
+        """Replace LLM-copied QoS baselines with the authoritative catalog facts."""
+        catalog_by_flow_id = {
+            str(item.get("flow_id") or "").strip(): item
+            for item in (evidence.catalog_payload or {}).get("flow_catalog") or []
+            if isinstance(item, dict) and str(item.get("flow_id") or "").strip()
+        }
+        if not catalog_by_flow_id:
+            return grounding_decision
+
+        enriched = grounding_decision.model_copy(deep=True)
+        resolved_flows = []
+        for flow in enriched.flows or []:
+            is_resolved = str(flow.resolution_status or "resolved").strip().lower() == "resolved"
+            catalog_entry = catalog_by_flow_id.get(str(flow.flow_id or "").strip()) if is_resolved else None
+            if catalog_entry is None:
+                resolved_flows.append(flow)
+                continue
+            # This projection is a code-owned fact boundary. The LLM chooses
+            # only the catalog identity; it does not transcribe SLA facts.
+            resolved_flows.append(IntentEvidenceBuilder._build_flow_selector_from_catalog(catalog_entry))
+
+        enriched.flows = resolved_flows
+        return enriched
+
+    @staticmethod
     def _attach_subscription_evidence(
         *,
-        operation_intent: OperationIntent,
+        grounding_decision: GroundingDecision,
         evidence: IntentEvidence,
-    ) -> OperationIntent:
+    ) -> GroundingDecision:
         subscription = dict(evidence.subscription_summary or {})
         if not subscription:
-            return operation_intent
-        enriched = operation_intent.model_copy(deep=True)
+            return grounding_decision
+        enriched = grounding_decision.model_copy(deep=True)
         mobility_targets = dict(enriched.grounding_evidence.grounded_mobility_targets or {})
         mobility_targets["subscription_entitlement"] = subscription
         enriched.grounding_evidence.grounded_mobility_targets = mobility_targets
         sources = dict(enriched.grounding_evidence.evidence_sources or {})
         source_list = list(sources.get("ue_slice_subscription") or [])
-        authority = str(subscription.get("authority") or "free5gc_udr_subscription_data").strip()
+        authority = str(subscription.get("authority") or "postgresql_ue_context").strip()
         if authority and authority not in source_list:
             source_list.append(authority)
         sources["ue_slice_subscription"] = source_list

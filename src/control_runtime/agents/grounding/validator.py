@@ -1,25 +1,35 @@
 from __future__ import annotations
 
+import re
 from typing import Any, List
 
 from ...domain.intent_encoding import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS
 from .common import flow_id_is_grounded, mobility_request_mentions_specific_targets
 from .contracts import IntentEvidence
-from ...domain.policy_plan import OperationIntent
+from ...domain.policy_plan import GroundingDecision
 
 
 class IntentGroundingValidator:
+    _SUBSCRIPTION_CHANGE_PATTERN = re.compile(
+        r"(?:add|enable|provision|subscribe|subscription|开通|订阅|增加.*(?:切片|nssai)|变更.*(?:订阅|签约))",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _user_requests_subscription_change(cls, user_input: str) -> bool:
+        return bool(cls._SUBSCRIPTION_CHANGE_PATTERN.search(str(user_input or "")))
+
     def validate_intent_grounding(
         self,
         *,
         evidence: IntentEvidence,
         grounding_tools: List[str],
-        operation_intent: OperationIntent | None = None,
+        grounding_decision: GroundingDecision | None = None,
     ) -> List[str]:
         errors: List[str] = []
         requested_domains = {
             str(item or "").strip().lower()
-            for item in ((operation_intent.requested_domains if operation_intent is not None else evidence.requested_domains) or [])
+            for item in (evidence.requested_domains or [])
             if str(item or "").strip()
         }
         used_grounding_tools = {str(item or "").strip() for item in (grounding_tools or []) if str(item or "").strip()}
@@ -33,7 +43,7 @@ class IntentGroundingValidator:
                     "QoS intent with a known SUPI requires get_sm_ue_flow_catalog catalog evidence before final intent"
                 )
         if requested_domains == {"mobility"}:
-            decision_has_am_context = self._operation_intent_has_grounded_am_policy(operation_intent)
+            decision_has_am_context = self._grounding_decision_has_grounded_am_policy(grounding_decision)
             if not evidence.am_context_summary and not decision_has_am_context:
                 errors.append("mobility-only intent requires grounded AM policy context before returning final intent")
             if mobility_request_mentions_specific_targets(evidence.user_input):
@@ -62,10 +72,10 @@ class IntentGroundingValidator:
         return errors
 
     @staticmethod
-    def _operation_intent_has_grounded_am_policy(operation_intent: OperationIntent | None) -> bool:
-        if operation_intent is None:
+    def _grounding_decision_has_grounded_am_policy(grounding_decision: GroundingDecision | None) -> bool:
+        if grounding_decision is None:
             return False
-        mobility_intent: Any = operation_intent.mobility_intent or {}
+        mobility_intent: Any = grounding_decision.mobility_intent or {}
         if not isinstance(mobility_intent, dict):
             return False
         association_id = str(
@@ -77,38 +87,30 @@ class IntentGroundingValidator:
         allowed_snssais = mobility_intent.get("current_allowed_snssais", mobility_intent.get("allowed_snssais"))
         return bool(association_id and rfsp is not None and allowed_snssais)
 
-    def validate_operation_intent(
+    def validate_grounding_decision(
         self,
         *,
         evidence: IntentEvidence,
-        operation_intent: OperationIntent,
+        grounding_decision: GroundingDecision,
     ) -> List[str]:
         errors: List[str] = []
-        grounded_domains = {
-            str(item or "").strip().lower()
-            for item in (operation_intent.requested_domains or evidence.requested_domains or [])
-            if str(item or "").strip()
-        }
-        requested_domains = grounded_domains or {
+        requested_domains = {
             str(item or "").strip().lower()
             for item in (evidence.requested_domains or [])
             if str(item or "").strip()
         }
-        if operation_intent.domain_resolution not in {"confirmed", "narrowed", "widened", "cannot_confirm"}:
-            errors.append("domain_resolution must be confirmed, narrowed, widened, or cannot_confirm")
-        if operation_intent.domain_resolution == "cannot_confirm" and not operation_intent.open_questions:
-            errors.append("cannot_confirm domain resolution requires open_questions")
-        if grounded_domains and not grounded_domains.issubset(VALID_DOMAINS):
-            errors.append(f"requested_domains contains unsupported values: {sorted(grounded_domains)}")
+        if requested_domains and not requested_domains.issubset(VALID_DOMAINS):
+            errors.append(f"Main requested_domains contains unsupported values: {sorted(requested_domains)}")
         requires_slice_change = any(
             bool(constraint.require_slice_change)
-            for constraint in (operation_intent.qos_operation_constraints or [])
+            for constraint in (grounding_decision.qos_operation_constraints or [])
         )
         if requires_slice_change:
-            authorization = operation_intent.slice_migration_authorization
+            authorization = grounding_decision.slice_migration_authorization
             valid_decisions = {
                 "migration_pending_target_authorization",
                 "migration_authorized",
+                "blocked_by_subscription_entitlement",
                 "blocked_requires_subscription_provisioning",
                 "evidence_missing",
             }
@@ -120,13 +122,34 @@ class IntentGroundingValidator:
                 errors.append("slice migration authorization must name its evidence authority")
             if not authorization.authorized_snssais and not authorization.subscription_change_required:
                 errors.append("slice migration authorization must preserve authorized S-NSSAI evidence or request provisioning")
-        if requested_domains == {"mobility"} and operation_intent.flows:
-            errors.append("Mobility-only OperationIntent must not include QoS flows.")
+            explicit_subscription_change = self._user_requests_subscription_change(evidence.user_input)
+            decision = str(authorization.decision or "").strip()
+            if authorization.subscription_change_required and not explicit_subscription_change:
+                errors.append(
+                    "slice migration cannot request subscription provisioning unless the user explicitly asks to add or change the subscription"
+                )
+            if decision == "blocked_by_subscription_entitlement" and authorization.subscription_change_required:
+                errors.append(
+                    "blocked_by_subscription_entitlement must not request subscription provisioning"
+                )
+            if decision in {"migration_pending_target_authorization", "evidence_missing"} and not explicit_subscription_change:
+                errors.append(
+                    "unverified slice migration is blocked: the user did not request subscription provisioning; keep the serving slice or return an explicit blocking question"
+                )
+            if decision == "migration_authorized":
+                authorized = {str(item or "").strip() for item in authorization.authorized_snssais if str(item or "").strip()}
+                targets = {str(item or "").strip() for item in authorization.target_snssais if str(item or "").strip()}
+                if not authorized:
+                    errors.append("migration_authorized requires non-empty subscription entitlement evidence")
+                elif targets and not targets.issubset(authorized):
+                    errors.append("migration_authorized target S-NSSAI is absent from subscription entitlement evidence")
+        if requested_domains == {"mobility"} and grounding_decision.flows:
+            errors.append("Mobility-only GroundingDecision must not include QoS flows.")
         if "qos" not in requested_domains:
             return errors
 
-        if not operation_intent.flows:
-            errors.append("QoS OperationIntent must include grounded target flows.")
+        if not grounding_decision.flows:
+            errors.append("QoS GroundingDecision must include grounded target flows.")
             return errors
 
         explicit_target_names = {
@@ -149,7 +172,7 @@ class IntentGroundingValidator:
                 grounded_flow_name_by_id.setdefault(flow_id, flow_name)
         for flow_name in explicit_target_names:
             matching_flows = [
-                flow for flow in operation_intent.flows
+                flow for flow in grounding_decision.flows
                 if (
                     str(flow.name or "").strip() == flow_name
                     or grounded_flow_name_by_id.get(str(flow.flow_id or "").strip()) == flow_name
@@ -160,36 +183,31 @@ class IntentGroundingValidator:
                     f"explicitly named QoS flow '{flow_name}' must appear in advisor decision flows as resolved or unresolved"
                 )
 
-        for index, flow in enumerate(operation_intent.flows):
+        for index, flow in enumerate(grounding_decision.flows):
             resolution_status = str(flow.resolution_status or "resolved").strip().lower() or "resolved"
             flow_id = str(flow.flow_id or "").strip()
             if resolution_status == "resolved" and not flow_id:
-                errors.append(f"QoS OperationIntent flow[{index}] is resolved but missing flow_id.")
+                errors.append(f"QoS GroundingDecision flow[{index}] is resolved but missing flow_id.")
             if resolution_status == "resolved" and flow_id and not flow_id_is_grounded(
                 flow_id=flow_id,
                 evidence=evidence,
             ):
                 errors.append(
-                    f"QoS OperationIntent flow[{index}] resolved flow_id={flow_id} is not grounded by catalog/search evidence."
+                    f"QoS GroundingDecision flow[{index}] resolved flow_id={flow_id} is not grounded by catalog/search evidence."
                 )
             if resolution_status == "unresolved" and not str(flow.name or "").strip():
                 errors.append(
-                    f"QoS OperationIntent unresolved flow[{index}] must preserve the named target in name."
+                    f"QoS GroundingDecision unresolved flow[{index}] must preserve the named target in name."
                 )
         resolved_flow_ids = {
             str(flow.flow_id or "").strip()
-            for flow in operation_intent.flows
+            for flow in grounding_decision.flows
             if str(flow.resolution_status or "resolved").strip().lower() == "resolved"
             and str(flow.flow_id or "").strip()
         }
-        envelope_by_flow_id = {
-            str(envelope.flow_id or "").strip(): envelope
-            for envelope in (operation_intent.qos_target_envelopes or [])
-            if str(envelope.flow_id or "").strip()
-        }
         flow_by_id = {
             str(flow.flow_id or "").strip(): flow
-            for flow in operation_intent.flows
+            for flow in grounding_decision.flows
             if str(flow.flow_id or "").strip()
         }
         flow_baseline_fields = (
@@ -204,16 +222,6 @@ class IntentGroundingValidator:
             "priority",
             "current_slice_snssai",
         )
-        envelope_baseline_fields = (
-            "baseline_priority",
-            "baseline_latency_ms",
-            "baseline_jitter_ms",
-            "baseline_packet_error_rate",
-            "baseline_max_br_ul_mbps",
-            "baseline_max_br_dl_mbps",
-            "baseline_gbr_ul_mbps",
-            "baseline_gbr_dl_mbps",
-        )
         for flow_id in sorted(resolved_flow_ids):
             flow = flow_by_id.get(flow_id)
             if flow is not None:
@@ -227,40 +235,6 @@ class IntentGroundingValidator:
                         f"incomplete QoS flow selector for resolved flow_id={flow_id}: "
                         + ", ".join(missing_flow_fields)
                     )
-            envelope = envelope_by_flow_id.get(flow_id)
-            if envelope is None:
-                errors.append(f"missing QoS baseline envelope for resolved flow_id={flow_id}")
-                continue
-            missing_envelope_fields = [
-                field
-                for field in envelope_baseline_fields
-                if _missing_baseline_value(getattr(envelope, field, None))
-            ]
-            if len(missing_envelope_fields) == len(envelope_baseline_fields):
-                errors.append(f"missing QoS baseline values for resolved flow_id={flow_id}")
-            elif missing_envelope_fields:
-                errors.append(
-                    f"incomplete QoS baseline for resolved flow_id={flow_id}: "
-                    + ", ".join(missing_envelope_fields)
-                )
-        stages = list(operation_intent.control_semantics.stages or [])
-        if not stages:
-            errors.append("QoS OperationIntent must include IEA-owned control_semantics stages.")
-            return errors
-        active_flow_ids = {
-            str(flow_id or "").strip()
-            for stage in stages
-            for flow_id in (stage.active_flow_ids or [])
-            if str(flow_id or "").strip()
-        }
-        if resolved_flow_ids and not active_flow_ids:
-            errors.append("QoS OperationIntent control_semantics must include active_flow_ids for grounded stage targets.")
-        unknown_active_ids = active_flow_ids - resolved_flow_ids
-        if unknown_active_ids:
-            errors.append(
-                "QoS OperationIntent control_semantics active_flow_ids must reference flows: "
-                + ", ".join(sorted(unknown_active_ids))
-            )
         return errors
 
 

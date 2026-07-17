@@ -12,20 +12,33 @@ from shared.runtime import ToolLoopExecutionError
 from shared.runtime import ArtifactWorkerMixin
 from ...domain.collaboration import PlanningRequest
 from ...domain.policy_plan import PolicyPlanDraft
-from ...context.projectors import project_collaboration_context_for_prompt, project_operation_intent_for_prompt
+from ...context.projectors import project_collaboration_context_for_prompt, project_grounding_decision_for_prompt
 from ...context.observability import measure_context_components
 from ...context.prompts import PlanningPromptBuilder
 from shared.logging import log_event, log_timing
 
 from .compiler import OptimizationStrategyCompiler
-from .planning_validation import normalize_app_id as _normalize_app_id
 from .response_models import OsaAdvisorOutput
 from .tool_result_adapter import extract_planning_tool_evidence
 from .tools import build_request_tools
 
 
-def _build_lean_operation_intent(operation_intent: Any) -> dict:
-    return project_operation_intent_for_prompt(operation_intent)
+def _build_lean_grounding_decision(grounding_decision: Any) -> dict:
+    return project_grounding_decision_for_prompt(grounding_decision)
+
+
+def _planning_supi(planning_request: PlanningRequest) -> str:
+    main_supi = str(planning_request.context.shared_context.main_intent.supi or "").strip()
+    if main_supi:
+        return main_supi
+    return next(
+        (
+            str(flow.supi or "").strip()
+            for flow in (planning_request.grounding_decision.flows or [])
+            if str(flow.supi or "").strip()
+        ),
+        "",
+    )
 
 
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
@@ -60,11 +73,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _active_domain_names(planning_request: PlanningRequest) -> set[str]:
-        domain_values = (
-            planning_request.context.active_domains
-            or planning_request.operation_intent.requested_domains
-            or []
-        )
+        domain_values = planning_request.context.shared_context.main_intent.requested_domains or []
         return {
             str(item.value if hasattr(item, "value") else item or "").strip().lower()
             for item in domain_values
@@ -72,7 +81,24 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         }
 
     def _include_knowledge_tools(self, planning_request: PlanningRequest) -> bool:
-        return self.rag_enabled and self._active_domain_names(planning_request) != {"qos"}
+        if not self.rag_enabled:
+            return False
+        # Standards retrieval is exceptional: local optimizer, UE context, and
+        # IEA evidence own normal planning facts. Do not make RAG callable just
+        # because mobility participates in the plan.
+        question_text = " ".join(
+            " ".join(
+                [
+                    str(question.owner_agent or ""),
+                    str(question.question or ""),
+                ]
+            )
+            for question in (planning_request.grounding_decision.open_questions or [])
+        ).lower()
+        return any(
+            marker in question_text
+            for marker in ("3gpp", "ts 23.", "ts 29.", "standard", "specification", "标准", "规范")
+        )
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> PolicyPlanDraft:
         planning_request = PlanningRequest.model_validate(envelope.payload)
@@ -123,9 +149,8 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 planning_request=planning_request,
                 reason=str(exc),
             )
-        operation_intent = effective_request.operation_intent
-        normalized_user_intent = _build_lean_operation_intent(operation_intent)
-        normalized_user_intent["app_id"] = _normalize_app_id(normalized_user_intent.get("app_id"))
+        grounding_decision = effective_request.grounding_decision
+        normalized_grounding_decision = _build_lean_grounding_decision(grounding_decision)
         coordination_context = project_collaboration_context_for_prompt(effective_request.context)
 
         total_start = time.perf_counter()
@@ -143,7 +168,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             ]
             prompt_builder = PlanningPromptBuilder()
             base_prompt = prompt_builder.advisor_user_prompt(
-                normalized_user_intent=normalized_user_intent,
+                normalized_user_intent=normalized_grounding_decision,
                 coordination_context=coordination_context,
                 planning_evidence=planning_evidence,
                 available_tool_names=available_tool_names,
@@ -155,12 +180,16 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             grounding_tools: list[str] = []
             contract_errors: list[str] = []
             invocation_error = ""
+            retry_tool_evidence: dict[str, Any] = {}
+            disable_knowledge_tools = False
             for attempt_index in range(3):
                 try:
                     advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
                         planning_request=effective_request,
                         prompt=current_prompt,
                         trace_metadata=trace_metadata,
+                        cached_tool_evidence=retry_tool_evidence,
+                        disable_knowledge_tools=disable_knowledge_tools,
                     )
                 except RuntimeError as exc:
                     invocation_error = str(exc)
@@ -169,14 +198,9 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                         "attempt_index": attempt_index + 1,
                         "invocation_error": invocation_error,
                     }
-                    # Merge tool results from the failed invocation into the
-                    # tools_cache so retry prompt can include them.
-                    raw_messages = list(getattr(exc, "_tool_output_messages", None) or [])
-                    if raw_messages:
-                        tools_cache = getattr(self, "_tools_cache", {}) if hasattr(self, "_tools_cache") else {}
-                        cached_preview = tools_cache.get("latest_optimizer_preview") if isinstance(tools_cache, dict) else None
-                        if cached_preview is not None:
-                            tools_cache["latest_optimizer_preview"] = dict(cached_preview)
+                    retry_tool_evidence = self._cached_tool_evidence_for_retry()
+                    if "get_knowledge_by_key exceeded" in invocation_error or "search_semantic_knowledge exceeded" in invocation_error:
+                        disable_knowledge_tools = True
                     if attempt_index == 2:
                         raise
                     log_event(self.logger, "osa_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
@@ -194,6 +218,10 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 grounding_tools = extract_grounding_tool_names(
                     advisor_result,
                     self.GROUNDING_TOOLS,
+                )
+                advisor_output = self._enforce_entitlement_limited_execution_boundary(
+                    advisor_output=advisor_output,
+                    planning_request=effective_request,
                 )
                 contract_errors = self.compiler.validate_advisor_output(
                     advisor_output=advisor_output,
@@ -213,6 +241,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     break
                 if attempt_index == 2:
                     raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
+                retry_tool_evidence = self._cached_tool_evidence_for_retry()
                 log_event(self.logger, "osa_retry", attempt=attempt_index + 2,
                           reason="contract_errors", errors=contract_errors)
                 current_prompt = prompt_builder.validation_retry_prompt(
@@ -260,61 +289,52 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _effective_planning_request(planning_request: PlanningRequest) -> PlanningRequest:
-        semantics = planning_request.operation_intent.control_semantics
-        stages = semantics.stages or []
-        if not stages:
-            return planning_request
-        current_stage_index = max(1, int(semantics.current_stage or 1))
-        current_stage = next(
-            (stage for stage in stages if int(stage.stage_index or 0) == current_stage_index),
-            stages[0],
-        )
-        active_flow_ids = {
-            str(flow_id or "").strip()
-            for flow_id in (current_stage.active_flow_ids or [])
-            if str(flow_id or "").strip()
-        }
-        filtered_intent = planning_request.operation_intent.model_copy(deep=True)
-        filtered_intent.control_semantics = semantics.model_copy(
-            update={
-                "current_stage": 1,
-                "stages": [
-                    current_stage.model_copy(
-                        update={"stage_index": 1},
-                        deep=True,
-                    )
-                ],
-            },
-            deep=True,
-        )
-        # Mobility-only requests have no QoS flows. They still receive only the
-        # current semantic stage instead of the complete stage history.
-        is_mobility_only = (
-            planning_request.operation_intent.requested_domains
-            == ["mobility"]
-        )
-        if not active_flow_ids and is_mobility_only:
-            return planning_request.model_copy(
-                update={"operation_intent": filtered_intent},
-                deep=True,
-            )
-        if not active_flow_ids:
+        domains = OptimizationStrategyAgent._active_domain_names(planning_request)
+        if "qos" in domains and not planning_request.grounding_decision.flows:
             raise ValueError(
-                "current control stage has no grounded active_flow_ids; OSA must request upstream reground instead of expanding to all flows"
+                "Main selected QoS for this stage but IEA returned no grounded flows; request upstream reground"
             )
-        filtered_intent.flows = [
-            flow for flow in filtered_intent.flows
-            if str(flow.flow_id or "").strip() in active_flow_ids
-        ]
-        filtered_intent.qos_target_envelopes = [
-            envelope for envelope in filtered_intent.qos_target_envelopes
-            if str(envelope.flow_id or "").strip() in active_flow_ids
-        ]
-        filtered_intent.qos_operation_constraints = [
-            constraint for constraint in filtered_intent.qos_operation_constraints
-            if str(constraint.flow_id or "").strip() in active_flow_ids
-        ]
-        return planning_request.model_copy(update={"operation_intent": filtered_intent}, deep=True)
+        # IEA is invoked with one Main-selected stage and returns bindings for
+        # that stage only. No second stage model or flow filtering belongs in
+        # OSA; it consumes that handoff as-is.
+        return planning_request
+
+    @staticmethod
+    def _enforce_entitlement_limited_execution_boundary(
+        *,
+        advisor_output: OsaAdvisorOutput,
+        planning_request: PlanningRequest,
+    ) -> OsaAdvisorOutput:
+        """Remove policy types prohibited by IEA's entitlement evidence.
+
+        OSA still chooses the QoS strategy. This is only the final execution
+        boundary: AM/URSP cannot provision or bypass a target S-NSSAI when IEA
+        has grounded that entitlement as unavailable.
+        """
+        decision = str(
+            planning_request.grounding_decision.slice_migration_authorization.decision or ""
+        ).strip()
+        if decision not in {
+            "blocked_by_subscription_entitlement",
+            "blocked_requires_subscription_provisioning",
+            "evidence_missing",
+        }:
+            return advisor_output
+
+        bounded = advisor_output.model_copy(deep=True)
+        bounded.am_policy = None
+        bounded.ursp_policies = []
+        if bounded.sm_policies or bounded.partial_policies:
+            bounded.planning_status = "partial_plan"
+        if not bounded.blocked_targets:
+            bounded.blocked_targets = ["requested target slice migration"]
+        if not bounded.missing_evidence:
+            bounded.missing_evidence = ["authorized target S-NSSAI after subscription provisioning"]
+        if not bounded.planner_conflicts:
+            bounded.planner_conflicts = [
+                "Subscription entitlement blocks the target slice change; only current-slice QoS delivery is executable."
+            ]
+        return bounded
 
     def _invoke_strategy_advisor(
         self,
@@ -322,21 +342,28 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         planning_request: PlanningRequest,
         prompt: str,
         trace_metadata: dict[str, Any] | None = None,
+        cached_tool_evidence: dict[str, Any] | None = None,
+        disable_knowledge_tools: bool = False,
     ) -> tuple[OsaAdvisorOutput, dict[str, Any], dict[str, Any]]:
         token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
             session_id=planning_request.context.session_id,
             snapshot_id=planning_request.context.snapshot_id,
-            supi=planning_request.operation_intent.supi,
+            supi=_planning_supi(planning_request),
             thread_id=planning_request.context.session_id,
             token_budget=token_budget,
             token_counter=token_counter,
             trace_metadata=trace_metadata,
         )
-        planning_tools, tools_cache = build_request_tools(planning_request)
+        planning_tools, tools_cache = build_request_tools(
+            planning_request,
+            cached_tool_evidence=cached_tool_evidence,
+        )
         self._tools_cache = tools_cache
-        include_knowledge_tools = self._include_knowledge_tools(planning_request)
+        include_knowledge_tools = (
+            not disable_knowledge_tools and self._include_knowledge_tools(planning_request)
+        )
         advisor_agent = self.create_json_agent(
             tools=[
                 *(self._RAG_TOOLS if include_knowledge_tools else []),

@@ -10,7 +10,7 @@ from ...domain.control_plane import (
     OptimizationProblemConfig,
     OptimizationTemplate,
 )
-from ...domain.policy_plan import OperationIntent
+from ...domain.policy_plan import GroundingDecision
 from ..projectors import ProjectorRegistry
 from .normalizer import normalize_app_id
 
@@ -52,11 +52,11 @@ class EvidenceFormatter:
     def for_osa(
         cls,
         *,
-        operation_intent: OperationIntent,
+        grounding_decision: GroundingDecision,
         planning_context: PlanningContext,
     ) -> Dict[str, Any]:
         operation_constraints = _qos_operation_constraints_for_flows(
-            operation_intent.model_dump(mode="json"),
+            grounding_decision.model_dump(mode="json"),
             planning_context,
         )
         return (
@@ -78,7 +78,8 @@ class EvidenceFormatter:
     ) -> JointOptimizationRequest:
         from ...integrations.storage import get_snapshot_data_by_id, get_ue_context_by_supi
 
-        operation_intent = planning_request.operation_intent
+        grounding_decision = planning_request.grounding_decision
+        main_intent = planning_request.context.shared_context.main_intent
         snapshot_id = str(planning_request.context.snapshot_id or "").strip()
         if not snapshot_id:
             raise ValueError("optimizer request requires a bound snapshot_id")
@@ -88,23 +89,16 @@ class EvidenceFormatter:
         target_supis = _collect_target_supis(planning_request)
 
         requested_domains: list[ControlDomain] = []
-        for item in planning_request.context.active_domains or []:
-            normalized = str(item or "").strip().lower()
-            if normalized in {"both", "all"}:
-                requested_domains = [ControlDomain.QOS, ControlDomain.MOBILITY]
-                break
-            requested_domains.append(ControlDomain(normalized))
+        requested_domains = list(main_intent.requested_domains or [])
         if not requested_domains:
-            raise ValueError("optimizer request requires non-empty active_domains from Main/IEA")
+            raise ValueError("optimizer request requires non-empty Main requested_domains")
 
         ue_contexts = {
             supi: (get_ue_context_by_supi(supi, snapshot_id=snapshot_id) or {})
             for supi in target_supis
         }
 
-        objective_profile_payload = dict(
-            planning_request.context.shared_context.initial_intent.objective_profile
-        )
+        objective_profile_payload = main_intent.objective_profile.model_dump(mode="json")
         if not objective_profile_payload:
             raise ValueError("optimizer request requires an explicit objective_profile")
         if profile_name is not None:
@@ -133,21 +127,28 @@ class EvidenceFormatter:
         problem_config.qos_feasibility_mode = normalized_feasibility_mode
         problem_config.enable_sla_constraints = normalized_feasibility_mode == "hard"
 
-        optimizer_operation_intent = _canonicalize_operation_intent_for_optimizer(
-            operation_intent.model_dump(mode="json"),
+        optimizer_grounding_view = _build_optimizer_grounding_view(
+            grounding_decision.model_dump(mode="json"),
             snapshot,
         )
         _apply_qos_operation_constraints(
-            optimizer_operation_intent,
+            optimizer_grounding_view,
             planning_request.context,
         )
+        if _slice_migration_is_blocked_by_iea(optimizer_grounding_view):
+            _apply_entitlement_limited_qos_delivery(optimizer_grounding_view)
+            # Hybrid mode pins the serving S-NSSAI while leaving the QoS
+            # envelope adjustable. This is a code-owned execution boundary;
+            # the LLM still decides whether the resulting best-effort plan is
+            # useful enough to deliver.
+            problem_config.solver_mode = "hybrid"
 
         return JointOptimizationRequest(
             session_id=planning_request.context.session_id,
             snapshot_id=snapshot_id,
             target_ues=target_supis,
             requested_domains=requested_domains,
-            operation_intent=optimizer_operation_intent,
+            grounding_decision=optimizer_grounding_view,
             traffic_state={
                 "apps": snapshot.get("apps", []),
                 "slices": snapshot.get("slices", []),
@@ -174,7 +175,8 @@ class EvidenceFormatter:
 
 
 def _collect_target_supis(planning_request: PlanningRequest) -> list[str]:
-    operation_intent = planning_request.operation_intent
+    grounding_decision = planning_request.grounding_decision
+    main_intent = planning_request.context.shared_context.main_intent
     target_supis: list[str] = []
 
     def _append(candidate: str) -> None:
@@ -182,17 +184,25 @@ def _collect_target_supis(planning_request: PlanningRequest) -> list[str]:
         if supi and supi not in target_supis:
             target_supis.append(supi)
 
-    _append(operation_intent.supi)
-    for flow in operation_intent.flows or []:
+    _append(main_intent.supi)
+    for stage in main_intent.control_semantics.stages or []:
+        for target in stage.targets or []:
+            _append(target.supi)
+    for flow in grounding_decision.flows or []:
         _append(flow.supi)
     return target_supis
 
 
-def _canonicalize_operation_intent_for_optimizer(
-    operation_intent_payload: Dict[str, Any],
+def _build_optimizer_grounding_view(
+    grounding_decision_payload: Dict[str, Any],
     snapshot: Dict[str, Any],
 ) -> Dict[str, Any]:
-    payload = dict(operation_intent_payload or {})
+    """Combine the typed IEA result with snapshot defaults for the optimizer.
+
+    This is a private runtime view, not an agent artifact: Main's scope remains
+    in shared context and the original GroundingDecision is never mutated.
+    """
+    payload = dict(grounding_decision_payload or {})
     flow_catalog = _snapshot_flow_catalog_by_id(snapshot)
     canonical_flows: List[Dict[str, Any]] = []
     for flow_payload in payload.get("flows") or []:
@@ -210,50 +220,27 @@ def _canonicalize_operation_intent_for_optimizer(
 
 
 def _qos_operation_constraints_for_flows(
-    operation_intent_payload: Dict[str, Any],
+    grounding_decision_payload: Dict[str, Any],
     planning_context: PlanningContext,
 ) -> List[Dict[str, Any]]:
     flow_by_id = {
         str(flow.get("flow_id") or "").strip(): flow
-        for flow in (operation_intent_payload.get("flows") or [])
+        for flow in (grounding_decision_payload.get("flows") or [])
         if isinstance(flow, dict) and str(flow.get("flow_id") or "").strip()
     }
     constraints: List[Dict[str, Any]] = []
-    for raw_constraint in operation_intent_payload.get("qos_operation_constraints") or []:
+    for raw_constraint in grounding_decision_payload.get("qos_operation_constraints") or []:
         if not isinstance(raw_constraint, dict):
             continue
         constraint = _normalize_qos_operation_constraint(raw_constraint, flow_by_id)
         if constraint:
             constraints.append(constraint)
 
-    initial_intent = planning_context.shared_context.initial_intent
-    for raw_constraint in initial_intent.global_constraints:
-        if not isinstance(raw_constraint, dict):
-            continue
-        if str(raw_constraint.get("type") or "").strip() != "qos_slice_migration":
-            continue
-        for flow_id, flow in flow_by_id.items():
-            if any(item.get("flow_id") == flow_id for item in constraints):
-                continue
-            source_slice = str(flow.get("current_slice_snssai") or "").strip()
-            preference = str(((raw_constraint.get("target_slice_policy") or {}).get("preference")) or "").strip()
-            constraint = _normalize_qos_operation_constraint(
-                {
-                    "flow_id": flow_id,
-                    "app_id": normalize_app_id(flow.get("app_id")),
-                    "operation_type": "slice_migration",
-                    "require_slice_change": bool(raw_constraint.get("required", True)),
-                    "source_slice_snssai": source_slice,
-                    "target_slice_preference": preference,
-                    "no_op_allowed": bool(raw_constraint.get("no_op_allowed", False)),
-                    "rationale": [
-                        "Initial intent requires QoS slice migration",
-                    ],
-                },
-                flow_by_id,
-            )
-            if constraint:
-                constraints.append(constraint)
+    # Main's global migration cue remains available in shared context for
+    # routing and audit, but it is not a per-flow execution constraint. IEA
+    # alone decides whether an explicitly grounded flow requires a serving
+    # S-NSSAI change; synthesizing such a constraint here made same-slice QoS
+    # tuning incorrectly require AM policy output.
     return constraints
 
 
@@ -289,14 +276,14 @@ def _normalize_qos_operation_constraint(
 
 
 def _apply_qos_operation_constraints(
-    operation_intent_payload: Dict[str, Any],
+    optimizer_grounding_view: Dict[str, Any],
     planning_context: PlanningContext,
 ) -> None:
-    constraints = _qos_operation_constraints_for_flows(operation_intent_payload, planning_context)
+    constraints = _qos_operation_constraints_for_flows(optimizer_grounding_view, planning_context)
     if constraints:
-        operation_intent_payload["qos_operation_constraints"] = constraints
+        optimizer_grounding_view["qos_operation_constraints"] = constraints
     by_flow_id = {item["flow_id"]: item for item in constraints if item.get("flow_id")}
-    for flow in operation_intent_payload.get("flows") or []:
+    for flow in optimizer_grounding_view.get("flows") or []:
         if not isinstance(flow, dict):
             continue
         flow_id = str(flow.get("flow_id") or "").strip()
@@ -307,6 +294,49 @@ def _apply_qos_operation_constraints(
         flow["excluded_slice_snssais"] = list(constraint.get("excluded_slice_snssais") or [])
         flow["target_slice_preference"] = str(constraint.get("target_slice_preference") or "").strip()
         flow["no_op_allowed"] = bool(constraint.get("no_op_allowed", True))
+
+
+def _slice_migration_is_blocked_by_iea(optimizer_grounding_view: Dict[str, Any]) -> bool:
+    authorization = optimizer_grounding_view.get("slice_migration_authorization")
+    if not isinstance(authorization, dict):
+        return False
+    return str(authorization.get("decision") or "").strip() in {
+        "blocked_by_subscription_entitlement",
+        "blocked_requires_subscription_provisioning",
+        "evidence_missing",
+    }
+
+
+def _apply_entitlement_limited_qos_delivery(optimizer_grounding_view: Dict[str, Any]) -> None:
+    """Turn a blocked migration into an optimizer-safe QoS-only fallback.
+
+    Subscription evidence is an execution boundary: the optimizer may tune
+    bandwidth/QoS on the serving slice but cannot select a new S-NSSAI.
+    """
+    optimizer_grounding_view["entitlement_limited_best_effort"] = True
+    optimizer_grounding_view["preserve_current_slice"] = True
+    for constraint in optimizer_grounding_view.get("qos_operation_constraints") or []:
+        if not isinstance(constraint, dict):
+            continue
+        constraint["operation_type"] = "qos_reallocation"
+        constraint["require_slice_change"] = False
+        constraint["excluded_slice_snssais"] = []
+        constraint["target_slice_preference"] = ""
+        constraint["no_op_allowed"] = True
+        rationale = list(constraint.get("rationale") or [])
+        constraint["rationale"] = list(
+            dict.fromkeys(
+                [*rationale, "Subscription boundary: preserve current slice and optimize QoS best effort"]
+            )
+        )
+    for flow in optimizer_grounding_view.get("flows") or []:
+        if not isinstance(flow, dict):
+            continue
+        flow["require_slice_change"] = False
+        flow["excluded_slice_snssais"] = []
+        flow["target_slice_preference"] = ""
+        flow["no_op_allowed"] = True
+        flow["preserve_current_slice"] = True
 
 
 def _resolve_qos_feasibility_mode(
@@ -323,7 +353,7 @@ def _resolve_qos_feasibility_mode(
         raise ValueError("qos_feasibility_mode must be 'auto', 'hard', or 'soft'")
 
     raw_text = str(
-        planning_request.context.shared_context.initial_intent.request_summary
+        planning_request.context.shared_context.main_intent.raw_input
     ).strip().lower()
     if not raw_text:
         return "soft"

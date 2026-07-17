@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Protocol
 
-from ..domain.collaboration import InitialIntentContext, PlanningContext, SharedControlContext
+from ..domain.collaboration import PlanningContext, SharedControlContext
 from ..domain.control_plane import GlobalControlIntent
 from .projectors import project_global_intent_for_prompt
 
@@ -33,7 +33,6 @@ class IntentContextBuilder(Protocol):
         session_id: str,
         snapshot_id: str,
         *,
-        active_domains: Optional[List[str]] = None,
         round_index: int,
         memory_context: str = "",
         feedback_context: str = "",
@@ -79,7 +78,6 @@ class DefaultIntentContextBuilder:
         session_id: str,
         snapshot_id: str,
         *,
-        active_domains: Optional[List[str]] = None,
         round_index: int,
         memory_context: str = "",
         feedback_context: str = "",
@@ -95,12 +93,6 @@ class DefaultIntentContextBuilder:
             shared_context=_build_shared_control_context(global_intent),
             feedback_context=feedback_context,
             handoff_history=list(handoff_history or [])[-2:],
-            active_domains=list(active_domains or [item.value for item in global_intent.requested_domains]),
-            retry_scope=(
-                global_intent.retry_scope.value
-                if getattr(global_intent, "retry_scope", None) is not None and hasattr(global_intent.retry_scope, "value")
-                else str(getattr(global_intent, "retry_scope", "") or "").strip()
-            ),
             revision_requests=list(revision_requests or []),
             unified_constraints=dict(unified_constraints or {}),
         )
@@ -133,83 +125,7 @@ class DefaultIntentContextBuilder:
 
 
 def _build_shared_control_context(global_intent: GlobalControlIntent) -> SharedControlContext:
-    raw_input = str(global_intent.raw_input or "").strip()
-    semantics = global_intent.control_semantics.model_dump(mode="json")
-    constraints: List[Dict[str, Any]] = []
-    if _has_qos_slice_migration_goal(global_intent):
-        constraints.append(
-            {
-                "type": "qos_slice_migration",
-                "required": True,
-                "no_op_allowed": False,
-                "source": "main_control",
-                "target_slice_policy": {
-                    "exclude_current": True,
-                    "preference": _infer_slice_preference(raw_input, semantics),
-                },
-                "semantic_cues": _slice_migration_cues(raw_input, semantics),
-            }
-        )
-    target_supis: List[str] = []
-    target_names: List[str] = []
-    if str(global_intent.supi or "").strip():
-        target_supis.append(str(global_intent.supi).strip())
-    for stage in semantics.get("stages") or []:
-        if not isinstance(stage, dict):
-            continue
-        for target in stage.get("targets") or []:
-            if not isinstance(target, dict):
-                continue
-            target_supi = str(target.get("supi") or "").strip()
-            target_name = str(target.get("semantic_name") or "").strip()
-            if target_supi and target_supi not in target_supis:
-                target_supis.append(target_supi)
-            if target_name and target_name not in target_names:
-                target_names.append(target_name)
-    return SharedControlContext(
-        initial_intent=InitialIntentContext(
-            request_summary=raw_input,
-            requested_domains=[item.value for item in global_intent.requested_domains],
-            target_supis=target_supis,
-            target_names=target_names,
-            objective_profile=global_intent.objective_profile.model_dump(mode="json"),
-            required_evidence=list(global_intent.required_evidence or []),
-            forbidden_assumptions=list(global_intent.forbidden_assumptions or []),
-            global_constraints=constraints,
-        )
-    )
-
-
-def _has_qos_slice_migration_goal(global_intent: GlobalControlIntent) -> bool:
-    domains = {str(item.value if hasattr(item, "value") else item).strip().lower() for item in global_intent.requested_domains}
-    if "qos" not in domains:
-        return False
-    text = " ".join(
-        [
-            str(global_intent.raw_input or ""),
-            str(global_intent.routing_rationale or ""),
-            json.dumps(global_intent.control_semantics.model_dump(mode="json"), ensure_ascii=False),
-        ]
-    ).lower()
-    return any(token in text for token in ("迁移", "迁出", "切换", "换到", "migrate", "migration", "switch", "move away"))
-
-
-def _infer_slice_preference(raw_input: str, semantics: Dict[str, Any]) -> str:
-    text = f"{raw_input} {json.dumps(semantics, ensure_ascii=False)}".lower()
-    if any(token in text for token in ("低时延", "更低时延", "lower latency", "lower-latency", "latency")):
-        return "lower_latency"
-    if any(token in text for token in ("高吞吐", "throughput", "bandwidth")):
-        return "higher_throughput"
-    return "runtime_feasible"
-
-
-def _slice_migration_cues(raw_input: str, semantics: Dict[str, Any]) -> List[str]:
-    text = f"{raw_input} {json.dumps(semantics, ensure_ascii=False)}".lower()
-    return [
-        token
-        for token in ("迁移", "迁出", "切换", "换到", "migrate", "migration", "switch", "move away")
-        if token in text
-    ]
+    return SharedControlContext(main_intent=global_intent.model_copy(deep=True))
 
 
 def _project_iea_routing_contract(global_intent: Dict[str, Any]) -> Dict[str, Any]:
