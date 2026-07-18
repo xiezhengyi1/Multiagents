@@ -5,15 +5,15 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+from pydantic import ValidationError
+
 from shared.runtime import ArtifactEnvelope
 from shared.runtime import ContextPolicy
 from shared.runtime import ToolLoopExecutionError
 from shared.agents import BaseAgent, coerce_structured_response, extract_grounding_tool_names
 from shared.runtime import ArtifactWorkerMixin
-from knowledge_runtime.retrieval.raw import get_knowledge_by_key, search_semantic_knowledge
 from ...integrations.pcf import (
     get_am_policy_context,
-    get_sm_ue_context,
     get_sm_ue_flow_catalog,
     get_ue_slice_subscription,
     search_am_policy_targets,
@@ -22,7 +22,14 @@ from ...integrations.pcf import (
 from ...context.projectors import project_intent_evidence_for_prompt
 from ...context.observability import measure_context_components
 from ...context.evidence.grounding import IntentEvidenceBuilder
-from ...domain.policy_plan import GroundingDecision
+from ...domain.policy_plan import (
+    FlowSelector,
+    GroundingAdvisorOutput,
+    GroundingDecision,
+    GroundingEvidenceBundle,
+    QosOperationConstraint,
+    SliceMigrationAuthorization,
+)
 from ...context.prompts import GroundingPromptBuilder, RetryPromptBuilder
 from ..common import validate_grounding_decision
 from shared.logging import log_event, log_timing
@@ -64,32 +71,27 @@ class IntentAdvisorInvocation:
 
 class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "intent_encoding"
-    SM_GROUNDING_TOOLS = {"search_sm_flow_targets", "get_sm_ue_context", "get_sm_ue_flow_catalog"}
+    SM_GROUNDING_TOOLS = {"search_sm_flow_targets", "get_sm_ue_flow_catalog"}
     AM_GROUNDING_TOOLS = {"get_am_policy_context", "search_am_policy_targets"}
     SUBSCRIPTION_GROUNDING_TOOLS = {"get_ue_slice_subscription"}
-    GROUNDING_TOOLS = SM_GROUNDING_TOOLS | AM_GROUNDING_TOOLS | SUBSCRIPTION_GROUNDING_TOOLS | {"search_semantic_knowledge", "get_knowledge_by_key"}
+    GROUNDING_TOOLS = SM_GROUNDING_TOOLS | AM_GROUNDING_TOOLS | SUBSCRIPTION_GROUNDING_TOOLS
 
     def __init__(
         self,
         model_name: str = "qwen3-30b-a3b-instruct-2507",
         use_local_model: bool = False,
-        rag_enabled: bool = True,
     ) -> None:
         super().__init__(model_name=model_name, use_local_model=use_local_model)
         self.agent_name = "intent_encoding"
-        self.rag_enabled = rag_enabled
         self.compiler = IntentCompiler()
         self.initialize_agent_runtime(logger_color="\033[95m")
         self.tools = [
             search_sm_flow_targets,
-            get_sm_ue_context,
             get_sm_ue_flow_catalog,
             get_am_policy_context,
             get_ue_slice_subscription,
             search_am_policy_targets,
         ]
-        if self.rag_enabled:
-            self.tools.extend([search_semantic_knowledge, get_knowledge_by_key])
         self.advisor_agent = self._create_advisor_agent(self.tools)
         self.last_failure_debug: Dict[str, Any] = {}
 
@@ -97,34 +99,29 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         return self.create_json_agent(
             tools=tools,
             system_prompt=GroundingPromptBuilder().system_prompt(),
-            response_model=GroundingDecision,
+            response_model=GroundingAdvisorOutput,
             max_iterations=14,
             max_calls_per_tool=3,
+            forbid_duplicate_tool_calls=True,
             tool_call_limits={
                 "get_sm_ue_flow_catalog": 4,
                 "search_sm_flow_targets": 4,
             },
             tool_result_limits={
                 "get_sm_ue_flow_catalog": 16000,
-                "get_sm_ue_context": 8000,
                 "search_sm_flow_targets": 8000,
                 "get_am_policy_context": 8000,
                 "search_am_policy_targets": 8000,
                 "get_ue_slice_subscription": 8000,
-                "search_semantic_knowledge": 8000,
-                "get_knowledge_by_key": 8000,
             },
             context_policy=ContextPolicy(
                 default_tool_result_chars=8000,
                 tool_result_char_limits={
                     "get_sm_ue_flow_catalog": 16000,
-                    "get_sm_ue_context": 8000,
                     "search_sm_flow_targets": 8000,
                     "get_am_policy_context": 8000,
                     "search_am_policy_targets": 8000,
                     "get_ue_slice_subscription": 8000,
-                    "search_semantic_knowledge": 8000,
-                    "get_knowledge_by_key": 8000,
                 },
                 recent_tool_results_per_tool=1,
                 tool_history_keep_limits={
@@ -139,6 +136,8 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         cls,
         tools: List[Any],
         requested_domains: List[str] | None,
+        *,
+        include_subscription: bool = True,
     ) -> List[Any]:
         domains = {
             str(item or "").strip().lower()
@@ -148,17 +147,28 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         if not domains:
             return list(tools)
 
-        allowed = {"search_semantic_knowledge", "get_knowledge_by_key"}
+        allowed: set[str] = set()
         if "qos" in domains:
             allowed |= cls.SM_GROUNDING_TOOLS
-            # Tool availability is a factual capability boundary, not an
-            # operation classifier. IEA decides whether migration semantics
-            # need this evidence; code later requires it only when IEA emits a
-            # serving-slice change constraint.
-            allowed |= cls.SUBSCRIPTION_GROUNDING_TOOLS
+            if include_subscription:
+                allowed |= cls.SUBSCRIPTION_GROUNDING_TOOLS
         if "mobility" in domains:
             allowed |= cls.AM_GROUNDING_TOOLS
         return [tool for tool in tools if str(getattr(tool, "name", "") or "").strip() in allowed]
+
+    @staticmethod
+    def _should_offer_subscription_tool(*, evidence: IntentEvidence) -> bool:
+        """Expose entitlement lookup only for Main's typed migration decision.
+
+        User prose and coordinator free text are deliberately excluded: Main
+        owns the semantic classification and must set the explicit boolean.
+        """
+        domains = {str(item or "").strip().lower() for item in (evidence.requested_domains or [])}
+        return (
+            domains == {"qos", "mobility"}
+            and evidence.serving_slice_change_requested is True
+            and not bool(evidence.subscription_summary)
+        )
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> GroundingDecision:
         payload = envelope.payload or {}
@@ -285,6 +295,9 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 self._filter_tools_for_domains(
                     self.tools,
                     evidence.requested_domains,
+                    include_subscription=self._should_offer_subscription_tool(
+                        evidence=evidence,
+                    ),
                 )
             )
             advisor_prompt = self._build_advisor_prompt(evidence=evidence, context=context)
@@ -325,11 +338,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     )
                     continue
                 advisor_result = advisor_invocation.advisor_result
-                grounding_decision = coerce_structured_response(
-                    advisor_result,
-                    GroundingDecision,
-                    error_message="IEA advisor returned no structured_response",
-                )
                 grounding_tools = extract_grounding_tool_names(advisor_result, self.GROUNDING_TOOLS)
                 refreshed_evidence = self._refresh_intent_evidence_from_tool_results(
                     evidence=evidence,
@@ -337,11 +345,59 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     main_directives=main_directives,
                     snapshot_id=snapshot_id,
                 )
-                grounding_decision = self._attach_subscription_evidence(
-                    grounding_decision=grounding_decision,
+                try:
+                    advisor_output = coerce_structured_response(
+                        advisor_result,
+                        GroundingAdvisorOutput,
+                        error_message="IEA advisor returned no structured_response",
+                    )
+                except (RuntimeError, ValidationError) as exc:
+                    # A narrow raw schema is deliberately strict.  Treat an
+                    # invalid model draft as a repairable IEA turn, while
+                    # retaining any authoritative tool evidence it collected
+                    # before returning the malformed object.
+                    advisor_validation_errors = [str(exc)]
+                    validation_errors = []
+                    evidence = refreshed_evidence
+                    self.last_failure_debug = {
+                        "phase": "intent_encoding",
+                        "attempt_index": attempt_index + 1,
+                        "grounding_tools": list(grounding_tools or []),
+                        "advisor_validation_errors": list(advisor_validation_errors),
+                        "grounding_validation_errors": [],
+                        "evidence_snapshot": evidence.model_dump(mode="json"),
+                    }
+                    if attempt_index == 2:
+                        raise RuntimeError(
+                            "IEA advisor output contract validation failed: "
+                            + "; ".join(advisor_validation_errors)
+                        ) from exc
+                    log_event(
+                        self.logger,
+                        "iea_retry",
+                        attempt=attempt_index + 2,
+                        reason="advisor_output_contract",
+                        advisor_errors=advisor_validation_errors,
+                    )
+                    advisor_prompt = self._build_validation_retry_prompt(
+                        base_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
+                        advisor_validation_errors=advisor_validation_errors,
+                        grounding_validation_errors=[],
+                        invocation_error="",
+                    )
+                    continue
+                grounding_decision = self._compile_advisor_output(
+                    advisor_output=advisor_output,
                     evidence=refreshed_evidence,
                 )
                 grounding_decision = self._materialize_catalog_facts(
+                    grounding_decision=grounding_decision,
+                    evidence=refreshed_evidence,
+                )
+                grounding_decision = self._materialize_qos_constraint_facts(
+                    grounding_decision=grounding_decision,
+                )
+                grounding_decision = self._attach_subscription_evidence(
                     grounding_decision=grounding_decision,
                     evidence=refreshed_evidence,
                 )
@@ -410,10 +466,30 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _build_advisor_prompt(*, evidence: IntentEvidence, context: str) -> str:
-        requested_domains = [str(item or "").strip() for item in (evidence.requested_domains or []) if str(item or "").strip()]
+        requested_domains = [
+            str(item or "").strip()
+            for item in (evidence.requested_domains or [])
+            if str(item or "").strip()
+        ]
         domain_mode = ",".join(requested_domains) or "<empty>"
         qos_required = "qos" in requested_domains
         mobility_only = requested_domains == ["mobility"]
+        subscription_eligible = IntentEncodingAgent._should_offer_subscription_tool(
+            evidence=evidence,
+        )
+        explicit_target_names = [
+            str(item.flow_name or "").strip()
+            for item in (evidence.explicit_flow_targets or [])
+            if str(item.flow_name or "").strip()
+        ]
+        candidate_names = {
+            str(item.flow_name or "").strip()
+            for item in (evidence.candidate_flows or [])
+            if str(item.flow_name or "").strip()
+        }
+        missing_target_names = [
+            name for name in explicit_target_names if name not in candidate_names
+        ]
         domain_specific_rules: List[str] = [
             f"- Domain mode for this request: {domain_mode}.",
             "- Final answer must be exactly one raw JSON object with no markdown fence and no surrounding prose.",
@@ -423,63 +499,90 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         if qos_required:
             domain_specific_rules.extend(
                 [
-                    "- For each named QoS flow with a known SUPI, call get_sm_ue_flow_catalog before final JSON; when no exact candidate is already grounded, call search_sm_flow_targets first. Return a non-empty flows array.",
-                    "- Mark a flow resolved only when its flow_id is in that catalog; otherwise preserve the named target as unresolved.",
-                    "- A missing flow binding does not change Main's domain scope; preserve the named target as unresolved.",
+                    "- Binding and feasibility are separate: every named QoS target gets exactly one flows entry even when migration is blocked or no target slice is known.",
+                    "- An exact catalog/search match is resolved; an absent match is {app_id:'',flow_id:'',name,resolution_status:'unresolved'}. Runtime attaches the Main-owned SUPI. Never use flows:[] for a QoS target.",
+                    "- Runtime fills SLA, current-slice, traffic, and provenance facts after parsing. Output only the compact flow binding fields shown by the schema.",
                 ]
             )
-            domain_specific_rules.extend(
-                [
-                    "- Decide from the request and evidence whether a serving-S-NSSAI change is part of the operation. Only after flow grounding, if it is, call get_ue_slice_subscription once per target SUPI and return slice_migration_authorization.",
-                    "- If you decide the operation is prioritization, deferment, congestion relief, or same-slice QoS tuning, do not call get_ue_slice_subscription and do not set require_slice_change=true.",
-                    "- A target S-NSSAI may be used only when it is present in get_ue_slice_subscription.authorized_snssais. Do not invent authorization.",
-                    "- If the requested target is not authorized and the user did not explicitly ask to add/change a subscription, block the migration and keep the serving slice; never emit an executable migration policy.",
-                    "- Set subscription_change_required=true only when the user explicitly requests subscription provisioning or a subscription change.",
-                ]
-            )
-            if evidence.candidate_flows:
+            if not evidence.catalog_evidence_observed:
                 domain_specific_rules.extend(
                     [
-                        "- candidate_flows contains a possible binding. Reuse an exact candidate after catalog confirmation; do not re-search it for reassurance.",
+                        "- For every known target SUPI that has no catalog evidence yet, call get_sm_ue_flow_catalog once before final JSON.",
                     ]
                 )
-            elif str(evidence.explicit_flow_name or "").strip():
+            elif evidence.candidate_flows and not missing_target_names:
                 domain_specific_rules.extend(
                     [
-                        f"- No candidate exists for '{evidence.explicit_flow_name}'; search that exact target, then confirm it in the catalog.",
+                        "- Catalog evidence already contains the exact binding. Reuse candidate_flows and do not call get_sm_ue_flow_catalog or search_sm_flow_targets again.",
                     ]
                 )
-            explicit_target_names = [
-                str(item.flow_name or "").strip()
-                for item in (evidence.explicit_flow_targets or [])
-                if str(item.flow_name or "").strip()
-            ]
-            if len(explicit_target_names) > 1:
-                grounded_explicit_target_names = {
-                    str(item.flow_name or "").strip()
-                    for item in (evidence.candidate_flows or [])
-                    if str(item.flow_name or "").strip() in explicit_target_names
-                }
-                unresolved_explicit_target_names = [
-                    item for item in explicit_target_names
-                    if item not in grounded_explicit_target_names
-                ]
+            elif evidence.search_evidence_observed:
+                domain_specific_rules.extend(
+                    [
+                        "- Catalog/search evidence has already been collected and did not bind this target. Do not call either tool again; return the named flow as unresolved.",
+                    ]
+                )
+            elif missing_target_names:
+                domain_specific_rules.extend(
+                    [
+                        f"- Catalog has no exact binding for {json.dumps(missing_target_names, ensure_ascii=False)}. Call search_sm_flow_targets once per missing exact target, then resolve or return unresolved.",
+                    ]
+                )
+            elif str(evidence.explicit_app_name or "").strip():
+                domain_specific_rules.extend(
+                    [
+                        f"- The app '{evidence.explicit_app_name}' is known but its requested flow is generic. Call search_sm_flow_targets once with that app and SUPI; if it returns no unique candidate, return an unresolved named flow.",
+                    ]
+                )
+            else:
+                domain_specific_rules.extend(
+                    [
+                        "- No exact flow binding is present after catalog lookup. Call search_sm_flow_targets once for the explicit target; if it has no exact result, return unresolved.",
+                    ]
+                )
+            if explicit_target_names:
                 domain_specific_rules.extend(
                     [
                         f"- Explicit QoS targets: {json.dumps(explicit_target_names, ensure_ascii=False)}. Return each as its exact resolved or unresolved entry; never substitute a neighbor.",
                     ]
                 )
-                if grounded_explicit_target_names and unresolved_explicit_target_names:
-                    domain_specific_rules.extend(
-                        [
-                            f"- Already grounded: {json.dumps(sorted(grounded_explicit_target_names), ensure_ascii=False)}; unresolved: {json.dumps(unresolved_explicit_target_names, ensure_ascii=False)}. Return both sets.",
-                        ]
-                    )
+            if evidence.subscription_summary:
+                domain_specific_rules.extend(
+                    [
+                        "- Subscription entitlement evidence is already present. Do not call get_ue_slice_subscription again; runtime copies its authority and authorized S-NSSAI list into the handoff.",
+                    ]
+                )
+            elif not subscription_eligible:
+                domain_specific_rules.extend(
+                    [
+                        "- Main did not set the typed serving_slice_change_requested flag together with qos+mobility domains. This is same-slice QoS work: set require_slice_change=false, decision=not_applicable, and do not request subscription evidence. The subscription tool is intentionally unavailable.",
+                    ]
+                )
+            else:
+                domain_specific_rules.extend(
+                    [
+                        "- Main supplied the typed serving_slice_change_requested flag with qos+mobility domains. Only after flow grounding, call get_ue_slice_subscription exactly once for each target SUPI. Reuse that UE-level result for every flow and comparison; a different rationale never permits another call.",
+                    ]
+                )
+            domain_specific_rules.extend(
+                [
+                    "- For same-slice QoS tuning, set require_slice_change=false and do not request subscription evidence.",
+                    "- For a required slice change, decision is exactly one of migration_authorized, blocked_by_subscription_entitlement, blocked_requires_subscription_provisioning, or evidence_missing; never write migration_blocked.",
+                    "- If no different authorized S-NSSAI exists and the user did not ask to change a subscription, use blocked_by_subscription_entitlement with subscription_change_required=false; do not invent a target slice.",
+                    "- Set subscription_change_required=true only when the user explicitly requests subscription provisioning or a subscription change.",
+                ]
+            )
+            if evidence.search_evidence_observed and missing_target_names:
+                domain_specific_rules.extend(
+                    [
+                        "- The required search already returned no binding. Its correct final form is unresolved, not another search or an empty flows array.",
+                    ]
+                )
         if mobility_only:
             domain_specific_rules.extend(
                 [
                     "- This is mobility-only grounding. Final JSON must keep flows empty.",
-                    "- Do not call any SM grounding tool: search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
+                    "- Do not call any SM grounding tool: search_sm_flow_targets or get_sm_ue_flow_catalog.",
                     "- Use only AM grounding if more evidence is needed.",
                 ]
             )
@@ -495,7 +598,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             "- Resolve only choices that remain ambiguous; use already-grounded evidence directly.\n"
             "- Do not guess identifiers. An unresolved QoS target still appears in flows with its name and resolution_status='unresolved'.\n"
             f"{chr(10).join(domain_specific_rules)}\n"
-            "- Return one GroundingDecision JSON object only."
+            "- Return one raw IEA decision JSON object only."
         )
 
     @staticmethod
@@ -546,9 +649,15 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             if isinstance(exc, ToolLoopExecutionError):
                 failed_tool_call = exc.failed_tool_call or {}
                 if failed_tool_call:
-                    raise RuntimeError(
+                    invocation_error = RuntimeError(
                         f"IEA tool call failed: {failed_tool_call.get('name') or '<unknown>'}: {exc}"
-                    ) from exc
+                    )
+                    # Retain successful calls made before the failed one.  A
+                    # retry can then finish from their evidence rather than
+                    # re-running catalog/search queries and hitting another
+                    # tool-limit loop.
+                    invocation_error._tool_output_messages = list(exc.output_messages)
+                    raise invocation_error from exc
                 message = str(exc)
                 if "max iterations" in message.lower():
                     raise RuntimeError(f"IEA advisor did not converge to valid JSON: {message}") from exc
@@ -586,6 +695,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             main_directives=main_directives,
             catalog_payload={},
             catalog_evidence_observed=False,
+            search_evidence_observed=False,
             semantic_candidates=[],
             am_context_payload={},
             am_policy_candidates=[],
@@ -603,6 +713,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         semantic_candidates: List[Dict[str, Any]] = list(evidence.semantic_candidates or [])
         catalog_payload: Dict[str, Any] = dict(evidence.catalog_payload or {})
         catalog_evidence_observed = bool(evidence.catalog_evidence_observed)
+        search_evidence_observed = bool(evidence.search_evidence_observed)
         am_context_payload: Dict[str, Any] = dict(evidence.am_context_payload or {})
         am_policy_candidates: List[Dict[str, Any]] = list(evidence.am_policy_candidates or [])
         subscription_payload: Dict[str, Any] = dict(evidence.subscription_payload or {})
@@ -619,6 +730,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     catalog_evidence_observed = True
                     catalog_payload = merge_catalog_payloads(catalog_payload, payload)
             elif tool_name == "search_sm_flow_targets":
+                search_evidence_observed = True
                 semantic_candidates = merge_candidate_dicts(semantic_candidates, list(payload.get("candidates") or []))
             elif tool_name == "get_am_policy_context":
                 payload_supi = str(call_args.get("supi") or payload.get("supi") or evidence.supi or "").strip()
@@ -637,11 +749,127 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             main_directives=main_directives,
             catalog_payload=catalog_payload,
             catalog_evidence_observed=catalog_evidence_observed,
+            search_evidence_observed=search_evidence_observed,
             semantic_candidates=semantic_candidates,
             am_context_payload=am_context_payload,
             am_policy_candidates=am_policy_candidates,
             subscription_payload=subscription_payload,
         )
+
+    @staticmethod
+    def _compile_advisor_output(
+        *,
+        advisor_output: GroundingAdvisorOutput,
+        evidence: IntentEvidence,
+    ) -> GroundingDecision:
+        """Build the OSA handoff from narrow LLM choices and tool-owned facts."""
+        subscription = dict(evidence.subscription_summary or {})
+        authorized_snssais = [
+            str(item or "").strip()
+            for item in (subscription.get("authorized_snssais") or [])
+            if str(item or "").strip()
+        ]
+        evidence_sources: Dict[str, List[str]] = {}
+        if evidence.catalog_evidence_observed:
+            evidence_sources["get_sm_ue_flow_catalog"] = ["runtime"]
+        if evidence.search_evidence_observed:
+            evidence_sources["search_sm_flow_targets"] = ["runtime"]
+        if evidence.am_context_summary:
+            evidence_sources["get_am_policy_context"] = ["runtime"]
+        if evidence.am_policy_candidates:
+            evidence_sources["search_am_policy_targets"] = ["runtime"]
+        mobility_targets: Dict[str, Any] = {}
+        if evidence.am_context_summary:
+            mobility_targets["summary"] = dict(evidence.am_context_summary)
+
+        return GroundingDecision(
+            flows=[
+                FlowSelector(
+                    supi=IntentEncodingAgent._binding_supi_from_evidence(flow=flow, evidence=evidence),
+                    app_id=str(flow.app_id or "").strip(),
+                    flow_id=str(flow.flow_id or "").strip() or None,
+                    name=str(flow.name or "").strip(),
+                    resolution_status=str(flow.resolution_status or "resolved").strip(),
+                )
+                for flow in (advisor_output.flows or [])
+            ],
+            mobility_intent=dict(advisor_output.mobility_intent or {}),
+            grounding_evidence=GroundingEvidenceBundle(
+                grounded_supi=str(evidence.supi or "").strip(),
+                grounded_apps=[dict(item) for item in (evidence.candidate_apps or []) if isinstance(item, dict)],
+                grounded_flows=[item.model_dump(mode="json") for item in (evidence.candidate_flows or [])],
+                grounded_mobility_targets=mobility_targets,
+                evidence_sources=evidence_sources,
+            ),
+            qos_operation_constraints=[
+                QosOperationConstraint(
+                    flow_id=str(constraint.flow_id or "").strip(),
+                    app_id=str(constraint.app_id or "").strip(),
+                    operation_type=str(constraint.operation_type or "").strip(),
+                    require_slice_change=bool(constraint.require_slice_change),
+                    target_slice_preference=str(constraint.target_slice_preference or "").strip(),
+                    no_op_allowed=bool(constraint.no_op_allowed),
+                    rationale=list(constraint.rationale or []),
+                )
+                for constraint in (advisor_output.qos_operation_constraints or [])
+            ],
+            slice_migration_authorization=SliceMigrationAuthorization(
+                decision=advisor_output.slice_migration_authorization.decision,
+                authority=str(subscription.get("authority") or "").strip(),
+                authorized_snssais=authorized_snssais,
+                target_snssais=list(advisor_output.slice_migration_authorization.target_snssais or []),
+                subscription_change_required=bool(
+                    advisor_output.slice_migration_authorization.subscription_change_required
+                ),
+                rationale=list(advisor_output.slice_migration_authorization.rationale or []),
+            ),
+            open_questions=list(advisor_output.open_questions or []),
+        )
+
+    @staticmethod
+    def _binding_supi_from_evidence(*, flow: Any, evidence: IntentEvidence) -> str:
+        """Attach Main/tool-owned UE identity without asking IEA to echo it."""
+        flow_id = str(getattr(flow, "flow_id", "") or "").strip()
+        flow_name = str(getattr(flow, "name", "") or "").strip()
+        for item in (evidence.catalog_payload or {}).get("flow_catalog") or []:
+            if isinstance(item, dict) and flow_id and str(item.get("flow_id") or "").strip() == flow_id:
+                return str(item.get("supi") or "").strip()
+        for item in (evidence.semantic_candidates or []):
+            if not isinstance(item, dict):
+                continue
+            if flow_id and str(item.get("flow_id") or "").strip() == flow_id:
+                return str(item.get("supi") or "").strip()
+        for target in (evidence.explicit_flow_targets or []):
+            if str(target.flow_name or "").strip() == flow_name and str(target.supi or "").strip():
+                return str(target.supi or "").strip()
+        requested_supis = extract_requested_supis(evidence.supi, evidence.user_input)
+        return requested_supis[0] if len(requested_supis) == 1 else ""
+
+    @staticmethod
+    def _materialize_qos_constraint_facts(
+        *,
+        grounding_decision: GroundingDecision,
+    ) -> GroundingDecision:
+        """Derive source/excluded slice facts from the materialized flow binding."""
+        by_flow_id = {
+            str(flow.flow_id or "").strip(): flow
+            for flow in (grounding_decision.flows or [])
+            if str(flow.flow_id or "").strip()
+        }
+        enriched = grounding_decision.model_copy(deep=True)
+        constraints: List[QosOperationConstraint] = []
+        for constraint in enriched.qos_operation_constraints or []:
+            source_slice_snssai = constraint.source_slice_snssai
+            if constraint.require_slice_change and not str(source_slice_snssai or "").strip():
+                flow = by_flow_id.get(str(constraint.flow_id or "").strip())
+                source_slice_snssai = getattr(flow, "current_slice_snssai", None) if flow is not None else None
+            constraint_payload = constraint.model_dump(mode="json")
+            constraint_payload["source_slice_snssai"] = source_slice_snssai
+            constraints.append(
+                QosOperationConstraint(**constraint_payload)
+            )
+        enriched.qos_operation_constraints = constraints
+        return enriched
 
     @staticmethod
     def _materialize_catalog_facts(
@@ -683,6 +911,22 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         if not subscription:
             return grounding_decision
         enriched = grounding_decision.model_copy(deep=True)
+        requires_slice_change = any(
+            bool(constraint.require_slice_change)
+            for constraint in (enriched.qos_operation_constraints or [])
+        )
+        if requires_slice_change:
+            authorization = enriched.slice_migration_authorization.model_copy(
+                update={
+                    "authority": str(subscription.get("authority") or "").strip(),
+                    "authorized_snssais": [
+                        str(item or "").strip()
+                        for item in (subscription.get("authorized_snssais") or [])
+                        if str(item or "").strip()
+                    ],
+                }
+            )
+            enriched.slice_migration_authorization = authorization
         mobility_targets = dict(enriched.grounding_evidence.grounded_mobility_targets or {})
         mobility_targets["subscription_entitlement"] = subscription
         enriched.grounding_evidence.grounded_mobility_targets = mobility_targets

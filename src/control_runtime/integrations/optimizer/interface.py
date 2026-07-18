@@ -420,7 +420,7 @@ def _build_flow_from_payload(flow_payload: Dict[str, Any], matched_old_flow: Opt
             current_slice_snssai=matched_old_flow.allocation.current_slice_snssai if matched_old_flow else None,
             allocated_bandwidth_ul=matched_old_flow.allocation.allocated_bandwidth_ul if matched_old_flow else None,
             allocated_bandwidth_dl=matched_old_flow.allocation.allocated_bandwidth_dl if matched_old_flow else None,
-            optimize_requested=True,
+            optimize_requested=not bool(flow_payload.get("preserve_current_slice", False)),
             excluded_slice_snssais=[
                 str(item or "").strip()
                 for item in (flow_payload.get("excluded_slice_snssais") or [])

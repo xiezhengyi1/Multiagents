@@ -288,6 +288,7 @@ def build_single_agent_tools(
     from ...integrations.pcf import (
         get_am_policy_context,
         get_sm_ue_context,
+        get_ue_slice_subscription,
         search_am_policy_targets,
         search_sm_flow_targets,
     )
@@ -394,6 +395,7 @@ def build_single_agent_tools(
                 search_sm_flow_targets,
                 get_sm_ue_context,
                 get_sm_ue_flow_catalog,
+                get_ue_slice_subscription,
                 preview_qos_optimizer,
                 fetch_qos_network_status,
             ]

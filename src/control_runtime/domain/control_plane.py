@@ -402,6 +402,7 @@ class GlobalControlIntent(BaseModel):
     round_strategy: MainRoundStrategy = Field(default=MainRoundStrategy.INITIAL_GROUNDING)
     next_agent: Literal["intent_encoding", "optimization_strategy"]
     requested_domains: List[ControlDomain] = Field(default_factory=list)
+    serving_slice_change_requested: bool = False
     domain_evidence: Dict[str, List[str]] = Field(default_factory=dict)
     control_semantics: MainControlSemantics = Field(default_factory=MainControlSemantics)
     objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)

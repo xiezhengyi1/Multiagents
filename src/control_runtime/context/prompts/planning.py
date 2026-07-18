@@ -164,9 +164,9 @@ Output contract (violations are rejected):
 - Never return a bare policy object like `{\"flow_id\":...}` outside the sm_policies array.
 - Every SmPolicySpec has an exact GroundingDecision flow_id/app_id, priority 1-15, target_latency_ms >= 1.0, packet_error_rate 0-1, max_br_ul_mbps, and max_br_dl_mbps. Optional GBR cannot exceed maxBR.
 - Optimizer output is evidence, not an SmPolicySpec. Never copy `new_slice`, `current_slice`, `slice_snssai`, `jitter_ms`, or other allocation metadata into sm_policies. The compiler retains the optimizer assignment and generates the executable policy_id; `policy_id` belongs only in partial_policies. When jitter is needed in an SM policy, use the exact key `target_jitter_ms`.
-- Every AmPolicySpec has ONLY triggers, rfsp, allowed_snssais, target_snssais, optional ue_ambr_ul_mbps, optional ue_ambr_dl_mbps, and optional serv_area_res. SUPI/session/policy IDs are code-owned and must not appear inside am_policy. It has non-empty triggers, rfsp >= 1, non-empty allowed_snssais, and target_snssais contained in allowed_snssais.
+- Every AmPolicySpec has ONLY triggers, rfsp, allowed_snssais, target_snssais, and optional ue_ambr_ul_mbps/ue_ambr_dl_mbps. `serv_area_res` is runtime-owned and must be omitted. SUPI/session/policy IDs are code-owned and must not appear inside am_policy. It has non-empty triggers, rfsp >= 1, non-empty allowed_snssais, and target_snssais contained in allowed_snssais.
 - Every UrspPolicySpec uses target_type `flow` or `app`, app_id, relat_precedence >= 1, and non-empty route_sel_param_sets; a flow target also needs flow_id and traffic_desc.
-- Partial policy items MUST include: policy_type, policy_id, and grounded flow_id/app_id/target_type plus blocked_reason when available.
+- `blocked_reason` is forbidden in `sm_policies`. Partial policy items MUST include: policy_type, policy_id, and grounded flow_id/app_id/target_type plus blocked_reason when available.
 
 Return raw JSON only, no markdown fence, no prose outside the JSON object.
 """
@@ -229,6 +229,41 @@ def build_validation_retry_prompt(
             "never a bare array or a bare policy item.\n\n"
             + _QOS_EXAMPLE
         )
+    elif (
+        "serv_area_res is runtime-owned" in joined
+        or "servareares.pra-" in joined
+        or "serv_area_res.pra-" in joined
+    ):
+        correction = (
+            "Repair the AM-policy ownership boundary. serv_area_res is runtime-owned: omit it entirely from am_policy. "
+            "Do not copy mobility presenceAreas, do not create pra-* keys, and do not invent any service-area restriction. "
+            "The compiler preserves the validated servAreaRes from the inspected mobility context. "
+            "Keep only triggers, rfsp, allowed_snssais, target_snssais, and optional UE-AMBR fields in am_policy.\n\n"
+            + _MOBILITY_EXAMPLE
+        )
+    elif (
+        "authorized slice migration requires main to activate mobility" in joined
+        or "migration without mobility-active planning" in joined
+        or "am_policy outside mobility-active planning" in joined
+    ):
+        correction = (
+            "Do not try to repair an authorized serving-slice migration inside a QoS-only Main stage. "
+            "A migration requires joint AM+SM execution, but Main did not activate mobility. "
+            "Return planning_status=\"needs_upstream_reground\" with no sm_policies, am_policy:null, and no ursp_policies; "
+            "explain that Main must activate qos and mobility together. Do not fabricate a QoS-only migration or an out-of-scope AM policy.\n\n"
+            "Example: {\"planning_status\":\"needs_upstream_reground\",\"rationale\":\"Authorized serving-slice change requires Main to activate mobility together with QoS.\",\"missing_evidence\":[],\"blocked_targets\":[\"authorized serving-slice migration\"],\"upstream_requests\":[\"Reground this request with qos and mobility active.\"],\"planner_conflicts\":[\"AM policy is outside the current QoS-only stage.\"],\"sm_policies\":[],\"am_policy\":null,\"ursp_policies\":[],\"partial_policies\":[]}"
+        )
+    elif (
+        "authorized slice migration requires an am policy" in joined
+        or "mobility-active planning requires am_policy" in joined
+    ):
+        correction = (
+            "Apply the migration/domain decision table exactly. If Main activated both qos and mobility and IEA authorized the serving-slice change, "
+            "emit one evidence-backed AM policy plus the grounded SM policy; inspect mobility context first. "
+            "If mobility is not active, return needs_upstream_reground with no executable policies instead. "
+            "In either case, omit serv_area_res: it is compiler-owned and must never contain presenceAreas or pra-* keys.\n\n"
+            + _MOBILITY_EXAMPLE
+        )
     elif "am_policy.supi" in joined or ("ursp_policies" in joined and "valid list" in joined):
         correction = (
             "Repair the exact OSA schema shape. am_policy must not contain supi, session_id, snapshot_id, policy_id, or policy_type; "
@@ -241,7 +276,7 @@ def build_validation_retry_prompt(
             "Your previous answer included fields not in the OsaAdvisorOutput schema. "
             "Remove every unsupported top-level field. "
             "Unsupported fields may be nested, not only top-level. "
-            "Inside sm_policies, remove policy_id, policy_type, target_type, policy_details, slice_snssai, new_slice, jitter_ms, and any other field outside SmPolicySpec. "
+            "Inside sm_policies, remove policy_id, policy_type, target_type, policy_details, slice_snssai, new_slice, jitter_ms, blocked_reason, and any other field outside SmPolicySpec. "
             "SmPolicySpec fields are only: flow_id, app_id, priority, target_latency_ms, packet_error_rate, "
             "max_br_ul_mbps, max_br_dl_mbps, optional gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, flow_description. "
             "Only emit the defined OsaAdvisorOutput fields.\n\n"
@@ -251,6 +286,8 @@ def build_validation_retry_prompt(
         "target slice migration" in joined
         or "entitlement-limited qos delivery" in joined
         or "blocked slice migration may deliver" in joined
+        or "optimizer-selected slice is absent from subscription entitlement evidence" in joined
+        or "unauthorized slice migration must not include executable" in joined
         or "blocked_targets.0" in joined
         or "upstream_requests.0" in joined
     ):

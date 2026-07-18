@@ -25,6 +25,7 @@ class IntentEvidence(BaseModel):
     user_input: str = ""
     supi: str = ""
     requested_domains: List[str] = Field(default_factory=list)
+    serving_slice_change_requested: bool = False
     retry_scope: str = ""
     explicit_app_id: str = ""
     explicit_app_name: str = ""
@@ -38,6 +39,7 @@ class IntentEvidence(BaseModel):
     am_policy_candidates: List[Dict[str, Any]] = Field(default_factory=list)
     subscription_summary: Dict[str, Any] = Field(default_factory=dict)
     catalog_evidence_observed: bool = Field(default=False, exclude=True)
+    search_evidence_observed: bool = Field(default=False, exclude=True)
     catalog_payload: Dict[str, Any] = Field(default_factory=dict, exclude=True)
     semantic_candidates: List[Dict[str, Any]] = Field(default_factory=list, exclude=True)
     am_context_payload: Dict[str, Any] = Field(default_factory=dict, exclude=True)

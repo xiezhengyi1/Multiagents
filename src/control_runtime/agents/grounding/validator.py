@@ -64,10 +64,17 @@ class IntentGroundingValidator:
             and named_flow_request
             and not evidence.candidate_flows
             and (evidence.catalog_payload or {}).get("flow_catalog")
+            and not evidence.search_evidence_observed
             and "search_sm_flow_targets" not in used_grounding_tools
         ):
             errors.append("named QoS flow request requires search_sm_flow_targets before returning final intent")
-        if "qos" in requested_domains and not evidence.candidate_flows and not grounding_tools:
+        if (
+            "qos" in requested_domains
+            and not evidence.candidate_flows
+            and not grounding_tools
+            and not evidence.catalog_evidence_observed
+            and not evidence.search_evidence_observed
+        ):
             errors.append("unresolved QoS intent requires at least one grounding tool call")
         return errors
 
@@ -108,7 +115,6 @@ class IntentGroundingValidator:
         if requires_slice_change:
             authorization = grounding_decision.slice_migration_authorization
             valid_decisions = {
-                "migration_pending_target_authorization",
                 "migration_authorized",
                 "blocked_by_subscription_entitlement",
                 "blocked_requires_subscription_provisioning",
@@ -132,7 +138,7 @@ class IntentGroundingValidator:
                 errors.append(
                     "blocked_by_subscription_entitlement must not request subscription provisioning"
                 )
-            if decision in {"migration_pending_target_authorization", "evidence_missing"} and not explicit_subscription_change:
+            if decision == "evidence_missing" and not explicit_subscription_change:
                 errors.append(
                     "unverified slice migration is blocked: the user did not request subscription provisioning; keep the serving slice or return an explicit blocking question"
                 )

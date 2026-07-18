@@ -15,6 +15,19 @@ class SharedControlContext(BaseModel):
     main_intent: GlobalControlIntent = Field(description="Canonical Main decision; Main is its sole producer")
 
 
+class QosRetryConstraint(BaseModel):
+    """A PDA-derived feasibility bound for a flow in the next OSA attempt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    flow_id: str = Field(min_length=1)
+    observed_latency_ms: float = Field(gt=0.0)
+    allowed_latency_ms: float = Field(gt=0.0)
+    minimum_target_latency_ms: int = Field(ge=1)
+    tolerance_ratio: float = Field(ge=0.0)
+    policy_id: str = Field(default="")
+
+
 class PlanningContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -30,6 +43,10 @@ class PlanningContext(BaseModel):
     )
     revision_requests: list[Dict[str, Any]] = Field(default_factory=list, description="Structured revision requests returned by Mediator")
     unified_constraints: Dict[str, Any] = Field(default_factory=dict, description="Structured hard constraints returned by Mediator")
+    qos_retry_constraints: list[QosRetryConstraint] = Field(
+        default_factory=list,
+        description="PDA assurance-derived QoS feasibility floors for this retry",
+    )
 
 
 class PlanningRequest(BaseModel):

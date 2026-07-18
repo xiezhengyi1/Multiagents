@@ -351,6 +351,9 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 errors.append("next_agent must be either intent_encoding or optimization_strategy")
             if round_index <= 1 and str(intent.next_agent or "").strip() != "intent_encoding":
                 errors.append("round-1 main routing must set next_agent=intent_encoding; optimization_strategy is retry-only")
+        domain_values = {item.value for item in intent.requested_domains}
+        if intent.serving_slice_change_requested and domain_values != {"qos", "mobility"}:
+            errors.append("serving_slice_change_requested requires requested_domains=[qos,mobility]")
         round_strategy = str(intent.round_strategy.value if hasattr(intent.round_strategy, "value") else intent.round_strategy or "").strip()
         if round_index <= 1 and round_strategy != "initial_grounding":
             errors.append("round-1 main routing must set round_strategy=initial_grounding")

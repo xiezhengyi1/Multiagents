@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Tuple
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
 from shared.logging import setup_logger
 from database.models import (
     UeAmPolicyAssociationRecord,
@@ -122,7 +125,7 @@ def _build_seed_am_policy_context(supi: str, index: int, mobility_context: Dict[
     }
 
 
-def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
+def _seed_ue_contexts_from_apps(apps: List[App], *, session: Session | None = None) -> int:
     """
     根据场景中的 flow 为每个 UE 生成并写入 UeContext 关键字段。
     返回成功 upsert 的 UE 数量。
@@ -295,6 +298,7 @@ def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
             am_policy_context=payload["am_policy_context"],
             serving_nf_context=payload["serving_nf_context"],
             mobility_summary=payload["mobility_summary"],
+            session=session,
         )
         if ok:
             success += 1
@@ -303,10 +307,7 @@ def _seed_ue_contexts_from_apps(apps: List[App]) -> int:
 
 
 def sync_latest_flow_five_tuples_to_ue_context(snapshot_id: str = "") -> Dict[str, int]:
-    """
-    Rebuild UE flow catalogs from the latest snapshot and refresh PCC flowInfos
-    so flowDescription matches the authoritative five_tuple when available.
-    """
+    """Refresh a live runtime's catalog outside the atomic snapshot rebuild path."""
     return sync_latest_snapshot_flow_catalog_to_ue_context(snapshot_id=snapshot_id)
 
 
@@ -377,83 +378,61 @@ def rebuild_ue_related_tables_from_graph_snapshot(snapshot_id: str) -> Dict[str,
     apps, slices, nodes, snapshot_id = _load_graph_scenario_strict(snapshot_id)
 
     with session_scope() as session:
+        schema_name = str(session.execute(text("SELECT current_schema()")).scalar_one() or "public")
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_name))"),
+            {"lock_name": f"ue-rebuild:{schema_name}"},
+        )
         session.query(UeMobilityEventRecord).delete()
         session.query(UeServingNfBindingRecord).delete()
         session.query(UeAmPolicyAssociationRecord).delete()
         session.query(UeContextRecord).delete()
+        seeded = _seed_ue_contexts_from_apps(apps, session=session)
+        association_count = 0
+        binding_count = 0
+        mobility_event_count = 0
+        for app_index, app in enumerate(apps):
+            supi = _normalize_supi(getattr(app, "supi", None))
+            if not supi:
+                continue
 
-    seeded = _seed_ue_contexts_from_apps(apps)
-    sync_summary = sync_latest_flow_five_tuples_to_ue_context(snapshot_id=snapshot_id)
+            mobility_context = _build_seed_mobility_context(supi, app_index, app)
+            am_policy_context = _build_seed_am_policy_context(supi, app_index, mobility_context)
+            associations = am_policy_context.get("associations") if isinstance(am_policy_context, dict) else {}
+            for pol_asso_id, association in (associations.items() if isinstance(associations, dict) else []):
+                association = association if isinstance(association, dict) else {}
+                if upsert_am_policy_association(
+                    supi=supi, pol_asso_id=str(pol_asso_id), association_request=association.get("request") or {},
+                    association_policy={
+                        "triggers": list(association.get("triggers") or []), "rfsp": association.get("rfsp"),
+                        "pras": association.get("pras") or {}, "suppFeat": association.get("suppFeat"),
+                        "allowedSnssais": am_policy_context.get("allowedSnssais") or [],
+                        "targetSnssais": am_policy_context.get("targetSnssais") or [],
+                        "mappingSnssais": am_policy_context.get("mappingSnssais") or [],
+                    },
+                    status="active", trigger_event="GRAPH_REBUILD", snapshot_id=snapshot_id, session=session,
+                ):
+                    association_count += 1
 
-    association_count = 0
-    binding_count = 0
-    mobility_event_count = 0
-    for app_index, app in enumerate(apps):
-        supi = _normalize_supi(getattr(app, "supi", None))
-        if not supi:
-            continue
-
-        mobility_context = _build_seed_mobility_context(supi, app_index, app)
-        am_policy_context = _build_seed_am_policy_context(supi, app_index, mobility_context)
-        associations = am_policy_context.get("associations") if isinstance(am_policy_context, dict) else {}
-        if not isinstance(associations, dict):
-            associations = {}
-
-        for pol_asso_id, association in associations.items():
-            association = association if isinstance(association, dict) else {}
-            association_policy = {
-                "triggers": list(association.get("triggers") or []),
-                "rfsp": association.get("rfsp"),
-                "pras": association.get("pras") or {},
-                "suppFeat": association.get("suppFeat"),
-                "allowedSnssais": am_policy_context.get("allowedSnssais") or [],
-                "targetSnssais": am_policy_context.get("targetSnssais") or [],
-                "mappingSnssais": am_policy_context.get("mappingSnssais") or [],
+            serving_nf_context = {
+                "pcf_id": "pcf-sim-1", "pcf_uri": "http://localhost:8000/pcf",
+                "amf_id": f"amf-sim-{app_index + 1}", "amf_uri": f"http://localhost:8000/amf/{supi}",
             }
-            if upsert_am_policy_association(
-                supi=supi,
-                pol_asso_id=str(pol_asso_id),
-                association_request=association.get("request") or {},
-                association_policy=association_policy,
-                status="active",
-                trigger_event="GRAPH_REBUILD",
-                snapshot_id=snapshot_id,
+            for nf_type, instance_key, uri_key in (("PCF", "pcf_id", "pcf_uri"), ("AMF", "amf_id", "amf_uri")):
+                if upsert_serving_nf_binding(
+                    supi=supi, nf_type=nf_type, nf_instance_id=serving_nf_context[instance_key],
+                    nf_uri=serving_nf_context[uri_key], binding_info={"supi": supi, "snapshot_id": snapshot_id},
+                    status="active", session=session,
+                ):
+                    binding_count += 1
+            if record_mobility_event(
+                supi=supi, event_type=str(mobility_context.get("mobilityEventType") or "INITIAL_ATTACH"),
+                event_payload=mobility_context, event_summary="rebuild_from_latest_graph", snapshot_id=snapshot_id,
+                session=session,
             ):
-                association_count += 1
+                mobility_event_count += 1
 
-        serving_nf_context = {
-            "pcf_id": "pcf-sim-1",
-            "pcf_uri": "http://localhost:8000/pcf",
-            "amf_id": f"amf-sim-{app_index + 1}",
-            "amf_uri": f"http://localhost:8000/amf/{supi}",
-        }
-        if upsert_serving_nf_binding(
-            supi=supi,
-            nf_type="PCF",
-            nf_instance_id=serving_nf_context["pcf_id"],
-            nf_uri=serving_nf_context["pcf_uri"],
-            binding_info={"supi": supi, "snapshot_id": snapshot_id},
-            status="active",
-        ):
-            binding_count += 1
-        if upsert_serving_nf_binding(
-            supi=supi,
-            nf_type="AMF",
-            nf_instance_id=serving_nf_context["amf_id"],
-            nf_uri=serving_nf_context["amf_uri"],
-            binding_info={"supi": supi, "snapshot_id": snapshot_id},
-            status="active",
-        ):
-            binding_count += 1
-
-        if record_mobility_event(
-            supi=supi,
-            event_type=str(mobility_context.get("mobilityEventType") or "INITIAL_ATTACH"),
-            event_payload=mobility_context,
-            event_summary="rebuild_from_latest_graph",
-            snapshot_id=snapshot_id,
-        ):
-            mobility_event_count += 1
+    flow_count = sum(len(app.flows or []) for app in apps)
 
     cache_scenario(
         apps,
@@ -467,8 +446,8 @@ def rebuild_ue_related_tables_from_graph_snapshot(snapshot_id: str) -> Dict[str,
     return {
         "snapshot_id": snapshot_id,
         "ues": seeded,
-        "flow_catalog_ues": sync_summary.get("ues", 0),
-        "flow_catalog_flows": sync_summary.get("flows", 0),
+        "flow_catalog_ues": seeded,
+        "flow_catalog_flows": flow_count,
         "am_policy_associations": association_count,
         "serving_nf_bindings": binding_count,
         "mobility_events": mobility_event_count,

@@ -342,7 +342,7 @@ flows:
     sla_target:
       latency_ms: 10.0
       jitter_ms: 1.5
-      loss_rate: 0.0003
+      loss_rate: 0.0005
       bandwidth_dl_mbps: 3.0
       bandwidth_ul_mbps: 3.8
       guaranteed_bandwidth_dl_mbps: 2.4
@@ -462,7 +462,7 @@ flows:
     sla_target:
       latency_ms: 15.0
       jitter_ms: 2.0
-      loss_rate: 0.0005
+      loss_rate: 0.0006
       bandwidth_dl_mbps: 3.0
       bandwidth_ul_mbps: 3.8
       guaranteed_bandwidth_dl_mbps: 2.4

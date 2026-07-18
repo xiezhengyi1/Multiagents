@@ -416,6 +416,3 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         if failure_scope:
             payload["failure_scope"] = failure_scope
         return payload
-
-
-

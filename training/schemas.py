@@ -77,6 +77,27 @@ class ProjectedTraceRecord(BaseModel):
     compiler_output: Any = None
 
 
+class FineTuningTraceRecord(BaseModel):
+    """The minimal per-agent trajectory used as a fine-tuning example.
+
+    The runtime run tree is intentionally richer and remains in ``raw_traces``
+    for debugging.  This record is the stable, compact artifact emitted by an
+    experiment for model training.
+    """
+
+    trace_id: str
+    timestamp: str
+    agent_name: str
+    session_id: str
+    snapshot_id: str
+    input: List[Dict[str, Any]] = Field(default_factory=list)
+    output: Any = None
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_results: List[Dict[str, Any]] = Field(default_factory=list)
+    status: str
+    error: Optional[str] = None
+
+
 class WorkflowTrajectoryRecord(BaseModel):
     workflow_id: str
     record_index: Optional[int] = None

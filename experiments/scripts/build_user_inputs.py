@@ -343,7 +343,7 @@ def _build_task_catalog() -> Dict[str, Any]:
             "task_id": "T029",
             "category": "cross_domain_coordination",
             "scenario_ids": ["S2", "S3", "S2P", "S3P"],
-            "user_input": "先把 Remote_Drive_video_1 低时延化；如果 OSA 选择了新切片，就同步 AM allowed/target NSSAI，否则只下发 SM policy，不要凭空改 AM。",
+            "user_input": "先把 Remote_Drive_video_1 的时延降下来；只有确实需要切换到新的服务切片时，才同步调整相应的移动性策略，否则只优化 QoS，不要做额外的移动性变更。",
             "expected_objects": {"app": "Remote_Drive", "flow": "Remote_Drive_video_1"},
             "expected_direction": "条件式 QoS-AM 同步",
             "success_criteria": "跨域计划以 optimizer 结果为条件，避免无依据 AM policy 修改",

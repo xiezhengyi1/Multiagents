@@ -133,6 +133,17 @@ def _resolve_bge_reranker_model() -> str:
             return str(snapshots[0])
 
     return BGE_RERANK_MODEL
+
+
+def _bge_reranker_model_kwargs() -> Dict[str, Any]:
+    """Return optional CrossEncoder settings configured for this process.
+
+    The default remains the library-selected device.  Setting
+    ``BGE_RERANK_DEVICE=cpu`` keeps the cross-encoder off the GPU while the
+    LLM server can continue using it.
+    """
+    device = str(os.getenv("BGE_RERANK_DEVICE", "")).strip()
+    return {"device": device} if device else {}
 GLOSSARY_QUERY_KEYWORDS = {
     "acronym",
     "alias",
@@ -1379,10 +1390,9 @@ def _doc_to_candidate(
     }
 
 
-@lru_cache(maxsize=8)
-def _bge_reranker(top_n: int) -> Any:
+@lru_cache(maxsize=1)
+def _bge_cross_encoder() -> Any:
     try:
-        from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
         from langchain_community.cross_encoders import HuggingFaceCrossEncoder
     except ImportError as exc:
         raise RuntimeError(
@@ -1390,8 +1400,28 @@ def _bge_reranker(top_n: int) -> Any:
             "Install `sentence-transformers` and ensure `langchain_community.cross_encoders.HuggingFaceCrossEncoder` is available."
         ) from exc
 
-    model = HuggingFaceCrossEncoder(model_name=_resolve_bge_reranker_model())
-    return CrossEncoderReranker(model=model, top_n=top_n)
+    return HuggingFaceCrossEncoder(
+        model_name=_resolve_bge_reranker_model(),
+        model_kwargs=_bge_reranker_model_kwargs(),
+    )
+
+
+def _bge_reranker(top_n: int) -> Any:
+    """Create a cheap top-N wrapper around the process-wide cached model.
+
+    ``top_n`` differs between startup warmup and real queries.  It must not be
+    part of the model cache key, otherwise each distinct result limit loads a
+    second full cross-encoder copy.
+    """
+    try:
+        from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+    except ImportError as exc:
+        raise RuntimeError(
+            "BGE reranking requires LangChain's HuggingFace cross-encoder support. "
+            "Install `sentence-transformers` and ensure `langchain_community.cross_encoders.HuggingFaceCrossEncoder` is available."
+        ) from exc
+
+    return CrossEncoderReranker(model=_bge_cross_encoder(), top_n=top_n)
 
 
 def warmup_knowledge_tool_models() -> Dict[str, Any]:

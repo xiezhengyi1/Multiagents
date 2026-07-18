@@ -161,6 +161,7 @@ def build_domain_feedback(
 
     qos_feedback = {
         "execution_status": "Success" if qos_receipts and all(item.get("status") == "success" for item in qos_receipts) else report.execution_status,
+        "intent_status": str(getattr(report, "intent_status", "satisfied") or "satisfied"),
         "dispatch_receipts": qos_receipts,
         "assurance_verdicts": qos_verdicts,
         "failure_scope": str(report.failure_scope or "").strip(),
@@ -168,6 +169,7 @@ def build_domain_feedback(
     }
     mobility_feedback = {
         "status": "success" if mobility_receipts and all(item.get("status") == "success" for item in mobility_receipts) else "failed",
+        "intent_status": str(getattr(report, "intent_status", "satisfied") or "satisfied"),
         "dispatch_receipts": mobility_receipts,
         "assurance_verdicts": mobility_verdicts,
         "failure_scope": str(report.failure_scope or "").strip(),

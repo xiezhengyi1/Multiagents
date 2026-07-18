@@ -110,6 +110,10 @@ class AmPolicySpec(BaseModel):
         target = {(item.sst, item.sd) for item in self.target_snssais}
         if not target.issubset(allowed):
             raise ValueError("target_snssais must be a subset of allowed_snssais")
+        if self.serv_area_res is not None:
+            raise ValueError(
+                "serv_area_res is runtime-owned; omit it so the compiler preserves the validated mobility context"
+            )
         return self
 
 

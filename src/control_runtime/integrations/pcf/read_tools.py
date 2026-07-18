@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
 
 from langchain.tools import ToolRuntime
-import requests
 
 from shared.logging import setup_logger
 from shared.runtime import AgentRuntimeContext
@@ -19,14 +17,6 @@ from ..storage import (
 from .helpers import _trim_am_policy_context_for_agent, _trim_sm_ue_context_for_agent, _trim_ue_context_for_agent
 
 logger = setup_logger(__name__)
-
-UDR_BASE_URL = str(os.getenv("UDR_BASE_URL", "http://10.100.200.4:8000")).rstrip("/")
-UDR_SERVING_PLMN_ID = str(os.getenv("UDR_SERVING_PLMN_ID", "20893")).strip()
-try:
-    UDR_REQUEST_TIMEOUT_SEC = max(0.1, float(os.getenv("UDR_REQUEST_TIMEOUT_SEC", "5")))
-except (TypeError, ValueError):
-    UDR_REQUEST_TIMEOUT_SEC = 5.0
-
 
 def _normalize_snssai_key(value: object) -> str:
     if isinstance(value, dict):
@@ -44,67 +34,94 @@ def _normalize_snssai_key(value: object) -> str:
     return ""
 
 
-def _read_udr_json(path: str) -> tuple[dict, bool]:
-    response = requests.get(f"{UDR_BASE_URL}{path}", timeout=UDR_REQUEST_TIMEOUT_SEC)
-    if response.status_code == 404:
-        return {}, False
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError(f"UDR returned a non-object payload for {path}")
-    return dict(payload), True
+def _collect_snssai_keys(*raw_values: object) -> list[str]:
+    keys: list[str] = []
+    for raw_value in raw_values:
+        values = raw_value if isinstance(raw_value, (list, tuple)) else []
+        for value in values:
+            key = _normalize_snssai_key(value)
+            if key and key not in keys:
+                keys.append(key)
+    return keys
 
 
-def _normalize_ue_slice_subscription(
+def _resolve_serving_plmn_id(
+    *,
+    requested_plmn_id: str,
+    am_policy_context: dict,
+    access_mobility_context: dict,
+) -> str:
+    if requested_plmn_id:
+        return requested_plmn_id
+    for context in (am_policy_context, access_mobility_context):
+        plmn = context.get("servingPlmn")
+        if not isinstance(plmn, dict):
+            continue
+        mcc = str(plmn.get("mcc") or "").strip()
+        mnc = str(plmn.get("mnc") or "").strip()
+        if mcc and mnc:
+            return f"{mcc}{mnc}"
+    return ""
+
+
+def _normalize_ue_slice_subscription_from_db(
     *,
     supi: str,
     serving_plmn_id: str,
-    am_data: dict,
-    smf_selection_data: dict,
-    am_data_found: bool,
-    smf_selection_found: bool,
+    ue_context: dict,
 ) -> dict:
-    nssai = am_data.get("nssai") if isinstance(am_data.get("nssai"), dict) else {}
-    subscribed_infos = (
-        smf_selection_data.get("subscribedSnssaiInfos")
-        if isinstance(smf_selection_data.get("subscribedSnssaiInfos"), dict)
+    am_policy_context = (
+        ue_context.get("amPolicyContext")
+        if isinstance(ue_context.get("amPolicyContext"), dict)
         else {}
     )
-    default_snssais = [
-        key
-        for key in (_normalize_snssai_key(item) for item in (nssai.get("defaultSingleNssais") or []))
-        if key
-    ]
-    am_single_snssais = [
-        key
-        for key in (_normalize_snssai_key(item) for item in (nssai.get("singleNssais") or []))
-        if key
-    ]
-    subscribed_snssai_infos: dict[str, dict] = {}
-    for raw_key, value in subscribed_infos.items():
-        key = _normalize_snssai_key(raw_key)
-        if key and isinstance(value, dict):
-            subscribed_snssai_infos[key] = dict(value)
-    authorized_snssais = list(
-        dict.fromkeys([*default_snssais, *am_single_snssais, *subscribed_snssai_infos.keys()])
+    access_mobility_context = (
+        ue_context.get("accessMobilityContext")
+        if isinstance(ue_context.get("accessMobilityContext"), dict)
+        else {}
     )
-    dnn_availability = {
-        key: [
-            str(item.get("dnn") or "").strip()
-            for item in (details.get("dnnInfos") or [])
-            if isinstance(item, dict) and str(item.get("dnn") or "").strip()
-        ]
-        for key, details in subscribed_snssai_infos.items()
-    }
+    associations = (
+        am_policy_context.get("associations")
+        if isinstance(am_policy_context.get("associations"), dict)
+        else {}
+    )
+    association_allowed_snssais: list[object] = []
+    for association in associations.values():
+        if not isinstance(association, dict):
+            continue
+        request = association.get("request")
+        if isinstance(request, dict):
+            association_allowed_snssais.append(request.get("allowedSnssais"))
+
+    authorized_snssais = _collect_snssai_keys(
+        am_policy_context.get("allowedSnssais"),
+        access_mobility_context.get("allowedSnssais"),
+        *association_allowed_snssais,
+    )
+    default_snssais = _collect_snssai_keys(
+        am_policy_context.get("defaultSingleNssais"),
+        access_mobility_context.get("defaultSingleNssais"),
+    )
+    current_target_snssais = _collect_snssai_keys(
+        am_policy_context.get("targetSnssais"),
+        access_mobility_context.get("targetSnssais"),
+    )
     return {
         "supi": supi,
-        "authority": "free5gc_udr_subscription_data",
-        "serving_plmn_id": serving_plmn_id,
-        "records_found": bool(am_data_found or smf_selection_found),
+        "authority": "postgresql_ue_context",
+        "source_table": "ue_context",
+        "serving_plmn_id": _resolve_serving_plmn_id(
+            requested_plmn_id=serving_plmn_id,
+            am_policy_context=am_policy_context,
+            access_mobility_context=access_mobility_context,
+        ),
+        "records_found": True,
         "authorized_snssais": authorized_snssais,
-        "default_snssais": list(dict.fromkeys(default_snssais)),
-        "subscribed_snssai_infos": subscribed_snssai_infos,
-        "dnn_availability": dnn_availability,
+        "default_snssais": default_snssais,
+        "current_target_snssais": current_target_snssais,
+        # The local UE context has no DNN entitlement column. Keep absent
+        # facts empty rather than inventing a UDR-derived subscription.
+        "dnn_availability": {},
     }
 
 
@@ -285,34 +302,22 @@ def get_ue_slice_subscription(
     runtime: ToolRuntime[AgentRuntimeContext] = None,
 ) -> str:
     """
-    Read authoritative UE slice subscription entitlement from free5GC UDR.
+    Read authoritative UE slice entitlement from the PostgreSQL ue_context table.
     Use this before treating a requested S-NSSAI change as executable.
     This tool is read-only and does not create or modify subscription data.
     """
     normalized_supi = str(supi or "").strip()
-    normalized_plmn = str(serving_plmn_id or UDR_SERVING_PLMN_ID).strip()
+    normalized_plmn = str(serving_plmn_id or "").strip()
     if not normalized_supi:
         return "UE Slice Subscription Query Failed: supi is required"
-    if not normalized_plmn:
-        return "UE Slice Subscription Query Failed: serving_plmn_id is required"
-
-    base_path = f"/nudr-dr/v2/subscription-data/{normalized_supi}/{normalized_plmn}/provisioned-data"
-    try:
-        am_data, am_data_found = _read_udr_json(f"{base_path}/am-data")
-        smf_selection_data, smf_selection_found = _read_udr_json(
-            f"{base_path}/smf-selection-subscription-data"
-        )
-        subscription = _normalize_ue_slice_subscription(
-            supi=normalized_supi,
-            serving_plmn_id=normalized_plmn,
-            am_data=am_data,
-            smf_selection_data=smf_selection_data,
-            am_data_found=am_data_found,
-            smf_selection_found=smf_selection_found,
-        )
-    except (requests.RequestException, ValueError) as exc:
-        logger.error(f"Failed to read UE slice subscription for {normalized_supi}: {exc}")
-        return f"UE Slice Subscription Query Failed: {exc}"
+    ue_context = get_ue_context_by_supi(normalized_supi)
+    if not ue_context:
+        return "UE Slice Subscription Query Failed: ue_context record not found"
+    subscription = _normalize_ue_slice_subscription_from_db(
+        supi=normalized_supi,
+        serving_plmn_id=normalized_plmn,
+        ue_context=ue_context,
+    )
 
     prefix = ""
     if runtime is not None:

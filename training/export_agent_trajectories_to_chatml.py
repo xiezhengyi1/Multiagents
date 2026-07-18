@@ -8,9 +8,13 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from training.common import ensure_agent_layout, load_trace_records, processed_dir
-from training.schemas import ChatmlSftRecord, ProjectedTraceRecord, write_jsonl
-from training.trajectory_projection import build_chatml_record_from_trace
+from training.common import ensure_agent_layout, processed_dir
+from training.schemas import ChatmlSftRecord, FineTuningTraceRecord, ProjectedTraceRecord, write_jsonl
+from training.trajectory_projection import (
+    build_chatml_record_from_finetuning_trace,
+    build_chatml_record_from_trace,
+    read_jsonl_objects,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,11 +43,17 @@ def parse_args() -> argparse.Namespace:
 
 def export_agent_trajectories_to_chatml(*, agent_name: str, input_path: Path, output_path: Path) -> int:
     ensure_agent_layout(agent_name)
-    traces = load_trace_records(input_path, ProjectedTraceRecord)
-    chatml_records: list[ChatmlSftRecord] = [
-        build_chatml_record_from_trace(trace)
-        for trace in traces
-    ]
+    rows = read_jsonl_objects(input_path)
+    if all("input" in row and "output" in row for row in rows):
+        traces = [FineTuningTraceRecord.model_validate(row) for row in rows]
+        chatml_records: list[ChatmlSftRecord] = [
+            build_chatml_record_from_finetuning_trace(trace)
+            for trace in traces
+        ]
+    else:
+        # Keep conversion of pre-change projected trajectory files available.
+        traces = [ProjectedTraceRecord.model_validate(row) for row in rows]
+        chatml_records = [build_chatml_record_from_trace(trace) for trace in traces]
     return write_jsonl(output_path, chatml_records)
 
 

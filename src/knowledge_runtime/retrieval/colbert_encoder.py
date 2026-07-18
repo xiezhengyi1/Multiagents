@@ -44,7 +44,8 @@ class ColBERTEncoder:
         from transformers import AutoModel, AutoTokenizer
 
         if device is None:
-            self._device = "cuda" if torch.cuda.is_available() else "cpu"
+            configured_device = str(os.getenv("COLBERT_DEVICE", "")).strip()
+            self._device = configured_device or ("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self._device = device
 

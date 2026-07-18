@@ -56,6 +56,7 @@ class IntentEncodingDirectives:
     domain_evidence: Dict[str, List[str]]
     supi: str
     retry_scope: str
+    serving_slice_change_requested: bool
 
     @classmethod
     def from_context(cls, context: str) -> "IntentEncodingDirectives":
@@ -71,6 +72,7 @@ class IntentEncodingDirectives:
             domain_evidence=normalize_domain_evidence(main_intent.get("domain_evidence")),
             supi=str(main_intent.get("supi") or "").strip(),
             retry_scope=str(main_intent.get("retry_scope") or "").strip(),
+            serving_slice_change_requested=main_intent.get("serving_slice_change_requested") is True,
         )
 
     def model_dump(self) -> Dict[str, Any]:
@@ -79,6 +81,7 @@ class IntentEncodingDirectives:
             "domain_evidence": dict(self.domain_evidence),
             "supi": self.supi,
             "retry_scope": self.retry_scope,
+            "serving_slice_change_requested": self.serving_slice_change_requested,
         }
 
 

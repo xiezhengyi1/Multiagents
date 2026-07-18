@@ -23,6 +23,7 @@ class ControlRoundSnapshot:
     negotiation_request: Dict[str, Any] = field(default_factory=dict)
     planning_blocker: Dict[str, Any] = field(default_factory=dict)
     execution_reentry: Dict[str, Any] = field(default_factory=dict)
+    single_agent_detail: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_trace_payload(cls, trace_payload: Dict[str, Any], *, feedback_added: str = "") -> "ControlRoundSnapshot":
@@ -45,6 +46,7 @@ class ControlRoundSnapshot:
             negotiation_request=dict(trace_payload.get("negotiation_request") or {}),
             planning_blocker=dict(trace_payload.get("planning_blocker") or {}),
             execution_reentry=dict(trace_payload.get("execution_reentry") or {}),
+            single_agent_detail=dict(trace_payload.get("single_agent_detail") or {}),
         )
 
     def to_trace_payload(self) -> Dict[str, Any]:
@@ -62,6 +64,7 @@ class ControlRoundSnapshot:
             "negotiation_request": dict(self.negotiation_request),
             "planning_blocker": dict(self.planning_blocker),
             "execution_reentry": dict(self.execution_reentry),
+            "single_agent_detail": dict(self.single_agent_detail),
         }
 
 
@@ -132,6 +135,11 @@ def append_round_trace(
         del state.rounds[:-3]
     if state.latest_result is not None:
         state.latest_result.round_traces = state.round_traces
+        state.latest_result.single_agent_details = [
+            dict(item.single_agent_detail)
+            for item in state.rounds
+            if item.single_agent_detail
+        ]
 
 
 def finish_control_session(

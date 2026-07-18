@@ -225,6 +225,7 @@ class SingleAgentOrchestrator:
                 qos_feedback=qos_feedback,
                 mobility_feedback=mobility_feedback,
                 diagnosis=diagnosis,
+                single_agent_detail=dict(getattr(self.single_agent, "last_round_detail", {}) or {}),
             )
             log_event(
                 self.single_agent.logger,

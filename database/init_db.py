@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ for candidate in (PACKAGE_ROOT, SRC_ROOT):
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
 
-from database.connection import engine, Base
+from database.connection import Base, WORKER_SCHEMA, engine
 from database.langchain_pg import ensure_semantic_knowledge_collection, setup_langgraph_postgres
 # Import models so Base metadata is populated
 from database.models import (
@@ -40,10 +41,21 @@ def init_db():
         raise RuntimeError("Database engine not configured.")
 
     try:
-        with engine.connect() as connection:
-            logger.info("Enabling pgvector extension...")
-            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            connection.commit()
+        if WORKER_SCHEMA:
+            with engine.connect() as connection:
+                current_schema = str(connection.execute(text("SELECT current_schema()")).scalar_one() or "")
+                search_path = str(connection.execute(text("SHOW search_path")).scalar_one() or "")
+            if current_schema != WORKER_SCHEMA:
+                raise RuntimeError(
+                    "Worker database schema isolation failed: "
+                    f"expected={WORKER_SCHEMA} current_schema={current_schema or '<empty>'} search_path={search_path}"
+                )
+            logger.info("Worker database schema verified: schema=%s search_path=%s", current_schema, search_path)
+        else:
+            with engine.connect() as connection:
+                logger.info("Enabling pgvector extension...")
+                connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                connection.commit()
             
         logger.info("Creating tables...")
         
@@ -84,11 +96,18 @@ def init_db():
             connection.execute(text("UPDATE session_context SET current_stage = current_step WHERE current_stage IS NULL"))
             connection.commit()
 
-        logger.info("Initializing semantic knowledge PGVector collection...")
-        ensure_semantic_knowledge_collection()
+        if WORKER_SCHEMA:
+            # Parallel experiment workers use a schema-local transactional state
+            # but share the read-only RAG/LangGraph collections in `public` via
+            # the connection search_path.  Recreating those global collections
+            # here would shadow them with empty worker-local tables.
+            logger.info("Skipping shared knowledge/bootstrap setup for worker schema %s", WORKER_SCHEMA)
+        else:
+            logger.info("Initializing semantic knowledge PGVector collection...")
+            ensure_semantic_knowledge_collection()
 
-        logger.info("Initializing LangGraph postgres backends...")
-        setup_langgraph_postgres()
+            logger.info("Initializing LangGraph postgres backends...")
+            setup_langgraph_postgres()
 
         logger.info("Database tables created successfully.")
         

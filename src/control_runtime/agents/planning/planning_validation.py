@@ -240,6 +240,20 @@ class PlanningAdvisorValidator:
             if has_sm or has_am or has_ursp:
                 errors.append("unauthorized slice migration must not include executable AM, SM, or URSP policies")
             return errors
+        if migration_requirements and not migration_blocked and "mobility" not in domains:
+            # A serving-S-NSSAI change is jointly executed by AM and SM. Main
+            # did not authorize the AM domain for this stage, so OSA must not
+            # try to repair the omission by emitting AM outside its scope or
+            # silently deliver a migration-shaped SM policy alone.
+            if planning_status != "needs_upstream_reground":
+                errors.append(
+                    "authorized slice migration requires Main to activate mobility; return needs_upstream_reground"
+                )
+            if has_sm or has_am or has_ursp:
+                errors.append(
+                    "migration without mobility-active planning must not include executable AM, SM, or URSP policies"
+                )
+            return errors
 
         if has_sm and "qos" not in domains:
             errors.append("advisor emitted sm_policies outside qos-active planning")
@@ -740,6 +754,7 @@ class PlanningArtifactValidator:
             has_sm_policy = any(item.policy_type == "SmPolicyDecision" for item in policy_plan.all_policies)
             if not has_sm_policy:
                 raise ValueError("OptimizationStrategyAgent did not include an executable SM policy for a qos-active round.")
+            self._validate_pda_qos_retry_constraints(policy_plan, planning_request)
         if ControlDomain.MOBILITY.value in active_domains:
             has_am_policy = any(item.policy_type == "PcfAmPolicyControlPolicyAssociation" for item in policy_plan.all_policies)
             if not has_am_policy:
@@ -797,6 +812,52 @@ class PlanningArtifactValidator:
                     )
         if ControlDomain.QOS.value in active_domains and ControlDomain.MOBILITY.value in active_domains:
             self._validate_joint_snssai_consistency(policy_plan)
+
+    @staticmethod
+    def _validate_pda_qos_retry_constraints(
+        policy_plan: PolicyPlanDraft,
+        planning_request: PlanningRequest,
+    ) -> None:
+        """Reject a retry that repeats a PDA-measured infeasible latency PDB."""
+
+        constraints = {
+            str(item.flow_id or "").strip(): int(item.minimum_target_latency_ms)
+            for item in (planning_request.context.qos_retry_constraints or [])
+            if str(item.flow_id or "").strip()
+        }
+        if not constraints:
+            return
+
+        sm_policies = {
+            str(item.flow_id or "").strip(): item
+            for item in policy_plan.all_policies
+            if item.policy_type == "SmPolicyDecision" and str(item.flow_id or "").strip()
+        }
+        missing = sorted(flow_id for flow_id in constraints if flow_id not in sm_policies)
+        if missing:
+            raise ValueError(
+                "PDA QoS retry constraints require executable SM policies for the measured flows: "
+                + ", ".join(missing)
+            )
+
+        violations: list[str] = []
+        for flow_id, minimum_target_latency_ms in constraints.items():
+            policy_details = sm_policies[flow_id].policy_details
+            qos_decs = policy_details.get("qosDecs") if isinstance(policy_details, dict) else None
+            if not isinstance(qos_decs, dict) or len(qos_decs) != 1:
+                raise ValueError(f"SM policy for flow_id={flow_id} is missing exactly one QoS decision")
+            qos_payload = next(iter(qos_decs.values()))
+            try:
+                target_latency_ms = int((qos_payload or {}).get("packetDelayBudget"))
+            except (TypeError, ValueError):
+                raise ValueError(f"SM policy for flow_id={flow_id} has no integral packetDelayBudget") from None
+            if target_latency_ms < minimum_target_latency_ms:
+                violations.append(
+                    f"flow_id={flow_id} packetDelayBudget={target_latency_ms}ms < "
+                    f"PDA feasibility floor {minimum_target_latency_ms}ms"
+                )
+        if violations:
+            raise ValueError("; ".join(violations))
 
     @staticmethod
     def _validate_joint_snssai_consistency(policy_plan: PolicyPlanDraft) -> None:

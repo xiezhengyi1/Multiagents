@@ -7,7 +7,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from agent_runtime.trace.models import RunTreeTraceRecord
 from training.trace_projectors import project_trace_to_training_trace
 from training.common import load_trace_records
-from training.schemas import ChatmlSftRecord, DatasetMessage, ProjectedTraceRecord, WorkflowTrajectoryRecord
+from training.schemas import (
+    ChatmlSftRecord,
+    DatasetMessage,
+    FineTuningTraceRecord,
+    ProjectedTraceRecord,
+    WorkflowTrajectoryRecord,
+)
 
 COLLABORATION_AGENT_NAMES: tuple[str, ...] = (
     "autonomous_requirement_agent",
@@ -154,6 +160,23 @@ def build_workflow_trajectory_record(
     )
 
 
+def build_finetuning_trace_record(trace: ProjectedTraceRecord) -> FineTuningTraceRecord:
+    """Drop runtime-only trace fields before persisting an agent training row."""
+    return FineTuningTraceRecord(
+        trace_id=trace.trace_id,
+        timestamp=trace.timestamp,
+        agent_name=trace.agent_name,
+        session_id=trace.session_id,
+        snapshot_id=trace.snapshot_id,
+        input=list(trace.input_messages),
+        output=trace.structured_response,
+        tool_calls=list(trace.tool_calls),
+        tool_results=list(trace.tool_results),
+        status=trace.status,
+        error=trace.error,
+    )
+
+
 def build_chatml_record_from_trace(trace: ProjectedTraceRecord) -> ChatmlSftRecord:
     if not trace.message_trajectory:
         raise ValueError(f"Trace {trace.trace_id} has empty message_trajectory")
@@ -186,10 +209,53 @@ def build_chatml_record_from_trace(trace: ProjectedTraceRecord) -> ChatmlSftReco
     )
 
 
+def build_chatml_record_from_finetuning_trace(trace: FineTuningTraceRecord) -> ChatmlSftRecord:
+    """Build ChatML from the compact training artifact without debug metadata."""
+    messages = [
+        DatasetMessage(
+            role=str(message.get("role") or "user"),
+            content=str(message.get("content") or ""),
+        )
+        for message in trace.input
+        if isinstance(message, Mapping) and str(message.get("content") or "").strip()
+    ]
+    for call in trace.tool_calls:
+        messages.append(
+            DatasetMessage(
+                role="assistant",
+                content=json.dumps({"tool_call": call}, ensure_ascii=False),
+            )
+        )
+    for result in trace.tool_results:
+        messages.append(
+            DatasetMessage(
+                role="tool",
+                content=json.dumps(result, ensure_ascii=False),
+            )
+        )
+    messages.append(DatasetMessage(role="assistant", content=json.dumps(trace.output, ensure_ascii=False)))
+    return ChatmlSftRecord(
+        sample_id=f"{trace.agent_name}-chatml-{trace.trace_id}",
+        task=f"{trace.agent_name}_chatml_trace",
+        agent=trace.agent_name,
+        messages=messages,
+        metadata={
+            "trace_id": trace.trace_id,
+            "session_id": trace.session_id,
+            "snapshot_id": trace.snapshot_id,
+            "status": trace.status,
+            "tool_call_count": len(trace.tool_calls),
+            "tool_result_count": len(trace.tool_results),
+        },
+    )
+
+
 __all__ = [
     "COLLABORATION_AGENT_NAMES",
     "WORKFLOW_AGENT_NAMES",
+    "build_chatml_record_from_finetuning_trace",
     "build_chatml_record_from_trace",
+    "build_finetuning_trace_record",
     "build_workflow_trajectory_record",
     "flatten_tool_calls",
     "flatten_tool_results",

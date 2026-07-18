@@ -187,6 +187,21 @@ class ExecutionController:
         policy_types = [entry.get("policy_type") for entry in entries if isinstance(entry, dict)]
         return self._failure_scope_from_policies([{"policy_type": item} for item in policy_types if item])
 
+    @staticmethod
+    def _dispatch_failure_detail(dispatch_result: Dict[str, Any]) -> str:
+        explicit_error = str(dispatch_result.get("error") or "").strip()
+        if explicit_error:
+            return explicit_error
+        diagnostics = {
+            key: dispatch_result.get(key)
+            for key in ("phase", "status_code", "response_code", "operation_id")
+            if dispatch_result.get(key) not in (None, "")
+        }
+        if diagnostics:
+            details = ", ".join(f"{key}={value}" for key, value in diagnostics.items())
+            return f"gateway returned a failed response without an error field ({details})"
+        return "gateway returned a failed response without an error field"
+
     def _dispatch_single_policy(
         self,
         *,
@@ -202,7 +217,16 @@ class ExecutionController:
             snapshot_id=snapshot_id or None,
         )
         last_result = result if isinstance(result, dict) else {"status": "failed", "error": str(result)}
-        if last_result.get("status") == "success":
+        pda_status = str(last_result.get("status") or "").strip().lower()
+        pda_phase = str(last_result.get("phase") or "").strip().lower()
+        # The gateway acknowledges a synchronous dispatch as ``success`` and
+        # an asynchronously-polled completion as ``applied`` (or an equivalent
+        # terminal success label).  Normalize those labels for the rest of the
+        # execution pipeline, which deliberately uses one internal success
+        # vocabulary.
+        if pda_status in {"success", "applied", "completed", "succeeded"}:
+            if pda_status != "success":
+                last_result = {**last_result, "status": "success", "pda_status": pda_status}
             slice_error, slice_evidence = self._slice_execution_error(
                 policy=policy,
                 dispatch_result=last_result,
@@ -222,19 +246,32 @@ class ExecutionController:
                     dispatch_attempts=1,
                 )
             return last_result, 1
-        failure_message = (
-            f"policy {policy['policy_id']} dispatch failed: "
-            f"{str(last_result.get('error') or 'unknown dispatch error').strip()}"
-        )
+        pda_wait_expired = pda_status == "pending" or pda_phase in {"pda_deadline", "ns3_timeout", "waiting_for_ns3"}
+        if pda_wait_expired:
+            operation_id = str(last_result.get("operation_id") or "").strip()
+            failure_message = (
+                f"policy {policy['policy_id']} did not reach a terminal PDA status before the dispatch deadline"
+                f"{f' (operation_id={operation_id})' if operation_id else ''}; "
+                "terminate this case without retrying or redispatching the policy"
+            )
+            phase = pda_phase if pda_phase in {"pda_deadline", "ns3_timeout", "waiting_for_ns3"} else "pda_pending_timeout"
+        else:
+            dispatch_detail = self._dispatch_failure_detail(last_result)
+            failure_message = (
+                f"policy {policy['policy_id']} dispatch failed: "
+                f"{dispatch_detail}"
+            )
+            phase = str(last_result.get("phase") or "dispatch")
         raise ExecutionDecisionError(
             failure_message,
             feedback_payload={
-                "phase": "dispatch",
+                "phase": phase,
                 "policy_id": policy.get("policy_id"),
                 "policy_type": policy.get("policy_type"),
                 "flow_id": self._policy_flow_id(policy),
                 "error": failure_message,
                 "last_dispatch_result": last_result,
+                "retry_forbidden": pda_wait_expired,
             },
             dispatch_attempts=1,
         )
@@ -658,6 +695,12 @@ class ExecutionController:
                     ensure_ascii=False,
                 )
                 has_assurance_failure = any(str(item.get("phase") or "").strip() == "assurance" for item in failures)
+                retry_forbidden = any(
+                    isinstance(item.get("feedback_payload"), dict)
+                    and bool(item["feedback_payload"].get("retry_forbidden"))
+                    for item in failures
+                    if isinstance(item, dict)
+                )
                 execution_status = "Failed" if has_assurance_failure else ("Partial Success" if successful_policy_ids else "Failed")
                 violation_details = "; ".join(
                     str(item.get("error") or "").strip() for item in failures if str(item.get("error") or "").strip()
@@ -682,6 +725,7 @@ class ExecutionController:
                         "successful_policy_ids": successful_policy_ids,
                         "failed_policy_ids": failed_policy_ids,
                         "failures": failures,
+                        "retry_forbidden": retry_forbidden,
                     },
                     dispatch_attempts=total_dispatch_attempts,
                 )

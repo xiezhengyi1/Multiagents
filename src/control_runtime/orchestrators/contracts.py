@@ -20,6 +20,7 @@ class ControlRoundTrace:
     negotiation_request: Dict[str, Any] = field(default_factory=dict)
     planning_blocker: Dict[str, Any] = field(default_factory=dict)
     execution_reentry: Dict[str, Any] = field(default_factory=dict)
+    single_agent_detail: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -39,6 +40,7 @@ class ControlRoundResult:
     retry_count: int = 0
     round_traces: List[Dict[str, Any]] = field(default_factory=list)
     agent_elapsed_ms: Dict[str, float] = field(default_factory=dict)
+    single_agent_details: List[Dict[str, Any]] = field(default_factory=list)
 
 
 __all__ = ["ControlRoundResult", "ControlRoundTrace"]

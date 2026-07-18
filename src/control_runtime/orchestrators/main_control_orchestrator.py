@@ -79,7 +79,7 @@ class MainControlOrchestrator:
             raise ValueError("max_rounds must be at least 1")
         _deepseek_kwargs = {"model_name": self._DEEPSEEK_MODEL} if use_deepseek else {}
         self.main_agent = main_agent or MainControlAgent(use_local_model=use_local_model, **_deepseek_kwargs)
-        self.ie_agent = ie_agent or IntentEncodingAgent(use_local_model=use_local_model, rag_enabled=rag_enabled, **_deepseek_kwargs)
+        self.ie_agent = ie_agent or IntentEncodingAgent(use_local_model=use_local_model, **_deepseek_kwargs)
         self.os_agent = os_agent or OptimizationStrategyAgent(use_local_model=use_local_model, rag_enabled=rag_enabled, **_deepseek_kwargs)
         self.pd_agent = pd_agent or PolicyDispatchAgent(use_local_model=use_local_model, **_deepseek_kwargs)
         self.cr_tool = cr_tool or ConflictResolutionTool()
@@ -272,6 +272,7 @@ class MainControlOrchestrator:
                 handoff_history=round_traces,
                 revision_requests=(previous_mediator_decision or {}).get("revision_requests") if isinstance(previous_mediator_decision, dict) else None,
                 unified_constraints=(previous_mediator_decision or {}).get("unified_constraints") if isinstance(previous_mediator_decision, dict) else None,
+                previous_execution_feedback=previous_report_payload,
             ),
         )
         agent_started_at = time.perf_counter()

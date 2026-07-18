@@ -13,13 +13,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from training.collect_workflow_trajectories import collect_workflow_trajectories, load_user_input_records
 from training.common import processed_dir
-from experiments.scripts.common import reset_simulator_state, write_json
+from experiments.scripts.common import parse_task_ids, reset_simulator_state, write_json
 
 
-def _average_elapsed_ms(results: List[Mapping[str, Any]]) -> float:
+def _average_numeric_field(results: List[Mapping[str, Any]], field_name: str) -> float:
     values: List[float] = []
     for item in results:
-        value = item.get("elapsed_ms")
+        value = item.get(field_name)
         if isinstance(value, (int, float)):
             values.append(float(value))
             continue
@@ -236,6 +236,8 @@ def summarize_run_results(
     total = len(results)
     correct_count = len(correct_cases)
     error_count = total - correct_count
+    total_round_count = sum(int(item.get("round_count") or 0) for item in results)
+    total_retry_count = sum(int(item.get("retry_count") or 0) for item in results)
 
     return {
         "total_cases": total,
@@ -249,7 +251,12 @@ def summarize_run_results(
         "main_judgement_wrong_cases": main_judgement_wrong_cases,
         "round_count_histogram": dict(sorted(round_histogram.items())),
         "retry_count_histogram": dict(sorted(retry_histogram.items())),
-        "avg_elapsed_ms": _average_elapsed_ms(results),
+        "total_round_count": total_round_count,
+        "total_retry_count": total_retry_count,
+        "avg_round_count": round(total_round_count / total, 4) if total else 0.0,
+        "avg_retry_count": round(total_retry_count / total, 4) if total else 0.0,
+        "avg_elapsed_ms": _average_numeric_field(results, "agent_elapsed_total_ms"),
+        "avg_wall_elapsed_ms": _average_numeric_field(results, "elapsed_ms"),
         "correct_cases": correct_cases,
         "error_cases": error_cases,
         "artifacts": {
@@ -271,11 +278,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--start-index", type=int, default=1, help="1-based record index to start from.")
+    parser.add_argument(
+        "--task-ids",
+        default="",
+        help="Optional comma-separated stable task ids. If omitted, use --start-index and --count.",
+    )
     parser.add_argument("--target-success-rate", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--snapshot-id", type=str, default="", help="Existing network graph snapshot id to read.")
     parser.add_argument("--disable-rag", action="store_true")
+    parser.add_argument(
+        "--local-model",
+        action="store_true",
+        dest="use_local_model",
+        help="Use the OpenAI-compatible local vLLM endpoint configured by vLLM_URL and vLLM_MODEL_NAME.",
+    )
     parser.add_argument("--deepseek", action="store_true", dest="use_deepseek", help="Use deepseek-v4-flash for all agents.")
     parser.add_argument("--scenario-prefix", type=str, default="workflow-experiment")
     parser.add_argument(
@@ -322,6 +340,7 @@ def main() -> None:
         raise ValueError("--max-rounds must be positive")
     if not 0.0 < args.target_success_rate < 1.0:
         raise ValueError("--target-success-rate must be between 0 and 1")
+    task_ids = parse_task_ids(args.task_ids)
 
     records = load_user_input_records(
         user_inputs_path=args.user_inputs,
@@ -330,6 +349,7 @@ def main() -> None:
         target_success_rate=args.target_success_rate,
         seed=args.seed,
         start_index=args.start_index,
+        task_ids=task_ids,
     )
     collection = collect_workflow_trajectories(
         records=records,
@@ -343,6 +363,7 @@ def main() -> None:
         rag_enabled=not args.disable_rag,
         reset_scenario_each_run=True,
         snapshot_id=args.snapshot_id,
+        use_local_model=args.use_local_model,
         use_deepseek=args.use_deepseek,
         case_finished_callback=reset_simulator_state,
     )

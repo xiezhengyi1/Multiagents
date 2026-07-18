@@ -77,7 +77,9 @@ def _extract_failure_type(item: Dict[str, Any]) -> str:
 
 
 def _extract_elapsed_ms(item: Dict[str, Any]) -> float | str:
-    value = item.get("elapsed_ms")
+    # Experiment latency is agent work only; wall-clock time stays in
+    # `elapsed_ms` solely as a diagnostic field.
+    value = item.get("agent_elapsed_total_ms")
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, str) and value.strip():

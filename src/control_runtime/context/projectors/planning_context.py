@@ -31,6 +31,7 @@ class PlanningContextProjector(BaseProjector):
                     "latest_handoff": _latest_handoff(raw.get("handoff_history")),
                     "revision_requests": raw.get("revision_requests"),
                     "unified_constraints": raw.get("unified_constraints"),
+                    "qos_retry_constraints": raw.get("qos_retry_constraints"),
                 }
             )
             if retry_delta:

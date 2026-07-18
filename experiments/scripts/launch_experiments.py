@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import json
 import os
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -19,11 +22,16 @@ from experiments.scripts.common import (
     PROJECT_ROOT,
     append_jsonl,
     load_json,
+    parse_task_ids,
+    read_jsonl,
     resolve_python_executable,
+    write_json,
 )
 from experiments.paths import scoped_catalog_input_path
 from experiments.scripts.simulator import (
+    allocate_simulator_instance as _allocate_simulator_instance,
     ensure_simulator_running as _ensure_simulator_running,
+    restart_simulator_for_current_scenario as _restart_simulator_for_current_scenario,
     run_command as _run_command,
     start_simulator_for_scenario as _start_simulator_for_scenario,
     stop_simulator as _stop_simulator,
@@ -38,10 +46,28 @@ RUN_METHOD_SCRIPT = EXPERIMENT_ROOT / "scripts" / "run_method.py"
 AGGREGATE_SCRIPT = EXPERIMENT_ROOT / "scripts" / "aggregate_results.py"
 FAILED_RUNS_PATH = LEDGER_ROOT / "failed_experiments.jsonl"
 ENV_PATH = PROJECT_ROOT / ".env"
+DEFAULT_SIMULATORS_PER_COMBINATION = 3
+MAX_WRITER_RESET_FULL_RESTARTS_PER_WORKER = 1
 
 
 def _append_failed_run(record: Dict[str, Any]) -> None:
     append_jsonl(FAILED_RUNS_PATH, record)
+
+
+def _is_exhausted_reset_writer_failure(exc: BaseException) -> bool:
+    """Recognize only the explicit fast-reset writer terminal condition.
+
+    `run_method.py` runs in a child process, so the typed RuntimeError becomes
+    `CalledProcessError`.  Keep the recovery gate deliberately narrow: a full
+    simulator restart must never mask model, policy, or ordinary reset errors.
+    """
+    output = str(getattr(exc, "output", "") or "")
+    text = f"{exc}\n{output}".lower()
+    return (
+        "simulator reset writer recovery exhausted" in text
+        and "a full simulator restart is required" in text
+        and "writer" in text
+    )
 
 def _load_matrix() -> List[Dict[str, Any]]:
     payload = load_json(MATRIX_PATH)
@@ -140,7 +166,13 @@ def _generated_inputs_path(*, experiment_id: str, scenario_id: str) -> Path:
     return scoped_catalog_input_path(experiment_id=experiment_id, scenario_id=scenario_id)
 
 
-def _load_generated_task_count(*, experiment_id: str, scenario_id: str, start_index: int = 1) -> int:
+def _load_generated_task_count(
+    *,
+    experiment_id: str,
+    scenario_id: str,
+    start_index: int = 1,
+    task_ids: List[str] | None = None,
+) -> int:
     path = _generated_inputs_path(experiment_id=experiment_id, scenario_id=scenario_id)
     if not path.exists():
         raise FileNotFoundError(f"Generated input file not found: {path}")
@@ -148,6 +180,26 @@ def _load_generated_task_count(*, experiment_id: str, scenario_id: str, start_in
     records = payload.get("records", [])
     if not isinstance(records, list):
         raise TypeError(f"Generated input records must be a list: {path}")
+    selected_task_ids = parse_task_ids(task_ids)
+    if selected_task_ids:
+        if start_index != 1:
+            raise ValueError("--task-ids cannot be combined with --start-index")
+        available_ids = {
+            str(
+                ((record.get("task_metadata") or {}).get("task_id") if isinstance(record, dict) else "")
+                or (record.get("task_id") if isinstance(record, dict) else "")
+                or ""
+            ).strip()
+            for record in records
+            if isinstance(record, dict)
+        }
+        missing_ids = [task_id for task_id in selected_task_ids if task_id not in available_ids]
+        if missing_ids:
+            raise ValueError(
+                "--task-ids contains task ids absent from "
+                f"{path}: {', '.join(missing_ids)}"
+            )
+        return len(selected_task_ids)
     if start_index <= 0:
         raise ValueError("--start-index must be positive")
     remaining_count = len(records) - start_index + 1
@@ -234,6 +286,151 @@ def _build_coverage_summary(experiment_summaries: Dict[str, Dict[str, Any]]) -> 
     return coverage
 
 
+def _partition_case_ranges(*, start_index: int, case_count: int, worker_count: int) -> List[Dict[str, int]]:
+    if worker_count <= 0:
+        raise ValueError("worker_count must be positive")
+    if case_count <= 0:
+        raise ValueError("case_count must be positive")
+    base, remainder = divmod(case_count, worker_count)
+    next_index = start_index
+    partitions: List[Dict[str, int]] = []
+    for worker_index in range(1, worker_count + 1):
+        count = base + (1 if worker_index <= remainder else 0)
+        partitions.append({"worker_index": worker_index, "start_index": next_index, "count": count})
+        next_index += count
+    return partitions
+
+
+def _partition_task_ids(*, task_ids: List[str], worker_count: int) -> List[Dict[str, Any]]:
+    if worker_count <= 0:
+        raise ValueError("worker_count must be positive")
+    if not task_ids:
+        raise ValueError("task_ids must not be empty")
+    base, remainder = divmod(len(task_ids), worker_count)
+    next_offset = 0
+    partitions: List[Dict[str, Any]] = []
+    for worker_index in range(1, worker_count + 1):
+        count = base + (1 if worker_index <= remainder else 0)
+        assigned_ids = list(task_ids[next_offset : next_offset + count])
+        partitions.append(
+            {
+                "worker_index": worker_index,
+                "start_index": 1,
+                "count": count,
+                "task_ids": assigned_ids,
+            }
+        )
+        next_offset += count
+    return partitions
+
+
+def _worker_environment(simulator_state: Dict[str, Any]) -> Dict[str, str]:
+    env = dict(os.environ)
+    gateway_port = int(simulator_state["gateway_port"])
+    reset_port = int(simulator_state["reset_port"])
+    env["PCF_BASE_URL"] = f"http://127.0.0.1:{gateway_port}"
+    env["POLICY_GATEWAY_INSTANCE_ID"] = str(simulator_state.get("gateway_instance_id") or "")
+    env["SIMULATOR_RESET_URL"] = f"http://127.0.0.1:{reset_port}/v1/reset"
+    instance = simulator_state.get("instance")
+    if instance is not None:
+        env["EXPERIMENT_WORKER_SCHEMA"] = str(instance.database_schema)
+    database_url = str(simulator_state.get("runtime_database_url") or "").strip()
+    if database_url:
+        env["DATABASE_URL"] = database_url
+    return env
+
+
+def _merge_worker_results(
+    *,
+    experiment_id: str,
+    scenario_id: str,
+    method_id: str,
+    worker_runs: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    if not worker_runs:
+        raise RuntimeError("Cannot merge an empty worker result set")
+    first_result_path = Path(worker_runs[0]["result_path"])
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    slug = "-".join(
+        "".join(character.lower() if character.isalnum() else "-" for character in value).strip("-")
+        for value in (experiment_id, scenario_id, method_id)
+    )
+    result_path = first_result_path.parent / f"{method_id.lower()}_runs_{slug}_{stamp}_merged.jsonl"
+    summary_path = first_result_path.parent.parent / "summaries" / f"{method_id.lower()}_summary_{slug}_{stamp}_merged.json"
+
+    result_rows: List[Dict[str, Any]] = []
+    summary_payloads: List[Dict[str, Any]] = []
+    for worker_run in worker_runs:
+        result_rows.extend(read_jsonl(Path(worker_run["result_path"])))
+        summary_payloads.append(load_json(Path(worker_run["summary_path"])))
+    result_rows.sort(key=lambda item: int(item.get("record_index") or 0))
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in result_rows),
+        encoding="utf-8",
+    )
+
+    count_keys = {
+        key
+        for payload in summary_payloads
+        for key, value in payload.items()
+        if key.endswith("_count") and isinstance(value, int)
+    }
+    merged_summary: Dict[str, Any] = {
+        key: sum(int(payload.get(key) or 0) for payload in summary_payloads)
+        for key in count_keys
+    }
+    total_cases = int(merged_summary.get("total_cases") or len(result_rows))
+    merged_summary["total_cases"] = total_cases
+    for numerator_key, rate_key in (
+        ("correct_case_count", "correct_case_rate"),
+        ("completed_case_count", "completed_case_rate"),
+        ("error_case_count", "error_case_rate"),
+        ("exception_case_count", "exception_case_rate"),
+        ("successful_invocation_count", "successful_invocation_rate"),
+    ):
+        if numerator_key in merged_summary:
+            merged_summary[rate_key] = round(int(merged_summary[numerator_key]) / total_cases, 4) if total_cases else 0.0
+    for elapsed_key in ("avg_elapsed_ms", "avg_wall_elapsed_ms", "avg_round_count", "avg_retry_count"):
+        elapsed_weight = sum(
+            float(payload.get(elapsed_key) or 0.0) * int(payload.get("total_cases") or 0)
+            for payload in summary_payloads
+        )
+        merged_summary[elapsed_key] = round(elapsed_weight / total_cases, 4) if total_cases else 0.0
+    for histogram_key in ("round_count_histogram", "retry_count_histogram"):
+        merged_histogram: Dict[int, int] = {}
+        for payload in summary_payloads:
+            histogram = payload.get(histogram_key) or {}
+            if not isinstance(histogram, dict):
+                continue
+            for key, value in histogram.items():
+                try:
+                    numeric_key = int(key)
+                    numeric_value = int(value)
+                except (TypeError, ValueError):
+                    continue
+                merged_histogram[numeric_key] = merged_histogram.get(numeric_key, 0) + numeric_value
+        merged_summary[histogram_key] = dict(sorted(merged_histogram.items()))
+    for key in ("correct_cases", "error_cases", "main_judgement_wrong_cases"):
+        values = [item for payload in summary_payloads for item in (payload.get(key) or []) if isinstance(item, dict)]
+        if values:
+            merged_summary[key] = values
+    merged_summary["artifacts"] = {
+        "run_records": str(result_path),
+        "worker_results": [
+            {
+                "worker_index": worker_run["worker_index"],
+                "result_path": worker_run["result_path"],
+                "summary_path": worker_run["summary_path"],
+                "snapshot_id": worker_run["snapshot_id"],
+            }
+            for worker_run in worker_runs
+        ],
+    }
+    write_json(summary_path, merged_summary)
+    return {"result_path": str(result_path), "summary_path": str(summary_path)}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Launch experiment runs strictly according to experiment_matrix.json.",
@@ -243,9 +440,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", default="", help="Only launch one method id, e.g. Ours")
     parser.add_argument("--start-index", type=int, default=1, help="1-based user_input record index to start from.")
     parser.add_argument(
+        "--task-ids",
+        default="",
+        help="Optional comma-separated stable task ids to run. If omitted, run the default start-index range.",
+    )
+    parser.add_argument(
+        "--simulators-per-combination",
+        type=int,
+        default=DEFAULT_SIMULATORS_PER_COMBINATION,
+        help="Independent simulator workers to start for every experiment/scenario/method combination (default: 3).",
+    )
+    parser.add_argument(
         "--skip-aggregate",
         action="store_true",
         help="Run build_user_inputs.py and run_method.py only, without ledger aggregation.",
+    )
+    parser.add_argument(
+        "--local-model",
+        action="store_true",
+        dest="use_local_model",
+        help="Use the OpenAI-compatible local vLLM endpoint configured by vLLM_URL and vLLM_MODEL_NAME.",
     )
     parser.add_argument(
         "--deepseek",
@@ -270,6 +484,11 @@ def main() -> None:
     start_index = int(args.start_index)
     if start_index <= 0:
         raise ValueError("--start-index must be positive")
+    task_ids = parse_task_ids(args.task_ids)
+    if task_ids and start_index != 1:
+        raise ValueError("--task-ids cannot be combined with --start-index")
+    if int(args.simulators_per_combination) <= 0:
+        raise ValueError("--simulators-per-combination must be positive")
     experiments = _iter_selected_experiments(
         _load_matrix(),
         experiment_filter=str(args.experiment or "").strip(),
@@ -324,12 +543,14 @@ def main() -> None:
                     experiment_id=experiment_id,
                     scenario_id=scenario_id,
                     start_index=start_index,
+                    task_ids=task_ids,
                 )
                 experiment_summaries[experiment_id]["built_scenarios"][scenario_id] = {
                     "task_count": task_count,
                     "generated_input_path": str(
                         _generated_inputs_path(experiment_id=experiment_id, scenario_id=scenario_id)
                     ),
+                    "task_ids": list(task_ids),
                 }
                 _print_experiment_progress(
                     experiment_id=experiment_id,
@@ -361,54 +582,84 @@ def main() -> None:
                 )
                 continue
 
-            simulator_state: Dict[str, Any] | None = None
-            try:
-                simulator_state = _start_simulator_for_scenario(experiment_id, scenario_id)
-            except Exception as exc:
-                failure = {
-                    "stage": "start_simulator",
-                    "experiment_id": experiment_id,
-                    "scenario_id": scenario_id,
-                    "method_id": "",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "traceback": traceback.format_exc(),
-                }
-                failed_runs.append(failure)
-                experiment_summaries[experiment_id]["failed_runs"].append(failure)
-                _append_failed_run(failure)
-                print(
-                    f"[launch][skip] simulator startup failed for {experiment_id}/{scenario_id}: {exc}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                continue
+            for method_index, method_id in enumerate(methods, start=1):
+                task_count = experiment_summaries[experiment_id]["built_scenarios"][scenario_id]["task_count"]
+                simulator_states: List[Dict[str, Any]] = []
+                worker_runs: List[Dict[str, Any]] = []
+                worker_failures: List[Dict[str, Any]] = []
+                worker_specs: List[Dict[str, Any]] = []
+                try:
+                    _print_experiment_progress(
+                        experiment_id=experiment_id,
+                        experiment_index=experiment_index,
+                        experiment_total=experiment_total,
+                        scenario_id=scenario_id,
+                        scenario_index=scenario_index,
+                        scenario_total=scenario_total,
+                        method_id=method_id,
+                        method_index=method_index,
+                        method_total=method_total,
+                        stage="start-worker-simulators",
+                        task_count=task_count,
+                    )
+                    if method_id not in methods_registry:
+                        raise ValueError(f"Method {method_id} referenced by {experiment_id} is not defined in methods.json")
+                    method_meta = methods_registry[method_id]
+                    if str(method_meta.get("implementation_status") or "").strip().lower() != "ready":
+                        raise RuntimeError(f"Method {method_id} is not runnable. Reason: {method_meta.get('notes', '')}")
 
-            try:
-                for method_index, method_id in enumerate(methods, start=1):
-                    try:
-                        simulator_state = _ensure_simulator_running(simulator_state)
-                        _print_experiment_progress(
-                            experiment_id=experiment_id,
-                            experiment_index=experiment_index,
-                            experiment_total=experiment_total,
-                            scenario_id=scenario_id,
-                            scenario_index=scenario_index,
-                            scenario_total=scenario_total,
-                            method_id=method_id,
-                            method_index=method_index,
-                            method_total=method_total,
-                            stage="run-method",
-                            task_count=experiment_summaries[experiment_id]["built_scenarios"][scenario_id]["task_count"],
+                    partitions = (
+                        _partition_task_ids(
+                            task_ids=task_ids,
+                            worker_count=int(args.simulators_per_combination),
                         )
-                        if method_id not in methods_registry:
-                            raise ValueError(f"Method {method_id} referenced by {experiment_id} is not defined in methods.json")
-                        method_meta = methods_registry[method_id]
-                        if str(method_meta.get("implementation_status") or "").strip().lower() != "ready":
-                            raise RuntimeError(
-                                f"Method {method_id} is not runnable. Reason: {method_meta.get('notes', '')}"
+                        if task_ids
+                        else _partition_case_ranges(
+                            start_index=start_index,
+                            case_count=task_count,
+                            worker_count=int(args.simulators_per_combination),
+                        )
+                    )
+                    for partition in partitions:
+                        worker_index = partition["worker_index"]
+                        worker_label = f"{experiment_id}-{scenario_id}-{method_id}-worker-{worker_index}"
+                        allocation = _allocate_simulator_instance(label=worker_label)
+                        try:
+                            simulator_state = _start_simulator_for_scenario(
+                                experiment_id,
+                                scenario_id,
+                                instance=allocation,
                             )
-                        run_method_cmd = [
+                        except Exception:
+                            allocation.release()
+                            raise
+                        simulator_states.append(simulator_state)
+                        print(
+                            "[launch] worker allocation "
+                            f"logical_worker={worker_index} physical_slot={allocation.slot} "
+                            f"schema={allocation.database_schema}",
+                            flush=True,
+                        )
+                        worker_specs.append({**partition, "label": worker_label, "simulator_state": simulator_state})
+
+                    model_flags = _resolve_model_flags(args, method_id=method_id)
+
+                    def run_worker(worker: Dict[str, Any]) -> Dict[str, Any]:
+                        if int(worker["count"]) <= 0:
+                            return {"worker_index": worker["worker_index"], "skipped": True}
+                        worker_task_ids = list(worker.get("task_ids") or [])
+                        case_scope = (
+                            ",".join(worker_task_ids)
+                            if worker_task_ids
+                            else f"{worker['start_index']}+{worker['count']}"
+                        )
+                        for run_attempt in range(MAX_WRITER_RESET_FULL_RESTARTS_PER_WORKER + 1):
+                            simulator_state = _ensure_simulator_running(worker["simulator_state"])
+                            worker["simulator_state"] = simulator_state
+                            run_label = str(worker["label"])
+                            if run_attempt:
+                                run_label = f"{run_label}-writer-recovery-{run_attempt}"
+                            run_method_cmd = [
                                 str(PYTHON_EXE),
                                 str(RUN_METHOD_SCRIPT),
                                 "--method",
@@ -419,34 +670,96 @@ def main() -> None:
                                 scenario_id,
                                 "--snapshot-id",
                                 str(simulator_state["live_graph_snapshot_id"]),
-                                "--start-index",
-                                str(start_index),
+                                "--count",
+                                str(worker["count"]),
+                                "--run-label",
+                                run_label,
+                                "--skip-ledger",
                             ]
-                        model_flags = _resolve_model_flags(args, method_id=method_id)
-                        if model_flags["use_deepseek"]:
-                            run_method_cmd.append("--deepseek")
-                        if model_flags["use_qwen"]:
-                            run_method_cmd.append("--qwen")
-                        stdout = _run_command(
-                            run_method_cmd,
-                            label=f"run {experiment_id}/{scenario_id}/{method_id}",
-                            stream_output=True,
-                        )
-                        payload = _parse_run_method_output(stdout)
-                        run_record = {
-                            "experiment_id": experiment_id,
-                            "scenario_id": scenario_id,
-                            "method_id": method_id,
-                            "task_count": experiment_summaries[experiment_id]["built_scenarios"][scenario_id]["task_count"],
-                            "result_path": str(payload["result_path"]),
-                            "summary_path": str(payload["summary_path"]),
-                        }
-                        launched_runs.append(run_record)
-                        experiment_summaries[experiment_id]["successful_runs"].append(run_record)
+                            if worker_task_ids:
+                                run_method_cmd.extend(["--task-ids", ",".join(worker_task_ids)])
+                            else:
+                                run_method_cmd.extend(["--start-index", str(worker["start_index"])])
+                            if args.use_local_model:
+                                run_method_cmd.append("--local-model")
+                            if model_flags["use_deepseek"]:
+                                run_method_cmd.append("--deepseek")
+                            if model_flags["use_qwen"]:
+                                run_method_cmd.append("--qwen")
+                            try:
+                                stdout = _run_command(
+                                    run_method_cmd,
+                                    label=(
+                                        f"run {experiment_id}/{scenario_id}/{method_id} "
+                                        f"logical_worker={worker['worker_index']} "
+                                        f"physical_slot={simulator_state['instance'].slot} "
+                                        f"cases={case_scope}"
+                                    ),
+                                    stream_output=True,
+                                    env=_worker_environment(simulator_state),
+                                )
+                            except subprocess.CalledProcessError as exc:
+                                if (
+                                    run_attempt >= MAX_WRITER_RESET_FULL_RESTARTS_PER_WORKER
+                                    or not _is_exhausted_reset_writer_failure(exc)
+                                ):
+                                    raise
+                                print(
+                                    "[launch] reset writer failed permanently; restarting the full "
+                                    f"simulator once for logical_worker={worker['worker_index']}",
+                                    flush=True,
+                                )
+                                worker["simulator_state"] = _restart_simulator_for_current_scenario(
+                                    simulator_state,
+                                    reason="fast-reset writer recovery exhausted",
+                                )
+                                continue
+                            payload = _parse_run_method_output(stdout)
+                            return {
+                                "worker_index": worker["worker_index"],
+                                "snapshot_id": simulator_state["live_graph_snapshot_id"],
+                                "result_path": str(payload["result_path"]),
+                                "summary_path": str(payload["summary_path"]),
+                            }
+                        raise RuntimeError("unreachable writer-recovery loop exit")
 
-                        if args.skip_aggregate:
-                            continue
+                    with ThreadPoolExecutor(max_workers=len(worker_specs)) as executor:
+                        future_map = {executor.submit(run_worker, worker): worker for worker in worker_specs}
+                        for future in as_completed(future_map):
+                            worker = future_map[future]
+                            try:
+                                worker_result = future.result()
+                                if not worker_result.get("skipped"):
+                                    worker_runs.append(worker_result)
+                            except Exception as exc:
+                                worker_failures.append(
+                                    {
+                                        "worker_index": worker["worker_index"],
+                                        "error_type": type(exc).__name__,
+                                        "error": str(exc),
+                                    }
+                                )
+                    if worker_failures:
+                        raise RuntimeError(f"{len(worker_failures)} parallel worker(s) failed: {worker_failures}")
+                    merged = _merge_worker_results(
+                        experiment_id=experiment_id,
+                        scenario_id=scenario_id,
+                        method_id=method_id,
+                        worker_runs=worker_runs,
+                    )
+                    run_record = {
+                        "experiment_id": experiment_id,
+                        "scenario_id": scenario_id,
+                        "method_id": method_id,
+                        "task_count": task_count,
+                        "worker_count": len(worker_specs),
+                        "result_path": merged["result_path"],
+                        "summary_path": merged["summary_path"],
+                    }
+                    launched_runs.append(run_record)
+                    experiment_summaries[experiment_id]["successful_runs"].append(run_record)
 
+                    if not args.skip_aggregate:
                         _print_experiment_progress(
                             experiment_id=experiment_id,
                             experiment_index=experiment_index,
@@ -458,14 +771,14 @@ def main() -> None:
                             method_index=method_index,
                             method_total=method_total,
                             stage="aggregate",
-                            task_count=run_record["task_count"],
+                            task_count=task_count,
                         )
                         _run_command(
                             [
                                 str(PYTHON_EXE),
                                 str(AGGREGATE_SCRIPT),
                                 "--result-jsonl",
-                                str(payload["result_path"]),
+                                merged["result_path"],
                                 "--method",
                                 method_id,
                                 "--experiment",
@@ -475,27 +788,31 @@ def main() -> None:
                             ],
                             label=f"aggregate {experiment_id}/{scenario_id}/{method_id}",
                         )
-                    except Exception as exc:
-                        failure = {
-                            "stage": "run_or_aggregate",
-                            "experiment_id": experiment_id,
-                            "scenario_id": scenario_id,
-                            "method_id": method_id,
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                            "traceback": traceback.format_exc(),
-                        }
-                        failed_runs.append(failure)
-                        experiment_summaries[experiment_id]["failed_runs"].append(failure)
-                        _append_failed_run(failure)
-                        print(
-                            f"[launch][skip] failed {experiment_id}/{scenario_id}/{method_id}: {exc}",
-                            file=sys.stderr,
-                            flush=True,
+                except Exception as exc:
+                    failure = {
+                        "stage": "parallel_run_or_aggregate",
+                        "experiment_id": experiment_id,
+                        "scenario_id": scenario_id,
+                        "method_id": method_id,
+                        "worker_failures": worker_failures,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                    failed_runs.append(failure)
+                    experiment_summaries[experiment_id]["failed_runs"].append(failure)
+                    _append_failed_run(failure)
+                    print(
+                        f"[launch][skip] failed {experiment_id}/{scenario_id}/{method_id}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                finally:
+                    for worker in reversed(worker_specs):
+                        _stop_simulator(
+                            worker["simulator_state"],
+                            reason=f"{experiment_id}/{scenario_id}/{method_id} worker complete",
                         )
-                        continue
-            finally:
-                _stop_simulator(simulator_state, reason=f"{experiment_id}/{scenario_id} complete")
 
     print(
         json.dumps(

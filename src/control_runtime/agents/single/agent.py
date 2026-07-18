@@ -15,12 +15,22 @@ from shared.runtime import ArtifactWorkerMixin, ContextPolicy, ToolLoopExecution
 from shared.logging import log_event, log_timing
 
 from ...context.prompts import SinglePromptBuilder
-from ...domain.collaboration import PlanningContext, SharedControlContext
+from ...context.prompts.planning import OSA_DYNAMIC_RULES, OSA_OUTPUT_FORMAT_RULES, build_validation_retry_prompt
+from ...domain.collaboration import PlanningContext, PlanningRequest, SharedControlContext
 from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
-from ...domain.policy_plan import FlowSelector, PlanningRationale, PolicyDraft, PolicyPlanDraft
+from ...domain.policy_plan import (
+    FlowSelector,
+    GroundingDecision,
+    PlanningRationale,
+    PolicyDraft,
+    PolicyPlanDraft,
+    QosOperationConstraint,
+    SliceMigrationAuthorization,
+)
 from ..planning.planning_validation import normalize_policy_plan_draft
 from ..planning.compiler import OptimizationStrategyCompiler
 from ..planning.tool_result_adapter import extract_planning_tool_evidence
+from ..planning.response_models import OsaAdvisorOutput
 from .contracts import SingleAgentRoundDecision
 from .tools import build_single_agent_tools
 
@@ -157,6 +167,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         self.agent_name = "single_control"
         self.rag_enabled = rag_enabled
         self.plan_compiler = OptimizationStrategyCompiler()
+        self.last_round_detail: Dict[str, Any] = {}
         self.initialize_agent_runtime(logger_color="\033[96m")
 
     def create_json_agent(self, **kwargs: Any) -> Any:
@@ -208,6 +219,15 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> PolicyPlanDraft:
         self.ensure_worker_runtime_initialized()
         total_start = time.perf_counter()
+        self.last_round_detail = {
+            "agent": self.agent_name,
+            "model_name": self.model_name,
+            "rag_enabled": self.rag_enabled,
+            "session_id": session_id,
+            "snapshot_id": snapshot_id,
+            "round_index": round_index,
+            "attempts": [],
+        }
         log_event(self.logger, "single_control_round_plan_start", session_id=session_id, round_index=round_index)
 
         supi_match = re.search(r"(?i)(imsi-\d{5,})", str(user_input or ""))
@@ -230,59 +250,303 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
         requested_domains = self._hint_requested_domains(user_input)
         allow_knowledge_tools = self._should_allow_knowledge_tools(user_input)
-        advisor_agent = self.create_json_agent(
-            tools=build_single_agent_tools(
-                rag_enabled=self.rag_enabled,
-                requested_domains=requested_domains,
-                allow_knowledge_tools=allow_knowledge_tools,
-            ),
-            system_prompt=SinglePromptBuilder().system_prompt(),
-            response_model=SingleAgentRoundDecision,
-            max_iterations=12,
-            tool_error_mode="raise",
-            forbid_duplicate_tool_calls=True,
-            max_tool_result_chars=context_policy.default_tool_result_chars,
-            tool_result_limits=context_policy.tool_result_char_limits,
-            max_tool_result_tokens=context_policy.default_tool_result_tokens,
-            tool_result_token_limits=context_policy.tool_result_token_limits,
-            context_policy=context_policy,
-        )
-        prompt = self._build_round_prompt(
+        base_prompt = self._build_round_prompt(
             user_input=user_input,
             evidence=evidence,
             context=context,
             feedback_context=feedback_context,
         )
-        result = self._invoke_round_advisor(
-            advisor_agent=advisor_agent,
-            prompt=prompt,
-            runtime_context=runtime_context,
-        )
-        decision = coerce_structured_response(
-            result,
-            SingleAgentRoundDecision,
-            error_message="Single control agent returned no unified round decision",
-        )
+        current_prompt = base_prompt
+        advisor_output: Optional[OsaAdvisorOutput] = None
+        result: Dict[str, Any] = {}
+        planning_tool_evidence: Dict[str, Any] = {}
+        planning_request: Optional[PlanningRequest] = None
+        contract_errors: List[str] = []
 
-        planning_tool_evidence = extract_planning_tool_evidence(advisor_result=result)
-        planning_context = self._build_planning_context(
-            decision=decision,
-            user_input=user_input,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            round_index=round_index,
-            feedback_context=feedback_context,
-            round_traces=round_traces or [],
-            previous_mediator_decision=previous_mediator_decision or {},
-        )
-        policy_plan = self._assemble_policy_plan_from_decision(
-            decision=decision,
-            planning_context=planning_context,
-            planning_tool_evidence=planning_tool_evidence,
-            advisor_result=result,
+        # Match OSA's bounded repair behaviour: every retry gets the original
+        # contract plus focused validation feedback and prior tool evidence.
+        for attempt_index in range(3):
+            attempt_detail: Dict[str, Any] = {
+                "attempt_index": attempt_index + 1,
+                "prompt_mode": "initial" if attempt_index == 0 else "validation_retry",
+                "retry_issues": list(contract_errors),
+            }
+            advisor_agent = self.create_json_agent(
+                tools=build_single_agent_tools(
+                    rag_enabled=self.rag_enabled,
+                    requested_domains=requested_domains,
+                    allow_knowledge_tools=allow_knowledge_tools,
+                ),
+                system_prompt=SinglePromptBuilder().system_prompt(),
+                response_model=OsaAdvisorOutput,
+                max_iterations=12,
+                tool_error_mode="raise",
+                forbid_duplicate_tool_calls=True,
+                max_tool_result_chars=context_policy.default_tool_result_chars,
+                tool_result_limits=context_policy.tool_result_char_limits,
+                max_tool_result_tokens=context_policy.default_tool_result_tokens,
+                tool_result_token_limits=context_policy.tool_result_token_limits,
+                context_policy=context_policy,
+            )
+            try:
+                result = self._invoke_round_advisor(
+                    advisor_agent=advisor_agent,
+                    prompt=current_prompt,
+                    runtime_context=runtime_context,
+                )
+                advisor_output = coerce_structured_response(
+                    result,
+                    OsaAdvisorOutput,
+                    error_message="Single control agent returned no OsaAdvisorOutput",
+                )
+                planning_tool_evidence = extract_planning_tool_evidence(advisor_result=result)
+                attempt_detail["tool_calls"] = extract_tool_calls(result.get("messages") or [])
+                attempt_detail["tool_results"] = extract_tool_results(result.get("messages") or [])
+                attempt_detail["osa_advisor_output"] = advisor_output.model_dump(mode="json")
+                attempt_detail["planning_tool_evidence"] = planning_tool_evidence
+                planning_request = self._build_single_planning_request(
+                    advisor_output=advisor_output,
+                    advisor_result=result,
+                    user_input=user_input,
+                    supi=supi,
+                    session_id=session_id,
+                    snapshot_id=snapshot_id,
+                    round_index=round_index,
+                    feedback_context=feedback_context,
+                    round_traces=round_traces or [],
+                    previous_mediator_decision=previous_mediator_decision or {},
+                )
+                grounding_tools = [
+                    str(item.get("name") or "").strip()
+                    for item in extract_tool_results(result.get("messages") or [])
+                    if str(item.get("name") or "").strip()
+                ]
+                contract_errors = self.plan_compiler.validate_advisor_output(
+                    advisor_output=advisor_output,
+                    planning_request=planning_request,
+                    grounding_tools=grounding_tools,
+                    planning_tool_evidence=planning_tool_evidence,
+                )
+                attempt_detail["materialized_planning_request"] = planning_request.model_dump(mode="json")
+                attempt_detail["contract_errors"] = list(contract_errors)
+                attempt_detail["status"] = "validated" if not contract_errors else "contract_rejected"
+                self.last_round_detail["attempts"].append(attempt_detail)
+                if not contract_errors:
+                    break
+            except Exception as exc:
+                contract_errors = [str(exc)]
+                attempt_detail["status"] = "invocation_or_processing_error"
+                attempt_detail["error_type"] = type(exc).__name__
+                attempt_detail["error"] = str(exc)
+                if result:
+                    attempt_detail["tool_calls"] = extract_tool_calls(result.get("messages") or [])
+                    attempt_detail["tool_results"] = extract_tool_results(result.get("messages") or [])
+                self.last_round_detail["attempts"].append(attempt_detail)
+
+            if attempt_index == 2:
+                self.last_round_detail["status"] = "failed"
+                self.last_round_detail["failure_reason"] = "; ".join(contract_errors)
+                raise RuntimeError(
+                    "Single control OSA-equivalent contract validation failed: "
+                    + "; ".join(contract_errors)
+                )
+            current_prompt = build_validation_retry_prompt(
+                base_prompt=base_prompt,
+                issues=contract_errors,
+                cached_planning_evidence=planning_tool_evidence,
+            )
+
+        if advisor_output is None or planning_request is None:
+            raise RuntimeError("Single control agent returned no OSA-compatible planning result")
+        try:
+            policy_plan = self.plan_compiler.assemble_policy_plan(
+                advisor_output=advisor_output,
+                planning_request=planning_request,
+                planning_tool_evidence=planning_tool_evidence,
+            )
+        except Exception as exc:
+            self.last_round_detail.update(
+                {
+                    "status": "compiler_error",
+                    "error_type": type(exc).__name__,
+                    "failure_reason": str(exc),
+                    "final_osa_advisor_output": advisor_output.model_dump(mode="json"),
+                }
+            )
+            raise
+        self.last_round_detail.update(
+            {
+                "status": "success",
+                "final_osa_advisor_output": advisor_output.model_dump(mode="json"),
+                "final_policy_plan": policy_plan.model_dump(mode="json"),
+                "attempt_count": len(self.last_round_detail["attempts"]),
+            }
         )
         log_timing(self.logger, "single_control_round_plan_total", time.perf_counter() - total_start, status="success")
         return policy_plan
+
+    def _build_single_planning_request(
+        self,
+        *,
+        advisor_output: OsaAdvisorOutput,
+        advisor_result: Dict[str, Any],
+        user_input: str,
+        supi: str,
+        session_id: str,
+        snapshot_id: str,
+        round_index: int,
+        feedback_context: str,
+        round_traces: List[Dict[str, Any]],
+        previous_mediator_decision: Dict[str, Any],
+    ) -> PlanningRequest:
+        """Materialize the hidden IEA handoff used by the single-agent loop.
+
+        The model never emits that handoff.  It is reconstructed only from
+        catalog/tool evidence and the OSA-compatible output, which keeps the
+        same ownership boundary as Main -> IEA -> OSA.
+        """
+        active_domains = self._single_output_domains(advisor_output, user_input)
+        rows_by_id = self._catalog_rows_by_flow_id(advisor_result)
+        requested_flow_ids = [str(item.flow_id or "").strip() for item in advisor_output.sm_policies]
+        requested_flow_ids.extend(
+            str(item.get("flow_id") or "").strip()
+            for item in advisor_output.partial_policies
+            if isinstance(item, dict)
+        )
+        requested_flow_ids = list(dict.fromkeys(item for item in requested_flow_ids if item))
+        flows: List[FlowSelector] = []
+        for flow_id in requested_flow_ids:
+            row = rows_by_id.get(flow_id, {})
+            if row:
+                flows.append(FlowSelector.model_validate(
+                    self._flow_selector_payload(supi=supi, flow_id=flow_id, row=row)
+                ))
+                continue
+            matching = next((item for item in advisor_output.sm_policies if item.flow_id == flow_id), None)
+            app_id = str(getattr(matching, "app_id", "") or "").strip()
+            if flow_id and app_id:
+                flows.append(FlowSelector(supi=supi, app_id=app_id, flow_id=flow_id, name=flow_id))
+
+        retry_scope = "target_stable" if "retry_contract:" in feedback_context else "full_reground"
+        profile_name = self._single_objective_profile(user_input)
+        main_intent = GlobalControlIntent(
+            raw_input=str(user_input or "").strip(),
+            supi=supi,
+            next_agent="optimization_strategy",
+            round_strategy=(MainRoundStrategy.POLICY_REVISION if round_index > 1 else MainRoundStrategy.INITIAL_GROUNDING),
+            requested_domains=[ControlDomain(item) for item in active_domains],
+            objective_profile=ObjectiveProfile(profile_name=profile_name),
+            retry_scope=retry_scope,
+            required_evidence=self._required_evidence_from_domains(active_domains),
+        )
+        planning_context = PlanningContext(
+            round_index=round_index,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            shared_context=SharedControlContext(main_intent=main_intent),
+            feedback_context=feedback_context,
+            handoff_history=round_traces[-2:],
+            revision_requests=list(previous_mediator_decision.get("revision_requests") or []),
+            unified_constraints=dict(previous_mediator_decision.get("unified_constraints") or {}),
+        )
+        migration_required = self._requires_serving_slice_change(user_input)
+        subscription = self._single_subscription_evidence(advisor_result)
+        authorized_snssais = [
+            str(item or "").strip()
+            for item in (subscription.get("authorized_snssais") or [])
+            if str(item or "").strip()
+        ]
+        migration_decision = "not_applicable"
+        if migration_required:
+            migration_decision = "migration_authorized" if authorized_snssais else "evidence_missing"
+        return PlanningRequest(
+            grounding_decision=GroundingDecision(
+                flows=flows,
+                grounding_evidence={
+                    "grounded_supi": supi,
+                    "grounded_flows": [item.model_dump(mode="json") for item in flows],
+                    "evidence_sources": {"single_agent": ["get_sm_ue_flow_catalog"] if flows else []},
+                },
+                qos_operation_constraints=[
+                    QosOperationConstraint(
+                        flow_id=str(flow.flow_id or "").strip(),
+                        app_id=str(flow.app_id or "").strip(),
+                        operation_type="slice_migration" if migration_required else "qos_reallocation",
+                        require_slice_change=migration_required,
+                        no_op_allowed=not migration_required,
+                        rationale=["Single-agent hidden IEA migration decision"] if migration_required else [],
+                    )
+                    for flow in flows
+                    if str(flow.flow_id or "").strip() and str(flow.app_id or "").strip()
+                ],
+                slice_migration_authorization=SliceMigrationAuthorization(
+                    decision=migration_decision,
+                    authority=str(subscription.get("authority") or "").strip(),
+                    authorized_snssais=authorized_snssais,
+                    rationale=["Read-only subscription entitlement evidence was observed"] if subscription else [],
+                ),
+            ),
+            context=planning_context,
+        )
+
+    @staticmethod
+    def _single_output_domains(advisor_output: OsaAdvisorOutput, user_input: str) -> List[str]:
+        domains: List[str] = []
+        if advisor_output.sm_policies or any(
+            isinstance(item, dict) and str(item.get("policy_type") or "").lower() == "smpolicydecision"
+            for item in advisor_output.partial_policies
+        ):
+            domains.append("qos")
+        if advisor_output.am_policy is not None:
+            domains.append("mobility")
+        lowered = str(user_input or "").lower()
+        if not domains:
+            domains.append("qos")
+        mobility_markers = ("am policy", "rfsp", "allowed nssai", "target nssai", "handover", "registration", "服务区域", "移动性策略")
+        if any(marker in lowered for marker in mobility_markers) and not any(
+            marker in lowered for marker in ("do not change mobility", "不要动 mobility", "别影响移动性")
+        ):
+            domains.append("mobility")
+        if SingleControlAgent._requires_serving_slice_change(user_input):
+            domains.append("mobility")
+        return list(dict.fromkeys(domains))
+
+    @staticmethod
+    def _requires_serving_slice_change(user_input: str) -> bool:
+        lowered = str(user_input or "").lower()
+        explicit_markers = (
+            "move off the current slice",
+            "change serving snssai",
+            "serving s-nssai",
+            "target nssai",
+            "allowed nssai after",
+            "迁移到",
+            "切换到",
+            "更换服务切片",
+            "目标切片",
+        )
+        return any(marker in lowered for marker in explicit_markers)
+
+    @classmethod
+    def _single_subscription_evidence(cls, advisor_result: Dict[str, Any]) -> Dict[str, Any]:
+        for result in reversed(extract_tool_results((advisor_result or {}).get("messages") or [])):
+            if str(result.get("name") or "").strip() != "get_ue_slice_subscription":
+                continue
+            payload = cls._parse_json_content(result.get("content"))
+            if isinstance(payload, dict):
+                return payload
+        return {}
+
+    @staticmethod
+    def _single_objective_profile(user_input: str) -> str:
+        lowered = str(user_input or "").lower()
+        if any(token in lowered for token in ("latency", "delay", "时延")):
+            return "latency"
+        if any(token in lowered for token in ("throughput", "bandwidth", "带宽", "吞吐")):
+            return "throughput"
+        if any(token in lowered for token in ("stability", "stable", "稳定", "jitter", "可靠")):
+            return "stability"
+        return "balanced"
 
     @classmethod
     def _catalog_rows_by_flow_id(cls, advisor_result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -331,11 +595,13 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             f"{context or 'N/A'}\n\n"
             f"{feedback_block}"
             "Task:\n"
-            "- Stage 1: infer requested_domains and ground the required identifiers.\n"
-            "- Stage 2: use planning tools in the same loop and return executable policy payloads.\n"
-            "- If qos is active, flows and sm_policies must refer to the same grounded flow_ids.\n"
-            "- If mobility is active, am_policy must be backed by grounded UE mobility evidence.\n"
-            "- Return one final policy product JSON object only.\n"
+            "- Execute Main-equivalent routing, IEA-equivalent grounding, then OSA-equivalent planning in that order.\n"
+            "- Keep the first two stages internal; only return the final OsaAdvisorOutput.\n"
+            "- For QoS, sm_policies must use exact catalog-grounded flow_id/app_id pairs and current-round optimizer evidence.\n"
+            "- For mobility, am_policy must use current-round mobility evidence.\n"
+            "- Respect every retry_contract field as a binding repair constraint.\n\n"
+            f"{OSA_DYNAMIC_RULES.strip()}\n\n"
+            f"{OSA_OUTPUT_FORMAT_RULES.strip()}\n"
         )
 
     @classmethod
@@ -362,6 +628,13 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
 
     @classmethod
     def _normalize_final_dict_payload(cls, payload: Dict[str, Any], conversation: List[Any]) -> Optional[Dict[str, Any]]:
+        # Single Agent now speaks the same wire contract as OSA.  Preserve a
+        # valid OsaAdvisorOutput verbatim; legacy PCF normalization below is
+        # retained only to make historical traces readable.
+        try:
+            return OsaAdvisorOutput.model_validate(payload).model_dump(mode="json")
+        except Exception:
+            pass
         candidate = cls._sanitize_round_decision_payload(payload)
         try:
             return cls._dump_final_product(SingleAgentRoundDecision.model_validate(candidate))

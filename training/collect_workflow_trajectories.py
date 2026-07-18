@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
+from pydantic import BaseModel
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PACKAGE_ROOT.parent
 SRC_ROOT = PACKAGE_ROOT / "src"
@@ -23,13 +25,14 @@ from experiments.scripts.generate_user_inputs import (
     build_output,
     load_network_state,
 )
+from experiments.scripts.common import parse_task_ids
 from experiments.paths import default_catalog_input_path, workflow_experiment_input_path
 from control_runtime.integrations.scenario.init_scenario import rebuild_ue_related_tables_from_graph_snapshot
 from control_runtime.integrations.storage import get_latest_snapshot_metadata
 from training.common import ensure_agent_layout, processed_dir
-from training.schemas import write_jsonl
 from training.trajectory_projection import (
     WORKFLOW_AGENT_NAMES,
+    build_finetuning_trace_record,
     build_workflow_trajectory_record,
     index_projected_traces_by_session,
     load_projected_traces_by_agent,
@@ -111,9 +114,13 @@ def load_user_input_records(
     target_success_rate: float,
     seed: int,
     start_index: int = 1,
+    task_ids: Iterable[str] | str | None = None,
 ) -> List[Dict[str, Any]]:
     if start_index <= 0:
         raise ValueError("start_index must be positive")
+    selected_task_ids = parse_task_ids(task_ids)
+    if selected_task_ids and start_index != 1:
+        raise ValueError("--task-ids cannot be combined with --start-index")
     if user_inputs_path is not None:
         if not user_inputs_path.exists():
             raise FileNotFoundError(user_inputs_path)
@@ -126,11 +133,38 @@ def load_user_input_records(
             raw_records = payload
         else:
             raise TypeError(f"{user_inputs_path} must contain a JSON object or array")
-        selected_records = raw_records[start_index - 1 :]
+        if selected_task_ids:
+            requested_ids = set(selected_task_ids)
+            indexed_records = list(enumerate(raw_records, start=1))
+            found_ids: set[str] = set()
+            selected_records = []
+            for index, record in indexed_records:
+                if not isinstance(record, Mapping):
+                    continue
+                task_metadata = record.get("task_metadata") or {}
+                task_id = str(
+                    (task_metadata.get("task_id") if isinstance(task_metadata, Mapping) else "")
+                    or record.get("task_id")
+                    or ""
+                ).strip()
+                if task_id in requested_ids:
+                    found_ids.add(task_id)
+                    selected_records.append((index, record))
+            missing_ids = [task_id for task_id in selected_task_ids if task_id not in found_ids]
+            if missing_ids:
+                raise ValueError(
+                    "--task-ids contains task ids absent from "
+                    f"{user_inputs_path}: {', '.join(missing_ids)}"
+                )
+            return [_normalize_record(record, index) for index, record in selected_records]
+
+        selected_records = raw_records[start_index - 1 : start_index - 1 + count]
         if not selected_records:
             raise RuntimeError(f"No records found in {user_inputs_path} from start_index={start_index}")
         return [_normalize_record(record, index) for index, record in enumerate(selected_records, start=start_index)]
 
+    if selected_task_ids:
+        raise ValueError("--task-ids requires --user-inputs; generated network inputs have no stable task ids")
     network_state = load_network_state(network_input_path)
     payload = build_output(
         network_state,
@@ -141,16 +175,17 @@ def load_user_input_records(
     raw_records = payload.get("records", [])
     if not isinstance(raw_records, list):
         raise TypeError("generated user input payload must contain a 'records' list")
-    selected_records = raw_records[start_index - 1 :]
+    selected_records = raw_records[start_index - 1 : start_index - 1 + count]
     if not selected_records:
         raise RuntimeError(f"No generated records available from start_index={start_index}")
     return [_normalize_record(record, index) for index, record in enumerate(selected_records, start=start_index)]
 
 
-def _write_jsonl_incremental(path: Path, record: Dict[str, Any]) -> None:
+def _write_jsonl_incremental(path: Path, record: BaseModel | Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = record.model_dump(mode="json") if isinstance(record, BaseModel) else dict(record)
     with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False))
+        handle.write(json.dumps(payload, ensure_ascii=False))
         handle.write("\n")
         handle.flush()
 
@@ -211,74 +246,68 @@ def _merge_tags(record_tags: Iterable[str], extra_tags: Iterable[str]) -> List[s
     return ordered
 
 
-def _batch_session_ids(results: Iterable[Mapping[str, Any]]) -> List[str]:
-    session_ids: List[str] = []
-    for result in results:
-        session_id = str(result.get("session_id") or "").strip()
-        if session_id and session_id not in session_ids:
-            session_ids.append(session_id)
-    return session_ids
-
-
 def _agent_trajectory_output_path(agent_name: str, *, output_root: Path | None) -> Path:
     if output_root is None:
         return processed_dir(agent_name) / f"{agent_name}_trajectories_v1.jsonl"
     return output_root / agent_name / f"{agent_name}_trajectories_v1.jsonl"
 
 
-def _store_projected_trajectories(
+def _initialize_projection_outputs(
     *,
-    results: List[Dict[str, Any]],
     workflow_output: Path,
     agent_output_root: Path | None,
 ) -> Dict[str, Any]:
-    session_ids = _batch_session_ids(results)
-    traces_by_agent = load_projected_traces_by_agent(PACKAGE_ROOT, agent_names=WORKFLOW_AGENT_NAMES)
-    traces_by_session = index_projected_traces_by_session(traces_by_agent)
-
-    workflow_records = []
-    agent_records: Dict[str, List[Any]] = {agent_name: [] for agent_name in WORKFLOW_AGENT_NAMES}
-    skipped_without_session = 0
-
-    for result in results:
-        session_id = str(result.get("session_id") or "").strip()
-        if not session_id:
-            skipped_without_session += 1
-            continue
-        session_traces = traces_by_session.get(session_id)
-        if session_traces is None:
-            raise RuntimeError(f"Missing raw traces for workflow session {session_id}")
-        if "main_control" not in session_traces:
-            raise RuntimeError(f"Workflow session {session_id} is missing main_control raw trace")
-        workflow_records.append(
-            build_workflow_trajectory_record(
-                result,
-                session_traces=session_traces,
-                agent_order=WORKFLOW_AGENT_NAMES,
-            )
-        )
-        for agent_name in WORKFLOW_AGENT_NAMES:
-            agent_records[agent_name].extend(sort_traces(session_traces.get(agent_name, [])))
-
-    workflow_count = write_jsonl(workflow_output, workflow_records)
-
-    agent_counts: Dict[str, int] = {}
+    workflow_output.parent.mkdir(parents=True, exist_ok=True)
+    workflow_output.write_text("", encoding="utf-8")
     agent_paths: Dict[str, str] = {}
-    for agent_name, records in agent_records.items():
+    for agent_name in WORKFLOW_AGENT_NAMES:
         ensure_agent_layout(agent_name)
         output_path = _agent_trajectory_output_path(agent_name, output_root=agent_output_root)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        agent_counts[agent_name] = write_jsonl(output_path, records)
+        output_path.write_text("", encoding="utf-8")
         agent_paths[agent_name] = str(output_path)
-
     return {
-        "workflow_count": workflow_count,
+        "workflow_count": 0,
         "workflow_output": str(workflow_output),
-        "agent_counts": agent_counts,
+        "agent_counts": {agent_name: 0 for agent_name in WORKFLOW_AGENT_NAMES},
         "agent_outputs": agent_paths,
-        "session_ids": session_ids,
-        "skipped_without_session": skipped_without_session,
+        "session_ids": [],
+        "skipped_without_session": 0,
     }
+
+
+def _append_projected_case(
+    *,
+    result: Mapping[str, Any],
+    workflow_output: Path,
+    projection_summary: Dict[str, Any],
+) -> None:
+    session_id = str(result.get("session_id") or "").strip()
+    if not session_id:
+        projection_summary["skipped_without_session"] += 1
+        return
+
+    traces_by_agent = load_projected_traces_by_agent(PACKAGE_ROOT, agent_names=WORKFLOW_AGENT_NAMES)
+    session_traces = index_projected_traces_by_session(traces_by_agent).get(session_id)
+    if session_traces is None:
+        raise RuntimeError(f"Missing raw traces for workflow session {session_id}")
+    if "main_control" not in session_traces:
+        raise RuntimeError(f"Workflow session {session_id} is missing main_control raw trace")
+
+    workflow_record = build_workflow_trajectory_record(
+        result,
+        session_traces=session_traces,
+        agent_order=WORKFLOW_AGENT_NAMES,
+    )
+    _write_jsonl_incremental(workflow_output, workflow_record)
+    projection_summary["workflow_count"] += 1
+    projection_summary["session_ids"].append(session_id)
+
+    for agent_name in WORKFLOW_AGENT_NAMES:
+        output_path = Path(projection_summary["agent_outputs"][agent_name])
+        for trace in sort_traces(session_traces.get(agent_name, [])):
+            _write_jsonl_incremental(output_path, build_finetuning_trace_record(trace))
+            projection_summary["agent_counts"][agent_name] += 1
 
 
 def collect_workflow_trajectories(
@@ -294,6 +323,7 @@ def collect_workflow_trajectories(
     rag_enabled: bool,
     reset_scenario_each_run: bool,
     snapshot_id: str = "",
+    use_local_model: bool = False,
     use_deepseek: bool = False,
     case_finished_callback: Callable[[], None] | None = None,
 ) -> Dict[str, Any]:
@@ -320,16 +350,26 @@ def collect_workflow_trajectories(
 
     result_output.parent.mkdir(parents=True, exist_ok=True)
     result_output.write_text("", encoding="utf-8")
+    projection_summary = _initialize_projection_outputs(
+        workflow_output=workflow_output,
+        agent_output_root=agent_trajectory_output_root,
+    )
 
     total = len(records)
-    for record in records:
+    for record_position, record in enumerate(records):
+        # Reset at the hand-off to the next case, after the previous case's
+        # result and projected traces are durable.  Doing it at the end of
+        # every iteration needlessly starts a reset after the final case and
+        # made worker completion appear to hang on that unrelated reset.
+        if record_position > 0 and case_finished_callback is not None:
+            case_finished_callback()
         scenario_id = _scenario_id(record, prefix=scenario_prefix)
         merged_tags = _merge_tags(record.get("scenario_tags", []), scenario_tags)
         if reset_scenario_each_run:
             rebuild_ue_related_tables_from_graph_snapshot(bound_snapshot_id)
         orchestrator = MainControlOrchestrator(
             max_rounds=max_rounds,
-            use_local_model=False,
+            use_local_model=use_local_model,
             rag_enabled=rag_enabled,
             use_deepseek=use_deepseek,
         )
@@ -344,6 +384,7 @@ def collect_workflow_trajectories(
                 scenario_tags=merged_tags,
                 snapshot_id=bound_snapshot_id,
             )
+            agent_elapsed_ms = run_result.agent_elapsed_ms
             result_record = {
                 "record_index": record["record_index"],
                 "task_id": str((record.get("task_metadata") or {}).get("task_id") or "").strip(),
@@ -368,6 +409,8 @@ def collect_workflow_trajectories(
                 "round_count": run_result.round_count,
                 "retry_count": run_result.retry_count,
                 "round_traces": run_result.round_traces,
+                "agent_elapsed_ms": dict(agent_elapsed_ms),
+                "agent_elapsed_total_ms": float(agent_elapsed_ms["total"]),
             }
             print(
                 f"[{record['record_index']}/{total}] workflow done: session_id={run_result.session_id} completed={run_result.completed}",
@@ -398,6 +441,8 @@ def collect_workflow_trajectories(
                 "round_count": 0,
                 "retry_count": 0,
                 "round_traces": [],
+                "agent_elapsed_ms": {},
+                "agent_elapsed_total_ms": 0.0,
             }
             print(
                 f"[{record['record_index']}/{total}] workflow error: scenario_id={scenario_id} error={type(exc).__name__}: {exc}",
@@ -407,14 +452,11 @@ def collect_workflow_trajectories(
         result_record["elapsed_ms"] = round((time.perf_counter() - run_started_at) * 1000, 3)
         results.append(result_record)
         _write_jsonl_incremental(result_output, result_record)
-        if case_finished_callback is not None:
-            case_finished_callback()
-
-    projection_summary = _store_projected_trajectories(
-        results=results,
-        workflow_output=workflow_output,
-        agent_output_root=agent_trajectory_output_root,
-    )
+        _append_projected_case(
+            result=result_record,
+            workflow_output=workflow_output,
+            projection_summary=projection_summary,
+        )
     return {
         "results": results,
         "projection_summary": projection_summary,
@@ -444,6 +486,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--snapshot-id", type=str, default="", help="Existing network graph snapshot id to read.")
     parser.add_argument("--disable-rag", action="store_true")
+    parser.add_argument(
+        "--local-model",
+        action="store_true",
+        dest="use_local_model",
+        help="Use the OpenAI-compatible local vLLM endpoint configured by vLLM_URL and vLLM_MODEL_NAME.",
+    )
     parser.add_argument("--deepseek", action="store_true", dest="use_deepseek", help="Use deepseek-v4-flash for all agents.")
     parser.add_argument("--scenario-prefix", type=str, default="workflow-user-input")
     parser.add_argument(
@@ -530,6 +578,7 @@ def main() -> None:
         rag_enabled=not args.disable_rag,
         reset_scenario_each_run=not args.no_reset_scenario,
         snapshot_id=args.snapshot_id,
+        use_local_model=args.use_local_model,
         use_deepseek=args.use_deepseek,
     )
     results = collection["results"]

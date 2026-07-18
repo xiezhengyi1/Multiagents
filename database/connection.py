@@ -1,9 +1,10 @@
 import os
+import re
 import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -21,6 +22,16 @@ load_dotenv()
 logger = setup_logger(__name__)
 
 RAW_DATABASE_URL = os.getenv("DATABASE_URL")
+WORKER_SCHEMA = str(os.getenv("EXPERIMENT_WORKER_SCHEMA") or "").strip()
+
+
+def _validated_worker_schema(schema: str) -> str:
+    normalized = str(schema or "").strip()
+    if not normalized:
+        return ""
+    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", normalized):
+        raise RuntimeError(f"Invalid EXPERIMENT_WORKER_SCHEMA: {normalized!r}")
+    return normalized
 
 
 def to_sqlalchemy_url(database_url: str) -> str:
@@ -33,6 +44,7 @@ def to_sqlalchemy_url(database_url: str) -> str:
 
 
 DATABASE_URL = to_sqlalchemy_url(RAW_DATABASE_URL)
+WORKER_SCHEMA = _validated_worker_schema(WORKER_SCHEMA)
 
 Base = declarative_base()
 
@@ -57,6 +69,14 @@ try:
         pool_pre_ping=True,
         connect_args={"client_encoding": "utf8"},
     )
+    if WORKER_SCHEMA:
+        @event.listens_for(engine, "connect")
+        def _pin_worker_search_path(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute(f'SET search_path TO "{WORKER_SCHEMA}", public')
+            finally:
+                cursor.close()
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 except Exception as e:
     redacted_url = _redact_database_url(DATABASE_URL)
@@ -76,6 +96,7 @@ __all__ = [
     "DATABASE_URL",
     "RAW_DATABASE_URL",
     "SessionLocal",
+    "WORKER_SCHEMA",
     "engine",
     "get_db",
     "to_sqlalchemy_url",

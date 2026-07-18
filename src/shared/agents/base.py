@@ -21,11 +21,11 @@ load_dotenv()
 
 
 def resolve_agent_model_name(model_name: str = "", *, use_local_model: bool = False) -> str:
+    if use_local_model:
+        return str(os.getenv("vLLM_MODEL_NAME") or model_name or "").strip()
     env_model_name = str(os.getenv("MODEL_NAME") or "").strip()
     if env_model_name:
         return env_model_name
-    if use_local_model:
-        return str(os.getenv("vLLM_MODEL_NAME") or model_name or "").strip()
     return str(model_name or "qwen-plus").strip()
 
 

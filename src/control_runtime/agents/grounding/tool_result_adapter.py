@@ -8,7 +8,6 @@ from shared.runtime import extract_tool_calls, extract_tool_results
 
 TOOL_RESULT_MARKERS: Dict[str, str] = {
     "get_sm_ue_flow_catalog": "SM UE Flow Catalog Retrieved:",
-    "get_sm_ue_context": "SM UE Context Retrieved:",
     "search_sm_flow_targets": "SM Flow Target Search Retrieved:",
     "get_am_policy_context": "AM Policy Context Retrieved:",
     "search_am_policy_targets": "AM Policy Target Search Retrieved:",

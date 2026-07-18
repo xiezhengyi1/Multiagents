@@ -22,7 +22,7 @@ class RetryPromptBuilder:
 
         cleaned = _strip_retry_feedback(base_prompt)
         required_keys = (
-            "supi, round_strategy, next_agent, requested_domains, domain_evidence, "
+            "supi, round_strategy, next_agent, requested_domains, serving_slice_change_requested, domain_evidence, "
             "control_semantics, objective_profile, investigation_targets, uncertainty_flags, "
             "retry_scope, required_evidence, forbidden_assumptions, intent_encoding_guidance, "
             "routing_decision, routing_rationale, reuse_contract"
@@ -49,6 +49,7 @@ class RetryPromptBuilder:
             "GlobalControlIntent control_semantics is Main-owned; IEA never outputs it.\n"
             "For multi-SUPI requests, leave top-level supi empty and set each target.supi separately; never comma-join SUPIs.\n"
             "For exactly one explicit imsi-... in the user request, top-level supi and every semantic target.supi must equal that exact identifier; never leave either empty.\n"
+            "Set serving_slice_change_requested=true only for a structured serving-S-NSSAI change and then include exactly qos and mobility; otherwise set it false.\n"
             "If validation says execution_failure with stable bindings, route to optimization_strategy, set round_strategy=policy_revision, retry_scope=target_stable, and set reuse_contract.allowed=true.\n"
             "If a previous draft was a list, convert the intended route into the top-level GlobalControlIntent object.\n"
             "If a previous draft only contained reuse_contract fields, keep those fields nested under reuse_contract and add all missing routing fields.\n\n"
@@ -71,8 +72,8 @@ class RetryPromptBuilder:
         if grounding_validation_errors:
             issues.extend(grounding_validation_errors)
         repair_rules: List[str] = [
-            "Return one corrected GroundingDecision JSON object only.",
-            "Do not guess identifiers. Code materializes catalog SLA facts after parsing; select only catalog-grounded flow identities.",
+            "Return one corrected raw IEA decision JSON object only.",
+            "Do not guess identifiers. Runtime materializes catalog SLA, provenance, and subscription-entitlement facts after parsing; select only catalog-grounded flow identities and IEA-owned decisions.",
             "Return raw JSON only, with no markdown fence and no prose outside the JSON object.",
             "`open_questions` must be an array of objects with owner_agent, question, blocking, and related_domains; never emit question strings.",
             "For unresolved targets use app_id='', flow_id='', and resolution_status='unresolved'.",
@@ -91,14 +92,30 @@ class RetryPromptBuilder:
                     "Use at most 1 additional tool call if absolutely required; then finalize.",
                 ]
             )
+        if "mobility_intent" in joined and "valid dictionary" in joined:
+            repair_rules.append(
+                "Set mobility_intent to {} when no mobility fact is needed; never use null, a string, or prose."
+            )
+        if "qos_operation_constraints" in joined and (
+            "valid list" in joined
+            or "valid dictionary" in joined
+            or "input_type=str" in joined
+        ):
+            repair_rules.append(
+                "qos_operation_constraints must be a JSON array: use [] or [{...}], never a single object, quoted JSON string, or prose. Every array element is a JSON object."
+            )
+        if "target_slice_preference" in joined and "valid string" in joined:
+            repair_rules.append(
+                "Use target_slice_preference=\"\" when there is no preference; never use null."
+            )
         if "QoS GroundingDecision must include grounded target flows." in joined:
             repair_rules.extend(
                 [
                     "This retry is specifically failing because your previous JSON omitted flows.",
-                    "For the next answer, flows must be non-empty.",
-                    "If you already have a grounded QoS candidate in evidence, copy it into flows and finalize.",
+                    "For the next answer, flows must be non-empty even when migration is blocked or the target is unresolved.",
+                    "If you already have a grounded QoS candidate in evidence, return its compact resolved binding and finalize.",
                     "If only some explicit QoS targets are grounded, return resolved entries for those grounded targets and unresolved entries for the remaining explicit targets.",
-                    "If you still do not have a grounded QoS candidate, do not return an empty object; call the required SM grounding tool and then return an explicitly unresolved flow entry: {\"supi\":\"<known SUPI>\",\"name\":\"<target>\",\"resolution_status\":\"unresolved\"}.",
+                    "If you still do not have a grounded QoS candidate, do not return an empty object; return an explicitly unresolved flow entry: {\"app_id\":\"\",\"flow_id\":\"\",\"name\":\"<target>\",\"resolution_status\":\"unresolved\"}. Runtime attaches the Main-owned SUPI.",
                     "Do not spend another tool call to reconfirm a single exact candidate that is already grounded in evidence.",
                 ]
             )
@@ -112,16 +129,15 @@ class RetryPromptBuilder:
             )
         if (
             "slice_migration_authorization." in joined
-            and "Extra inputs are not permitted" in joined
+            or "slice migration requires an explicit slice_migration_authorization decision" in joined
+            or "slice migration authorization must preserve authorized S-NSSAI evidence" in joined
         ):
             repair_rules.extend(
                 [
-                    "Your previous JSON placed fields in the strict `slice_migration_authorization` object that do not belong there.",
-                    "That object may contain ONLY: decision, authority, authorized_snssais, target_snssais, subscription_change_required, rationale.",
-                    "Keep open_questions at the top level of GroundingDecision.",
-                    "Move source_slice_snssai and target_slice_preference to qos_operation_constraints[].",
-                    "Replace explicit_target_keys with target_snssais, and replace reason with rationale as an array of strings.",
-                    "Do not place any other fields under slice_migration_authorization, even when explaining why migration is blocked.",
+                    "Your raw `slice_migration_authorization` contains only decision, target_snssais, subscription_change_required, and rationale.",
+                    "Runtime injects authority and authorized_snssais from read-only entitlement evidence; never output either field.",
+                    "Choose exactly one decision: not_applicable, migration_authorized, blocked_by_subscription_entitlement, blocked_requires_subscription_provisioning, or evidence_missing. Never write migration_blocked.",
+                    "Keep open_questions at the top level. Keep source-slice and target-slice preference only in qos_operation_constraints[].",
                 ]
             )
         if (
@@ -144,7 +160,7 @@ class RetryPromptBuilder:
             repair_rules.extend(
                 [
                     "This retry is mobility-only.",
-                    "Do not call search_sm_flow_targets, get_sm_ue_context, or get_sm_ue_flow_catalog.",
+                    "Do not call search_sm_flow_targets or get_sm_ue_flow_catalog.",
                 ]
             )
         if "QoS-only intent must not call AM grounding tools" in joined:
@@ -170,7 +186,7 @@ class RetryPromptBuilder:
             repair_rules.extend(
                 [
                     "The user did not explicitly request a subscription add/change. Do NOT request provisioning and do NOT set subscription_change_required=true.",
-                    "Keep the requested target migration blocked with decision=\"blocked_by_subscription_entitlement\", authority=\"postgresql_ue_context\", the observed authorized_snssais, subscription_change_required=false, and a rationale that the entitlement is absent.",
+                    "Keep the requested target migration blocked with decision=\"blocked_by_subscription_entitlement\", target_snssais=[], subscription_change_required=false, and a rationale that the entitlement is absent. Runtime retains the observed authority and authorized S-NSSAIs.",
                     "Do not invent a target S-NSSAI or an AM/SM/URSP policy. Preserve only the grounded QoS intent for entitlement-limited best-effort planning.",
                 ]
             )

@@ -17,27 +17,27 @@ Never use knowledge tools:
 """
 
 
-IEA_KNOWLEDGE_SEARCH_SKILL = (
-    COMMON_KNOWLEDGE_SEARCH_SKILL
-    + """
-IEA-specific knowledge-search rules:
-- Search only for exact 3GPP semantic ambiguity that runtime grounding cannot answer.
-- If the unresolved fact is a local target binding, keep using runtime grounding tools or return the target as unresolved.
-- Never use knowledge tools to decide what a local app, flow, slice label, service_type_id, or business phrase should mean.
-- If runtime grounding cannot uniquely bind the named target, return unresolved rather than using the knowledge base to force an interpretation.
-"""
-)
-
-
 OSA_KNOWLEDGE_SEARCH_SKILL = (
     COMMON_KNOWLEDGE_SEARCH_SKILL
     + """
 OSA-specific knowledge-search rules:
-- Knowledge tools never replace `preview_qos_optimizer`, `fetch_qos_network_status`, or `inspect_mobility_ue_policies`.
+- Knowledge tools are callable only when they appear in the round's callable-tools list; this guidance is not permission to call them. They never replace `preview_qos_optimizer`, `fetch_qos_network_status`, or `inspect_mobility_ue_policies`.
 - Search only when one required executable field still depends on an exact external 3GPP object or enumerated token that local runtime evidence does not provide.
 - If an executable field is blocked by missing optimizer or mobility evidence, return `partial_plan` or `needs_upstream_reground` instead of searching for a standards-side substitute.
 - Never use knowledge tools to validate, justify, or soften values that are already fixed by optimizer output, live UE context, or local schema.
 - You have at most 1 call to `get_knowledge_by_key` per round. If it does not resolve the missing fact exactly, finalize from current evidence. Do not retry the same knowledge lookup.
+"""
+)
+
+
+IEA_KNOWLEDGE_SEARCH_SKILL = (
+    COMMON_KNOWLEDGE_SEARCH_SKILL
+    + """
+IEA-specific knowledge-search rules:
+- Knowledge tools are callable only when they appear in the round's callable-tools list; this guidance is not permission to call them.
+- Never use a standards lookup for local SUPI, flow/app identity, slice entitlement, SLA/allocation, or scenario labels: those facts must come from IEA runtime tools.
+- If runtime catalog/search evidence cannot bind a named QoS target, return the target as unresolved; do not use knowledge search to guess a local identifier.
+- If an exact external semantic fact remains necessary but no callable knowledge tool can provide it, record an open question or return the target as unresolved.
 """
 )
 

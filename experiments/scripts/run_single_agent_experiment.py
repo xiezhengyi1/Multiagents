@@ -17,7 +17,7 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
 from control_runtime.integrations.scenario.init_scenario import rebuild_ue_related_tables_from_graph_snapshot
 from control_runtime.orchestrators.single_agent_orchestrator import SingleAgentOrchestrator
 from experiments.paths import default_catalog_input_path, resolve_scenario_source_path
-from experiments.scripts.common import append_jsonl, reset_simulator_state, write_json
+from experiments.scripts.common import append_jsonl, parse_task_ids, reset_simulator_state, write_json
 from training.collect_workflow_trajectories import load_user_input_records
 from training.common import processed_dir
 
@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-inputs", type=Path, default=default_catalog_input_path())
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--start-index", type=int, default=1, help="1-based record index to start from.")
+    parser.add_argument(
+        "--task-ids",
+        default="",
+        help="Optional comma-separated stable task ids. If omitted, use --start-index and --count.",
+    )
     parser.add_argument("--target-success-rate", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-rounds", type=int, default=1)
@@ -70,6 +75,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scenario-prefix", type=str, default="single-agent-experiment")
     parser.add_argument("--scenario-tag", action="append", default=["single_agent_experiment"])
     parser.add_argument("--disable-rag", action="store_true")
+    parser.add_argument(
+        "--local-model",
+        action="store_true",
+        dest="use_local_model",
+        help="Use the OpenAI-compatible local vLLM endpoint configured by vLLM_URL and vLLM_MODEL_NAME.",
+    )
     parser.add_argument(
         "--qwen",
         action="store_true",
@@ -96,6 +107,7 @@ def main() -> None:
     snapshot_id = str(args.snapshot_id or "").strip()
     if not snapshot_id:
         raise ValueError("--snapshot-id is required so Multiagents reads an existing graph snapshot")
+    task_ids = parse_task_ids(args.task_ids)
     records = load_user_input_records(
         user_inputs_path=args.user_inputs,
         network_input_path=None,
@@ -103,6 +115,7 @@ def main() -> None:
         target_success_rate=args.target_success_rate,
         seed=args.seed,
         start_index=args.start_index,
+        task_ids=task_ids,
     )
     args.result_output.parent.mkdir(parents=True, exist_ok=True)
     args.result_output.write_text("", encoding="utf-8")
@@ -127,7 +140,7 @@ def main() -> None:
         rebuild_ue_related_tables_from_graph_snapshot(snapshot_id)
         orchestrator = SingleAgentOrchestrator(
             max_rounds=args.max_rounds,
-            use_local_model=False,
+            use_local_model=args.use_local_model,
             rag_enabled=not args.disable_rag,
             single_model_name=QWEN_SINGLE_AGENT_MODEL if args.use_qwen else "",
         )
@@ -162,6 +175,7 @@ def main() -> None:
                 "round_count": run_result.round_count,
                 "retry_count": run_result.retry_count,
                 "round_traces": run_result.round_traces,
+                "single_agent_details": run_result.single_agent_details,
             }
         except Exception as exc:
             result_record = {
@@ -185,6 +199,7 @@ def main() -> None:
                 "round_count": 0,
                 "retry_count": 0,
                 "round_traces": [],
+                "single_agent_details": [],
             }
         result_record["elapsed_ms"] = round((time.perf_counter() - run_started_at) * 1000, 3)
         results.append(result_record)

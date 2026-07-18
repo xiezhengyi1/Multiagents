@@ -5,11 +5,8 @@ from .knowledge_search import IEA_KNOWLEDGE_SEARCH_SKILL
 
 
 IEA_DYNAMIC_RULES = """
-Dynamic grounding rules for this round:
-- Treat Main's routing and retry scope from the user prompt as binding guidance.
-- Preserve stable artifacts only when the evidence still supports them.
-- Use cached evidence directly when it already grounds the answer.
-- Call tools only when a required target is still ambiguous.
+Round discipline: use cached evidence; call a tool only for a required missing fact;
+preserve stable bindings unless fresh evidence contradicts them.
 """
 
 

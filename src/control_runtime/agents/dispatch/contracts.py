@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class FeedbackReport(BaseModel):
     execution_status: str = Field(description="Deterministic execution result: Success, Partial Success, or Failed")
+    intent_status: str = Field(default="satisfied", description="Whether the original user intent was satisfied, partially satisfied, or unsatisfied")
     performance_metrics: str = Field(description="Serialized dispatch receipts and assurance verdicts produced by the execution controller")
     violation_details: str = Field(description="Concrete deterministic failure or violation details, or None")
     failure_scope: str = Field(default="none", description="Raw failure scope observed during execution: qos, mobility, mixed, compile, or none")
