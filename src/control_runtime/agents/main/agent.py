@@ -6,14 +6,18 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from pydantic import BaseModel, ConfigDict
+
 from shared.runtime import ArtifactEnvelope
 from shared.runtime import ToolLoopExecutionError
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.runtime import ArtifactWorkerMixin
 from ...domain.control_plane import (
     GlobalControlIntent,
+    MainControlDecision,
     MainRetryScope,
     MainRoundStrategy,
+    ReuseContract,
 )
 from shared.logging import log_event
 
@@ -44,8 +48,54 @@ class MainControlInvocation:
         )
 
 
+class MainControlDecisionWire(BaseModel):
+    """Permissive transport shape repaired before strict decision validation."""
+
+    model_config = ConfigDict(extra="allow")
+
+    supi: str = ""
+    next_agent: str = ""
+    requested_domains: List[Any] = []
+    serving_slice_change_requested: bool = False
+    domain_evidence: Dict[str, Any] = {}
+    control_semantics: Dict[str, Any] = {}
+    objective_profile: Dict[str, Any] = {}
+    investigation_targets: List[Any] = []
+    uncertainty_flags: List[Any] = []
+    retry_scope: str = ""
+    required_evidence: List[Any] = []
+    forbidden_assumptions: List[Any] = []
+    intent_encoding_guidance: str = ""
+
+
 class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "main_control"
+    _CONTROL_SEMANTICS_LEAK_FIELDS = (
+        "objective_profile",
+        "investigation_targets",
+        "uncertainty_flags",
+        "retry_scope",
+        "required_evidence",
+        "forbidden_assumptions",
+        "intent_encoding_guidance",
+        "routing_decision",
+        "routing_rationale",
+        "reuse_contract",
+    )
+    _DECISION_FIELDS = frozenset(
+        {
+            "supi", "next_agent", "requested_domains", "serving_slice_change_requested",
+            "domain_evidence", "control_semantics", "objective_profile",
+            "investigation_targets", "uncertainty_flags", "retry_scope",
+            "required_evidence", "forbidden_assumptions", "intent_encoding_guidance",
+        }
+    )
+    _COMPILED_FIELDS = frozenset(
+        {
+            "session_id", "snapshot_id", "raw_input", "round_strategy",
+            "routing_decision", "routing_rationale", "reuse_contract",
+        }
+    )
 
     def __init__(self, model_name: str = "qwen3-30b-a3b-instruct-2507", use_local_model: bool = False) -> None:
         super().__init__(model_name=model_name, use_local_model=use_local_model)
@@ -55,8 +105,33 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         self.agent = self.create_json_agent(
             tools=self.tools,
             system_prompt=MainPromptBuilder().system_prompt(),
-            response_model=GlobalControlIntent,
+            response_model=MainControlDecisionWire,
             max_iterations=6,
+        )
+        self.reset_schema_projection_metrics()
+
+    def reset_schema_projection_metrics(self) -> None:
+        self._schema_projection_count = 0
+        self._schema_projected_fields: List[str] = []
+
+    @property
+    def schema_projection_metrics(self) -> Dict[str, Any]:
+        return {
+            "count": self._schema_projection_count,
+            "field_count": len(self._schema_projected_fields),
+            "fields": list(dict.fromkeys(self._schema_projected_fields)),
+        }
+
+    def _record_schema_projection(self, fields: List[str]) -> None:
+        if not fields:
+            return
+        self._schema_projection_count += 1
+        self._schema_projected_fields.extend(fields)
+        log_event(
+            self.logger,
+            "main_control_schema_projected",
+            projected_field_count=len(fields),
+            projected_fields=",".join(fields),
         )
 
     def analyze_global_intent(
@@ -76,7 +151,8 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 f"User input:\n{user_input}\n\n"
                 f"Coordinator context:\n{context or 'N/A'}\n\n"
                 f"{MAIN_CONTROL_DYNAMIC_RULES.strip()}\n\n"
-                "Resolve only the round-level domain routing, retry scope, explicit SUPI already present in the request, and keep intent_encoding_guidance empty unless non-empty routing guidance is strictly necessary."
+                "Resolve the staged semantic plan, round-level routing, retry scope, and explicit SUPI already present in the request. "
+                "On a retry routed to intent_encoding, provide explicit intent_encoding_guidance; otherwise leave it empty unless needed."
             ),
         }
         token_budget, token_counter = self._resolve_token_context()
@@ -108,14 +184,23 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                     session_id=session_id,
                     snapshot_id=snapshot_id,
                 )
+                projected_fields: List[str] = []
                 try:
                     invocation = self._invoke_global_intent_result(
                         current_prompt,
                         runtime_context=runtime_context,
                         trace_metadata=base_trace_metadata,
                     )
-                    parsed_intent = self._validate_global_intent_result(invocation.raw_result)
+                    parsed_intent = self._validate_global_intent_result(
+                        invocation.raw_result,
+                        user_input=user_input,
+                        session_id=session_id,
+                        snapshot_id=snapshot_id,
+                        context=context,
+                        projected_fields=projected_fields,
+                    )
                 except RuntimeError as exc:
+                    self._record_schema_projection(projected_fields)
                     invocation_error = str(exc)
                     log_event(
                         self.logger,
@@ -132,12 +217,8 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                         invocation_error=invocation_error,
                     )
                     continue
+                self._record_schema_projection(projected_fields)
                 intent = parsed_intent
-                self._normalize_retry_routing(
-                    intent,
-                    user_input=user_input,
-                    context=context,
-                )
                 self._normalize_semantic_target_scope(
                     intent,
                     user_input=user_input,
@@ -166,7 +247,7 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 )
                 if attempt_index == 2:
                     raise RuntimeError(
-                        "Main Agent could not produce a valid GlobalControlIntent: "
+                        "Main Agent could not produce a valid MainControlDecision: "
                         + "; ".join(validation_errors)
                     )
                 current_prompt = self._build_validation_retry_prompt(
@@ -176,17 +257,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 )
             if intent is None:
                 raise RuntimeError("Main Agent returned no intent payload")
-            if not intent.session_id:
-                intent.session_id = session_id
-            if not intent.snapshot_id:
-                intent.snapshot_id = snapshot_id
-            if not intent.raw_input:
-                intent.raw_input = user_input
-            self._enrich_global_intent_contract(
-                intent,
-                context=context,
-                user_input=user_input,
-            )
             if invocation is None:
                 raise RuntimeError("Main Agent finished without a trace invocation")
             invocation.write_final_trace(
@@ -248,28 +318,127 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
     @staticmethod
-    def _validate_global_intent_result(result: Dict[str, Any]) -> GlobalControlIntent:
+    def _validate_global_intent_result(
+        result: Dict[str, Any],
+        *,
+        user_input: str = "",
+        session_id: str = "",
+        snapshot_id: str = "",
+        context: str = "",
+        projected_fields: Optional[List[str]] = None,
+    ) -> GlobalControlIntent:
         try:
-            intent = coerce_structured_response(
-                MainControlAgent._repair_global_intent_payload(result),
-                GlobalControlIntent,
-                error_message="Main Agent returned no structured_response",
+            raw_payload = MainControlAgent._raw_structured_payload(result)
+            decision = coerce_structured_response(
+                MainControlAgent._repair_global_intent_payload(
+                    result,
+                    projected_fields=projected_fields,
+                ),
+                MainControlDecision,
+                error_message="Main Agent returned no structured MainControlDecision",
             )
-            return intent
+            return MainControlAgent._compile_global_intent(
+                decision,
+                user_input=str(user_input or raw_payload.get("raw_input") or ""),
+                session_id=session_id or str(raw_payload.get("session_id") or ""),
+                snapshot_id=snapshot_id or str(raw_payload.get("snapshot_id") or ""),
+                context=context,
+            )
         except Exception as exc:
-            raise RuntimeError(f"Main Agent returned invalid GlobalControlIntent payload: {exc}") from exc
+            raise RuntimeError(f"Main Agent returned invalid MainControlDecision payload: {exc}") from exc
 
     @staticmethod
-    def _repair_global_intent_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    def _raw_structured_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+        structured = result.get("structured_response")
+        if isinstance(structured, BaseModel):
+            return structured.model_dump(mode="json", exclude_unset=True)
+        if isinstance(structured, str):
+            try:
+                structured = json.loads(structured)
+            except json.JSONDecodeError:
+                return {}
+        return dict(structured) if isinstance(structured, dict) else {}
+
+    @staticmethod
+    def _compile_global_intent(
+        decision: MainControlDecision,
+        *,
+        user_input: str,
+        session_id: str,
+        snapshot_id: str,
+        context: str,
+    ) -> GlobalControlIntent:
+        parsed_context = MainControlAgent._parse_context_payload(context)
+        try:
+            round_index = int(parsed_context.get("round_index") or 1)
+        except (TypeError, ValueError):
+            round_index = 1
+        next_agent = str(decision.next_agent or "").strip()
+        if round_index <= 1:
+            round_strategy = MainRoundStrategy.INITIAL_GROUNDING
+            retry_scope = MainRetryScope.FULL_REGROUND
+        elif next_agent == "optimization_strategy":
+            round_strategy = MainRoundStrategy.POLICY_REVISION
+            retry_scope = decision.retry_scope or MainRetryScope.TARGET_STABLE
+        else:
+            round_strategy = MainRoundStrategy.REGROUNDING
+            retry_scope = decision.retry_scope or MainRetryScope.FULL_REGROUND
+
+        reuse_allowed = next_agent == "optimization_strategy"
+        guidance = str(decision.intent_encoding_guidance or "").strip()
+        if round_index > 1 and next_agent == "intent_encoding" and not guidance:
+            guidance = "Re-ground the active stage using required_evidence; do not assume forbidden_assumptions."
+        domains = ",".join(item.value for item in decision.requested_domains) or "none"
+        return GlobalControlIntent(
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            raw_input=user_input,
+            supi=decision.supi,
+            round_strategy=round_strategy,
+            next_agent=decision.next_agent,
+            requested_domains=decision.requested_domains,
+            serving_slice_change_requested=decision.serving_slice_change_requested,
+            domain_evidence=decision.domain_evidence,
+            control_semantics=decision.control_semantics,
+            objective_profile=decision.objective_profile,
+            investigation_targets=decision.investigation_targets,
+            uncertainty_flags=decision.uncertainty_flags,
+            retry_scope=retry_scope,
+            required_evidence=decision.required_evidence,
+            forbidden_assumptions=decision.forbidden_assumptions,
+            intent_encoding_guidance=guidance,
+            routing_decision=f"{round_strategy.value}_{next_agent}_{domains}",
+            routing_rationale=(
+                f"Round {round_index}: route {domains} control through {next_agent}; "
+                "preserve the Main-owned staged semantic plan."
+            ),
+            reuse_contract=ReuseContract(
+                allowed=reuse_allowed,
+                preserve_bindings=reuse_allowed,
+                preserve_domains=reuse_allowed,
+                preserve_stage_scope=reuse_allowed,
+                invalidate_on=[] if reuse_allowed else ["reground_required"],
+            ),
+        )
+
+    @staticmethod
+    def _repair_global_intent_payload(
+        result: Dict[str, Any],
+        *,
+        projected_fields: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Recover known Main/IEA ownership leaks before strict validation.
 
         The Main agent sometimes places IEA-owned flow fields on a semantic
-        target or confuses uncertainty flags with investigation targets.  Both
-        are lossy presentation errors: the target name/SUPI and uncertainty
-        flag remain intact, while IEA still grounds all concrete identifiers.
+        target, confuses uncertainty flags with investigation targets, or
+        nests Main decision fields under control_semantics.  Compiler-owned
+        artifact fields are discarded; decision fields are promoted before
+        strict validation.
         """
         structured = result.get("structured_response")
-        if isinstance(structured, GlobalControlIntent) or not isinstance(structured, (dict, str)):
+        if isinstance(structured, BaseModel):
+            structured = structured.model_dump(mode="json", exclude_unset=True)
+        if not isinstance(structured, (dict, str)):
             return result
         if isinstance(structured, str):
             try:
@@ -280,6 +449,21 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             return result
 
         repaired = deepcopy(structured)
+        for field_name in MainControlAgent._COMPILED_FIELDS:
+            if field_name in repaired:
+                repaired.pop(field_name)
+                if projected_fields is not None:
+                    projected_fields.append(field_name)
+        semantics = repaired.get("control_semantics")
+        if isinstance(semantics, dict):
+            for field_name in MainControlAgent._CONTROL_SEMANTICS_LEAK_FIELDS:
+                if field_name not in semantics:
+                    continue
+                leaked_value = semantics.pop(field_name)
+                if field_name in MainControlAgent._DECISION_FIELDS and field_name not in repaired:
+                    repaired[field_name] = leaked_value
+                if projected_fields is not None:
+                    projected_fields.append(field_name)
         for stage in (repaired.get("control_semantics") or {}).get("stages") or []:
             if not isinstance(stage, dict):
                 continue
@@ -331,16 +515,10 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> List[str]:
         errors: List[str] = []
         parsed_context = MainControlAgent._parse_context_payload(context)
-        round_index = 0
-        round_match = re.search(r"(?im)^\s*-\s*round_index:\s*(\d+)\s*$", str(context or ""))
-        if round_match:
-            round_index = int(round_match.group(1))
-        else:
-            if isinstance(parsed_context, dict):
-                try:
-                    round_index = int(parsed_context.get("round_index") or 0)
-                except (TypeError, ValueError):
-                    round_index = 0
+        try:
+            round_index = int(parsed_context.get("round_index") or 1)
+        except (TypeError, ValueError):
+            round_index = 1
         if not intent.requested_domains:
             errors.append("requested_domains is empty")
         else:
@@ -354,9 +532,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         domain_values = {item.value for item in intent.requested_domains}
         if intent.serving_slice_change_requested and domain_values != {"qos", "mobility"}:
             errors.append("serving_slice_change_requested requires requested_domains=[qos,mobility]")
-        round_strategy = str(intent.round_strategy.value if hasattr(intent.round_strategy, "value") else intent.round_strategy or "").strip()
-        if round_index <= 1 and round_strategy != "initial_grounding":
-            errors.append("round-1 main routing must set round_strategy=initial_grounding")
         explicit_supis = re.findall(r"(?i)(imsi-\d{5,})", str(user_input or ""))
         unique_explicit_supis = list(dict.fromkeys(explicit_supis))
         if len(unique_explicit_supis) == 1:
@@ -375,38 +550,11 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
                 errors.append(
                     f"domain_evidence must cover every requested domain: requested={sorted(requested)} evidence={sorted(evidence_keys)}"
                 )
-        retry_scope = (
-            intent.retry_scope.value
-            if getattr(intent, "retry_scope", None) is not None and hasattr(intent.retry_scope, "value")
-            else str(getattr(intent, "retry_scope", "") or "").strip()
-        )
-        if round_index <= 1 and retry_scope and retry_scope != "full_reground":
-            intent.retry_scope = MainRetryScope.FULL_REGROUND
-            retry_scope = "full_reground"
         next_agent = str(intent.next_agent or "").strip()
-        if not str(intent.routing_decision or "").strip():
-            errors.append("routing_decision must not be empty")
-        if not str(intent.routing_rationale or "").strip():
-            errors.append("routing_rationale must not be empty")
-        if next_agent == "optimization_strategy" and not bool(intent.reuse_contract.allowed):
-            errors.append("next_agent=optimization_strategy requires reuse_contract.allowed=true")
-        if next_agent == "intent_encoding" and intent.reuse_contract.allowed:
-            errors.append("reuse_contract.allowed must be false when next_agent=intent_encoding")
-        if round_index > 1 and MainControlAgent._context_indicates_stable_execution_failure(
-            parsed_context=parsed_context,
-            context=context,
-        ):
-            if (
-                next_agent != "optimization_strategy"
-                or retry_scope != "target_stable"
-                or not bool(intent.reuse_contract.allowed)
-            ):
-                errors.append(
-                    "execution_failure with stable bindings must route to optimization_strategy "
-                    "with retry_scope=target_stable and reuse_contract.allowed=true"
-                )
         if next_agent == "intent_encoding" and not str(intent.intent_encoding_guidance or "").strip() and round_index > 1:
             errors.append("retry routing into intent_encoding requires explicit intent_encoding_guidance")
+        if next_agent != "intent_encoding" and str(intent.intent_encoding_guidance or "").strip():
+            errors.append("intent_encoding_guidance must stay empty unless next_agent=intent_encoding")
         if len(unique_explicit_supis) == 1:
             explicit_supi = unique_explicit_supis[0]
             for stage_index, stage in enumerate(intent.control_semantics.stages or [], start=1):
@@ -449,86 +597,6 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
         return payload
 
     @staticmethod
-    def _context_indicates_stable_execution_failure(
-        *,
-        parsed_context: Dict[str, Any],
-        context: str,
-    ) -> bool:
-        if not isinstance(parsed_context, dict):
-            parsed_context = {}
-        diagnosis = parsed_context.get("previous_diagnosis") if isinstance(parsed_context.get("previous_diagnosis"), dict) else {}
-        category = str(diagnosis.get("root_cause_category") or "").strip().lower()
-        if category != "execution_failure":
-            return False
-        context_text = (json.dumps(parsed_context, ensure_ascii=False) + "\n" + str(context or "")).lower()
-        unstable_markers = (
-            "wrong binding",
-            "binding is wrong",
-            "stale binding",
-            "identifier conflict",
-            "missing_flow_binding",
-            "missing grounded assignment",
-            "wrong_supi",
-        )
-        if any(marker in context_text for marker in unstable_markers):
-            return False
-        previous_grounding_decision = (
-            parsed_context.get("previous_grounding_decision")
-            if isinstance(parsed_context.get("previous_grounding_decision"), dict)
-            else {}
-        )
-        bindings = previous_grounding_decision.get("flow_bindings") if isinstance(previous_grounding_decision.get("flow_bindings"), list) else []
-        return any(
-            isinstance(item, dict)
-            and str(item.get("resolution_status") or "").strip().lower() == "resolved"
-            and str(item.get("flow_id") or "").strip()
-            and str(item.get("app_id") or "").strip()
-            for item in bindings
-        )
-
-    @staticmethod
-    def _normalize_retry_routing(
-        intent: GlobalControlIntent,
-        *,
-        user_input: str,
-        context: str = "",
-    ) -> None:
-        parsed_context = MainControlAgent._parse_context_payload(context)
-        try:
-            round_index = int(parsed_context.get("round_index") or 0)
-        except (TypeError, ValueError):
-            round_index = 0
-        if round_index <= 1:
-            return
-        if not MainControlAgent._context_indicates_stable_execution_failure(
-            parsed_context=parsed_context,
-            context=context,
-        ):
-            return
-
-        explicit_supis = re.findall(r"(?i)(imsi-\d{5,})", str(user_input or ""))
-        unique_explicit_supis = list(dict.fromkeys(explicit_supis))
-        if len(unique_explicit_supis) == 1:
-            intent.supi = unique_explicit_supis[0]
-        elif len(unique_explicit_supis) > 1:
-            intent.supi = ""
-
-        intent.next_agent = "optimization_strategy"
-        intent.round_strategy = MainRoundStrategy.POLICY_REVISION
-        intent.retry_scope = MainRetryScope.TARGET_STABLE
-        intent.intent_encoding_guidance = ""
-        intent.reuse_contract.allowed = True
-        intent.reuse_contract.preserve_bindings = True
-        intent.reuse_contract.preserve_domains = True
-        intent.reuse_contract.preserve_stage_scope = True
-        intent.reuse_contract.invalidate_on = []
-        intent.routing_decision = "retry_policy_revision_target_stable"
-        intent.routing_rationale = (
-            "Previous execution failed after IEA had already produced stable resolved bindings; "
-            "reuse the target binding and revise only executable policy values in OSA."
-        )
-
-    @staticmethod
     def _normalize_semantic_target_scope(
         intent: GlobalControlIntent,
         *,
@@ -547,13 +615,3 @@ class MainControlAgent(BaseAgent, ArtifactWorkerMixin):
             for target in stage.targets or []:
                 if not str(target.supi or "").strip():
                     target.supi = default_supi
-
-    @staticmethod
-    def _enrich_global_intent_contract(
-        intent: GlobalControlIntent,
-        *,
-        context: str,
-        user_input: str,
-    ) -> None:
-        if intent.intent_encoding_guidance and str(intent.next_agent or "").strip() != "intent_encoding":
-            raise ValueError("intent_encoding_guidance must stay empty unless next_agent=intent_encoding")

@@ -32,6 +32,7 @@ SIMULATOR_RESET_URL = str(os.getenv("SIMULATOR_RESET_URL") or "http://127.0.0.1:
 SIMULATOR_RESET_TIMEOUT_SECONDS = 120.0
 SIMULATOR_RESET_RETRY_INTERVAL_SECONDS = 1.0
 SIMULATOR_RESET_REQUEST_TIMEOUT_SECONDS = 5.0
+SIMULATOR_RESET_POST_TIMEOUT_SECONDS = 90.0
 SIMULATOR_RESET_MAX_RECOVERY_REQUESTS = 3
 SIMULATOR_RESET_RECOVERY_GRACE_SECONDS = 10.0
 POLICY_GATEWAY_HEALTHCHECK_PATH = "/policy-executions/launch-healthcheck"
@@ -41,6 +42,14 @@ def _bounded_request_timeout(*, deadline: float) -> float:
     """Keep one unavailable endpoint from consuming the whole reset budget."""
     return min(
         SIMULATOR_RESET_REQUEST_TIMEOUT_SECONDS,
+        max(0.01, deadline - time.monotonic()),
+    )
+
+
+def _bounded_reset_post_timeout(*, deadline: float) -> float:
+    """A reset POST is synchronous; do not abandon a normal cold start early."""
+    return min(
+        SIMULATOR_RESET_POST_TIMEOUT_SECONDS,
         max(0.01, deadline - time.monotonic()),
     )
 
@@ -126,7 +135,7 @@ def reset_simulator_state(
         if not reset_accepted:
             attempts += 1
             try:
-                response = requests.post(reset_url, timeout=_bounded_request_timeout(deadline=deadline))
+                response = requests.post(reset_url, timeout=_bounded_reset_post_timeout(deadline=deadline))
             except requests.RequestException as exc:
                 last_reset_body = f"request error: {exc}"
             else:
@@ -208,6 +217,23 @@ def reset_simulator_state(
             reset_accepted_at is not None
             and time.monotonic() - reset_accepted_at >= SIMULATOR_RESET_RECOVERY_GRACE_SECONDS
         )
+        writer_recovery_exhausted = (
+            reset_accepted
+            and last_status_status == 503
+            and missing_processes
+            and not _reset_is_active(status_payload)
+            and recovery_grace_elapsed
+            and attempts >= SIMULATOR_RESET_MAX_RECOVERY_REQUESTS
+        )
+        if writer_recovery_exhausted:
+            raise RuntimeError(
+                "Simulator reset writer recovery exhausted; a supervised child exited "
+                f"after {attempts} fast-reset request(s): {','.join(missing_processes)}. "
+                "A full simulator restart is required because another fast reset cannot "
+                "recreate the missing writer. "
+                f"status=HTTP {last_status_status} {last_status_body}; "
+                f"gateway=HTTP {last_gateway_status or '<error>'} {last_gateway_body}"
+            )
         if (
             reset_accepted
             and last_status_status == 503

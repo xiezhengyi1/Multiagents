@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 from ...context.evidence import build_slice_snssai
@@ -147,6 +148,30 @@ class PlanningArtifactCompiler:
                 planning_request=planning_request,
             )
 
+        # The optimizer, rather than the advisor, is authoritative for the
+        # S-NSSAI actually selected for each QoS flow.  Gather it once here
+        # and feed the exact same assignments into both the SM payloads and
+        # the AM policy compiler.  Previously the advisor could omit an
+        # optimizer-selected S-NSSAI from allowed_snssais, causing a joint
+        # QoS/mobility plan to fail only after it had otherwise compiled.
+        sm_assignments: List[tuple[SmPolicySpec, List[str], str]] = []
+        for spec in advisor_output.sm_policies:
+            resource_keys = PlanningAdvisorValidator()._extract_qos_resource_keys(
+                optimizer_preview,
+                flow_id=spec.flow_id,
+            )
+            if not resource_keys:
+                raise ValueError(
+                    f"optimizer preview does not contain a grounded QoS assignment for flow_id={spec.flow_id}"
+                )
+            sm_assignments.append(
+                (
+                    self._with_optimizer_bandwidths(spec, optimizer_preview),
+                    resource_keys,
+                    self._target_slice_snssai(resource_keys=resource_keys, flow_id=spec.flow_id),
+                )
+            )
+
         if advisor_output.am_policy is not None:
             plan.all_policies.append(
                 PolicyDraft(
@@ -164,21 +189,15 @@ class PlanningArtifactCompiler:
                         advisor_output.am_policy,
                         planning_request=planning_request,
                         mobility_context=mobility_context,
+                        qos_selected_snssais=[assignment[2] for assignment in sm_assignments],
                     ),
                 )
             )
 
-        for spec in advisor_output.sm_policies:
+        for spec, resource_keys, target_slice_snssai in sm_assignments:
             flow_ctx = self._resolve_flow(planning_request, spec.flow_id)
             if _normalize_app_id(spec.app_id) != _normalize_app_id(flow_ctx.app_id or ""):
                 raise ValueError(f"sm policy app_id does not match resolved flow context for flow_id={spec.flow_id}")
-            resource_keys = PlanningAdvisorValidator()._extract_qos_resource_keys(optimizer_preview, flow_id=spec.flow_id)
-            if not resource_keys:
-                raise ValueError(f"optimizer preview does not contain a grounded QoS assignment for flow_id={spec.flow_id}")
-            target_slice_snssai = self._target_slice_snssai(
-                resource_keys=resource_keys,
-                flow_id=spec.flow_id,
-            )
             plan.all_policies.append(
                 PolicyDraft(
                     recommended_actions=[],
@@ -278,6 +297,37 @@ class PlanningArtifactCompiler:
         return target_slice_snssai
 
     @staticmethod
+    def _with_optimizer_bandwidths(spec: SmPolicySpec, optimizer_preview: Any) -> SmPolicySpec:
+        """Make the optimizer allocation authoritative without changing absent legacy evidence."""
+        assignments = optimizer_preview.get("qos_flow_assignments") if isinstance(optimizer_preview, dict) else []
+        assignment = next(
+            (
+                item
+                for item in (assignments or [])
+                if isinstance(item, dict) and str(item.get("flow_id") or "").strip() == spec.flow_id
+            ),
+            None,
+        )
+        if not assignment:
+            return spec
+        try:
+            bandwidth_ul = float(assignment["bw_ul"])
+            bandwidth_dl = float(assignment["bw_dl"])
+        except (KeyError, TypeError, ValueError):
+            return spec
+        if bandwidth_ul <= 0 or bandwidth_dl <= 0:
+            return spec
+        updates: Dict[str, Any] = {
+            "max_br_ul_mbps": bandwidth_ul,
+            "max_br_dl_mbps": bandwidth_dl,
+        }
+        if spec.gbr_ul_mbps is not None:
+            updates["gbr_ul_mbps"] = min(float(spec.gbr_ul_mbps), bandwidth_ul)
+        if spec.gbr_dl_mbps is not None:
+            updates["gbr_dl_mbps"] = min(float(spec.gbr_dl_mbps), bandwidth_dl)
+        return spec.model_copy(update=updates)
+
+    @staticmethod
     def _build_sm_policy_details(
         spec: SmPolicySpec,
         flow_ctx: FlowSelector,
@@ -373,6 +423,7 @@ class PlanningArtifactCompiler:
         *,
         planning_request: PlanningRequest,
         mobility_context: Dict[str, Any],
+        qos_selected_snssais: List[str] | None = None,
     ) -> Dict[str, Any]:
         am_policy_context = mobility_context.get("amPolicyContext") if isinstance(mobility_context, dict) else {}
         access_context = mobility_context.get("accessMobilityContext") if isinstance(mobility_context, dict) else {}
@@ -397,8 +448,24 @@ class PlanningArtifactCompiler:
         request_payload = _json_friendly(request_payload)
         policy_payload = _json_friendly(policy_payload)
         request_payload["supi"] = _planning_supi(planning_request)
-        request_payload["allowedSnssais"] = [item.model_dump(mode="json") for item in spec.allowed_snssais]
-        request_payload["targetSnssais"] = [item.model_dump(mode="json") for item in spec.target_snssais]
+        selected_snssai_payloads: List[Dict[str, Any]] = []
+        for snssai in qos_selected_snssais or []:
+            selected_payload = build_slice_snssai(snssai)
+            if selected_payload is not None:
+                selected_snssai_payloads.append(selected_payload)
+        # An SM policy is generated exclusively from an optimizer-selected
+        # slice.  If AM is active in the same plan, that slice must be allowed
+        # and targeted by the AM association as well.  Preserve any separately
+        # grounded AM choices, but add the code-grounded QoS selections so the
+        # two policy domains cannot drift because of an advisor omission.
+        request_payload["allowedSnssais"] = self._merge_snssai_payloads(
+            [item.model_dump(mode="json") for item in spec.allowed_snssais],
+            selected_snssai_payloads,
+        )
+        request_payload["targetSnssais"] = self._merge_snssai_payloads(
+            [item.model_dump(mode="json") for item in spec.target_snssais],
+            selected_snssai_payloads,
+        )
         request_payload["rfsp"] = int(spec.rfsp)
         if spec.ue_ambr_ul_mbps is not None or spec.ue_ambr_dl_mbps is not None:
             if spec.ue_ambr_ul_mbps is None or spec.ue_ambr_dl_mbps is None:
@@ -422,6 +489,22 @@ class PlanningArtifactCompiler:
         if "servAreaRes" in request_payload:
             policy_payload["servAreaRes"] = request_payload["servAreaRes"]
         return policy_payload
+
+    @staticmethod
+    def _merge_snssai_payloads(*groups: List[Dict[str, Any] | None]) -> List[Dict[str, Any]]:
+        """Deduplicate S-NSSAI payloads without changing their PCF wire shape."""
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        for group in groups:
+            for payload in group:
+                if not isinstance(payload, dict):
+                    continue
+                normalized = _json_friendly(payload)
+                if not isinstance(normalized, dict):
+                    continue
+                key = json.dumps(normalized, sort_keys=True, ensure_ascii=False)
+                merged.setdefault(key, normalized)
+        return list(merged.values())
 
     @staticmethod
     def _build_ursp_policy_details(spec: UrspPolicySpec) -> Dict[str, Any]:

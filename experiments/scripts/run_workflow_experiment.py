@@ -238,6 +238,9 @@ def summarize_run_results(
     error_count = total - correct_count
     total_round_count = sum(int(item.get("round_count") or 0) for item in results)
     total_retry_count = sum(int(item.get("retry_count") or 0) for item in results)
+    projection_count = sum(int(item.get("main_schema_projection_count") or 0) for item in results)
+    projected_field_count = sum(int(item.get("main_schema_projected_field_count") or 0) for item in results)
+    projection_case_count = sum(1 for item in results if int(item.get("main_schema_projection_count") or 0) > 0)
 
     return {
         "total_cases": total,
@@ -255,6 +258,9 @@ def summarize_run_results(
         "total_retry_count": total_retry_count,
         "avg_round_count": round(total_round_count / total, 4) if total else 0.0,
         "avg_retry_count": round(total_retry_count / total, 4) if total else 0.0,
+        "main_schema_projection_count": projection_count,
+        "main_schema_projected_field_count": projected_field_count,
+        "main_schema_projection_case_count": projection_case_count,
         "avg_elapsed_ms": _average_numeric_field(results, "agent_elapsed_total_ms"),
         "avg_wall_elapsed_ms": _average_numeric_field(results, "elapsed_ms"),
         "correct_cases": correct_cases,

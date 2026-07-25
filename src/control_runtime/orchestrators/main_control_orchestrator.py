@@ -292,6 +292,7 @@ class MainControlOrchestrator:
         snapshot_id: str = "",
         routing_hint: Optional[Dict[str, Any]] = None,
     ) -> ControlRoundResult:
+        self.main_agent.reset_schema_projection_metrics()
         session_id, snapshot_id = start_control_session(step_name="main_control", user_input=user_input, snapshot_id=snapshot_id)
         self.memory_manager.bind_thread(session_id)
         self._token_budget = TokenBudget()
@@ -616,6 +617,10 @@ class MainControlOrchestrator:
             agent_name: round(elapsed_ms, 3)
             for agent_name, elapsed_ms in agent_elapsed_totals.items()
         }
+        projection_metrics = self.main_agent.schema_projection_metrics
+        state.latest_result.main_schema_projection_count = int(projection_metrics["count"])
+        state.latest_result.main_schema_projected_field_count = int(projection_metrics["field_count"])
+        state.latest_result.main_schema_projected_fields = list(projection_metrics["fields"])
         return state.latest_result
 
 

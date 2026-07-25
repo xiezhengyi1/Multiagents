@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-Usage: bash experiment.sh [--model deepseek|qwen] [--scenario S2|S3] [--method B|B1|B2|B3|Ours|ablation]
+Usage: bash experiment.sh [--model deepseek|qwen] [--local-model] [--scenario S2|S3] [--method B|B1|B2|B3|Ours|ablation] [--workers N]
 
 Examples:
   bash experiment.sh
@@ -12,10 +12,14 @@ Examples:
 	bash experiment.sh --model qwen --scenario S2 --method B2
   bash experiment.sh --scenario S3 --method Ours
   bash experiment.sh --model deepseek --method ablation
+  bash experiment.sh --scenario S2 --method Ours --workers 3
+  bash experiment.sh --local-model --scenario S2 --method Ours
 
 Notes:
 	- --method B runs all baseline methods: B1, B2, B3.
 	- --method B1, B2, or B3 runs only that baseline.
+  - --workers starts this many isolated simulators per experiment/scenario/method combination (default: 3).
+  - --local-model uses the local vLLM endpoint configured by vLLM_URL.
   - DRY_RUN=1 prints matching commands without executing them.
 EOF
 }
@@ -23,6 +27,8 @@ EOF
 model_filter=""
 scenario_filter=""
 method_filter=""
+simulators_per_combination="3"
+use_local_model="false"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -40,6 +46,15 @@ while [[ $# -gt 0 ]]; do
 			[[ $# -ge 2 ]] || { echo "Missing value for --method" >&2; exit 1; }
 			method_filter="$2"
 			shift 2
+			;;
+		--workers)
+			[[ $# -ge 2 ]] || { echo "Missing value for --workers" >&2; exit 1; }
+			simulators_per_combination="$2"
+			shift 2
+			;;
+		--local-model)
+			use_local_model="true"
+			shift
 			;;
 		-h|--help)
 			usage
@@ -62,6 +77,11 @@ case "$model_filter" in
 		exit 1
 		;;
 esac
+
+if ! [[ "$simulators_per_combination" =~ ^[1-9][0-9]*$ ]]; then
+	echo "Invalid --workers: $simulators_per_combination" >&2
+	exit 1
+fi
 
 case "$scenario_filter" in
 	""|S2|S3)
@@ -138,11 +158,9 @@ for spec in "${experiments[@]}"; do
 		fi
 	fi
 
-	cmd=(python experiments/scripts/launch_experiments.py --experiment "$experiment" --scenario "$scenario" --method "$method")
-	if [[ "$model" == "deepseek" ]]; then
-		cmd+=(--deepseek)
-	elif [[ "$model" == "qwen" ]]; then
-		cmd+=(--qwen)
+	cmd=(python experiments/scripts/launch_experiments.py --experiment "$experiment" --scenario "$scenario" --method "$method" --simulators-per-combination "$simulators_per_combination")
+	if [[ "$use_local_model" == "true" ]]; then
+		cmd+=(--local-model)
 	fi
 
 	((selected_count += 1))

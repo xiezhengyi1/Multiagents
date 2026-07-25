@@ -365,6 +365,31 @@ class ReuseContract(BaseModel):
     invalidate_on: List[str] = Field(default_factory=list)
 
 
+class MainControlDecision(BaseModel):
+    """LLM-owned Main decisions before the control-loop artifact is compiled.
+
+    Main retains the complete staged semantic plan.  Session metadata,
+    round-state labels, reuse flags, and audit text are derived from this
+    decision plus authoritative control-loop state.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    supi: str = ""
+    next_agent: Literal["intent_encoding", "optimization_strategy"]
+    requested_domains: List[ControlDomain] = Field(default_factory=list)
+    serving_slice_change_requested: bool = False
+    domain_evidence: Dict[str, List[str]] = Field(default_factory=dict)
+    control_semantics: MainControlSemantics = Field(default_factory=MainControlSemantics)
+    objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)
+    investigation_targets: List[MainInvestigationTarget] = Field(default_factory=list)
+    uncertainty_flags: List[MainUncertaintyFlag] = Field(default_factory=list)
+    retry_scope: Optional[MainRetryScope] = Field(default=None)
+    required_evidence: List[str] = Field(default_factory=list)
+    forbidden_assumptions: List[str] = Field(default_factory=list)
+    intent_encoding_guidance: str = ""
+
+
 class AgentContribution(BaseModel):
     agent: str = Field(default="")
     summary: str = Field(default="")

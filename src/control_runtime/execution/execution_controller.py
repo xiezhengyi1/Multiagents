@@ -11,7 +11,7 @@ from shared.logging import log_event, log_timing, setup_logger
 
 from ..domain.policy_compiler import PolicyCompiler
 from ..domain.policy_guard import PolicyGuard
-from ..domain.policy_plan import PolicyPlan
+from ..domain.policy_plan import AssuranceVerdict, PolicyPlan
 from .assurance_evaluator import AssuranceEvaluator
 
 
@@ -276,6 +276,64 @@ class ExecutionController:
             dispatch_attempts=1,
         )
 
+    @staticmethod
+    def _post_apply_assurance_verdict(
+        *,
+        policy: Dict[str, Any],
+        dispatch_result: Dict[str, Any],
+        fallback_snapshot_id: str,
+    ) -> AssuranceVerdict | None:
+        """Prefer the gateway's same-tick compliance checks over a second sample."""
+        if str(policy.get("target_type") or "").strip() != "flow":
+            return None
+        monitoring = dispatch_result.get("monitoring_data")
+        monitoring = monitoring if isinstance(monitoring, dict) else {}
+        checks = monitoring.get("qos_parameter_checks")
+        applied_tick = monitoring.get("latest_tick", dispatch_result.get("applied_tick", ""))
+        metrics = {
+            "snapshot_id": f"{fallback_snapshot_id}@ns3-tick-{applied_tick}",
+            "source": "policy_post_apply_receipt",
+            "qos_parameter_checks": checks,
+            "observed_telemetry": monitoring.get("observed_telemetry", {}),
+            "run_id": monitoring.get("run_id"),
+            "reset_generation": monitoring.get("reset_generation"),
+            "baseline_tick": monitoring.get("baseline_tick"),
+        }
+        try:
+            baseline_tick = int(monitoring["baseline_tick"])
+            latest_tick = int(monitoring["latest_tick"])
+            sla_epoch_tick = int((monitoring.get("observed_telemetry") or {})["sla_epoch_start_tick"])
+            contract_valid = (
+                monitoring.get("assurance_contract_version") == 1
+                and bool(str(monitoring.get("run_id") or "").strip())
+                and int(monitoring["reset_generation"]) >= 0
+                and latest_tick > baseline_tick
+                and sla_epoch_tick > baseline_tick
+            )
+        except (KeyError, TypeError, ValueError):
+            contract_valid = False
+        if not contract_valid or not isinstance(checks, list) or not checks:
+            metrics["source"] = "unverified_gateway_receipt"
+            return AssuranceVerdict(
+                policy_id=str(policy.get("policy_id") or "").strip(),
+                flow_id=ExecutionController._policy_flow_id(policy) or None,
+                status="failed",
+                reason="Gateway response lacks same-generation post-policy ns-3 assurance evidence.",
+                metrics=metrics,
+            )
+        satisfied = all(isinstance(check, dict) and bool(check.get("satisfied")) for check in checks)
+        return AssuranceVerdict(
+            policy_id=str(policy.get("policy_id") or "").strip(),
+            flow_id=ExecutionController._policy_flow_id(policy) or None,
+            status="satisfied" if satisfied else "violated",
+            reason=(
+                "Post-apply ns-3 checks satisfy the policy requirements."
+                if satisfied
+                else "Post-apply ns-3 checks violate the policy requirements."
+            ),
+            metrics=metrics,
+        )
+
     def _run_policies(self, *, policies: list[Dict[str, Any]], policy_plan: PolicyPlan) -> Dict[str, Any]:
         batch = {
             "execution_receipts": [],
@@ -339,7 +397,14 @@ class ExecutionController:
                 )
                 continue
 
-            verdict = self.assurance_evaluator.evaluate(policy=policy, snapshot_id=policy_plan.snapshot_id)
+            verdict = self._post_apply_assurance_verdict(
+                policy=policy,
+                dispatch_result=dispatch_result,
+                fallback_snapshot_id=policy_plan.snapshot_id,
+            ) or self.assurance_evaluator.evaluate(
+                policy=policy,
+                snapshot_id=policy_plan.snapshot_id,
+            )
             verdict_payload = verdict.model_dump(mode="json")
             verdict_payload.setdefault("policy_type", policy.get("policy_type"))
             batch["assurance_results"].append(verdict_payload)

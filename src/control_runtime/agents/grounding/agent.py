@@ -586,6 +586,20 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     "- Use only AM grounding if more evidence is needed.",
                 ]
             )
+        # Keep the mandatory next action at the end of the dynamic prompt.  This
+        # is a rule for the advisor, not an automatic tool invocation: other
+        # request types can still finish from their own evidence contract.
+        if qos_required and not evidence.catalog_evidence_observed:
+            domain_specific_rules.append(
+                "- FINAL TOOL GATE: do not return JSON yet. Your next action must be one get_sm_ue_flow_catalog call for each known target SUPI."
+            )
+        elif qos_required and missing_target_names and not evidence.search_evidence_observed:
+            domain_specific_rules.append(
+                "- FINAL TOOL GATE: do not return JSON yet. Your next action must be one search_sm_flow_targets call for each missing exact target."
+            )
+        domain_specific_rules.append(
+            "- FINAL JSON TYPE GATE: `open_questions[].blocking` is JSON true/false (never a string); operation_type is only qos_reallocation or slice_migration."
+        )
         return (
             "User request:\n"
             f"{evidence.user_input}\n\n"

@@ -48,6 +48,8 @@ FAILED_RUNS_PATH = LEDGER_ROOT / "failed_experiments.jsonl"
 ENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_SIMULATORS_PER_COMBINATION = 3
 MAX_WRITER_RESET_FULL_RESTARTS_PER_WORKER = 1
+DEFAULT_WORKFLOW_MODEL = "qwen3-30b-a3b-instruct-2507"
+DEFAULT_SINGLE_AGENT_MODEL = "deepseek-v4-flash"
 
 
 def _append_failed_run(record: Dict[str, Any]) -> None:
@@ -120,6 +122,35 @@ def _load_model_name_from_env() -> str:
             continue
         return value.strip().strip('"').strip("'")
     return ""
+
+
+def _filename_slug(value: str, *, default: str) -> str:
+    normalized = "".join(
+        character.lower() if character.isalnum() else "-"
+        for character in str(value or "").strip()
+    ).strip("-")
+    return normalized or default
+
+
+def _resolve_model_name_for_run(
+    *,
+    args: argparse.Namespace,
+    method_id: str,
+    model_flags: Dict[str, bool],
+) -> str:
+    """Return the model identity used in artifact names, not a display label."""
+
+    if bool(getattr(args, "use_local_model", False)):
+        return str(os.getenv("vLLM_MODEL_NAME") or "local-vllm").strip() or "local-vllm"
+    configured = _load_model_name_from_env()
+    if configured:
+        return configured
+    if bool(model_flags.get("use_deepseek")):
+        return DEFAULT_SINGLE_AGENT_MODEL
+    if bool(model_flags.get("use_qwen")):
+        return DEFAULT_WORKFLOW_MODEL
+    is_single_agent = str(method_id or "").strip() in {"B1", "B2", "B3"}
+    return DEFAULT_SINGLE_AGENT_MODEL if is_single_agent else DEFAULT_WORKFLOW_MODEL
 
 
 def _resolve_model_flags(args: argparse.Namespace, *, method_id: str) -> Dict[str, bool]:
@@ -345,18 +376,19 @@ def _merge_worker_results(
     experiment_id: str,
     scenario_id: str,
     method_id: str,
+    model_name: str,
     worker_runs: List[Dict[str, Any]],
 ) -> Dict[str, str]:
     if not worker_runs:
         raise RuntimeError("Cannot merge an empty worker result set")
     first_result_path = Path(worker_runs[0]["result_path"])
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    slug = "-".join(
-        "".join(character.lower() if character.isalnum() else "-" for character in value).strip("-")
-        for value in (experiment_id, scenario_id, method_id)
-    )
-    result_path = first_result_path.parent / f"{method_id.lower()}_runs_{slug}_{stamp}_merged.jsonl"
-    summary_path = first_result_path.parent.parent / "summaries" / f"{method_id.lower()}_summary_{slug}_{stamp}_merged.json"
+    method_slug = _filename_slug(method_id, default="method")
+    model_slug = _filename_slug(model_name, default="default-model")
+    slug = "-".join(_filename_slug(value, default="unspecified") for value in (experiment_id, scenario_id, method_id))
+    merge_suffix = f"method-{method_slug}_model-{model_slug}"
+    result_path = first_result_path.parent / f"{method_slug}_runs_{slug}_{stamp}_merged_{merge_suffix}.jsonl"
+    summary_path = first_result_path.parent.parent / "summaries" / f"{method_slug}_summary_{slug}_{stamp}_merged_{merge_suffix}.json"
 
     result_rows: List[Dict[str, Any]] = []
     summary_payloads: List[Dict[str, Any]] = []
@@ -417,6 +449,8 @@ def _merge_worker_results(
             merged_summary[key] = values
     merged_summary["artifacts"] = {
         "run_records": str(result_path),
+        "method_id": method_id,
+        "model_name": model_name,
         "worker_results": [
             {
                 "worker_index": worker_run["worker_index"],
@@ -643,6 +677,11 @@ def main() -> None:
                         worker_specs.append({**partition, "label": worker_label, "simulator_state": simulator_state})
 
                     model_flags = _resolve_model_flags(args, method_id=method_id)
+                    model_name = _resolve_model_name_for_run(
+                        args=args,
+                        method_id=method_id,
+                        model_flags=model_flags,
+                    )
 
                     def run_worker(worker: Dict[str, Any]) -> Dict[str, Any]:
                         if int(worker["count"]) <= 0:
@@ -745,6 +784,7 @@ def main() -> None:
                         experiment_id=experiment_id,
                         scenario_id=scenario_id,
                         method_id=method_id,
+                        model_name=model_name,
                         worker_runs=worker_runs,
                     )
                     run_record = {

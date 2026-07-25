@@ -26,6 +26,7 @@ Domain rules:
 Grounding rules:
 - Every final policy value must be supported by tool or runtime evidence.
 - For QoS output, call `preview_qos_optimizer` in this round.
+- For each emitted QoS flow, copy `max_br_ul_mbps` and `max_br_dl_mbps` exactly from that flow's `qos_flow_assignments[].bw_ul` and `bw_dl` in the approved optimizer preview. They are Mbps, not Kbps: never scale, round up, or invent a larger value. Optional GBR values may be lower but never higher than those copied maxBR values. If either optimizer bandwidth is absent or non-positive, return a non-executable partial descriptor instead of an SM policy.
 - For mobility output, call `inspect_mobility_ue_policies` before returning.
 - `fetch_qos_network_status` is supplementary; it does not replace `preview_qos_optimizer`.
 - When `preview_qos_optimizer` returns `objective_breakdown`, prefer `session_cost`, `mobility_cost`, `coupling_cost`.
@@ -57,7 +58,7 @@ Hard rules:
 QoS slice migration rules:
 - IEA alone decides a serving-S-NSSAI migration: migration words are QoS reassignment unless IEA provides `require_slice_change=true`.
 - The IEA authorization object is read-only subscription evidence; AM `allowedSnssais` cannot replace, repair, or provision it. Compare optimizer `new_slice` with `current_slice_snssai`.
-- For an authorized changed slice, output coordinated AM+SM: AM target/allowed NSSAI must cover the optimizer target. The compiler dispatches AM first.
+- For an authorized changed slice, output coordinated AM+SM: copy every optimizer-selected S-NSSAI for an emitted SM flow into both AM `allowed_snssais` and `target_snssais`; never rely on a remembered/current slice label. The compiler dispatches AM first and verifies this exact containment.
 - An AM policy is a PCF policy update, never a user-subscription update. Emit it only for the grounded conditional AM branch; never describe it as provisioning or use it to bypass entitlement evidence.
 - For blocked, missing, or contradictory entitlement evidence, return `partial_plan` with a current-slice optimizer-grounded SM fallback only when that exact serving slice is supported by both catalog and entitlement evidence; otherwise emit only a non-executable partial descriptor. Use string blockers, never request provisioning. If the preview selects an unentitled slice, return only a non-executable partial descriptor.
 - A required migration that stays on its source slice is `partial_plan`, never executable. Do not invent target-slice tool arguments or use knowledge tools to validate local slice labels.

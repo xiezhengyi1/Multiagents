@@ -1,5 +1,12 @@
 # Multiagents 技术文档
 
+
+
+vllm serve /home/yyx/6gcore/vLLM/Qwen3-4B-Instruct-2507 --served-model-name qwen3-4b-instruct --enable-auto-tool-choice --tool-call-parser hermes --tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.8
+
+vllm serve /home/yyx/6gcore/vLLM/Qwen3-1.7B --served-model-name qwen3-1.7b --enable-auto-tool-choice --tool-call-parser hermes --gpu-memory-utilization 0.8
+
+
 ## 1. 项目定位
 
 `Multiagents` 是一个面向 6G/5G 控制闭环的多智能体工作区，核心目标是把“用户控制请求 -> 意图理解 -> 目标接地 -> 策略规划 -> 冲突仲裁 -> 策略执行 -> 执行诊断”组织成一条可迭代、可实验、可训练的运行链路。

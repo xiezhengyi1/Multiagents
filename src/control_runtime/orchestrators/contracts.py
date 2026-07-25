@@ -40,6 +40,9 @@ class ControlRoundResult:
     retry_count: int = 0
     round_traces: List[Dict[str, Any]] = field(default_factory=list)
     agent_elapsed_ms: Dict[str, float] = field(default_factory=dict)
+    main_schema_projection_count: int = 0
+    main_schema_projected_field_count: int = 0
+    main_schema_projected_fields: List[str] = field(default_factory=list)
     single_agent_details: List[Dict[str, Any]] = field(default_factory=list)
 
 

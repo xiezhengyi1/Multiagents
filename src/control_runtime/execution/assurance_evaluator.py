@@ -36,7 +36,14 @@ class AssuranceEvaluator:
     def __init__(self, *, load_snapshot_by_id: Callable[[str], Optional[Dict[str, Any]]]) -> None:
         self.load_snapshot_by_id = load_snapshot_by_id
 
-    def evaluate(self, *, policy: Dict[str, Any], snapshot_id: str, k: float = QOS_TOLERANCE_RATIO) -> AssuranceVerdict:
+    def evaluate(
+        self,
+        *,
+        policy: Dict[str, Any],
+        snapshot_id: str,
+        snapshot: Optional[Dict[str, Any]] = None,
+        k: float = QOS_TOLERANCE_RATIO,
+    ) -> AssuranceVerdict:
         policy_id = str(policy.get("policy_id") or "").strip()
         target_type = str(policy.get("target_type") or "").strip()
         flow_id = str(policy.get("flow_id") or "").strip() or None
@@ -54,7 +61,7 @@ class AssuranceEvaluator:
         if not snapshot_id:
             raise RuntimeError(f"policy {policy_id} missing snapshot_id for assurance evaluation")
 
-        snapshot = self.load_snapshot_by_id(snapshot_id)
+        snapshot = snapshot or self.load_snapshot_by_id(snapshot_id)
         if not isinstance(snapshot, dict):
             raise RuntimeError(f"policy {policy_id} snapshot {snapshot_id} not found for assurance evaluation")
 
@@ -108,6 +115,7 @@ class AssuranceEvaluator:
                 "throughput_dl": sim_throughput_dl,
                 "throughput_dl_requirement": gbr_dl,
                 "tolerance_ratio": tolerance_ratio,
+                "source": str(snapshot.get("assurance_source") or "snapshot"),
                 "latency_within_tolerance": latency_ok,
                 "jitter_within_tolerance": jitter_ok,
                 "throughput_ul_within_tolerance": throughput_ul_ok,

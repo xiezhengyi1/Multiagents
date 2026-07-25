@@ -411,6 +411,9 @@ def collect_workflow_trajectories(
                 "round_traces": run_result.round_traces,
                 "agent_elapsed_ms": dict(agent_elapsed_ms),
                 "agent_elapsed_total_ms": float(agent_elapsed_ms["total"]),
+                "main_schema_projection_count": run_result.main_schema_projection_count,
+                "main_schema_projected_field_count": run_result.main_schema_projected_field_count,
+                "main_schema_projected_fields": run_result.main_schema_projected_fields,
             }
             print(
                 f"[{record['record_index']}/{total}] workflow done: session_id={run_result.session_id} completed={run_result.completed}",
@@ -443,6 +446,9 @@ def collect_workflow_trajectories(
                 "round_traces": [],
                 "agent_elapsed_ms": {},
                 "agent_elapsed_total_ms": 0.0,
+                "main_schema_projection_count": orchestrator.main_agent.schema_projection_metrics["count"],
+                "main_schema_projected_field_count": orchestrator.main_agent.schema_projection_metrics["field_count"],
+                "main_schema_projected_fields": orchestrator.main_agent.schema_projection_metrics["fields"],
             }
             print(
                 f"[{record['record_index']}/{total}] workflow error: scenario_id={scenario_id} error={type(exc).__name__}: {exc}",
