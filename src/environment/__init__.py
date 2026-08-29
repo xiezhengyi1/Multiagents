@@ -9,6 +9,12 @@ from .contracts import (
     ScenarioCandidate,
 )
 from .launcher import EnvironmentLauncher
+from .design import (
+    EnvironmentCatalog,
+    EnvironmentDesign,
+    EnvironmentDesignCompiler,
+    EnvironmentDesignError,
+)
 from .specs import ExistingScenarioSpecExplorer
 from .tools import build_environment_tools
 
@@ -17,6 +23,10 @@ __all__ = [
     "EnvironmentAgentCompiler",
     "EnvironmentGenerationRequest",
     "EnvironmentLauncher",
+    "EnvironmentCatalog",
+    "EnvironmentDesign",
+    "EnvironmentDesignCompiler",
+    "EnvironmentDesignError",
     "EnvironmentValidationReport",
     "LaunchPlan",
     "ScenarioCandidate",

@@ -12,7 +12,7 @@ from experiments.scripts.common import resolve_python_executable
 
 from .compiler import EnvironmentAgentCompiler, S3_QUALITY_PROFILE
 from .contracts import EnvironmentGenerationRequest, ScenarioCandidate
-from .prompts import ENVIRONMENT_AGENT_SYSTEM_PROMPT
+from .prompts import ENVIRONMENT_DESIGN_AGENT_SYSTEM_PROMPT
 from .tools import build_environment_tools
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.logging import log_event, log_timing
@@ -118,7 +118,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         self.compiler = EnvironmentAgentCompiler()
         self.quality_profile = quality_profile
         self.compiler.quality_requirements(quality_profile)
-        self.system_prompt = ENVIRONMENT_AGENT_SYSTEM_PROMPT
+        self.system_prompt = ENVIRONMENT_DESIGN_AGENT_SYSTEM_PROMPT
         self.environment_tools = environment_tools
         if not initialize_runtime:
             self.agent = None
@@ -145,6 +145,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                 scenario_root=scenario_root or (project_root / "experiments" / "scenarios"),
                 execute_simulator=True,
                 quality_profile=self.quality_profile,
+                semantic_design_mode=True,
                 logger=self.logger,
             )
         self.agent = self.create_json_agent(
@@ -155,17 +156,20 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             tool_error_mode="return",
             max_calls_per_tool=8,
             tool_call_limits={
-                "replace_draft_section": 20,
-                "patch_draft_entity": 16,
-                "inspect_draft_section": 12,
+                "list_existing_environment_specs": 3,
+                "get_environment_runtime_reference": 3,
+                "submit_environment_catalog": 5,
+                "inspect_environment_catalog": 5,
+                "compile_environment_design": 10,
                 "validate_environment_draft": 10,
                 "write_validated_environment_yaml": 5,
                 "simulate_candidate_environment": 5,
             },
             tool_result_limits={
-                "replace_draft_section": 1200,
-                "patch_draft_entity": 1200,
-                "inspect_draft_section": 3000,
+                "submit_environment_catalog": 5000,
+                "get_environment_runtime_reference": 5000,
+                "inspect_environment_catalog": 5000,
+                "compile_environment_design": 6000,
                 "validate_environment_draft": 4000,
             },
             capability_aliases=ENVIRONMENT_TOOL_CAPABILITIES,
@@ -206,22 +210,27 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             session_id=session_id,
             snapshot_id=snapshot_id,
         )
-        prompt = self.compiler.build_generation_prompt(request, quality_profile=self.quality_profile)
+        prompt = self.compiler.build_semantic_generation_prompt(
+            request,
+            quality_profile=self.quality_profile,
+        )
         prompt = (
             f"{prompt}\n\n"
-            "Closed-loop requirement:\n"
+            "Semantic closed-loop requirement:\n"
             "- You must call list_existing_environment_specs before generating the candidate.\n"
-            "- Initialize metadata with initialize_environment_draft.\n"
-            "- Populate ordered sections with replace_draft_section; use patch_draft_entity and inspect_draft_section only for focused repairs.\n"
+            "- Call get_environment_runtime_reference and reuse its executable runtime shape.\n"
+            "- Submit the complete semantic-key manifest with submit_environment_catalog.\n"
+            "- Submit all topology decisions and exact flow metrics together with compile_environment_design.\n"
+            "- The compiler derives identifiers and references only; it never adjusts your metrics.\n"
+            "- If compilation fails, revise and resubmit the complete semantic design.\n"
             "- Use validate_environment_draft, write_validated_environment_yaml, and simulate_candidate_environment in that order.\n"
-            "- Obey validate_environment_draft repair_plan actions exactly. If a section action is replace_draft_section, replace that complete section in one call instead of patching entities one by one.\n"
             "- When simulation fails and returns failure_analysis, follow its suggested_section and guidance. Do NOT retry the same data unchanged.\n"
             "- If simulation fails but the draft appears correct in-memory, use read_back_written_yaml to compare the draft against the file on disk. Look for missing keys, type mismatches, or serialization gaps.\n"
             "- If validation or simulation reports a failure, call record_validation_feedback and produce a revised candidate.\n"
             "- Simulation succeeds only when the real launcher starts, the live graph snapshot exists, the policy gateway is healthy, and SLA initialization passes.\n"
             f"- Enforce the {self.quality_profile or 'schema-only'} quality contract: "
             f"{self.compiler.quality_requirements(self.quality_profile)}\n"
-            "- Do not submit a complete scenario mapping during draft mutation or in the final JSON.\n"
+            "- Do not emit final YAML or compiler-owned IDs; submit the semantic design through tools.\n"
             "- Final JSON must summarize the successfully validated environment candidate.\n"
             "- CRITICAL: your final JSON output MUST contain these top-level keys:\n"
             "    scenario_id (string), name (string), validation_status,\n"

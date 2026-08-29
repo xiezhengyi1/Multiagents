@@ -216,24 +216,37 @@ workflow:
         - input_space
         - experiment_matrix
       output:
-        artifact: scenario_design_brief
+        artifact: environment_catalog
         required_fields:
           - scenario_id
-          - complexity
-          - topology_mode
-          - slice_profile
-          - ue_app_flow_plan
-          - stress_mode
-          - expected_control_tasks
-    - name: synthesize_yaml
-      purpose: Convert the scenario design brief into executable YAML.
+          - objective
+          - rationale
+          - expected_counts
+          - slice_keys
+          - upf_keys
+          - gnb_keys
+          - ue_keys
+          - app_keys
+          - flow_keys
+    - name: author_semantic_design
+      purpose: Let the LLM choose the complete topology and every exact traffic/SLA metric.
+      output:
+        artifact: environment_design
+      constraints:
+        - Every catalog key must have exactly one detailed entity.
+        - Every topology relation must use a catalog semantic key.
+        - Every entity and flow must include a rationale.
+        - The LLM owns all capacities, QoS, traffic, SLA, guarantee, and allocation values.
+    - name: compile_design
+      purpose: Derive mechanical identifiers and assemble executable YAML without changing LLM metrics.
       output:
         artifacts:
           - base_scenario_yaml
           - split_mode_overlay_yaml
+          - environment_design_report_json
       constraints:
-        - Use the same field names and units as S1/S2/S3.
-        - Prefer deterministic IDs and seeds for reproducibility.
+        - Generate SUPI, app_id, flow_id, slice_ref, session_ref, and graph IDs deterministically.
+        - Never silently repair or normalize an LLM-authored metric.
         - Keep generated file names lowercase with underscores.
     - name: static_validate
       purpose: Check YAML structure before launching expensive simulation.
@@ -253,7 +266,7 @@ workflow:
         - live_graph_snapshot_created
         - policy_gateway_healthcheck_responds
     - name: debug_and_repair
-      purpose: Repair YAML from validation or startup failures.
+      purpose: Return structured conflicts so the LLM can revise the semantic design.
       max_attempts: 3
       failure_inputs:
         - static_validation_errors
@@ -261,12 +274,13 @@ workflow:
         - run_manifest
         - failed_experiments_ledger_entry
       output:
-        artifact: repair_report
+        artifact: semantic_design_revision_report
     - name: accept_or_reject
       purpose: Mark scenario as validated or rejected.
       accepted_outputs:
         - generated scenario YAML
         - split-mode overlay YAML
+        - semantic environment design report JSON
         - validation report JSON
         - suggested scenarios.json registry entry
       rejected_outputs:
@@ -334,15 +348,15 @@ debugging_policy:
       symptoms:
         - YAML root is not a mapping.
         - Required field is missing.
-      repair_action: Add or normalize fields according to generated_scenario_contract.
+      repair_action: Resubmit one complete typed semantic design; the compiler owns final YAML assembly.
     reference_integrity_error:
       symptoms:
         - app_id, flow_id, slice_ref, session_ref, gnb, or upf reference does not resolve.
-      repair_action: Repair names and IDs, then rerun static validation.
+      repair_action: Repair semantic-key relationships and recompile all derived identifiers.
     capacity_model_error:
       symptoms:
         - Aggregate guaranteed bandwidth exceeds declared capacity without a stress-mode note.
-      repair_action: Lower low-priority flow guarantees or increase slice capacity within input_space bounds.
+      repair_action: Return the deficit and affected semantic flow keys to the LLM for an explained redesign.
     simulator_bootstrap_error:
       symptoms:
         - Manifest is absent.
@@ -356,7 +370,9 @@ debugging_policy:
         - run_method.py cannot resolve scenario_id.
       repair_action: Update task compatibility metadata or provide a validated scenarios.json entry.
   repair_constraints:
-    - Prefer local YAML edits over code edits.
+    - Never patch generated YAML or compiler-owned IDs directly.
+    - Revise the semantic design and atomically recompile the candidate.
+    - Never silently change an LLM-authored topology or flow metric.
     - Preserve generated scenario_id unless the failure is an ID collision.
     - Keep high-priority emergency, telemedicine, remote-drive, and robot flows semantically stable during repair.
     - Stop after max_attempts and emit a rejected report instead of looping indefinitely.

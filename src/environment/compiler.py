@@ -5,7 +5,7 @@ from math import isfinite
 from typing import Any, Iterable
 
 from .contracts import EnvironmentGenerationRequest, EnvironmentValidationReport, ScenarioCandidate
-from .prompts import GENERATION_PROMPT_TEMPLATE
+from .prompts import GENERATION_PROMPT_TEMPLATE, SEMANTIC_GENERATION_PROMPT_TEMPLATE
 
 
 S3_QUALITY_PROFILE = "s3"
@@ -58,6 +58,24 @@ class EnvironmentAgentCompiler:
             output_dir=request.output_dir,
             quality_profile=quality_profile or "schema-only",
             quality_requirements=quality_requirements,
+        )
+
+    def build_semantic_generation_prompt(
+        self,
+        request: EnvironmentGenerationRequest,
+        *,
+        quality_profile: str | None = S3_QUALITY_PROFILE,
+    ) -> str:
+        return SEMANTIC_GENERATION_PROMPT_TEMPLATE.format(
+            scenario_id=request.scenario_id,
+            objective=request.objective,
+            complexity=request.complexity,
+            target_flow_count=request.target_flow_count,
+            topology_mode=request.topology_mode,
+            stress_mode=request.stress_mode,
+            output_dir=request.output_dir,
+            quality_profile=quality_profile or "schema-only",
+            quality_requirements=self.quality_requirements(quality_profile),
         )
 
     @classmethod

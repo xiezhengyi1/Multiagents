@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .compiler import EnvironmentAgentCompiler, S3_QUALITY_PROFILE
+from pydantic import ValidationError
+
+from .compiler import EnvironmentAgentCompiler, S3_MINIMUM_COUNTS, S3_QUALITY_PROFILE
+from .design import EnvironmentCatalog, EnvironmentDesign, EnvironmentDesignCompiler, EnvironmentDesignError
 from .draft import ScenarioDraftStore
 from .launcher import EnvironmentLauncher
 from .specs import ExistingScenarioSpecExplorer
@@ -40,6 +43,13 @@ def _make_tool(name: str, description: str, func: Callable[..., str]) -> Any:
 
 def _json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _format_design_validation_errors(exc: ValidationError) -> list[str]:
+    return [
+        f"{'.'.join(str(part) for part in error.get('loc') or ())}: {error.get('msg')}"
+        for error in exc.errors(include_url=False)
+    ]
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
@@ -293,18 +303,55 @@ def build_environment_tools(
     scenario_root: Path,
     execute_simulator: bool = True,
     quality_profile: str | None = S3_QUALITY_PROFILE,
+    semantic_design_mode: bool = False,
+    design_compiler: EnvironmentDesignCompiler | None = None,
     explorer: ExistingScenarioSpecExplorer | None = None,
     logger: logging.Logger | None = None,
 ) -> list[Any]:
     explorer = explorer or ExistingScenarioSpecExplorer()
+    design_compiler = design_compiler or EnvironmentDesignCompiler()
     draft = ScenarioDraftStore()
     feedback_log: list[dict[str, Any]] = []
     sections_requiring_replacement: set[str] = set()
+    submitted_catalog: EnvironmentCatalog | None = None
+    compiled_design_report: dict[str, Any] | None = None
+    design_report_path = ""
+    owned_scenario_path = ""
+    owned_overlay_path = ""
 
     def list_existing_environment_specs(reason: str = "", limit: int = 50) -> str:
         """Return compact specs for existing scenario YAML files before generating a new env."""
         specs = explorer.discover_specs(Path(scenario_root), limit=limit)
         return _json({"status": "ok", "reason": reason, "spec_count": len(specs), "specs": specs})
+
+    def get_environment_runtime_reference(
+        reason: str = "",
+        source: str = "s3_high_complexity.yaml",
+    ) -> str:
+        """Return exact executable runtime and split-mode sections from one trusted seed."""
+        root = Path(scenario_root).resolve()
+        source_path = (root / source).resolve()
+        if not source_path.is_relative_to(root) or not source_path.is_file():
+            raise ValueError(f"runtime reference must be an existing scenario under {root}")
+        scenario = _load_mapping(source_path)
+        overlay_path = root / "split_mode" / source_path.name
+        overlay = _load_mapping(overlay_path) if overlay_path.is_file() else {}
+        return _json(
+            {
+                "status": "ok",
+                "reason": reason,
+                "source": str(source_path),
+                "runtime": {
+                    "free5gc": deepcopy(scenario.get("free5gc") or {}),
+                    "ns3": deepcopy(scenario.get("ns3") or {}),
+                    "writer": deepcopy(scenario.get("writer") or {}),
+                    "bridge": deepcopy(scenario.get("bridge") or {}),
+                    "split_mode_ns3": deepcopy(overlay.get("ns3") or {}),
+                    "split_mode_runtime": deepcopy(overlay.get("runtime") or {}),
+                    "split_mode_radio": deepcopy(overlay.get("radio") or {}),
+                },
+            }
+        )
 
     def initialize_environment_draft(
         reason: str = "",
@@ -316,6 +363,168 @@ def build_environment_tools(
         if logger:
             log_event(logger, "environment_draft_initialized", scenario_id=summary["scenario_id"])
         return _json({"status": "ok", "reason": reason, "draft": draft.summary(compact=True)})
+
+    def submit_environment_catalog(
+        reason: str = "",
+        catalog: EnvironmentCatalog | None = None,
+    ) -> str:
+        """Submit the complete semantic entity manifest before any detailed design."""
+        nonlocal submitted_catalog, compiled_design_report
+        try:
+            parsed = EnvironmentCatalog.model_validate(catalog or {})
+        except ValidationError as exc:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "catalog_schema",
+                    "errors": _format_design_validation_errors(exc),
+                    "required_action": "resubmit_complete_environment_catalog",
+                }
+            )
+        errors = design_compiler.validate_catalog(parsed)
+        if quality_profile == S3_QUALITY_PROFILE:
+            counts = parsed.expected_counts.model_dump()
+            for section, minimum in S3_MINIMUM_COUNTS.items():
+                if counts[section] < minimum:
+                    errors.append(
+                        f"quality profile {S3_QUALITY_PROFILE} requires at least {minimum} {section}; "
+                        f"catalog declares {counts[section]}"
+                    )
+        if errors:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "catalog_completeness",
+                    "errors": errors,
+                    "required_action": "resubmit_complete_environment_catalog",
+                }
+            )
+        submitted_catalog = parsed
+        compiled_design_report = None
+        return _json(
+            {
+                "status": "ok",
+                "reason": reason,
+                "scenario_id": parsed.scenario_id,
+                "expected_counts": parsed.expected_counts.model_dump(mode="json"),
+                "semantic_keys": {
+                    field: list(getattr(parsed, key_field))
+                    for field, key_field in design_compiler.CATALOG_FIELDS.items()
+                },
+                "next_step": "compile_environment_design",
+            }
+        )
+
+    def inspect_environment_catalog(reason: str = "") -> str:
+        """Return the accepted semantic manifest and expected entity counts."""
+        if submitted_catalog is None:
+            raise ValueError("no environment catalog has been accepted")
+        return _json(
+            {
+                "status": "ok",
+                "reason": reason,
+                "catalog": submitted_catalog.model_dump(mode="json"),
+            }
+        )
+
+    def compile_environment_design(
+        reason: str = "",
+        design: EnvironmentDesign | None = None,
+    ) -> str:
+        """Compile one complete LLM-authored semantic design into an atomic YAML draft."""
+        nonlocal compiled_design_report
+        if submitted_catalog is None:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "catalog_missing",
+                    "errors": ["submit_environment_catalog must succeed before design compilation"],
+                    "required_action": "submit_environment_catalog",
+                }
+            )
+        try:
+            parsed = EnvironmentDesign.model_validate(design or {})
+        except ValidationError as exc:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "design_schema",
+                    "errors": _format_design_validation_errors(exc),
+                    "required_action": "resubmit_complete_environment_design",
+                }
+            )
+        try:
+            compiled = design_compiler.compile(submitted_catalog, parsed)
+        except EnvironmentDesignError as exc:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "design_completeness",
+                    "errors": list(exc.errors),
+                    "required_action": "resubmit_complete_environment_design",
+                }
+            )
+
+        candidate = compiled.candidate
+        scenario = candidate.scenario
+        draft.initialize(
+            {
+                key: deepcopy(scenario[key])
+                for key in ("name", "scenario_id", "tick_ms", "seed")
+            }
+        )
+        for section in ("slices", "upfs", "gnbs", "ues", "apps", "flows"):
+            draft.replace_section(section, deepcopy(scenario[section]))
+        draft.replace_section(
+            "runtime_config",
+            {
+                key: deepcopy(scenario[key])
+                for key in ("free5gc", "ns3", "writer", "topology", "bridge")
+            },
+        )
+        draft.replace_section("split_mode_overlay", deepcopy(candidate.split_mode_overlay))
+        report = compiler.validate_candidate(candidate, quality_profile=quality_profile)
+        draft.validation_passed = report.ok
+        compiled_design_report = compiled.report
+        repair_sections = sorted(
+            {
+                _repair_section_for_error(error)
+                for error in report.errors
+            }
+        )
+        if not report.ok:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "compiled_candidate_validation",
+                    "scenario_id": candidate.scenario_id,
+                    "errors": list(report.errors),
+                    "warnings": list(report.warnings),
+                    "affected_design_sections": repair_sections,
+                    "required_action": "revise_and_resubmit_complete_environment_design",
+                    "metric_policy": "The compiler did not change any LLM-authored topology or flow metric.",
+                }
+            )
+        return _json(
+            {
+                "status": "ok",
+                "reason": reason,
+                "scenario_id": candidate.scenario_id,
+                "counts": {
+                    section: len(scenario[section])
+                    for section in ("slices", "upfs", "gnbs", "ues", "apps", "flows")
+                },
+                "quality_profile": quality_profile or "schema-only",
+                "validation_passed": True,
+                "next_step": "validate_environment_draft",
+            }
+        )
 
     def replace_draft_section(reason: str = "", section: str = "", payload: Any = None) -> str:
         """Replace one draft section; first writes must follow the declared stage order."""
@@ -411,8 +620,9 @@ def build_environment_tools(
         candidate = draft.assemble_candidate()
         filename = candidate.scenario_id.lower().replace("-", "_") + ".yaml"
         base_path = _resolve_candidate_output_dir(Path(scenario_root), output_dir) / filename
-        prior_path = Path(draft.scenario_path).resolve() if draft.scenario_path else None
-        prior_overlay_path = Path(draft.split_mode_overlay_path).resolve() if draft.split_mode_overlay_path else None
+        nonlocal design_report_path, owned_scenario_path, owned_overlay_path
+        prior_path = Path(owned_scenario_path).resolve() if owned_scenario_path else None
+        prior_overlay_path = Path(owned_overlay_path).resolve() if owned_overlay_path else None
         if base_path.is_file() and base_path.resolve() != prior_path:
             raise FileExistsError(f"refusing to overwrite an existing scenario: {base_path}")
         overlay_path = None
@@ -424,6 +634,10 @@ def build_environment_tools(
             overlay_path = Path(scenario_root) / "split_mode" / relative_output_dir / filename
             if overlay_path.is_file() and overlay_path.resolve() != prior_overlay_path:
                 raise FileExistsError(f"refusing to overwrite an existing split-mode overlay: {overlay_path}")
+        report_path = base_path.with_suffix(".design.json") if compiled_design_report is not None else None
+        prior_report_path = Path(design_report_path).resolve() if design_report_path else None
+        if report_path is not None and report_path.is_file() and report_path.resolve() != prior_report_path:
+            raise FileExistsError(f"refusing to overwrite an existing environment design report: {report_path}")
         _dump_mapping(base_path, candidate.scenario)
         topology_graph_path = None
         topology = candidate.scenario.get("topology")
@@ -455,7 +669,16 @@ def build_environment_tools(
                 start=overlay_path.parent.resolve(),
             ).replace("\\", "/")
             _dump_mapping(overlay_path, overlay)
+        if report_path is not None:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(compiled_design_report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            design_report_path = str(report_path.resolve())
         draft.record_written_paths(scenario_path=base_path, split_mode_overlay_path=overlay_path)
+        owned_scenario_path = draft.scenario_path
+        owned_overlay_path = draft.split_mode_overlay_path
         if logger:
             log_event(
                 logger,
@@ -473,6 +696,7 @@ def build_environment_tools(
                 "scenario_path": draft.scenario_path,
                 "split_mode_overlay_path": draft.split_mode_overlay_path,
                 "topology_graph_path": str(topology_graph_path) if topology_graph_path else "",
+                "design_report_path": design_report_path,
             }
         )
 
@@ -619,15 +843,28 @@ def build_environment_tools(
             "draft": draft.summary(compact=True),
         })
 
-    return [
+    shared_tools = [
         _make_tool("list_existing_environment_specs", list_existing_environment_specs.__doc__ or "", list_existing_environment_specs),
-        _make_tool("initialize_environment_draft", initialize_environment_draft.__doc__ or "", initialize_environment_draft),
-        _make_tool("replace_draft_section", replace_draft_section.__doc__ or "", replace_draft_section),
-        _make_tool("patch_draft_entity", patch_draft_entity.__doc__ or "", patch_draft_entity),
-        _make_tool("inspect_draft_section", inspect_draft_section.__doc__ or "", inspect_draft_section),
         _make_tool("validate_environment_draft", validate_environment_draft.__doc__ or "", validate_environment_draft),
         _make_tool("write_validated_environment_yaml", write_validated_environment_yaml.__doc__ or "", write_validated_environment_yaml),
         _make_tool("simulate_candidate_environment", simulate_candidate_environment.__doc__ or "", simulate_candidate_environment),
         _make_tool("record_validation_feedback", record_validation_feedback.__doc__ or "", record_validation_feedback),
         _make_tool("read_back_written_yaml", read_back_written_yaml.__doc__ or "", read_back_written_yaml),
+    ]
+    if semantic_design_mode:
+        return [
+            shared_tools[0],
+            _make_tool("get_environment_runtime_reference", get_environment_runtime_reference.__doc__ or "", get_environment_runtime_reference),
+            _make_tool("submit_environment_catalog", submit_environment_catalog.__doc__ or "", submit_environment_catalog),
+            _make_tool("inspect_environment_catalog", inspect_environment_catalog.__doc__ or "", inspect_environment_catalog),
+            _make_tool("compile_environment_design", compile_environment_design.__doc__ or "", compile_environment_design),
+            *shared_tools[1:],
+        ]
+    return [
+        shared_tools[0],
+        _make_tool("initialize_environment_draft", initialize_environment_draft.__doc__ or "", initialize_environment_draft),
+        _make_tool("replace_draft_section", replace_draft_section.__doc__ or "", replace_draft_section),
+        _make_tool("patch_draft_entity", patch_draft_entity.__doc__ or "", patch_draft_entity),
+        _make_tool("inspect_draft_section", inspect_draft_section.__doc__ or "", inspect_draft_section),
+        *shared_tools[1:],
     ]
