@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .compiler import EnvironmentAgentCompiler
+from .compiler import EnvironmentAgentCompiler, S3_QUALITY_PROFILE
 from .draft import ScenarioDraftStore
 from .launcher import EnvironmentLauncher
 from .specs import ExistingScenarioSpecExplorer
@@ -292,6 +292,7 @@ def build_environment_tools(
     launcher: EnvironmentLauncher,
     scenario_root: Path,
     execute_simulator: bool = True,
+    quality_profile: str | None = S3_QUALITY_PROFILE,
     explorer: ExistingScenarioSpecExplorer | None = None,
     logger: logging.Logger | None = None,
 ) -> list[Any]:
@@ -368,7 +369,7 @@ def build_environment_tools(
     def validate_environment_draft(reason: str = "") -> str:
         """Validate the draft and return a section-level repair plan for any errors."""
         candidate = draft.assemble_candidate()
-        report = compiler.validate_candidate(candidate)
+        report = compiler.validate_candidate(candidate, quality_profile=quality_profile)
         draft.validation_passed = report.ok
         repair_plan = _build_repair_plan(list(report.errors))
         sections_requiring_replacement.clear()
@@ -394,6 +395,8 @@ def build_environment_tools(
                 "status": "ok" if report.ok else "failed",
                 "reason": reason,
                 "scenario_id": report.scenario_id,
+                "quality_profile": quality_profile or "schema-only",
+                "quality_contract": compiler.quality_requirements(quality_profile),
                 "repair_plan": repair_plan,
                 "errors": list(report.errors),
                 "warnings": list(report.warnings),
@@ -401,13 +404,26 @@ def build_environment_tools(
             }
         )
 
-    def write_validated_environment_yaml(reason: str = "", output_dir: str = "") -> str:
+    def write_validated_environment_yaml(reason: str = "", output_dir: str = "generated") -> str:
         """Write YAML only after the latest complete draft passes static validation."""
         if not draft.validation_passed:
             raise ValueError("draft must pass validation before writing YAML")
         candidate = draft.assemble_candidate()
         filename = candidate.scenario_id.lower().replace("-", "_") + ".yaml"
         base_path = _resolve_candidate_output_dir(Path(scenario_root), output_dir) / filename
+        prior_path = Path(draft.scenario_path).resolve() if draft.scenario_path else None
+        prior_overlay_path = Path(draft.split_mode_overlay_path).resolve() if draft.split_mode_overlay_path else None
+        if base_path.is_file() and base_path.resolve() != prior_path:
+            raise FileExistsError(f"refusing to overwrite an existing scenario: {base_path}")
+        overlay_path = None
+        if candidate.split_mode_overlay is not None:
+            try:
+                relative_output_dir = base_path.parent.resolve().relative_to(Path(scenario_root).resolve())
+            except ValueError:
+                relative_output_dir = Path()
+            overlay_path = Path(scenario_root) / "split_mode" / relative_output_dir / filename
+            if overlay_path.is_file() and overlay_path.resolve() != prior_overlay_path:
+                raise FileExistsError(f"refusing to overwrite an existing split-mode overlay: {overlay_path}")
         _dump_mapping(base_path, candidate.scenario)
         topology_graph_path = None
         topology = candidate.scenario.get("topology")
@@ -432,9 +448,7 @@ def build_environment_tools(
                         else "reused"
                     ),
                 )
-        overlay_path = None
-        if candidate.split_mode_overlay is not None:
-            overlay_path = Path(scenario_root) / "split_mode" / filename
+        if overlay_path is not None:
             overlay = deepcopy(candidate.split_mode_overlay)
             overlay["base_scenario"] = os.path.relpath(
                 base_path.resolve(),

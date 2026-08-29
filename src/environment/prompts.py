@@ -10,6 +10,11 @@ output must be grounded in the existing experiment stack:
 - Runtime readiness requires a graph snapshot, a healthy policy gateway response,
   and initialized SLA flow profiles whose allocations cover their guarantees.
 
+S3 production quality floor is mandatory: generated environments must meet or
+exceed the supplied S3 size, redundancy, traffic-diversity, split-mode, and
+SLA-allocation requirements. Static validation enforces this floor; do not
+attempt to write or simulate an environment that fails it.
+
 Return structured JSON only. Do not return markdown.
 
 Mandatory loop:
@@ -164,6 +169,9 @@ GENERATION_PROMPT_TEMPLATE = """Environment generation request:
 - stress_mode: {stress_mode}
 - output_dir: {output_dir}
 
+Required quality profile: {quality_profile}
+Quality contract: {quality_requirements}
+
 Repository launch context:
 - Static scenario schema follows experiments/scenarios/s1_basic_single_slice.yaml,
   experiments/scenarios/s2_medium_complexity.yaml, and
@@ -199,6 +207,8 @@ Every UE session `slice_ref` must be advertised by the UE's attached `gnb`.
 `slice_ref` must equal one slice `label` exactly. Never append `:<apn>` to it.
 Call validate_environment_draft, then write_validated_environment_yaml, then
 simulate_candidate_environment. Do not skip these gates.
+The requested target_flow_count is never permission to produce fewer flows than
+the required quality profile. Meet every stated S3 minimum before validation.
 
 IMPORTANT — final JSON keys:
   scenario_id (str), name (str), validation_status (str),

@@ -3,19 +3,24 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from pydantic import BaseModel, Field
 
 from experiments.scripts.common import resolve_python_executable
 
-from .compiler import EnvironmentAgentCompiler
+from .compiler import EnvironmentAgentCompiler, S3_QUALITY_PROFILE
 from .contracts import EnvironmentGenerationRequest, ScenarioCandidate
 from .prompts import ENVIRONMENT_AGENT_SYSTEM_PROMPT
 from .tools import build_environment_tools
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.logging import log_event, log_timing
-from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, ToolLoopExecutionError, extract_tool_results
+from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, RuntimePersistence, ToolLoopExecutionError, extract_tool_results
+from application_runtime.persistence import create_runtime_persistence
+
+
+ENVIRONMENT_TOOL_CAPABILITIES: Mapping[str, tuple[str, ...]] = MappingProxyType({})
 
 
 def simulation_validation_succeeded(payloads: list[dict[str, Any]]) -> bool:
@@ -106,9 +111,13 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         llm: Any = ...,
         environment_tools: list[Any] | None = None,
         scenario_root: Path | None = None,
+        persistence: RuntimePersistence | None = None,
+        quality_profile: str | None = S3_QUALITY_PROFILE,
     ) -> None:
         self.agent_name = "environment_generation"
         self.compiler = EnvironmentAgentCompiler()
+        self.quality_profile = quality_profile
+        self.compiler.quality_requirements(quality_profile)
         self.system_prompt = ENVIRONMENT_AGENT_SYSTEM_PROMPT
         self.environment_tools = environment_tools
         if not initialize_runtime:
@@ -117,7 +126,8 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         super().__init__(model_name=model_name, use_local_model=use_local_model)
         if llm is not ...:
             self.llm = llm
-        self.initialize_agent_runtime(logger_color="\033[92m")
+        runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.initialize_agent_runtime(logger_color="\033[92m", persistence=runtime_persistence)
         if self.environment_tools is None:
             project_root = Path.cwd()
             workspace_root = project_root.parent
@@ -134,6 +144,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                 ),
                 scenario_root=scenario_root or (project_root / "experiments" / "scenarios"),
                 execute_simulator=True,
+                quality_profile=self.quality_profile,
                 logger=self.logger,
             )
         self.agent = self.create_json_agent(
@@ -157,6 +168,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                 "inspect_draft_section": 3000,
                 "validate_environment_draft": 4000,
             },
+            capability_aliases=ENVIRONMENT_TOOL_CAPABILITIES,
         )
 
     def expected_request_type(self) -> str:
@@ -194,7 +206,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             session_id=session_id,
             snapshot_id=snapshot_id,
         )
-        prompt = self.compiler.build_generation_prompt(request)
+        prompt = self.compiler.build_generation_prompt(request, quality_profile=self.quality_profile)
         prompt = (
             f"{prompt}\n\n"
             "Closed-loop requirement:\n"
@@ -207,6 +219,8 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             "- If simulation fails but the draft appears correct in-memory, use read_back_written_yaml to compare the draft against the file on disk. Look for missing keys, type mismatches, or serialization gaps.\n"
             "- If validation or simulation reports a failure, call record_validation_feedback and produce a revised candidate.\n"
             "- Simulation succeeds only when the real launcher starts, the live graph snapshot exists, the policy gateway is healthy, and SLA initialization passes.\n"
+            f"- Enforce the {self.quality_profile or 'schema-only'} quality contract: "
+            f"{self.compiler.quality_requirements(self.quality_profile)}\n"
             "- Do not submit a complete scenario mapping during draft mutation or in the final JSON.\n"
             "- Final JSON must summarize the successfully validated environment candidate.\n"
             "- CRITICAL: your final JSON output MUST contain these top-level keys:\n"
@@ -251,7 +265,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         if not written_payloads:
             raise RuntimeError("Environment advisor returned without validated YAML write evidence")
         candidate = _load_written_candidate(written_payloads[-1], fallback_name=output.name)
-        report = self.compiler.validate_candidate(candidate)
+        report = self.compiler.validate_candidate(candidate, quality_profile=self.quality_profile)
         if not report.ok:
             log_timing(
                 self.logger,

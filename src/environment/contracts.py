@@ -13,7 +13,7 @@ class EnvironmentGenerationRequest:
     target_flow_count: int = 8
     topology_mode: str = "ulcl"
     stress_mode: str = "slice_resource_contention"
-    output_dir: Path = Path("")
+    output_dir: Path = Path("generated")
 
 
 @dataclass(frozen=True)
