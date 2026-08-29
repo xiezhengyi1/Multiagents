@@ -7,12 +7,13 @@ agent = EnvironmentGenerationAgent(
 )
 
 request = EnvironmentGenerationRequest(
-    scenario_id="G001",
-    objective="Generate a URLLC stress scenario with slice contention",
-    complexity="medium",
-    target_flow_count=8,
+    scenario_id="G001-S3",
+    objective="Generate an S3-class multi-slice ULCL stress scenario with resilient QoS contention",
+    complexity="high",
+    target_flow_count=15,
     topology_mode="ulcl",
     stress_mode="slice_resource_contention",
+    output_dir=Path("generated"),
 )
 
 candidate = agent.generate_environment(request)

@@ -11,7 +11,8 @@ for candidate in (PACKAGE_ROOT, SRC_ROOT):
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
 
-from database.connection import Base, WORKER_SCHEMA, engine
+from database.base import Base
+from database.connection import WORKER_SCHEMA, engine
 from database.langchain_pg import ensure_semantic_knowledge_collection, setup_langgraph_postgres
 # Import models so Base metadata is populated
 from database.models import (
@@ -93,7 +94,27 @@ def init_db():
             connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS current_artifact_id VARCHAR"))
             connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS round_index INTEGER DEFAULT 0"))
             connection.execute(text("ALTER TABLE session_context ADD COLUMN IF NOT EXISTS last_error TEXT"))
-            connection.execute(text("UPDATE session_context SET current_stage = current_step WHERE current_stage IS NULL"))
+            connection.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = current_schema()
+                              AND table_name = 'session_context'
+                              AND column_name = 'current_step'
+                        ) THEN
+                            UPDATE session_context
+                            SET current_stage = current_step
+                            WHERE current_stage IS NULL;
+                            ALTER TABLE session_context DROP COLUMN current_step;
+                        END IF;
+                    END $$
+                    """
+                )
+            )
             connection.commit()
 
         if WORKER_SCHEMA:

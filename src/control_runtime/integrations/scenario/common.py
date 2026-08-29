@@ -97,8 +97,6 @@ def _resolve_slice_current_bandwidth(
     load_key: str,
     utilization_key: str,
     total_bandwidth: float,
-    legacy_load_value: Any,
-    legacy_utilization_value: Any,
 ) -> float:
     explicit_load = _optional_float(load_payload.get(load_key))
     if explicit_load is not None:
@@ -109,14 +107,8 @@ def _resolve_slice_current_bandwidth(
         return telemetry_load
 
     utilization = _optional_float(telemetry_payload.get(utilization_key))
-    if utilization is None:
-        utilization = _optional_float(legacy_utilization_value)
     if utilization is not None:
         return utilization * total_bandwidth
-
-    legacy_load = _optional_float(legacy_load_value)
-    if legacy_load is not None:
-        return legacy_load
     return 0.0
 
 
@@ -219,8 +211,6 @@ def _build_slice_from_dict(s_dict: Dict[str, Any]) -> Slice:
         load_key="current_bandwidth_ul",
         utilization_key="utilization_ul",
         total_bandwidth=total_bandwidth_ul,
-        legacy_load_value=s_dict.get("current_load_bw_ul"),
-        legacy_utilization_value=s_dict.get("sim_utilization_ul"),
     )
     current_bandwidth_dl = _resolve_slice_current_bandwidth(
         load_payload=load_payload,
@@ -228,8 +218,6 @@ def _build_slice_from_dict(s_dict: Dict[str, Any]) -> Slice:
         load_key="current_bandwidth_dl",
         utilization_key="utilization_dl",
         total_bandwidth=total_bandwidth_dl,
-        legacy_load_value=s_dict.get("current_load_bw_dl"),
-        legacy_utilization_value=s_dict.get("sim_utilization_dl"),
     )
 
     return Slice(
@@ -253,8 +241,8 @@ def _build_slice_from_dict(s_dict: Dict[str, Any]) -> Slice:
             loss_rate=float(qos_payload.get("loss_rate", s_dict.get("loss", 0.0)) or 0.0),
         ),
         telemetry=SliceTelemetry(
-            utilization_ul=telemetry_payload.get("utilization_ul", s_dict.get("sim_utilization_ul")),
-            utilization_dl=telemetry_payload.get("utilization_dl", s_dict.get("sim_utilization_dl")),
+            utilization_ul=telemetry_payload.get("utilization_ul"),
+            utilization_dl=telemetry_payload.get("utilization_dl"),
             latency=telemetry_payload.get("latency", s_dict.get("sim_latency")),
             jitter=telemetry_payload.get("jitter", s_dict.get("sim_jitter")),
             loss_rate=telemetry_payload.get("loss_rate", s_dict.get("sim_loss_rate")),

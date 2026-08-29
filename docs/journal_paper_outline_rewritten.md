@@ -199,7 +199,7 @@ PolicyPlanDraft -> Conflict Request -> Domain Verdict -> Policy Compiler -> PCF 
 2. 输出root cause、affected policy、affected flow和recommended actions；
 3. Main根据诊断判断full reground、partial reground、target stable或禁止重试；
 4. 监控模块可扫描flow指标并生成MonitorAlert；
-5. Requirement Agent可把告警转成新的控制请求，触发AutonomousMonitorReentryLoop。
+5. 确定性意图生命周期管理器按告警 binding 触发规则化重规划。
 
 **建议插图 Fig. 7：失败类型与回流路径图**  
 左侧列出失败类型：对象接地失败、域边界错误、规划证据不足、冲突仲裁失败、执行失败、保障违约；右侧连接回Main、IEA或OSA。
@@ -239,7 +239,7 @@ PolicyPlanDraft -> Conflict Request -> Domain Verdict -> Policy Compiler -> PCF 
 
 写运行时和训练层：
 
-1. agent_runtime记录artifact、queue、trace、workspace和结构化工具循环；
+1. shared.runtime 记录 artifact、queue、trace、workspace 和结构化工具循环；
 2. 每轮保存GlobalControlIntent、OperationIntent、PolicyPlanDraft、dispatch receipts和diagnosis；
 3. training模块将workflow trajectories和agent trajectories投影为训练记录；
 4. 导出ChatML数据，用于后续监督微调或偏好优化。
@@ -391,7 +391,7 @@ Ours vs Ours w/o ClosedLoop，重点显示CRR和TCR。
 结合项目中的monitoring模块写未来扩展：
 
 1. 当前主实验以用户请求触发为主；
-2. 监控重入模块已经具备把FlowTelemetryMonitor告警转为RequirementDraft并重新进入编排器的原型；
+2. 监控模块以确定性规则把FlowTelemetryMonitor告警转为RequirementDraft并重新进入编排器；
 3. 后续可把一次性策略生成扩展为持续意图保障；
 4. 持续运行trace可进一步形成训练数据飞轮。
 

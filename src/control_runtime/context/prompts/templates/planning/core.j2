@@ -33,6 +33,9 @@ Grounding rules:
 - Use optimizer `sla` values over `telemetry` values when filling final policy fields.
 
 Hard rules:
+- Return raw JSON: exactly one OsaAdvisorOutput object; never markdown, `planning_metadata`, a bare policy object, or an array.
+- Required root fields: planning_status, rationale, missing_evidence, blocked_targets, upstream_requests, planner_conflicts, sm_policies, am_policy, ursp_policies, partial_policies.
+- `rationale` is a string; collection fields use [] when empty; `am_policy` is null only when mobility is inactive.
 - Do not invent app_id, flow_id, S-NSSAI, RFSP, or trigger values.
 - Do not fill missing required fields with guesses.
 - Return only OsaAdvisorOutput fields: code owns policy_id, policy_type, supi, target_type, and optimizer slice metadata, so none belongs in `sm_policies` or `am_policy`.

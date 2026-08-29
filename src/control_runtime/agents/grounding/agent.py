@@ -2,16 +2,27 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from pydantic import ValidationError
 
-from shared.runtime import ArtifactEnvelope
+from shared.runtime import ArtifactEnvelope, RuntimePersistence
 from shared.runtime import ContextPolicy
 from shared.runtime import ToolLoopExecutionError
-from shared.agents import BaseAgent, coerce_structured_response, extract_grounding_tool_names
+from shared.agents import (
+    BaseAgent,
+    RetryContext,
+    RetryPhase,
+    RetryPolicy,
+    StageAttempt,
+    StageRunner,
+    coerce_structured_response,
+    extract_grounding_tool_names,
+)
 from shared.runtime import ArtifactWorkerMixin
+from application_runtime.persistence import create_runtime_persistence
+from ...tool_capabilities import CONTROL_RUNTIME_CAPABILITY_ALIASES
 from ...integrations.pcf import (
     get_am_policy_context,
     get_sm_ue_flow_catalog,
@@ -21,24 +32,30 @@ from ...integrations.pcf import (
 )
 from ...context.projectors import project_intent_evidence_for_prompt
 from ...context.observability import measure_context_components
-from ...context.evidence.grounding import IntentEvidenceBuilder
-from ...domain.policy_plan import (
+from .contracts import (
     FlowSelector,
     GroundingAdvisorOutput,
     GroundingDecision,
     GroundingEvidenceBundle,
+    IntentEncodingDirectives,
+    IntentEvidence,
     QosOperationConstraint,
     SliceMigrationAuthorization,
 )
-from ...context.prompts import GroundingPromptBuilder, RetryPromptBuilder
-from ..common import validate_grounding_decision
+from ...context.prompts.grounding import (
+    build_grounding_validation_retry_prompt,
+    render_grounding_system_prompt,
+)
 from shared.logging import log_event, log_timing
 
-from .compiler import IntentCompiler
-from .common import extract_requested_supis, merge_candidate_dicts, merge_catalog_payloads
-from .contracts import IntentEvidence
-from ...context.prompts import IEA_DYNAMIC_RULES
-from .tool_result_adapter import extract_grounding_tool_payloads
+from .evidence import (
+    IntentEvidenceBuilder,
+    extract_grounding_tool_payloads,
+    extract_requested_supis,
+    merge_candidate_dicts,
+    merge_catalog_payloads,
+)
+from .validator import IntentGroundingValidator, validate_grounding
 
 
 @dataclass
@@ -69,6 +86,63 @@ class IntentAdvisorInvocation:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _IeaInvocationFailure:
+    """A retryable transport/tool-loop failure from one advisor invocation."""
+
+    error: RuntimeError
+
+
+@dataclass(frozen=True, slots=True)
+class _IeaAdvisorContractFailure:
+    """A retryable malformed structured advisor response."""
+
+    error: RuntimeError | ValidationError
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _IeaValidationOutcome:
+    """Keep decision and grounding validation failures distinct for retry/exit."""
+
+    advisor_errors: tuple[str, ...]
+    grounding_errors: tuple[str, ...]
+
+    @property
+    def issues(self) -> tuple[str, ...]:
+        return (*self.advisor_errors, *self.grounding_errors)
+
+    def terminal_error(self) -> RuntimeError:
+        if self.advisor_errors:
+            return RuntimeError(
+                "IEA advisor decision validation failed: " + "; ".join(self.advisor_errors)
+            )
+        return RuntimeError(
+            "IEA grounding validation failed: " + "; ".join(self.grounding_errors)
+        )
+
+
+@dataclass(slots=True)
+class _IeaAdvisorStageState:
+    """Mutable IEA advisor lifecycle state retained across bounded retries."""
+
+    current_prompt: str
+    evidence: IntentEvidence
+    main_directives: Dict[str, Any]
+    snapshot_id: str
+    context: str
+    runtime_context: Any
+    advisor_agent: Any
+    advisor_invocation: IntentAdvisorInvocation | None = None
+    refreshed_evidence: IntentEvidence | None = None
+    advisor_output: GroundingAdvisorOutput | None = None
+    grounding_decision: GroundingDecision | None = None
+    grounding_tools: List[str] = field(default_factory=list)
+    invocation_failure: _IeaInvocationFailure | None = None
+    advisor_contract_failure: _IeaAdvisorContractFailure | None = None
+    validation_outcome: _IeaValidationOutcome | None = None
+
+
 class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "intent_encoding"
     SM_GROUNDING_TOOLS = {"search_sm_flow_targets", "get_sm_ue_flow_catalog"}
@@ -80,11 +154,15 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         self,
         model_name: str = "qwen3-30b-a3b-instruct-2507",
         use_local_model: bool = False,
+        *,
+        persistence: RuntimePersistence | None = None,
     ) -> None:
         super().__init__(model_name=model_name, use_local_model=use_local_model)
         self.agent_name = "intent_encoding"
-        self.compiler = IntentCompiler()
-        self.initialize_agent_runtime(logger_color="\033[95m")
+        self.evidence_builder = IntentEvidenceBuilder()
+        self.validator = IntentGroundingValidator()
+        runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.initialize_agent_runtime(logger_color="\033[95m", persistence=runtime_persistence)
         self.tools = [
             search_sm_flow_targets,
             get_sm_ue_flow_catalog,
@@ -98,7 +176,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     def _create_advisor_agent(self, tools: List[Any]) -> Any:
         return self.create_json_agent(
             tools=tools,
-            system_prompt=GroundingPromptBuilder().system_prompt(),
+            system_prompt=render_grounding_system_prompt(),
             response_model=GroundingAdvisorOutput,
             max_iterations=14,
             max_calls_per_tool=3,
@@ -129,6 +207,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     "search_sm_flow_targets": 2,
                 },
             ),
+            capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
         )
 
     @classmethod
@@ -270,8 +349,9 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         self.ensure_worker_runtime_initialized()
         total_start = time.perf_counter()
         log_event(self.logger, "iea_analyze_start")
-        main_directives = self.compiler.extract_main_directives(context)
+        main_directives = IntentEncodingDirectives.from_context(context).model_dump()
         self.last_failure_debug = {}
+        stage_state: _IeaAdvisorStageState | None = None
 
         try:
             evidence = self._extract_intent_evidence(
@@ -300,143 +380,24 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     ),
                 )
             )
-            advisor_prompt = self._build_advisor_prompt(evidence=evidence, context=context)
-            grounding_decision = None
-            grounding_tools: List[str] = []
-            validation_errors: List[str] = []
-            advisor_validation_errors: List[str] = []
-            invocation_error: str = ""
-            for attempt_index in range(3):
-                try:
-                    advisor_invocation = self._invoke_intent_advisor(
-                        prompt=advisor_prompt,
-                        runtime_context=runtime_context,
-                        advisor_agent=request_advisor_agent,
-                    )
-                except RuntimeError as exc:
-                    invocation_error = str(exc)
-                    if attempt_index == 2:
-                        raise
-                    # If the failed invocation produced tool results, extract them
-                    # and merge into evidence so the retry prompt includes the data
-                    # the LLM already collected — prevents burning tool quota re-querying.
-                    raw_messages = list(getattr(exc, "_tool_output_messages", None) or [])
-                    if raw_messages:
-                        fake_result = {"messages": raw_messages}
-                        evidence = self._refresh_intent_evidence_from_tool_results(
-                            evidence=evidence,
-                            advisor_result=fake_result,
-                            main_directives=main_directives,
-                            snapshot_id=snapshot_id,
-                        )
-                    log_event(self.logger, "iea_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
-                    advisor_prompt = self._build_validation_retry_prompt(
-                        base_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
-                        advisor_validation_errors=[],
-                        grounding_validation_errors=[],
-                        invocation_error=invocation_error,
-                    )
-                    continue
-                advisor_result = advisor_invocation.advisor_result
-                grounding_tools = extract_grounding_tool_names(advisor_result, self.GROUNDING_TOOLS)
-                refreshed_evidence = self._refresh_intent_evidence_from_tool_results(
-                    evidence=evidence,
-                    advisor_result=advisor_result,
-                    main_directives=main_directives,
-                    snapshot_id=snapshot_id,
-                )
-                try:
-                    advisor_output = coerce_structured_response(
-                        advisor_result,
-                        GroundingAdvisorOutput,
-                        error_message="IEA advisor returned no structured_response",
-                    )
-                except (RuntimeError, ValidationError) as exc:
-                    # A narrow raw schema is deliberately strict.  Treat an
-                    # invalid model draft as a repairable IEA turn, while
-                    # retaining any authoritative tool evidence it collected
-                    # before returning the malformed object.
-                    advisor_validation_errors = [str(exc)]
-                    validation_errors = []
-                    evidence = refreshed_evidence
-                    self.last_failure_debug = {
-                        "phase": "intent_encoding",
-                        "attempt_index": attempt_index + 1,
-                        "grounding_tools": list(grounding_tools or []),
-                        "advisor_validation_errors": list(advisor_validation_errors),
-                        "grounding_validation_errors": [],
-                        "evidence_snapshot": evidence.model_dump(mode="json"),
-                    }
-                    if attempt_index == 2:
-                        raise RuntimeError(
-                            "IEA advisor output contract validation failed: "
-                            + "; ".join(advisor_validation_errors)
-                        ) from exc
-                    log_event(
-                        self.logger,
-                        "iea_retry",
-                        attempt=attempt_index + 2,
-                        reason="advisor_output_contract",
-                        advisor_errors=advisor_validation_errors,
-                    )
-                    advisor_prompt = self._build_validation_retry_prompt(
-                        base_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
-                        advisor_validation_errors=advisor_validation_errors,
-                        grounding_validation_errors=[],
-                        invocation_error="",
-                    )
-                    continue
-                grounding_decision = self._compile_advisor_output(
-                    advisor_output=advisor_output,
-                    evidence=refreshed_evidence,
-                )
-                grounding_decision = self._materialize_catalog_facts(
-                    grounding_decision=grounding_decision,
-                    evidence=refreshed_evidence,
-                )
-                grounding_decision = self._materialize_qos_constraint_facts(
-                    grounding_decision=grounding_decision,
-                )
-                grounding_decision = self._attach_subscription_evidence(
-                    grounding_decision=grounding_decision,
-                    evidence=refreshed_evidence,
-                )
-                advisor_validation_errors, validation_errors, _ = validate_grounding_decision(
-                    compiler=self.compiler,
-                    evidence=refreshed_evidence,
-                    grounding_decision=grounding_decision,
-                    grounding_tools=grounding_tools,
-                )
-                self.last_failure_debug = {
-                    "phase": "intent_encoding",
-                    "attempt_index": attempt_index + 1,
-                    "grounding_tools": list(grounding_tools or []),
-                    "grounding_decision": grounding_decision.model_dump(mode="json"),
-                    "advisor_validation_errors": list(advisor_validation_errors or []),
-                    "grounding_validation_errors": list(validation_errors or []),
-                    "evidence_snapshot": refreshed_evidence.model_dump(mode="json"),
-                }
-                evidence = refreshed_evidence
-                if not advisor_validation_errors and not validation_errors:
-                    break
-                if attempt_index == 2:
-                    if advisor_validation_errors:
-                        raise RuntimeError("IEA advisor decision validation failed: " + "; ".join(advisor_validation_errors))
-                    raise RuntimeError("IEA grounding validation failed: " + "; ".join(validation_errors))
-                log_event(self.logger, "iea_retry", attempt=attempt_index + 2,
-                          reason="validation_errors",
-                          advisor_errors=advisor_validation_errors,
-                          grounding_errors=validation_errors)
-                advisor_prompt = self._build_validation_retry_prompt(
-                    base_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
-                    advisor_validation_errors=advisor_validation_errors,
-                    grounding_validation_errors=validation_errors,
-                    invocation_error="",
-                )
-            if grounding_decision is None:
+            stage_state = _IeaAdvisorStageState(
+                current_prompt=self._build_advisor_prompt(evidence=evidence, context=context),
+                evidence=evidence,
+                main_directives=main_directives,
+                snapshot_id=snapshot_id,
+                context=context,
+                runtime_context=runtime_context,
+                advisor_agent=request_advisor_agent,
+            )
+            completed_stage = self._run_advisor_stage(state=stage_state)
+            grounding_decision = completed_stage.grounding_decision
+            advisor_invocation = completed_stage.advisor_invocation
+            grounding_tools = completed_stage.grounding_tools
+            evidence = completed_stage.evidence
+            if grounding_decision is None or advisor_invocation is None:
                 raise RuntimeError("IEA advisor returned no GroundingDecision payload")
-            _, _, validated_intent = validate_grounding_decision(
-                compiler=self.compiler,
+            _, _, validated_intent = validate_grounding(
+                validator=self.validator,
                 evidence=evidence,
                 grounding_decision=grounding_decision,
                 grounding_tools=grounding_tools,
@@ -451,9 +412,9 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             self.last_failure_debug = {}
             return validated_intent
         except Exception as exc:
-            if "advisor_invocation" in locals() and "grounding_decision" in locals():
-                advisor_invocation.write_final_trace(
-                    grounding_decision=grounding_decision,
+            if stage_state is not None and stage_state.advisor_invocation is not None:
+                stage_state.advisor_invocation.write_final_trace(
+                    grounding_decision=stage_state.grounding_decision,
                     status="error",
                     error=str(exc),
                 )
@@ -607,7 +568,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             f"{json.dumps(project_intent_evidence_for_prompt(evidence), ensure_ascii=False)}\n\n"
             "Coordinator context:\n"
             f"{context or 'N/A'}\n\n"
-            f"{IEA_DYNAMIC_RULES.strip()}\n\n"
             "Task:\n"
             "- Resolve only choices that remain ambiguous; use already-grounded evidence directly.\n"
             "- Do not guess identifiers. An unresolved QoS target still appears in flows with its name and resolution_status='unresolved'.\n"
@@ -615,20 +575,275 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             "- Return one raw IEA decision JSON object only."
         )
 
-    @staticmethod
-    def _build_validation_retry_prompt(
+    def _run_advisor_stage(
+        self,
         *,
-        base_prompt: str,
-        advisor_validation_errors: List[str],
-        grounding_validation_errors: List[str],
-        invocation_error: str,
-    ) -> str:
-        return RetryPromptBuilder().build_grounding(
-            base_prompt=base_prompt,
-            advisor_validation_errors=advisor_validation_errors,
-            grounding_validation_errors=grounding_validation_errors,
-            invocation_error=invocation_error,
+        state: _IeaAdvisorStageState,
+    ) -> _IeaAdvisorStageState:
+        """Run IEA's advisor parse/repair/validation lifecycle with old retry semantics."""
+
+        retry_policy = RetryPolicy(
+            max_attempts=3,
+            retryable_exceptions_by_phase=(
+                (RetryPhase.INVOKE, (RuntimeError,)),
+                (RetryPhase.PARSE, (RuntimeError, ValidationError)),
+                (RetryPhase.VALIDATION, (RuntimeError,)),
+            ),
         )
+
+        def invoke_advisor(_: StageAttempt) -> _IeaAdvisorStageState:
+            state.advisor_invocation = self._invoke_intent_advisor(
+                prompt=state.current_prompt,
+                runtime_context=state.runtime_context,
+                advisor_agent=state.advisor_agent,
+            )
+            state.invocation_failure = None
+            return state
+
+        def parse_advisor(
+            stage_value: _IeaAdvisorStageState,
+            attempt: StageAttempt,
+        ) -> _IeaAdvisorStageState:
+            invocation = stage_value.advisor_invocation
+            if invocation is None:
+                raise AssertionError("IEA advisor invocation must exist before structured parsing")
+            try:
+                stage_value.advisor_output = coerce_structured_response(
+                    invocation.advisor_result,
+                    GroundingAdvisorOutput,
+                    error_message="IEA advisor returned no structured_response",
+                )
+            except (RuntimeError, ValidationError) as exc:
+                failure = _IeaAdvisorContractFailure(
+                    error=exc,
+                    errors=(str(exc),),
+                )
+                stage_value.advisor_contract_failure = failure
+                stage_value.validation_outcome = None
+                if attempt.is_final_attempt:
+                    self._capture_advisor_contract_failure(
+                        state=stage_value,
+                        failure=failure,
+                        attempt_index=attempt.attempt,
+                    )
+                    raise RuntimeError(
+                        "IEA advisor output contract validation failed: "
+                        + "; ".join(failure.errors)
+                    ) from exc
+                raise
+            stage_value.advisor_contract_failure = None
+            return stage_value
+
+        def repair_advisor(
+            stage_value: _IeaAdvisorStageState,
+            _: StageAttempt,
+        ) -> _IeaAdvisorStageState:
+            advisor_output = stage_value.advisor_output
+            if advisor_output is None:
+                raise RuntimeError("IEA advisor returned no structured_response")
+            refreshed_evidence = self._refresh_advisor_stage_evidence(state=stage_value)
+            grounding_decision = self._compile_advisor_output(
+                advisor_output=advisor_output,
+                evidence=refreshed_evidence,
+            )
+            grounding_decision = self._materialize_catalog_facts(
+                grounding_decision=grounding_decision,
+                evidence=refreshed_evidence,
+            )
+            grounding_decision = self._materialize_qos_constraint_facts(
+                grounding_decision=grounding_decision,
+            )
+            stage_value.grounding_decision = self._attach_subscription_evidence(
+                grounding_decision=grounding_decision,
+                evidence=refreshed_evidence,
+            )
+            return stage_value
+
+        def validate_advisor(
+            stage_value: _IeaAdvisorStageState,
+            attempt: StageAttempt,
+        ) -> tuple[str, ...]:
+            grounding_decision = stage_value.grounding_decision
+            refreshed_evidence = stage_value.refreshed_evidence
+            if grounding_decision is None or refreshed_evidence is None:
+                raise RuntimeError("IEA advisor returned no GroundingDecision payload")
+            stage_value.validation_outcome = None
+            advisor_errors, grounding_errors, _ = validate_grounding(
+                validator=self.validator,
+                evidence=refreshed_evidence,
+                grounding_decision=grounding_decision,
+                grounding_tools=stage_value.grounding_tools,
+            )
+            outcome = _IeaValidationOutcome(
+                advisor_errors=tuple(advisor_errors),
+                grounding_errors=tuple(grounding_errors),
+            )
+            stage_value.validation_outcome = outcome
+            self.last_failure_debug = {
+                "phase": "intent_encoding",
+                "attempt_index": attempt.attempt,
+                "grounding_tools": list(stage_value.grounding_tools or []),
+                "grounding_decision": grounding_decision.model_dump(mode="json"),
+                "advisor_validation_errors": list(outcome.advisor_errors),
+                "grounding_validation_errors": list(outcome.grounding_errors),
+                "evidence_snapshot": refreshed_evidence.model_dump(mode="json"),
+            }
+            stage_value.evidence = refreshed_evidence
+            return outcome.issues
+
+        def terminal_validation_error(issues: tuple[str, ...]) -> RuntimeError:
+            outcome = state.validation_outcome
+            if outcome is None or outcome.issues != issues:
+                raise RuntimeError("IEA validation outcome was not recorded")
+            return outcome.terminal_error()
+
+        def record_stage_failure(retry_context: RetryContext) -> None:
+            # Final/non-retryable failures retain the old no-extra-side-effect
+            # behavior.  A non-final malformed advisor response is the one
+            # path that must retain its tool evidence before prompt repair.
+            if retry_context.phase is not RetryPhase.PARSE:
+                return
+            if not retry_policy.should_retry(retry_context):
+                return
+            failure = state.advisor_contract_failure
+            if failure is None or failure.error is not retry_context.error:
+                return
+            self._capture_advisor_contract_failure(
+                state=state,
+                failure=failure,
+                attempt_index=retry_context.attempt,
+            )
+
+        def prepare_advisor_retry(retry_context: RetryContext) -> None:
+            if retry_context.phase is RetryPhase.INVOKE:
+                error = retry_context.error
+                if not isinstance(error, RuntimeError):
+                    return
+                failure = _IeaInvocationFailure(error=error)
+                state.invocation_failure = failure
+                # If the failed invocation produced tool results, extract them
+                # and merge them into evidence so the retry avoids re-querying
+                # catalog/search data and burning its tool quota.
+                raw_messages = list(getattr(failure.error, "_tool_output_messages", None) or [])
+                if raw_messages:
+                    state.evidence = self._refresh_intent_evidence_from_tool_results(
+                        evidence=state.evidence,
+                        advisor_result={"messages": raw_messages},
+                        main_directives=state.main_directives,
+                        snapshot_id=state.snapshot_id,
+                    )
+                log_event(
+                    self.logger,
+                    "iea_retry",
+                    attempt=retry_context.attempt + 1,
+                    reason="invocation_error",
+                    error=str(failure.error),
+                )
+                state.current_prompt = build_grounding_validation_retry_prompt(
+                    base_prompt=self._build_advisor_prompt(
+                        evidence=state.evidence,
+                        context=state.context,
+                    ),
+                    advisor_validation_errors=[],
+                    grounding_validation_errors=[],
+                    invocation_error=str(failure.error),
+                )
+                return
+
+            if retry_context.phase is RetryPhase.PARSE:
+                failure = state.advisor_contract_failure
+                if failure is None:
+                    return
+                log_event(
+                    self.logger,
+                    "iea_retry",
+                    attempt=retry_context.attempt + 1,
+                    reason="advisor_output_contract",
+                    advisor_errors=list(failure.errors),
+                )
+                state.current_prompt = build_grounding_validation_retry_prompt(
+                    base_prompt=self._build_advisor_prompt(
+                        evidence=state.evidence,
+                        context=state.context,
+                    ),
+                    advisor_validation_errors=list(failure.errors),
+                    grounding_validation_errors=[],
+                    invocation_error="",
+                )
+                return
+
+            if retry_context.phase is RetryPhase.VALIDATION:
+                outcome = state.validation_outcome
+                if outcome is None:
+                    return
+                log_event(
+                    self.logger,
+                    "iea_retry",
+                    attempt=retry_context.attempt + 1,
+                    reason="validation_errors",
+                    advisor_errors=list(outcome.advisor_errors),
+                    grounding_errors=list(outcome.grounding_errors),
+                )
+                state.current_prompt = build_grounding_validation_retry_prompt(
+                    base_prompt=self._build_advisor_prompt(
+                        evidence=state.evidence,
+                        context=state.context,
+                    ),
+                    advisor_validation_errors=list(outcome.advisor_errors),
+                    grounding_validation_errors=list(outcome.grounding_errors),
+                    invocation_error="",
+                )
+
+        runner: StageRunner[_IeaAdvisorStageState] = StageRunner(retry_policy=retry_policy)
+        return runner.run(
+            invoke=invoke_advisor,
+            parse=parse_advisor,
+            repair=repair_advisor,
+            validate=validate_advisor,
+            validation_error=terminal_validation_error,
+            on_failure=record_stage_failure,
+            on_retry=prepare_advisor_retry,
+        )
+
+    def _refresh_advisor_stage_evidence(
+        self,
+        *,
+        state: _IeaAdvisorStageState,
+    ) -> IntentEvidence:
+        invocation = state.advisor_invocation
+        if invocation is None:
+            raise RuntimeError("IEA advisor returned no invocation payload")
+        advisor_result = invocation.advisor_result
+        state.grounding_tools = extract_grounding_tool_names(advisor_result, self.GROUNDING_TOOLS)
+        refreshed_evidence = self._refresh_intent_evidence_from_tool_results(
+            evidence=state.evidence,
+            advisor_result=advisor_result,
+            main_directives=state.main_directives,
+            snapshot_id=state.snapshot_id,
+        )
+        state.refreshed_evidence = refreshed_evidence
+        return refreshed_evidence
+
+    def _capture_advisor_contract_failure(
+        self,
+        *,
+        state: _IeaAdvisorStageState,
+        failure: _IeaAdvisorContractFailure,
+        attempt_index: int,
+    ) -> None:
+        # A narrow raw schema is deliberately strict.  Retain authoritative
+        # tool evidence collected before the malformed object so a repair turn
+        # can finish from the data without spending its tool quota again.
+        evidence = self._refresh_advisor_stage_evidence(state=state)
+        state.evidence = evidence
+        self.last_failure_debug = {
+            "phase": "intent_encoding",
+            "attempt_index": attempt_index,
+            "grounding_tools": list(state.grounding_tools or []),
+            "advisor_validation_errors": list(failure.errors),
+            "grounding_validation_errors": [],
+            "evidence_snapshot": evidence.model_dump(mode="json"),
+        }
 
     def _invoke_intent_advisor(
         self,
@@ -703,7 +918,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         supi = str(main_directives.get("supi") or "").strip()
         if not supi and explicit_supis:
             supi = ", ".join(explicit_supis)
-        return self.compiler.build_intent_evidence(
+        return self.evidence_builder.build_intent_evidence(
             user_input=normalized_input,
             supi=supi,
             main_directives=main_directives,
@@ -757,7 +972,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 if not requested_supis or payload_supi in requested_supis:
                     subscription_payload = {**subscription_payload, **payload}
 
-        return self.compiler.build_intent_evidence(
+        return self.evidence_builder.build_intent_evidence(
             user_input=evidence.user_input,
             supi=evidence.supi,
             main_directives=main_directives,

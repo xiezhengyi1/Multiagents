@@ -223,7 +223,7 @@ class FlowTelemetryMonitor:
             status="violated",
             violated_metrics=violated,
             metric_deltas=deltas,
-            recommended_consumer="autonomous_requirement_agent",
+            recommended_consumer="intent_lifecycle",
             suggested_domains=["qos"],
             reuse_binding=True,
             observed_at=observed_at,

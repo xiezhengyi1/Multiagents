@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -172,6 +173,191 @@ def get_ue_flow_catalog_by_supi(supi: str, snapshot_id: str = "") -> Dict[str, A
         "app_catalog": ctx.get("app_catalog") or [],
         "flow_catalog": ctx.get("flow_catalog") or [],
     }
+
+
+AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
+
+
+def _merge_context_bucket(existing_bucket: Any, policy_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    bucket = deepcopy(existing_bucket) if isinstance(existing_bucket, dict) else {}
+    bucket[policy_id] = payload
+    return bucket
+
+
+def merge_applied_access_policies(
+    existing_context: Dict[str, Any],
+    policies: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    sm_policy_data = deepcopy(existing_context.get("smPolicyData")) if isinstance(existing_context.get("smPolicyData"), dict) else {}
+    pcc_rules = deepcopy(existing_context.get("pccRules")) if isinstance(existing_context.get("pccRules"), dict) else {}
+    qos_decs = deepcopy(existing_context.get("qosDecs")) if isinstance(existing_context.get("qosDecs"), dict) else {}
+    sess_rules = deepcopy(existing_context.get("sessRules")) if isinstance(existing_context.get("sessRules"), dict) else {}
+    traff_cont_decs = deepcopy(existing_context.get("traffContDecs")) if isinstance(existing_context.get("traffContDecs"), dict) else {}
+    chg_decs = deepcopy(existing_context.get("chgDecs")) if isinstance(existing_context.get("chgDecs"), dict) else {}
+    ursp_rules = deepcopy(existing_context.get("urspRules")) if isinstance(existing_context.get("urspRules"), dict) else {}
+
+    for policy in policies:
+        policy_details = policy.get("policy_details")
+        if not isinstance(policy_details, dict):
+            continue
+        policy_id = str(policy.get("policy_id") or policy_details.get("policy_id") or "").strip()
+        if not policy_id:
+            continue
+        policy_type = str(policy.get("policy_type") or "").strip()
+        if policy_type == "SmPolicyDecision":
+            sm_policy_data[policy_id] = {
+                "policy_id": policy_id,
+                "policy_type": policy_type,
+                "policy_details": policy_details,
+            }
+            if isinstance(policy_details.get("pccRules"), dict):
+                pcc_rules = _merge_context_bucket(pcc_rules, policy_id, policy_details["pccRules"])
+            if isinstance(policy_details.get("qosDecs"), dict):
+                qos_decs = _merge_context_bucket(qos_decs, policy_id, policy_details["qosDecs"])
+            if isinstance(policy_details.get("sessRules"), dict):
+                sess_rules = _merge_context_bucket(sess_rules, policy_id, policy_details["sessRules"])
+            if isinstance(policy_details.get("traffContDecs"), dict):
+                traff_cont_decs = _merge_context_bucket(traff_cont_decs, policy_id, policy_details["traffContDecs"])
+            if isinstance(policy_details.get("chgDecs"), dict):
+                chg_decs = _merge_context_bucket(chg_decs, policy_id, policy_details["chgDecs"])
+        elif policy_type == "UrspRuleRequest":
+            ursp_rules[policy_id] = policy_details
+
+    return {
+        "sm_policy_data": sm_policy_data,
+        "pcc_rules": pcc_rules,
+        "qos_decs": qos_decs,
+        "sess_rules": sess_rules,
+        "traff_cont_decs": traff_cont_decs,
+        "chg_decs": chg_decs,
+        "ursp_rules": ursp_rules,
+    }
+
+
+def commit_applied_policy_plan(
+    *,
+    supi: str,
+    policies: List[Dict[str, Any]],
+    session_id: str,
+    snapshot_id: str,
+) -> None:
+    existing = get_ue_context_by_supi(supi, snapshot_id=snapshot_id) or {}
+    current_ue_context = deepcopy(existing)
+    access_policies = [
+        policy
+        for policy in policies
+        if str(policy.get("policy_type") or "").strip() != AM_POLICY_TYPE
+    ]
+    mobility_policies = [
+        policy
+        for policy in policies
+        if str(policy.get("policy_type") or "").strip() == AM_POLICY_TYPE
+    ]
+
+    if access_policies:
+        merged = merge_applied_access_policies(existing, access_policies)
+        catalog = get_ue_flow_catalog_by_supi(supi, snapshot_id=snapshot_id)
+        ok = upsert_ue_context(
+            supi=supi,
+            sm_policy_data=merged["sm_policy_data"],
+            pcc_rules=merged["pcc_rules"],
+            qos_decs=merged["qos_decs"],
+            sess_rules=merged["sess_rules"],
+            traff_cont_decs=merged["traff_cont_decs"],
+            chg_decs=merged["chg_decs"],
+            ursp_rules=merged["ursp_rules"],
+            app_catalog=catalog.get("app_catalog") or existing.get("app_catalog") or [],
+            flow_catalog=catalog.get("flow_catalog") or existing.get("flow_catalog") or [],
+        )
+        if not ok:
+            raise RuntimeError(f"failed to persist policies for supi {supi}")
+        current_ue_context.update(
+            {
+                "smPolicyData": merged["sm_policy_data"],
+                "pccRules": merged["pcc_rules"],
+                "qosDecs": merged["qos_decs"],
+                "sessRules": merged["sess_rules"],
+                "traffContDecs": merged["traff_cont_decs"],
+                "chgDecs": merged["chg_decs"],
+                "urspRules": merged["ursp_rules"],
+                "app_catalog": catalog.get("app_catalog") or existing.get("app_catalog") or [],
+                "flow_catalog": catalog.get("flow_catalog") or existing.get("flow_catalog") or [],
+            }
+        )
+
+    for policy in mobility_policies:
+        policy_details = policy.get("policy_details") or {}
+        request = policy_details.get("request")
+        if not isinstance(request, dict):
+            raise RuntimeError(f"AM policy {policy.get('policy_id')} missing request payload")
+        association_id = str(policy.get("policy_id") or "").strip()
+        if not association_id:
+            raise RuntimeError("AM policy missing top-level policy_id")
+        persisted = upsert_am_policy_association(
+            supi=supi,
+            pol_asso_id=association_id,
+            association_request=request,
+            association_policy=policy_details,
+            status="applied",
+            trigger_event="JOINT_CONTROL_REEVALUATION",
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            round_index=1,
+        )
+        if not persisted:
+            raise RuntimeError(f"failed to persist AM policy association for {association_id}")
+
+        am_policy_context = dict(current_ue_context.get("amPolicyContext") or {})
+        associations = dict(am_policy_context.get("associations") or {})
+        associations[association_id] = policy_details
+        am_policy_context["associations"] = associations
+        am_policy_context["allowedSnssais"] = request.get("allowedSnssais") or []
+        am_policy_context["targetSnssais"] = request.get("targetSnssais") or []
+        am_policy_context["mappingSnssais"] = request.get("mappingSnssais") or []
+        am_policy_context["rfsp"] = request.get("rfsp")
+        am_policy_context["ueAmbr"] = request.get("ueAmbr") or policy_details.get("ueAmbr")
+        am_policy_context["ueSliceMbrs"] = policy_details.get("ueSliceMbrs") or []
+        am_policy_context["pras"] = policy_details.get("pras") or {}
+        access_mobility_context = current_ue_context.get("accessMobilityContext") or {}
+        serving_nf_context = current_ue_context.get("servingNfContext") or {}
+        mobility_summary = {
+            "currentAssociationId": association_id,
+            "currentTriggers": policy_details.get("triggers") or [],
+            "currentRfsp": request.get("rfsp"),
+            "lastUpdatedReason": "policy_dispatch",
+        }
+        updated = upsert_ue_context(
+            supi=supi,
+            access_mobility_context=access_mobility_context,
+            am_policy_context=am_policy_context,
+            serving_nf_context=serving_nf_context,
+            mobility_summary=mobility_summary,
+        )
+        if not updated:
+            raise RuntimeError(f"failed to update UE mobility context for {association_id}")
+        current_ue_context["amPolicyContext"] = am_policy_context
+        current_ue_context["mobilitySummary"] = mobility_summary
+        current_ue_context["accessMobilityContext"] = access_mobility_context
+        current_ue_context["servingNfContext"] = serving_nf_context
+
+        if serving_nf_context.get("amf_id") or serving_nf_context.get("amf_uri"):
+            upsert_serving_nf_binding(
+                supi=supi,
+                nf_type="AMF",
+                nf_instance_id=str(serving_nf_context.get("amf_id") or ""),
+                nf_uri=str(serving_nf_context.get("amf_uri") or ""),
+                binding_info=serving_nf_context,
+            )
+        recorded = record_mobility_event(
+            supi=supi,
+            session_id=session_id,
+            snapshot_id=snapshot_id,
+            event_type="JOINT_CONTROL_REEVALUATION",
+            event_summary="AM policy association updated from policy dispatch execution",
+            event_payload={"association_id": association_id, "request": request, "policy": policy_details},
+        )
+        if not recorded:
+            raise RuntimeError(f"failed to record mobility event for {association_id}")
 
 
 def upsert_am_policy_association(

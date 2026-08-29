@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from shared.runtime import ArtifactEnvelope
+from shared.runtime import ArtifactEnvelope, RuntimePersistence
 from shared.runtime import ArtifactWorkerMixin
+from application_runtime.persistence import create_runtime_persistence
 
 from .contracts import AssuranceDiagnosisRequest, AssuranceDiagnosisResult
 
@@ -11,9 +12,10 @@ from .contracts import AssuranceDiagnosisRequest, AssuranceDiagnosisResult
 class AssuranceDiagnosisTool(ArtifactWorkerMixin):
     AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
 
-    def __init__(self) -> None:
+    def __init__(self, *, persistence: RuntimePersistence | None = None) -> None:
         self.agent_name = "assurance_diagnosis"
-        self.init_worker_runtime()
+        runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.init_worker_runtime(persistence=runtime_persistence)
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> AssuranceDiagnosisResult:
         request = AssuranceDiagnosisRequest.model_validate(envelope.payload)
@@ -258,7 +260,7 @@ class AssuranceDiagnosisTool(ArtifactWorkerMixin):
         elif phase == "runtime":
             summary = "Execution controller hit a runtime failure after dispatch."
             actions = [
-                "Inspect execution-controller runtime errors and snapshot writeback inputs before retrying.",
+                "Inspect policy persistence inputs before retrying.",
                 "Re-check live bindings for SUPI, app_id, and flow_id.",
             ]
         else:

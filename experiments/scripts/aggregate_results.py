@@ -144,11 +144,6 @@ def main() -> None:
             "status_code": _extract_status_code(item),
             "failure_type": failure_type,
             "snapshot_before": item.get("snapshot_id", ""),
-            "snapshot_after": (
-                (item.get("qos_feedback") or {}).get("committed_snapshot_id")
-                if isinstance(item.get("qos_feedback"), dict)
-                else ""
-            ),
             "result_path": str(args.result_jsonl),
             "summary_path": "",
             "notes": str(task.get("user_input") or item.get("user_input") or "").strip(),

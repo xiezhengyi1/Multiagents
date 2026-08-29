@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import os
 import re
@@ -11,27 +10,29 @@ from langchain_core.messages import AIMessage
 
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.agents.base import resolve_agent_model_name
-from shared.runtime import ArtifactWorkerMixin, ContextPolicy, ToolLoopExecutionError, extract_tool_calls, extract_tool_results
+from shared.runtime import ArtifactWorkerMixin, ContextPolicy, RuntimePersistence, ToolLoopExecutionError, extract_tool_calls, extract_tool_results
 from shared.logging import log_event, log_timing
+from application_runtime.persistence import create_runtime_persistence
 
-from ...context.prompts import SinglePromptBuilder
-from ...context.prompts.planning import OSA_DYNAMIC_RULES, OSA_OUTPUT_FORMAT_RULES, build_validation_retry_prompt
-from ...domain.collaboration import PlanningContext, PlanningRequest, SharedControlContext
-from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
-from ...domain.policy_plan import (
+from ...tool_capabilities import CONTROL_RUNTIME_CAPABILITY_ALIASES
+from ...context.prompts.single import render_single_system_prompt
+from ..grounding.contracts import (
     FlowSelector,
     GroundingDecision,
-    PlanningRationale,
-    PolicyDraft,
-    PolicyPlanDraft,
     QosOperationConstraint,
     SliceMigrationAuthorization,
 )
-from ..planning.planning_validation import normalize_policy_plan_draft
+from ..main.contracts import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
+from ..planning.contracts import (
+    PlanningContext,
+    PlanningRequest,
+    PolicyPlanDraft,
+    SharedControlContext,
+)
 from ..planning.compiler import OptimizationStrategyCompiler
-from ..planning.tool_result_adapter import extract_planning_tool_evidence
+from ..planning.evidence import extract_planning_tool_evidence
 from ..planning.response_models import OsaAdvisorOutput
-from .contracts import SingleAgentRoundDecision
+from ...context.prompts.planning import build_planning_validation_retry_prompt
 from .tools import build_single_agent_tools
 
 
@@ -62,29 +63,6 @@ class _SingleAgentChatDeepSeekMixin:
         return payload
 
 
-class _SingleAgentOutputNormalizingLlm:
-    def __init__(self, llm: Any) -> None:
-        self._llm = llm
-
-    def __getattr__(self, item: str) -> Any:
-        return getattr(self._llm, item)
-
-    def bind_tools(self, tools: Any) -> "_SingleAgentOutputNormalizingLlm":
-        return _SingleAgentOutputNormalizingLlm(self._llm.bind_tools(tools))
-
-    def invoke(self, conversation: Any, **kwargs: Any) -> Any:
-        message = self._llm.invoke(conversation, **kwargs)
-        if isinstance(message, AIMessage):
-            return SingleControlAgent._normalize_final_ai_message(message, list(conversation or []))
-        return message
-
-    async def ainvoke(self, conversation: Any, **kwargs: Any) -> Any:
-        message = await self._llm.ainvoke(conversation, **kwargs)
-        if isinstance(message, AIMessage):
-            return SingleControlAgent._normalize_final_ai_message(message, list(conversation or []))
-        return message
-
-
 class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "single_control"
     DEEPSEEK_MODEL = "deepseek-v4-flash"
@@ -108,14 +86,6 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         "search_semantic_knowledge": 3000,
         "get_knowledge_by_key": 3000,
     }
-    FINAL_PRODUCT_FIELDS = {
-        "supi",
-        "requested_domains",
-        "objective_profile_hint",
-        "sm_policies",
-        "am_policy",
-        "ursp_policies",
-    }
     KNOWLEDGE_HINT_TOKENS = (
         "3gpp",
         "29.5",
@@ -134,6 +104,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         *,
         use_local_model: bool = False,
         rag_enabled: bool = True,
+        persistence: RuntimePersistence | None = None,
     ) -> None:
         resolved_model_name = resolve_agent_model_name(model_name, use_local_model=use_local_model)
         use_deepseek_model = str(resolved_model_name or "").strip().lower().startswith("deepseek")
@@ -168,15 +139,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         self.rag_enabled = rag_enabled
         self.plan_compiler = OptimizationStrategyCompiler()
         self.last_round_detail: Dict[str, Any] = {}
-        self.initialize_agent_runtime(logger_color="\033[96m")
-
-    def create_json_agent(self, **kwargs: Any) -> Any:
-        original_llm = self.llm
-        self.llm = _SingleAgentOutputNormalizingLlm(original_llm)
-        try:
-            return super().create_json_agent(**kwargs)
-        finally:
-            self.llm = original_llm
+        runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.initialize_agent_runtime(logger_color="\033[96m", persistence=runtime_persistence)
 
     @staticmethod
     def _uses_small_model_context(model_name: str) -> bool:
@@ -277,7 +241,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     requested_domains=requested_domains,
                     allow_knowledge_tools=allow_knowledge_tools,
                 ),
-                system_prompt=SinglePromptBuilder().system_prompt(),
+                system_prompt=render_single_system_prompt(),
                 response_model=OsaAdvisorOutput,
                 max_iterations=12,
                 tool_error_mode="raise",
@@ -287,6 +251,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 max_tool_result_tokens=context_policy.default_tool_result_tokens,
                 tool_result_token_limits=context_policy.tool_result_token_limits,
                 context_policy=context_policy,
+                capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
             )
             try:
                 result = self._invoke_round_advisor(
@@ -350,7 +315,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     "Single control OSA-equivalent contract validation failed: "
                     + "; ".join(contract_errors)
                 )
-            current_prompt = build_validation_retry_prompt(
+            current_prompt = build_planning_validation_retry_prompt(
                 base_prompt=base_prompt,
                 issues=contract_errors,
                 cached_planning_evidence=planning_tool_evidence,
@@ -566,18 +531,6 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     rows_by_flow_id[flow_id] = row
         return rows_by_flow_id
 
-    @classmethod
-    def _extract_app_id_for_flow_from_policies(cls, policies: List[Dict[str, Any]], *, flow_id: str) -> str:
-        for policy_details in policies or []:
-            normalized = cls._normalize_sm_policy_payload(policy_details)
-            policy_flow_id = cls._extract_sm_policy_flow_id(normalized)
-            if policy_flow_id and policy_flow_id != flow_id:
-                continue
-            app_id = cls._extract_sm_policy_app_id(normalized)
-            if app_id:
-                return app_id
-        return ""
-
     @staticmethod
     def _build_round_prompt(*, user_input: str, evidence: Dict[str, Any], context: str, feedback_context: str) -> str:
         feedback_block = ""
@@ -600,84 +553,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             "- For QoS, sm_policies must use exact catalog-grounded flow_id/app_id pairs and current-round optimizer evidence.\n"
             "- For mobility, am_policy must use current-round mobility evidence.\n"
             "- Respect every retry_contract field as a binding repair constraint.\n\n"
-            f"{OSA_DYNAMIC_RULES.strip()}\n\n"
-            f"{OSA_OUTPUT_FORMAT_RULES.strip()}\n"
         )
-
-    @classmethod
-    def _normalize_final_ai_message(cls, message: AIMessage, conversation: List[Any]) -> AIMessage:
-        if getattr(message, "tool_calls", None) or getattr(message, "invalid_tool_calls", None):
-            return message
-        payload = cls._parse_json_content(message.content)
-        if isinstance(payload, dict):
-            normalized = cls._normalize_final_dict_payload(payload, conversation)
-        elif isinstance(payload, list) and payload:
-            normalized = cls._normalize_final_list_payload(payload, conversation)
-        else:
-            return message
-        if normalized is None:
-            return message
-        return AIMessage(
-            content=json.dumps(normalized, ensure_ascii=False),
-            additional_kwargs=dict(message.additional_kwargs or {}),
-            tool_calls=list(getattr(message, "tool_calls", None) or []),
-            invalid_tool_calls=list(getattr(message, "invalid_tool_calls", None) or []),
-            response_metadata=dict(message.response_metadata or {}),
-            id=message.id,
-        )
-
-    @classmethod
-    def _normalize_final_dict_payload(cls, payload: Dict[str, Any], conversation: List[Any]) -> Optional[Dict[str, Any]]:
-        # Single Agent now speaks the same wire contract as OSA.  Preserve a
-        # valid OsaAdvisorOutput verbatim; legacy PCF normalization below is
-        # retained only to make historical traces readable.
-        try:
-            return OsaAdvisorOutput.model_validate(payload).model_dump(mode="json")
-        except Exception:
-            pass
-        candidate = cls._sanitize_round_decision_payload(payload)
-        try:
-            return cls._dump_final_product(SingleAgentRoundDecision.model_validate(candidate))
-        except Exception:
-            if cls._latest_successful_optimizer_call(conversation) is None:
-                return None
-            return cls._normalize_final_list_payload([payload], conversation)
-
-    @classmethod
-    def _dump_final_product(cls, decision: SingleAgentRoundDecision) -> Dict[str, Any]:
-        return decision.model_dump(
-            mode="json",
-            include=cls.FINAL_PRODUCT_FIELDS,
-            exclude_defaults=True,
-            exclude_none=True,
-        )
-
-    @classmethod
-    def _sanitize_round_decision_payload(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
-        candidate = dict(payload)
-        for envelope_key in ("single_agent_decision", "single_agent_round_decision", "round_decision", "response"):
-            wrapped = candidate.get(envelope_key)
-            if isinstance(wrapped, dict):
-                candidate = dict(wrapped)
-                break
-        if "intent" not in candidate and candidate.get("intent_classification") is not None:
-            candidate["intent"] = str(candidate.get("intent_classification") or "").strip()
-        if "sm_policies" not in candidate and isinstance(candidate.get("smPolicies"), list):
-            candidate["sm_policies"] = candidate.get("smPolicies")
-        if "am_policy" not in candidate and isinstance(candidate.get("amPolicy"), dict):
-            candidate["am_policy"] = candidate.get("amPolicy")
-        if "ursp_policies" not in candidate and "ursp_rules" in candidate:
-            candidate["ursp_policies"] = candidate.get("ursp_rules")
-        if isinstance(candidate.get("sm_policies"), list):
-            candidate["sm_policies"] = [
-                normalized
-                for item in candidate.get("sm_policies") or []
-                if isinstance(item, dict)
-                for normalized in [cls._normalize_sm_policy_payload(item)]
-                if normalized
-            ]
-        allowed = set(SingleAgentRoundDecision.model_fields)
-        return {key: value for key, value in candidate.items() if key in allowed}
 
     @staticmethod
     def _parse_json_content(content: Any) -> Any:
@@ -719,341 +595,11 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 continue
         return None
 
-    @classmethod
-    def _normalize_final_list_payload(cls, payload: List[Any], conversation: List[Any]) -> Optional[Dict[str, Any]]:
-        if len(payload) == 1 and isinstance(payload[0], dict):
-            normalized_single = cls._normalize_final_dict_payload(payload[0], [])
-            if normalized_single is not None:
-                return normalized_single
-        optimizer_call = cls._latest_successful_optimizer_call(conversation)
-        if optimizer_call is None:
-            return None
-        args = dict(optimizer_call.get("args") or {})
-        requested_domains = [
-            str(item or "").strip().lower()
-            for item in (args.get("requested_domains") or ["qos"])
-            if str(item or "").strip()
-        ]
-        if requested_domains != ["qos"]:
-            return None
-        sm_policies = cls._extract_sm_policy_list(payload)
-        if not sm_policies:
-            return None
-        supi = str(args.get("supi") or "").strip()
-        flow_ids = [str(item or "").strip() for item in (args.get("flow_ids") or []) if str(item or "").strip()]
-        if not supi or not flow_ids:
-            return None
-        return {
-            "requested_domains": ["qos"],
-            "supi": supi,
-            "objective_profile_hint": str(args.get("objective_profile") or "balanced").strip().lower() or "balanced",
-            "sm_policies": sm_policies,
-        }
-
-    @staticmethod
-    def _extract_sm_policy_list(payload: List[Any]) -> List[Dict[str, Any]]:
-        policies: List[Dict[str, Any]] = []
-        for item in payload:
-            if not isinstance(item, dict):
-                return []
-            if isinstance(item.get("sm_policies"), list):
-                policies.extend(
-                    SingleControlAgent._normalize_sm_policy_payload(policy)
-                    for policy in item.get("sm_policies") or []
-                    if isinstance(policy, dict)
-                )
-                continue
-            if isinstance(item.get("smPolicies"), list):
-                policies.extend(
-                    SingleControlAgent._normalize_sm_policy_payload(policy)
-                    for policy in item.get("smPolicies") or []
-                    if isinstance(policy, dict)
-                )
-                continue
-            policies.append(SingleControlAgent._normalize_sm_policy_payload(item))
-        return [policy for policy in policies if policy]
-
-    @classmethod
-    def _normalize_sm_policy_payload(cls, policy_details: Dict[str, Any]) -> Dict[str, Any]:
-        data = copy.deepcopy(policy_details)
-        for wrapper_key in ("policy_decision", "policyDecision", "decision", "smPolicyDecision", "sm_policy_decision"):
-            wrapped = data.get(wrapper_key)
-            if not isinstance(wrapped, dict):
-                continue
-            if not any(key in wrapped for key in ("pccRules", "pcc_rules", "qosDecs", "qos_decs")):
-                continue
-            merged = copy.deepcopy(wrapped)
-            for carry_key in ("supi", "flow_id", "flowId", "app_id", "appId"):
-                if carry_key in data and carry_key not in merged:
-                    merged[carry_key] = data[carry_key]
-            data = merged
-            break
-
-        pcc_rules = cls._normalize_pcc_rules(data.get("pccRules") or data.get("pcc_rules"))
-        if pcc_rules:
-            data["pccRules"] = pcc_rules
-        qos_decs = cls._normalize_qos_decs(data.get("qosDecs") or data.get("qos_decs"))
-        if qos_decs:
-            data["qosDecs"] = qos_decs
-        if isinstance(data.get("policyCtrlReqTriggers"), list):
-            data["policyCtrlReqTriggers"] = cls._normalize_sm_policy_triggers(data.get("policyCtrlReqTriggers"))
-        sess_rules = data.get("sessRules") or data.get("sess_rules")
-        if not isinstance(sess_rules, dict) and isinstance(data.get("sessionRule"), dict):
-            sess_rule = copy.deepcopy(data["sessionRule"])
-            sess_rule_id = str(sess_rule.get("sessRuleId") or sess_rule.get("sessionRuleId") or "sess-rule-1").strip()
-            sess_rule["sessRuleId"] = sess_rule_id
-            data["sessRules"] = {sess_rule_id: sess_rule}
-        explicit_flow_id = cls._explicit_policy_flow_id(data)
-        if explicit_flow_id:
-            cls._repair_single_flow_policy_identity(data, explicit_flow_id)
-        cls._coerce_sm_policy_scalar_types(data)
-        return data
-
-    @staticmethod
-    def _explicit_policy_flow_id(data: Dict[str, Any]) -> str:
-        for key in ("flow_id", "flowId"):
-            value = str(data.get(key) or "").strip()
-            if value:
-                return value
-        return ""
-
-    @staticmethod
-    def _is_generic_pcf_id(value: Any, *, kind: str) -> bool:
-        text = str(value or "").strip()
-        if not text:
-            return True
-        patterns = {
-            "pcc": (r"^pcc-rule-\d{1,2}$", r"^rule-\d{1,2}$"),
-            "qos": (r"^qos-\d{1,2}$",),
-            "sess": (r"^sess-rule-\d{1,2}$", r"^session-rule-\d{1,2}$"),
-        }
-        return any(re.match(pattern, text, flags=re.IGNORECASE) for pattern in patterns.get(kind, ()))
-
-    @classmethod
-    def _repair_single_flow_policy_identity(cls, data: Dict[str, Any], flow_id: str) -> None:
-        target_pcc_id = f"pcc-{flow_id}"
-        target_qos_id = f"qos-{flow_id}"
-        target_sess_id = f"sess-{flow_id}"
-
-        pcc_rules = data.get("pccRules")
-        qos_decs = data.get("qosDecs")
-        if isinstance(pcc_rules, dict) and len(pcc_rules) == 1:
-            current_key, current_rule = next(iter(pcc_rules.items()))
-            if isinstance(current_rule, dict):
-                current_id = str(current_rule.get("pccRuleId") or current_key or "").strip()
-                if cls._is_generic_pcf_id(current_key, kind="pcc") or cls._is_generic_pcf_id(current_id, kind="pcc"):
-                    repaired_rule = dict(current_rule)
-                    repaired_rule["pccRuleId"] = target_pcc_id
-                    refs = repaired_rule.get("refQosData")
-                    if not isinstance(refs, list) or not refs or all(cls._is_generic_pcf_id(item, kind="qos") for item in refs):
-                        repaired_rule["refQosData"] = [target_qos_id]
-                    data["pccRules"] = {target_pcc_id: repaired_rule}
-
-        if isinstance(qos_decs, dict) and len(qos_decs) == 1:
-            current_key, current_qos = next(iter(qos_decs.items()))
-            if isinstance(current_qos, dict):
-                current_id = str(current_qos.get("qosId") or current_key or "").strip()
-                if cls._is_generic_pcf_id(current_key, kind="qos") or cls._is_generic_pcf_id(current_id, kind="qos"):
-                    repaired_qos = dict(current_qos)
-                    repaired_qos["qosId"] = target_qos_id
-                    data["qosDecs"] = {target_qos_id: repaired_qos}
-
-        sess_rules = data.get("sessRules")
-        if isinstance(sess_rules, dict) and len(sess_rules) == 1:
-            current_key, current_rule = next(iter(sess_rules.items()))
-            if isinstance(current_rule, dict):
-                current_id = str(current_rule.get("sessRuleId") or current_key or "").strip()
-                if cls._is_generic_pcf_id(current_key, kind="sess") or cls._is_generic_pcf_id(current_id, kind="sess"):
-                    repaired_rule = dict(current_rule)
-                    repaired_rule["sessRuleId"] = target_sess_id
-                    data["sessRules"] = {target_sess_id: repaired_rule}
-
-    @staticmethod
-    def _coerce_sm_policy_scalar_types(data: Dict[str, Any]) -> None:
-        qos_decs = data.get("qosDecs")
-        if not isinstance(qos_decs, dict):
-            return
-        for qos in qos_decs.values():
-            if not isinstance(qos, dict) or "packetDelayBudget" not in qos:
-                continue
-            value = qos.get("packetDelayBudget")
-            if isinstance(value, int):
-                continue
-            if isinstance(value, float):
-                qos["packetDelayBudget"] = int(round(value))
-                continue
-            if isinstance(value, str) and value.strip():
-                try:
-                    parsed = float(value)
-                except ValueError:
-                    continue
-                qos["packetDelayBudget"] = int(round(parsed))
-
-    @staticmethod
-    def _normalize_pcc_rules(value: Any) -> Dict[str, Any]:
-        if isinstance(value, list):
-            rules: Dict[str, Any] = {}
-            for index, item in enumerate(value, start=1):
-                if isinstance(item, str) and item.strip():
-                    rules[item.strip()] = {"pccRuleId": item.strip()}
-                    continue
-                if not isinstance(item, dict):
-                    continue
-                rule_id = str(item.get("pccRuleId") or item.get("id") or f"pcc-rule-{index}").strip()
-                rules[rule_id] = item
-            value = rules
-        if not isinstance(value, dict):
-            return {}
-        normalized: Dict[str, Any] = {}
-        for rule_key, rule_value in value.items():
-            if not isinstance(rule_value, dict):
-                continue
-            rule = copy.deepcopy(rule_value)
-            rule_id = str(rule.get("pccRuleId") or rule_key or "").strip()
-            if rule_id:
-                rule["pccRuleId"] = rule_id
-            if "flowInfos" not in rule and isinstance(rule.get("flowDescriptions"), list):
-                rule["flowInfos"] = [
-                    {"flowDescription": str(item)}
-                    for item in rule.get("flowDescriptions") or []
-                    if str(item or "").strip()
-                ]
-            if "flowInfos" in rule and isinstance(rule["flowInfos"], list):
-                flow_infos: List[Dict[str, Any]] = []
-                for item in rule["flowInfos"]:
-                    if not isinstance(item, dict):
-                        continue
-                    flow_info = copy.deepcopy(item)
-                    if "flowDescription" not in flow_info and flow_info.get("flowId"):
-                        flow_info["flowDescription"] = str(flow_info.get("flowId") or "").strip()
-                    flow_infos.append(flow_info)
-                rule["flowInfos"] = flow_infos
-            if "refQosData" not in rule:
-                refs = rule.get("qosDataRefs") or rule.get("qosData") or rule.get("qosDecs")
-                if isinstance(refs, list):
-                    rule["refQosData"] = [
-                        str(item.get("qosId") if isinstance(item, dict) else item).strip()
-                        for item in refs
-                        if str(item.get("qosId") if isinstance(item, dict) else item).strip()
-                    ]
-                elif isinstance(refs, str) and refs.strip():
-                    rule["refQosData"] = [refs.strip()]
-                elif isinstance(refs, dict):
-                    qos_id = str(refs.get("qosId") or "").strip()
-                    if qos_id:
-                        rule["refQosData"] = [qos_id]
-            normalized[str(rule_key)] = rule
-        return normalized
-
-    @staticmethod
-    def _normalize_qos_decs(value: Any) -> Dict[str, Any]:
-        if isinstance(value, list):
-            normalized: Dict[str, Any] = {}
-            for index, item in enumerate(value, start=1):
-                if isinstance(item, str) and item.strip():
-                    normalized[item.strip()] = {"qosId": item.strip()}
-                    continue
-                if not isinstance(item, dict):
-                    continue
-                qos = copy.deepcopy(item)
-                qos_id = str(qos.get("qosId") or qos.get("id") or f"qos-{index}").strip()
-                qos["qosId"] = qos_id
-                normalized[qos_id] = qos
-            return normalized
-        if not isinstance(value, dict):
-            return {}
-        normalized = {}
-        for qos_key, qos_value in value.items():
-            if not isinstance(qos_value, dict):
-                continue
-            qos = copy.deepcopy(qos_value)
-            qos_id = str(qos.get("qosId") or qos_key or "").strip()
-            if qos_id:
-                qos["qosId"] = qos_id
-            normalized[str(qos_key)] = qos
-        return normalized
-
-    @staticmethod
-    def _normalize_sm_policy_triggers(value: Any) -> List[str]:
-        from model.PolicyTrigger import PolicyTrigger
-
-        aliases = {
-            "QOS_NOTIF_CONTROL": "QOS_NOTIF",
-            "QOS_NOTIFICATION": "QOS_NOTIF",
-        }
-        allowed = {item.value for item in PolicyTrigger}
-        normalized: List[str] = []
-        for item in value or []:
-            trigger = aliases.get(str(item or "").strip(), str(item or "").strip())
-            if trigger in allowed and trigger not in normalized:
-                normalized.append(trigger)
-        return normalized
-
-    @classmethod
-    def _extract_sm_policy_flow_id(cls, policy_details: Any) -> str:
-        from ...domain.policy_compiler import PolicyCompiler
-
-        data = cls._normalize_sm_policy_payload(policy_details) if isinstance(policy_details, dict) else {}
-        explicit = str(PolicyCompiler.extract_flow_id(data) or "").strip()
-        if explicit:
-            return explicit
-        pcc_rules = data.get("pccRules")
-        if isinstance(pcc_rules, dict):
-            for rule in pcc_rules.values():
-                if not isinstance(rule, dict):
-                    continue
-                for key in ("flow_id", "flowId"):
-                    flow_id = str(rule.get(key) or "").strip()
-                    if flow_id:
-                        return flow_id
-                flow_infos = rule.get("flowInfos")
-                if isinstance(flow_infos, list):
-                    for info in flow_infos:
-                        if not isinstance(info, dict):
-                            continue
-                        flow_id = str(info.get("flow_id") or info.get("flowId") or "").strip()
-                        if flow_id:
-                            return flow_id
-        return ""
-
-    @classmethod
-    def _extract_sm_policy_app_id(cls, policy_details: Any) -> str:
-        data = cls._normalize_sm_policy_payload(policy_details) if isinstance(policy_details, dict) else {}
-        for key in ("app_id", "appId"):
-            app_id = str(data.get(key) or "").strip()
-            if app_id:
-                return app_id
-        pcc_rules = data.get("pccRules")
-        if isinstance(pcc_rules, dict):
-            for rule in pcc_rules.values():
-                if isinstance(rule, dict):
-                    app_id = str(rule.get("app_id") or rule.get("appId") or "").strip()
-                    if app_id:
-                        return app_id
-        return ""
-
-    @staticmethod
-    def _latest_successful_optimizer_call(conversation: List[Any]) -> Optional[Dict[str, Any]]:
-        calls_by_id = {
-            str(call.get("id") or "").strip(): call
-            for call in extract_tool_calls(conversation)
-            if str(call.get("name") or "").strip() == "preview_qos_optimizer"
-        }
-        successful_ids = {
-            str(result.get("tool_call_id") or "").strip()
-            for result in extract_tool_results(conversation)
-            if str(result.get("name") or "").strip() == "preview_qos_optimizer"
-            and str(result.get("status") or "success").strip().lower() != "error"
-        }
-        for call_id, call in reversed(list(calls_by_id.items())):
-            if call_id in successful_ids:
-                return call
-        return None
-
     @staticmethod
     def _flow_selector_payload(*, supi: str, flow_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
         service = row.get("service") if isinstance(row.get("service"), dict) else {}
         sla = row.get("sla") if isinstance(row.get("sla"), dict) else {}
+        allocation = row.get("allocation") if isinstance(row.get("allocation"), dict) else {}
         traffic = row.get("traffic") if isinstance(row.get("traffic"), dict) else {}
         flow_name = str(row.get("flow_name") or row.get("name") or flow_id).strip()
         return {
@@ -1075,6 +621,9 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             "priority": sla.get("priority"),
             "description": flow_name,
             "five_tuple": list(traffic.get("five_tuple")) if isinstance(traffic.get("five_tuple"), (list, tuple)) else None,
+            "current_slice_snssai": str(allocation.get("current_slice_snssai") or "").strip() or None,
+            "current_bw_ul": allocation.get("allocated_bandwidth_ul"),
+            "current_bw_dl": allocation.get("allocated_bandwidth_dl"),
             "resolution_status": "resolved",
         }
 
@@ -1100,434 +649,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 message = str(exc)
                 if "max iterations" in message.lower():
                     raise RuntimeError(f"Single control round advisor did not converge: {message}") from exc
-                if "SingleAgentRoundDecision" in message:
-                    raise RuntimeError(
-                        "Single control round advisor returned an invalid unified round decision. "
-                        f"Validator error: {message}"
-                    ) from exc
             raise RuntimeError(f"Single control round advisor invocation failed: {exc}") from exc
-
-    @staticmethod
-    def _validate_policy_presence(*, decision: SingleAgentRoundDecision, active_domains: set[str]) -> None:
-        requested_domains = {
-            str(domain or "").strip().lower()
-            for domain in (active_domains or set())
-            if str(domain or "").strip()
-        }
-        has_sm = bool(decision.sm_policies)
-        has_am = decision.am_policy is not None
-        has_ursp = bool(decision.ursp_policies)
-
-        if not has_sm and not has_am and not has_ursp:
-            raise RuntimeError("Single control round advisor returned empty policy output")
-        if "qos" in requested_domains and not has_sm:
-            raise RuntimeError("Single control round advisor omitted sm_policies for a qos request")
-        if "qos" not in requested_domains and has_sm:
-            raise RuntimeError("Single control round advisor returned sm_policies for a non-qos request")
-        if "mobility" in requested_domains and not has_am:
-            raise RuntimeError("Single control round advisor omitted am_policy for a mobility request")
-        if "mobility" not in requested_domains and has_am:
-            raise RuntimeError("Single control round advisor returned am_policy for a non-mobility request")
-
-    def _assemble_policy_plan_from_decision(
-        self,
-        *,
-        decision: SingleAgentRoundDecision,
-        planning_context: PlanningContext,
-        planning_tool_evidence: Dict[str, Any],
-        advisor_result: Dict[str, Any],
-    ) -> PolicyPlanDraft:
-        optimizer_preview = self.plan_compiler.advisor_validator._latest_optimizer_preview(planning_tool_evidence)
-        mobility_context = self.plan_compiler.advisor_validator._latest_mobility_context(planning_tool_evidence)
-
-        active_domains = {
-            str(item.value if hasattr(item, "value") else item or "").strip().lower()
-            for item in (planning_context.shared_context.main_intent.requested_domains or [])
-            if str(item.value if hasattr(item, "value") else item or "").strip()
-        }
-        self._validate_policy_presence(decision=decision, active_domains=active_domains)
-        if ControlDomain.QOS.value in active_domains:
-            self.plan_compiler.advisor_validator._validate_optimizer_preview(optimizer_preview)
-        if ControlDomain.MOBILITY.value in active_domains and decision.am_policy is not None and not mobility_context:
-            raise ValueError("am_policy compilation requires grounded mobility context")
-
-        planning_metadata = {
-            "planning_mode": "single_agent_direct_pcf",
-            "requested_domains": [item.value for item in planning_context.shared_context.main_intent.requested_domains],
-            "retry_scope": str(getattr(planning_context.shared_context.main_intent.retry_scope, "value", planning_context.shared_context.main_intent.retry_scope) or "").strip(),
-            "objective_breakdown": dict(optimizer_preview.get("objective_breakdown") or {}) if isinstance(optimizer_preview, dict) else {},
-            "revision_requests": planning_context.revision_requests or [],
-            "unified_constraints": planning_context.unified_constraints or {},
-            "optimizer_cross_domain_verdicts": [
-                item
-                for item in ((optimizer_preview.get("cross_domain_verdicts") if isinstance(optimizer_preview, dict) else []) or [])
-            ],
-            "snapshot_writeback_patch": self.plan_compiler.artifact_compiler._build_snapshot_writeback_patch(optimizer_preview),
-        }
-
-        plan = PolicyPlanDraft(
-            supi=str(decision.supi or "").strip(),
-            session_id=str(planning_context.session_id or "").strip(),
-            snapshot_id=str(planning_context.snapshot_id or "").strip(),
-            planning_metadata=planning_metadata,
-            planning_rationale=PlanningRationale(
-                selected_strategy_profile=str(
-                    planning_context.shared_context.main_intent.objective_profile.profile_name
-                    or decision.objective_profile_hint
-                    or ""
-                ).strip(),
-                objective_tradeoff_summary=str(planning_metadata["objective_breakdown"] or "").strip(),
-                decisive_evidence=[
-                    item
-                    for item in [
-                        "tool:preview_qos_optimizer" if decision.sm_policies else "",
-                        "tool:inspect_mobility_ue_policies" if decision.am_policy is not None else "",
-                        "mediator_constraints" if planning_context.unified_constraints else "",
-                        "revision_requests" if planning_context.revision_requests else "",
-                    ]
-                    if item
-                ],
-                active_constraints=[
-                    str(item)
-                    for item in self.plan_compiler.artifact_compiler._normalized_hard_constraints(
-                        planning_context.unified_constraints
-                    )
-                    if str(item).strip()
-                ],
-                explanation="Single-agent final policy product compiled from grounded tool evidence.",
-                rejected_alternatives=[],
-            ),
-            all_policies=[],
-        )
-
-        for index, policy_details in enumerate(decision.sm_policies, start=1):
-            normalized_policy_details = self._normalize_sm_policy_payload(policy_details)
-            flow_id = self._resolve_pcflow_id(
-                normalized_policy_details,
-                decision=decision,
-                optimizer_preview=optimizer_preview,
-            )
-            flow_ctx = self._resolve_single_agent_flow_context(
-                advisor_result=advisor_result,
-                decision=decision,
-                flow_id=flow_id,
-                policy_details=normalized_policy_details,
-            )
-            app_id = str(
-                flow_ctx.app_id
-                or self._extract_sm_policy_app_id(normalized_policy_details)
-                or ""
-            ).strip()
-            resource_keys = self.plan_compiler.advisor_validator._extract_qos_resource_keys(optimizer_preview, flow_id=flow_id)
-            if not resource_keys:
-                raise ValueError(f"optimizer preview does not contain a grounded QoS assignment for flow_id={flow_id}")
-            plan.all_policies.append(
-                PolicyDraft(
-                    recommended_actions=[f"Apply PCF SM policy for {flow_id}"],
-                    supi=str(flow_ctx.supi or decision.supi or "").strip(),
-                    app_id=app_id,
-                    flow_id=flow_id,
-                    target_type="flow",
-                    policy_id=f"smp-{app_id or 'app'}-{flow_id or index}",
-                    policy_type="SmPolicyDecision",
-                    resource_keys=resource_keys,
-                    policy_details=normalized_policy_details,
-                )
-            )
-
-        if decision.am_policy is not None:
-            normalized_am_policy = self._normalize_am_policy_payload(
-                decision.am_policy,
-                supi=str(decision.supi or "").strip(),
-                mobility_context=mobility_context,
-            )
-            plan.all_policies.append(
-                PolicyDraft(
-                    recommended_actions=[],
-                    supi=str(decision.supi or "").strip(),
-                    app_id="",
-                    flow_id=None,
-                    target_type="ue",
-                    policy_id=self._resolve_single_agent_am_association_id(
-                        policy_details=decision.am_policy,
-                        mobility_context=mobility_context,
-                    ),
-                    policy_type="PcfAmPolicyControlPolicyAssociation",
-                    policy_details=normalized_am_policy,
-                )
-            )
-
-        for index, policy_details in enumerate(decision.ursp_policies, start=1):
-            flow_id = self._resolve_pcflow_id(
-                policy_details,
-                decision=decision,
-                allow_missing=True,
-            )
-            app_id = self._resolve_decision_app_id(
-                decision,
-                flow_id=flow_id,
-                policy_details=policy_details,
-            )
-            plan.all_policies.append(
-                PolicyDraft(
-                    recommended_actions=[],
-                    supi=str(decision.supi or "").strip(),
-                    app_id=app_id,
-                    flow_id=flow_id,
-                    target_type="flow" if flow_id else "app",
-                    policy_id=f"ursp-{app_id or 'app'}-{flow_id or index}",
-                    policy_type="UrspRuleRequest",
-                    policy_details=dict(policy_details),
-                )
-            )
-
-        normalized = normalize_policy_plan_draft(plan)
-        self._validate_single_policy_plan(normalized, active_domains=active_domains)
-        return normalized
-
-    def _resolve_single_agent_flow_context(
-        self,
-        *,
-        advisor_result: Dict[str, Any],
-        decision: SingleAgentRoundDecision,
-        flow_id: str,
-        policy_details: Dict[str, Any],
-    ) -> FlowSelector:
-        row = self._catalog_rows_by_flow_id(advisor_result).get(str(flow_id or "").strip(), {})
-        payload = self._flow_selector_payload(supi=decision.supi, flow_id=flow_id, row=row)
-        if not payload.get("app_id"):
-            payload["app_id"] = self._resolve_decision_app_id(
-                decision,
-                flow_id=flow_id,
-                policy_details=policy_details,
-            )
-        if payload.get("app_id"):
-            return FlowSelector.model_validate(payload)
-        return FlowSelector(
-            supi=str(decision.supi or "").strip(),
-            app_id=str(
-                self._resolve_decision_app_id(
-                    decision,
-                    flow_id=flow_id,
-                    policy_details=policy_details,
-                )
-                or ""
-            ).strip(),
-            flow_id=str(flow_id or "").strip(),
-            name=str(flow_id or "").strip(),
-            target_type="flow",
-            resolution_status="resolved",
-        )
-
-    @classmethod
-    def _resolve_decision_app_id(
-        cls,
-        decision: SingleAgentRoundDecision,
-        *,
-        flow_id: str | None = None,
-        policy_details: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        target_flow_id = str(flow_id or "").strip()
-        if policy_details:
-            app_id = str(cls._extract_sm_policy_app_id(policy_details) or "").strip()
-            if app_id:
-                return app_id
-        for policy in decision.sm_policies or []:
-            app_id = str(cls._extract_sm_policy_app_id(policy) or "").strip()
-            if app_id:
-                return app_id
-        return ""
-
-    @staticmethod
-    def _resolve_single_agent_am_association_id(
-        *,
-        policy_details: Dict[str, Any],
-        mobility_context: Dict[str, Any],
-    ) -> str:
-        payload = policy_details if isinstance(policy_details, dict) else {}
-        association_id = str(payload.get("associationId") or payload.get("association_id") or "").strip()
-        if association_id:
-            return association_id
-        mobility_summary = mobility_context.get("mobilitySummary") if isinstance(mobility_context, dict) else {}
-        association_id = str((mobility_summary or {}).get("currentAssociationId") or "").strip()
-        if association_id:
-            return association_id
-        raise ValueError("mobility context does not contain a grounded association_id")
-
-    @staticmethod
-    def _normalize_am_policy_payload(
-        policy_details: Dict[str, Any],
-        *,
-        supi: str,
-        mobility_context: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        payload = copy.deepcopy(policy_details)
-        normalized_supi = str(supi or payload.get("supi") or "").strip()
-        if isinstance(payload.get("request"), dict):
-            request = copy.deepcopy(payload["request"])
-            request["supi"] = str(normalized_supi or request.get("supi") or "").strip()
-            request.setdefault("suppFeat", str(payload.get("suppFeat") or "1"))
-            normalized = {
-                key: copy.deepcopy(value)
-                for key, value in payload.items()
-                if key in SingleControlAgent._am_policy_allowed_fields()
-            }
-            normalized["request"] = request
-            normalized.setdefault("suppFeat", str(payload.get("suppFeat") or request.get("suppFeat") or "1"))
-            return normalized
-
-        association_id = str(payload.get("associationId") or payload.get("association_id") or "").strip()
-        mobility_summary = mobility_context.get("mobilitySummary") if isinstance(mobility_context, dict) else {}
-        if not association_id:
-            association_id = str((mobility_summary or {}).get("currentAssociationId") or "").strip()
-        am_policy_context = mobility_context.get("amPolicyContext") if isinstance(mobility_context, dict) else {}
-        associations = am_policy_context.get("associations") if isinstance(am_policy_context, dict) else {}
-        association_payload = associations.get(association_id) if isinstance(associations, dict) else {}
-        base_policy = copy.deepcopy(association_payload) if isinstance(association_payload, dict) else {}
-        base_request = base_policy.get("request") if isinstance(base_policy.get("request"), dict) else {}
-        request = copy.deepcopy(base_request)
-        request["supi"] = str(normalized_supi or payload.get("supi") or request.get("supi") or "").strip()
-        request["notificationUri"] = str(
-            payload.get("notificationUri")
-            or payload.get("notification_uri")
-            or request.get("notificationUri")
-            or f"http://localhost:8000/notify/{request['supi']}"
-        ).strip()
-        for key in (
-            "accessType",
-            "accessTypes",
-            "ratType",
-            "ratTypes",
-            "servingPlmn",
-            "allowedSnssais",
-            "targetSnssais",
-            "mappingSnssais",
-            "rfsp",
-            "ueAmbr",
-            "servAreaRes",
-            "guami",
-            "userLoc",
-        ):
-            if payload.get(key) is not None:
-                request[key] = copy.deepcopy(payload[key])
-        request["suppFeat"] = str(payload.get("suppFeat") or request.get("suppFeat") or base_policy.get("suppFeat") or "1")
-
-        normalized = {
-            key: copy.deepcopy(value)
-            for key, value in base_policy.items()
-            if key in SingleControlAgent._am_policy_allowed_fields() and key != "request"
-        }
-        normalized["request"] = request
-        if payload.get("triggers") is not None:
-            normalized["triggers"] = list(payload.get("triggers") or [])
-        elif normalized.get("triggers") is None:
-            normalized["triggers"] = []
-        normalized["rfsp"] = int(payload.get("rfsp") or request.get("rfsp") or normalized.get("rfsp") or 1)
-        normalized["suppFeat"] = str(payload.get("suppFeat") or normalized.get("suppFeat") or request.get("suppFeat") or "1")
-        return normalized
-
-    @staticmethod
-    def _am_policy_allowed_fields() -> set[str]:
-        return {
-            "request",
-            "triggers",
-            "servAreaRes",
-            "wlServAreaRes",
-            "rfsp",
-            "targetRfsp",
-            "smfSelInfo",
-            "ueAmbr",
-            "ueSliceMbrs",
-            "pras",
-            "suppFeat",
-            "pcfUeInfo",
-            "matchPdus",
-            "asTimeDisParam",
-        }
-
-    @staticmethod
-    def _optimizer_flow_ids(optimizer_preview: Any) -> List[str]:
-        if not isinstance(optimizer_preview, dict):
-            return []
-        flow_ids: List[str] = []
-        assignments = optimizer_preview.get("qos_flow_assignments")
-        if isinstance(assignments, list):
-            for item in assignments:
-                if not isinstance(item, dict):
-                    continue
-                flow_id = str(item.get("flow_id") or item.get("id") or "").strip()
-                if flow_id and flow_id not in flow_ids:
-                    flow_ids.append(flow_id)
-        qos_plan = optimizer_preview.get("qos_plan")
-        flow_sets: List[Any] = []
-        if isinstance(qos_plan, dict):
-            target_apps = qos_plan.get("target_apps")
-            if isinstance(target_apps, list):
-                for app in target_apps:
-                    if isinstance(app, dict):
-                        flow_sets.append(app.get("flows"))
-            target_app = qos_plan.get("target_app")
-            if isinstance(target_app, dict):
-                flow_sets.append(target_app.get("flows"))
-        for flows in flow_sets:
-            if not isinstance(flows, list):
-                continue
-            for item in flows:
-                if not isinstance(item, dict):
-                    continue
-                flow_id = str(item.get("id") or item.get("flow_id") or "").strip()
-                if flow_id and flow_id not in flow_ids:
-                    flow_ids.append(flow_id)
-        return flow_ids
-
-    @classmethod
-    def _resolve_pcflow_id(
-        cls,
-        policy_details: Dict[str, Any],
-        *,
-        decision: SingleAgentRoundDecision,
-        optimizer_preview: Any = None,
-        allow_missing: bool = False,
-    ) -> str:
-        inferred_flow_id = cls._extract_sm_policy_flow_id(policy_details)
-        optimizer_flow_ids = cls._optimizer_flow_ids(optimizer_preview)
-        authoritative_flow_ids = list(dict.fromkeys(optimizer_flow_ids))
-
-        if inferred_flow_id and inferred_flow_id in authoritative_flow_ids:
-            return inferred_flow_id
-        if len(authoritative_flow_ids) == 1:
-            return authoritative_flow_ids[0]
-        if inferred_flow_id:
-            return inferred_flow_id
-        if not allow_missing:
-            raise ValueError("PCF-style policy payload does not contain a grounded flow_id")
-        return ""
-
-    def _validate_single_policy_plan(self, policy_plan: PolicyPlanDraft, *, active_domains: set[str]) -> None:
-        if policy_plan.planning_status == "needs_upstream_reground":
-            if policy_plan.all_policies:
-                raise ValueError("needs_upstream_reground must not contain executable policies")
-            if not policy_plan.upstream_requests and not policy_plan.missing_evidence and not policy_plan.blocked_targets:
-                raise ValueError("needs_upstream_reground must preserve explicit upstream requests or missing evidence")
-            return
-        if policy_plan.planning_status == "partial_plan":
-            if not policy_plan.all_policies and not policy_plan.partial_policies:
-                raise ValueError("partial_plan must preserve executable fragments or partial policies")
-            if not policy_plan.missing_evidence and not policy_plan.blocked_targets and not policy_plan.planner_conflicts:
-                raise ValueError("partial_plan must preserve unresolved gaps")
-            return
-        if not policy_plan.all_policies:
-            raise ValueError("SingleControlAgent produced no policies for the requested domain.")
-        if ControlDomain.QOS.value in active_domains:
-            has_sm_policy = any(item.policy_type == "SmPolicyDecision" for item in policy_plan.all_policies)
-            if not has_sm_policy:
-                raise ValueError("SingleControlAgent did not include an executable SM policy for a qos-active round.")
-        if ControlDomain.MOBILITY.value in active_domains:
-            has_am_policy = any(item.policy_type == "PcfAmPolicyControlPolicyAssociation" for item in policy_plan.all_policies)
-            if not has_am_policy:
-                raise ValueError("SingleControlAgent did not include an executable AM policy for a mobility-active round.")
-        if ControlDomain.QOS.value in active_domains and ControlDomain.MOBILITY.value in active_domains:
-            self.plan_compiler.plan_validator._validate_joint_snssai_consistency(policy_plan)
 
     @staticmethod
     def _required_evidence_from_domains(domains: List[str]) -> List[str]:
@@ -1539,45 +661,6 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             required.append("mobility_policy_context")
         return required
 
-    @staticmethod
-    def _build_planning_context(
-        *,
-        decision: SingleAgentRoundDecision,
-        user_input: str,
-        session_id: str,
-        snapshot_id: str,
-        round_index: int,
-        feedback_context: str,
-        round_traces: List[Dict[str, Any]],
-        previous_mediator_decision: Dict[str, Any],
-    ) -> PlanningContext:
-        active_domains = [
-            str(item or "").strip().lower()
-            for item in (decision.requested_domains or [])
-            if str(item or "").strip()
-        ]
-        objective_profile_hint = str(decision.objective_profile_hint or "").strip()
-        objective_profile = {"profile_name": objective_profile_hint} if objective_profile_hint else {}
-        required_evidence = SingleControlAgent._required_evidence_from_domains(active_domains)
-        return PlanningContext(
-            round_index=round_index,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            shared_context=SharedControlContext(
-                main_intent=GlobalControlIntent(
-                    raw_input=str(user_input or "").strip(),
-                    next_agent="optimization_strategy",
-                    round_strategy=MainRoundStrategy.INITIAL_GROUNDING,
-                    requested_domains=[ControlDomain(item) for item in active_domains],
-                    objective_profile=ObjectiveProfile.model_validate(objective_profile or {"profile_name": "balanced"}),
-                    required_evidence=required_evidence,
-                ),
-            ),
-            feedback_context=feedback_context,
-            handoff_history=round_traces[-2:],
-            revision_requests=list((previous_mediator_decision or {}).get("revision_requests") or []),
-            unified_constraints=dict((previous_mediator_decision or {}).get("unified_constraints") or {}),
-        )
 
 
 __all__ = ["SingleControlAgent"]

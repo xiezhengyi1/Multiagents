@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -9,10 +9,10 @@ from pydantic import BaseModel
 
 from shared.runtime import ContextPolicy
 from shared.runtime import RuntimeCache
+from shared.runtime import RuntimePersistence
 from shared.runtime import AgentRuntimeContext
 from shared.runtime import StructuredToolLoop
 from shared.runtime import build_tool_specs, extract_tool_calls
-from shared.runtime import ArtifactEnvelope
 from shared.runtime import JsonlTraceWriter, TracedStructuredAgent
 from shared.logging import setup_logger
 
@@ -150,6 +150,7 @@ class BaseAgent:
         logger_color: Optional[str] = None,
         logger_name: Optional[str] = None,
         lease_seconds: int = 60,
+        persistence: RuntimePersistence,
     ) -> None:
         agent_name = str(getattr(self, "agent_name", "") or "").strip()
         if not agent_name:
@@ -157,71 +158,12 @@ class BaseAgent:
         if not hasattr(self, "init_worker_runtime"):
             raise RuntimeError("initialize_agent_runtime() requires ArtifactWorkerMixin")
 
-        self.init_worker_runtime(lease_seconds=lease_seconds)
+        self.init_worker_runtime(persistence=persistence, lease_seconds=lease_seconds)
         if logger_color is not None:
             self.logger = setup_logger(
                 logger_name or self.__class__.__name__,
                 default_msg_color=logger_color,
             )
-
-    @staticmethod
-    def serialize_artifact_payload(payload: Any) -> dict[str, Any]:
-        if hasattr(payload, "model_dump"):
-            dumped = payload.model_dump(mode="json")
-            if isinstance(dumped, dict):
-                return dumped
-        if isinstance(payload, dict):
-            return payload
-        raise TypeError(f"Unsupported artifact payload type: {type(payload).__name__}")
-
-    def cache_received_artifact(
-        self,
-        *,
-        artifact_type: str,
-        payload: Any,
-        source_agent: str = "coordinator",
-        session_id: str = "",
-        snapshot_id: str = "",
-        target_agent: Optional[str] = None,
-    ) -> ArtifactEnvelope:
-        if not hasattr(self, "cache"):
-            raise RuntimeError("cache_received_artifact() requires initialized worker runtime")
-
-        envelope = ArtifactEnvelope(
-            artifact_type=str(artifact_type or "").strip(),
-            source_agent=str(source_agent or "").strip(),
-            target_agent=str(target_agent or getattr(self, "agent_name", "") or "").strip(),
-            session_id=str(session_id or "").strip(),
-            snapshot_id=str(snapshot_id or "").strip(),
-            payload=self.serialize_artifact_payload(payload),
-        )
-        self.cache.cache_received(envelope)
-        return envelope
-
-    def cache_produced_artifact(
-        self,
-        *,
-        artifact_type: str,
-        request_envelope: ArtifactEnvelope,
-        payload: Any,
-        source_agent: Optional[str] = None,
-        target_agent: Optional[str] = None,
-    ) -> ArtifactEnvelope:
-        if not hasattr(self, "cache"):
-            raise RuntimeError("cache_produced_artifact() requires initialized worker runtime")
-
-        envelope = ArtifactEnvelope(
-            artifact_type=str(artifact_type or "").strip(),
-            source_agent=str(source_agent or getattr(self, "agent_name", "") or "").strip(),
-            target_agent=str(target_agent or request_envelope.source_agent or "").strip(),
-            session_id=request_envelope.session_id,
-            snapshot_id=request_envelope.snapshot_id,
-            correlation_id=request_envelope.correlation_id,
-            upstream_artifact_ids=[request_envelope.artifact_id],
-            payload=self.serialize_artifact_payload(payload),
-        )
-        self.cache.cache_produced(envelope)
-        return envelope
 
     @staticmethod
     def build_runtime_context(
@@ -273,6 +215,7 @@ class BaseAgent:
         context_policy: ContextPolicy | None = None,
         token_counter: Any = None,
         token_budget: Any = None,
+        capability_aliases: Mapping[str, Iterable[Any]] | None = None,
     ) -> TracedStructuredAgent:
         tool_list = list(tools)
         runnable = StructuredToolLoop(
@@ -300,7 +243,7 @@ class BaseAgent:
             agent_name=agent_name,
             model_name=self.model_name,
             system_prompt=system_prompt,
-            tool_specs=build_tool_specs(tool_list),
+            tool_specs=build_tool_specs(tool_list, capability_aliases=capability_aliases),
             runnable=runnable,
             writer=JsonlTraceWriter(agent_name),
         )

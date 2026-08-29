@@ -1,12 +1,5 @@
-from .connection import get_db, engine, SessionLocal
-from .models import SessionContext, EpisodicExperience, SemanticKnowledge, UeContextRecord
+"""Database models and infrastructure.
 
-__all__ = [
-    "get_db", 
-    "engine", 
-    "SessionLocal",
-    "SessionContext", 
-    "EpisodicExperience", 
-    "SemanticKnowledge",
-    "UeContextRecord"
-]
+Import concrete adapters from their defining modules so importing ORM models does
+not configure an engine as a package side effect.
+"""

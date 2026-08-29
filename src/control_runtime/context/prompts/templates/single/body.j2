@@ -51,21 +51,6 @@ Retry discipline:
 
 {% include 'planning/core.j2' %}
 
-Hard output contract:
-- Return raw JSON only: exactly one OsaAdvisorOutput object, never markdown,
-  prose, a bare policy, or an array.
-- Required root fields are: planning_status, rationale, missing_evidence,
-  blocked_targets, upstream_requests, planner_conflicts, sm_policies,
-  am_policy, ursp_policies, partial_policies.
-- All collection fields are arrays (use [] when empty); am_policy is null when
-  inactive. Never add SUPI, policy_id, policy_type, slice metadata, or runtime
-  wrapper fields at the top level.
-- Every SmPolicySpec has only OSA fields: flow_id, app_id, priority,
-  target_latency_ms, packet_error_rate, max_br_ul_mbps, max_br_dl_mbps, and
-  optional gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, flow_description.
-- For partial_plan, preserve evidence-backed blocker strings and a
-  non-executable partial_policies descriptor when no executable fragment exists.
-
 Single-agent few-shot examples — these demonstrate the hidden three-stage
 sequence and final wire shape only. All identifiers and values are illustrative;
 copy them only when they occur in the current runtime evidence.

@@ -4,7 +4,7 @@ from sqlalchemy import Column, String, Float, Text, DateTime, Integer, ForeignKe
 from sqlalchemy.dialects.postgresql import JSONB
 from pgvector.sqlalchemy import Vector
 
-from .connection import Base
+from .base import Base
 
 
 def _utcnow() -> datetime:
@@ -18,7 +18,6 @@ class SessionContext(Base):
     __tablename__ = "session_context"
 
     session_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    current_step = Column(String)  # 兼容旧字段
     current_stage = Column(String, nullable=True)
     current_snapshot_id = Column(String, nullable=True)
     current_artifact_id = Column(String, nullable=True)

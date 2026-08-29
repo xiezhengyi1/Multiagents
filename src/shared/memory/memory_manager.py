@@ -9,14 +9,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.memory import InMemoryStore
 
-from database.connection import RAW_DATABASE_URL
-from database.langchain_pg import get_embedding_dimensions, get_openai_embeddings
 from shared.agents import BaseAgent
-from shared.logging import setup_logger
-
-logger = setup_logger(__name__)
-
-
 def _build_short_term_graph(checkpointer: Any):
     def _persist_messages(_state: MessagesState) -> Dict[str, Any]:
         return {}
@@ -32,7 +25,6 @@ class MemoryManager:
     def __init__(
         self,
         short_term_limit: int = 10,
-        long_term_file: str = "",
         similarity_threshold: float = 0.5,
         enable_llm_summarization: bool = False,
         *,
@@ -43,12 +35,17 @@ class MemoryManager:
         summarizer_llm: Any = None,
     ):
         self.short_term_limit = max(1, int(short_term_limit))
-        self.long_term_file = str(long_term_file or "").strip()
         self.similarity_threshold = similarity_threshold
         self.enable_llm_summarization = bool(enable_llm_summarization)
-        self.database_url = str(database_url or RAW_DATABASE_URL).strip()
+        self.database_url = str(database_url or "").strip()
+        if not self.database_url and (checkpointer is None or store is None):
+            from database.connection import RAW_DATABASE_URL
+
+            self.database_url = str(RAW_DATABASE_URL or "").strip()
         self.embeddings = embeddings
         if self.embeddings is None and store is None:
+            from database.langchain_pg import get_openai_embeddings
+
             self.embeddings = get_openai_embeddings()
         self._summarizer_llm = summarizer_llm
 
@@ -60,9 +57,6 @@ class MemoryManager:
 
         self._thread_id = ""
         self._supi: Optional[str] = None
-
-        if self.long_term_file:
-            logger.info("long_term_file is deprecated and ignored by LangGraph-backed MemoryManager.")
 
     def __del__(self) -> None:
         for manager in (self._store_manager, self._checkpointer_manager):
@@ -84,6 +78,7 @@ class MemoryManager:
         return checkpointer
 
     def _init_store(self) -> Any:
+        from database.langchain_pg import get_embedding_dimensions
         from langgraph.store.postgres import PostgresStore
 
         manager = PostgresStore.from_conn_string(

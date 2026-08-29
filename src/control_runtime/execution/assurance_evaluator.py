@@ -2,11 +2,18 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
-from ..domain.policy_plan import AssuranceVerdict
-from ..integrations.scenario.network_graph import NetworkGraph
+from pydantic import BaseModel, Field
 
 
 QOS_TOLERANCE_RATIO = 0.10
+
+
+class AssuranceVerdict(BaseModel):
+    policy_id: str = Field(default="")
+    flow_id: Optional[str] = Field(default=None)
+    status: str = Field(default="unknown")
+    reason: str = Field(default="")
+    metrics: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _within_upper_bound(observed: float, target: float, *, tolerance_ratio: float) -> bool:
@@ -66,26 +73,21 @@ class AssuranceEvaluator:
             raise RuntimeError(f"policy {policy_id} snapshot {snapshot_id} not found for assurance evaluation")
 
         flow = None
-        if snapshot.get("nodes") and snapshot.get("edges"):
-            graph = NetworkGraph.from_payload(snapshot)
-            flow = graph.get_flow_record(supi, flow_id or "")
-        else:
-            # Compatibility snapshots store flows under apps[].flows[] with `id` and nested SLA/telemetry payloads.
-            app_data = snapshot.get("apps", [])
-            for app in app_data:
-                if not isinstance(app, dict):
+        app_data = snapshot.get("apps", [])
+        for app in app_data:
+            if not isinstance(app, dict):
+                continue
+            app_supi = str(app.get("supi") or "").strip()
+            for item in app.get("flows", []):
+                if not isinstance(item, dict):
                     continue
-                app_supi = str(app.get("supi") or "").strip()
-                for item in app.get("flows", []):
-                    if not isinstance(item, dict):
-                        continue
-                    flow_supi = app_supi or str(item.get("supi") or "").strip()
-                    item_flow_id = str(item.get("flow_id") or item.get("id") or "").strip()
-                    if flow_supi == supi and item_flow_id == (flow_id or ""):
-                        flow = item
-                        break
-                if flow is not None:
+                flow_supi = app_supi or str(item.get("supi") or "").strip()
+                item_flow_id = str(item.get("flow_id") or item.get("id") or "").strip()
+                if flow_supi == supi and item_flow_id == (flow_id or ""):
+                    flow = item
                     break
+            if flow is not None:
+                break
 
         if flow is not None:
             sla = flow.get("sla") if isinstance(flow.get("sla"), dict) else {}

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...domain.policy_plan import PolicyPlanDraft
+from ...agents.planning.contracts import PolicyPlanDraft
 from .base import BaseProjector, field, json_mapping, without_empty_values
 
 

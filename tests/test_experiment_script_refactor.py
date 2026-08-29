@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -8,6 +9,10 @@ from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = PROJECT_ROOT / "experiments" / "scripts"
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+psycopg://offline:offline@127.0.0.1:5432/offline_test",
+)
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -49,10 +54,17 @@ def test_simulator_lifecycle_has_dedicated_module() -> None:
     assert callable(simulator.restart_simulator_for_current_scenario)
 
 
-def test_aggregate_task_map_loads_canonical_catalog() -> None:
-    from experiments.scripts.aggregate_results import _task_map
+def test_aggregate_task_map_loads_catalog_from_configured_path(tmp_path: Path, monkeypatch) -> None:
+    from experiments.scripts import aggregate_results
 
-    assert len(_task_map()) == 20
+    catalog_path = tmp_path / "task_catalog.json"
+    catalog_path.write_text(
+        json.dumps({"tasks": [{"task_id": "T-01"}, {"task_id": "T-02"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(aggregate_results, "TASK_CATALOG_PATH", catalog_path)
+
+    assert set(aggregate_results._task_map()) == {"T-01", "T-02"}
 
 
 def test_launch_failure_recorder_appends_jsonl(tmp_path: Path, monkeypatch) -> None:
@@ -129,9 +141,8 @@ def test_single_agent_orchestrator_passes_model_name(monkeypatch) -> None:
 
     monkeypatch.setattr(single_agent_orchestrator, "SingleControlAgent", FakeSingleControlAgent)
     monkeypatch.setattr(single_agent_orchestrator, "PolicyDispatchAgent", FakePolicyDispatchAgent)
-    monkeypatch.setattr(single_agent_orchestrator, "ConflictResolutionTool", lambda: SimpleNamespace())
-    monkeypatch.setattr(single_agent_orchestrator, "AssuranceDiagnosisTool", lambda: SimpleNamespace())
-    single_agent_orchestrator.SingleAgentOrchestrator._startup_banner_printed = False
+    monkeypatch.setattr(single_agent_orchestrator, "ConflictResolutionTool", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(single_agent_orchestrator, "AssuranceDiagnosisTool", lambda **_kwargs: SimpleNamespace())
 
     single_agent_orchestrator.SingleAgentOrchestrator(
         max_rounds=1,
@@ -146,14 +157,15 @@ def test_workflow_summary_reports_average_elapsed_ms(tmp_path: Path) -> None:
 
     summary = summarize_run_results(
         [
-            {"status": "error", "completed": False, "elapsed_ms": 120, "round_count": 0, "retry_count": 0},
-            {"status": "error", "completed": False, "elapsed_ms": 280, "round_count": 0, "retry_count": 0},
+            {"status": "error", "completed": False, "agent_elapsed_total_ms": 120, "elapsed_ms": 180, "round_count": 0, "retry_count": 0},
+            {"status": "error", "completed": False, "agent_elapsed_total_ms": 280, "elapsed_ms": 320, "round_count": 0, "retry_count": 0},
         ],
         result_output=tmp_path / "runs.jsonl",
         workflow_output=tmp_path / "workflow.jsonl",
     )
 
     assert summary["avg_elapsed_ms"] == 200.0
+    assert summary["avg_wall_elapsed_ms"] == 250.0
 
 
 def test_single_agent_summary_reports_average_elapsed_ms(tmp_path: Path) -> None:
@@ -173,9 +185,9 @@ def test_single_agent_summary_reports_average_elapsed_ms(tmp_path: Path) -> None
 def test_aggregate_extracts_elapsed_ms_for_ledger_latency() -> None:
     from experiments.scripts.aggregate_results import _extract_elapsed_ms
 
-    assert _extract_elapsed_ms({"elapsed_ms": 42.6}) == 42.6
-    assert _extract_elapsed_ms({"elapsed_ms": "15.5"}) == 15.5
-    assert _extract_elapsed_ms({"elapsed_ms": ""}) == ""
+    assert _extract_elapsed_ms({"agent_elapsed_total_ms": 42.6}) == 42.6
+    assert _extract_elapsed_ms({"agent_elapsed_total_ms": "15.5"}) == 15.5
+    assert _extract_elapsed_ms({"agent_elapsed_total_ms": ""}) == ""
 
 
 def test_configured_runner_paths_still_exist() -> None:

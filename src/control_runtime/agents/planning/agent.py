@@ -2,24 +2,38 @@ from __future__ import annotations
 
 import copy
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
-from shared.runtime import ArtifactEnvelope
+from shared.runtime import ArtifactEnvelope, RuntimePersistence
 from shared.runtime import ContextPolicy
-from shared.agents import BaseAgent, coerce_structured_response, extract_grounding_tool_names
-from knowledge_runtime.retrieval.raw import get_knowledge_by_key, search_semantic_knowledge
+from shared.agents import (
+    BaseAgent,
+    RetryContext,
+    RetryPhase,
+    RetryPolicy,
+    StageAttempt,
+    StageRunner,
+    coerce_structured_response,
+    extract_grounding_tool_names,
+)
 from shared.runtime import ToolLoopExecutionError
 from shared.runtime import ArtifactWorkerMixin
-from ...domain.collaboration import PlanningRequest
-from ...domain.policy_plan import PolicyPlanDraft
+from application_runtime.persistence import create_runtime_persistence
+from ...tool_capabilities import CONTROL_RUNTIME_CAPABILITY_ALIASES
+from .contracts import PlanningRequest, PolicyPlanDraft
 from ...context.projectors import project_collaboration_context_for_prompt, project_grounding_decision_for_prompt
 from ...context.observability import measure_context_components
-from ...context.prompts import PlanningPromptBuilder
+from ...context.prompts.planning import (
+    build_planning_validation_retry_prompt,
+    build_planning_user_prompt,
+    render_planning_system_prompt,
+)
 from shared.logging import log_event, log_timing
 
 from .compiler import OptimizationStrategyCompiler
+from .evidence import extract_planning_tool_evidence
 from .response_models import OsaAdvisorOutput
-from .tool_result_adapter import extract_planning_tool_evidence
 from .tools import build_request_tools
 
 
@@ -41,6 +55,22 @@ def _planning_supi(planning_request: PlanningRequest) -> str:
     )
 
 
+@dataclass(slots=True)
+class _OsaAdvisorStageState:
+    """Inputs, response, and diagnostics retained while one advisor stage retries."""
+
+    current_prompt: str
+    retry_tool_evidence: dict[str, Any] = field(default_factory=dict)
+    disable_knowledge_tools: bool = False
+    invocation_error: str = ""
+    advisor_output: OsaAdvisorOutput | None = None
+    advisor_result: dict[str, Any] | None = None
+    advisor_trace: dict[str, Any] | None = None
+    planning_tool_evidence: dict[str, Any] = field(default_factory=dict)
+    grounding_tools: list[str] = field(default_factory=list)
+    contract_errors: list[str] = field(default_factory=list)
+
+
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     agent_name = "optimization_strategy"
     QOS_GROUNDING_TOOLS = {
@@ -56,20 +86,27 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         "search_semantic_knowledge",
         "get_knowledge_by_key",
     }
-    _RAG_TOOLS = [search_semantic_knowledge, get_knowledge_by_key]
-
     def __init__(
         self,
         model_name: str = "qwen3-30b-a3b-instruct-2507",
         use_local_model: bool = False,
         rag_enabled: bool = True,
+        *,
+        persistence: RuntimePersistence | None = None,
     ) -> None:
         super().__init__(model_name=model_name, use_local_model=use_local_model)
         self.agent_name = "optimization_strategy"
         self.rag_enabled = rag_enabled
         self.compiler = OptimizationStrategyCompiler()
-        self.initialize_agent_runtime(logger_color="\033[94m")
+        runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.initialize_agent_runtime(logger_color="\033[94m", persistence=runtime_persistence)
         self.last_failure_debug: dict[str, Any] = {}
+
+    @staticmethod
+    def _rag_tools() -> list[Any]:
+        from knowledge_runtime.retrieval.raw import get_knowledge_by_key, search_semantic_knowledge
+
+        return [search_semantic_knowledge, get_knowledge_by_key]
 
     @staticmethod
     def _active_domain_names(planning_request: PlanningRequest) -> set[str]:
@@ -155,7 +192,10 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
 
         total_start = time.perf_counter()
         log_event(self.logger, "osa_generate_start")
-        advisor_trace = None
+        advisor_trace: dict[str, Any] | None = None
+        advisor_output: OsaAdvisorOutput | None = None
+        advisor_result: dict[str, Any] | None = None
+        stage_state: _OsaAdvisorStageState | None = None
         self.last_failure_debug = {}
         try:
             planning_evidence = self.compiler.build_planning_evidence(effective_request)
@@ -163,92 +203,27 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             include_knowledge_tools = self._include_knowledge_tools(effective_request)
             available_tool_names = [
                 str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
-                for tool in [*(self._RAG_TOOLS if include_knowledge_tools else []), *prompt_planning_tools]
+                for tool in [*(self._rag_tools() if include_knowledge_tools else []), *prompt_planning_tools]
                 if str(getattr(tool, "name", "") or getattr(tool, "__name__", "")).strip()
             ]
-            prompt_builder = PlanningPromptBuilder()
-            base_prompt = prompt_builder.advisor_user_prompt(
+            base_prompt = build_planning_user_prompt(
                 normalized_user_intent=normalized_grounding_decision,
                 coordination_context=coordination_context,
                 planning_evidence=planning_evidence,
                 available_tool_names=available_tool_names,
             )
-            current_prompt = base_prompt
-            advisor_output = None
-            advisor_result = None
-            planning_tool_evidence: dict[str, Any] = {}
-            grounding_tools: list[str] = []
-            contract_errors: list[str] = []
-            invocation_error = ""
-            retry_tool_evidence: dict[str, Any] = {}
-            disable_knowledge_tools = False
-            for attempt_index in range(3):
-                try:
-                    advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
-                        planning_request=effective_request,
-                        prompt=current_prompt,
-                        trace_metadata=trace_metadata,
-                        cached_tool_evidence=retry_tool_evidence,
-                        disable_knowledge_tools=disable_knowledge_tools,
-                    )
-                except RuntimeError as exc:
-                    invocation_error = str(exc)
-                    self.last_failure_debug = {
-                        "phase": "optimization_strategy",
-                        "attempt_index": attempt_index + 1,
-                        "invocation_error": invocation_error,
-                    }
-                    retry_tool_evidence = self._cached_tool_evidence_for_retry()
-                    if "get_knowledge_by_key exceeded" in invocation_error or "search_semantic_knowledge exceeded" in invocation_error:
-                        disable_knowledge_tools = True
-                    if attempt_index == 2:
-                        raise
-                    log_event(self.logger, "osa_retry", attempt=attempt_index + 2, reason="invocation_error", error=invocation_error)
-                    current_prompt = prompt_builder.validation_retry_prompt(
-                        base_prompt=base_prompt,
-                        issues=[invocation_error],
-                        cached_planning_evidence=self._cached_tool_evidence_for_retry(),
-                    )
-                    continue
-
-                planning_tool_evidence = extract_planning_tool_evidence(
-                    advisor_result=advisor_result,
-                    tool_payload_cache=getattr(self, "_tools_cache", None),
-                )
-                grounding_tools = extract_grounding_tool_names(
-                    advisor_result,
-                    self.GROUNDING_TOOLS,
-                )
-                advisor_output = self._enforce_entitlement_limited_execution_boundary(
-                    advisor_output=advisor_output,
-                    planning_request=effective_request,
-                )
-                contract_errors = self.compiler.validate_advisor_output(
-                    advisor_output=advisor_output,
-                    planning_request=effective_request,
-                    grounding_tools=grounding_tools,
-                    planning_tool_evidence=planning_tool_evidence,
-                )
-                self.last_failure_debug = {
-                    "phase": "optimization_strategy",
-                    "attempt_index": attempt_index + 1,
-                    "grounding_tools": list(grounding_tools or []),
-                    "advisor_output": advisor_output.model_dump(mode="json"),
-                    "contract_errors": list(contract_errors or []),
-                    "planning_tool_evidence": planning_tool_evidence,
-                }
-                if not contract_errors:
-                    break
-                if attempt_index == 2:
-                    raise RuntimeError("OSA advisor contract validation failed: " + "; ".join(contract_errors))
-                retry_tool_evidence = self._cached_tool_evidence_for_retry()
-                log_event(self.logger, "osa_retry", attempt=attempt_index + 2,
-                          reason="contract_errors", errors=contract_errors)
-                current_prompt = prompt_builder.validation_retry_prompt(
-                    base_prompt=base_prompt,
-                    issues=list(contract_errors),
-                    cached_planning_evidence=self._cached_tool_evidence_for_retry(),
-                )
+            stage_state = _OsaAdvisorStageState(current_prompt=base_prompt)
+            completed_stage = self._run_advisor_stage(
+                planning_request=effective_request,
+                base_prompt=base_prompt,
+                trace_metadata=trace_metadata,
+                state=stage_state,
+            )
+            advisor_output = completed_stage.advisor_output
+            advisor_result = completed_stage.advisor_result
+            advisor_trace = completed_stage.advisor_trace
+            planning_tool_evidence = completed_stage.planning_tool_evidence
+            grounding_tools = completed_stage.grounding_tools
 
             if advisor_output is None or advisor_result is None:
                 raise RuntimeError("OSA advisor returned no structured_response")
@@ -272,10 +247,17 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             log_timing(self.logger, "osa_total", time.perf_counter() - total_start, status="success")
             return final_output
         except Exception as exc:
-            if advisor_trace is not None:
+            failed_advisor_trace = advisor_trace
+            failed_advisor_output = advisor_output
+            if stage_state is not None:
+                if failed_advisor_trace is None:
+                    failed_advisor_trace = stage_state.advisor_trace
+                if failed_advisor_output is None:
+                    failed_advisor_output = stage_state.advisor_output
+            if failed_advisor_trace is not None:
                 self._write_advisor_trace(
-                    advisor_trace=advisor_trace,
-                    advisor_output=advisor_output if "advisor_output" in locals() else None,
+                    advisor_trace=failed_advisor_trace,
+                    advisor_output=failed_advisor_output,
                     compiler_output=None,
                     status="error",
                     error=str(exc),
@@ -286,6 +268,128 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         finally:
             if hasattr(self, "_pending_invoke_messages"):
                 delattr(self, "_pending_invoke_messages")
+
+    def _run_advisor_stage(
+        self,
+        *,
+        planning_request: PlanningRequest,
+        base_prompt: str,
+        trace_metadata: dict[str, Any] | None,
+        state: _OsaAdvisorStageState,
+    ) -> _OsaAdvisorStageState:
+        """Run OSA's existing advisor/repair/validation lifecycle once or with retries."""
+
+        def invoke_advisor(_: StageAttempt) -> _OsaAdvisorStageState:
+            advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
+                planning_request=planning_request,
+                prompt=state.current_prompt,
+                trace_metadata=trace_metadata,
+                cached_tool_evidence=state.retry_tool_evidence,
+                disable_knowledge_tools=state.disable_knowledge_tools,
+            )
+            state.advisor_output = advisor_output
+            state.advisor_result = advisor_result
+            state.advisor_trace = advisor_trace
+            return state
+
+        def repair_advisor(
+            stage_value: _OsaAdvisorStageState,
+            _: StageAttempt,
+        ) -> _OsaAdvisorStageState:
+            stage_value.planning_tool_evidence = extract_planning_tool_evidence(
+                advisor_result=stage_value.advisor_result,
+                tool_payload_cache=getattr(self, "_tools_cache", None),
+            )
+            stage_value.grounding_tools = extract_grounding_tool_names(
+                stage_value.advisor_result,
+                self.GROUNDING_TOOLS,
+            )
+            stage_value.advisor_output = self._enforce_entitlement_limited_execution_boundary(
+                advisor_output=stage_value.advisor_output,
+                planning_request=planning_request,
+            )
+            return stage_value
+
+        def validate_advisor(
+            stage_value: _OsaAdvisorStageState,
+            attempt: StageAttempt,
+        ) -> list[str]:
+            contract_errors = self.compiler.validate_advisor_output(
+                advisor_output=stage_value.advisor_output,
+                planning_request=planning_request,
+                grounding_tools=stage_value.grounding_tools,
+                planning_tool_evidence=stage_value.planning_tool_evidence,
+            )
+            state.contract_errors = contract_errors
+            self.last_failure_debug = {
+                "phase": "optimization_strategy",
+                "attempt_index": attempt.attempt,
+                "grounding_tools": list(stage_value.grounding_tools or []),
+                "advisor_output": stage_value.advisor_output.model_dump(mode="json"),
+                "contract_errors": list(contract_errors or []),
+                "planning_tool_evidence": stage_value.planning_tool_evidence,
+            }
+            return contract_errors
+
+        def record_advisor_failure(context: RetryContext) -> None:
+            if context.phase is not RetryPhase.INVOKE or not isinstance(context.error, RuntimeError):
+                return
+            state.invocation_error = str(context.error)
+            self.last_failure_debug = {
+                "phase": "optimization_strategy",
+                "attempt_index": context.attempt,
+                "invocation_error": state.invocation_error,
+            }
+            state.retry_tool_evidence = self._cached_tool_evidence_for_retry()
+            if (
+                "get_knowledge_by_key exceeded" in state.invocation_error
+                or "search_semantic_knowledge exceeded" in state.invocation_error
+            ):
+                state.disable_knowledge_tools = True
+
+        def prepare_advisor_retry(context: RetryContext) -> None:
+            if context.phase is RetryPhase.INVOKE:
+                retry_issues = [str(context.error)]
+                log_event(
+                    self.logger,
+                    "osa_retry",
+                    attempt=context.attempt + 1,
+                    reason="invocation_error",
+                    error=retry_issues[0],
+                )
+            else:
+                retry_issues = list(context.issues)
+                state.retry_tool_evidence = self._cached_tool_evidence_for_retry()
+                log_event(
+                    self.logger,
+                    "osa_retry",
+                    attempt=context.attempt + 1,
+                    reason="contract_errors",
+                    errors=retry_issues,
+                )
+            state.current_prompt = build_planning_validation_retry_prompt(
+                base_prompt=base_prompt,
+                issues=retry_issues,
+                cached_planning_evidence=self._cached_tool_evidence_for_retry(),
+            )
+
+        runner: StageRunner[_OsaAdvisorStageState] = StageRunner(
+            retry_policy=RetryPolicy(
+                max_attempts=3,
+                retryable_exceptions=(RuntimeError,),
+                retryable_phases=frozenset({RetryPhase.INVOKE, RetryPhase.VALIDATION}),
+            )
+        )
+        return runner.run(
+            invoke=invoke_advisor,
+            repair=repair_advisor,
+            validate=validate_advisor,
+            validation_error=lambda issues: RuntimeError(
+                "OSA advisor contract validation failed: " + "; ".join(issues)
+            ),
+            on_failure=record_advisor_failure,
+            on_retry=prepare_advisor_retry,
+        )
 
     @staticmethod
     def _effective_planning_request(planning_request: PlanningRequest) -> PlanningRequest:
@@ -366,10 +470,10 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         )
         advisor_agent = self.create_json_agent(
             tools=[
-                *(self._RAG_TOOLS if include_knowledge_tools else []),
+                *(self._rag_tools() if include_knowledge_tools else []),
                 *planning_tools,
             ],
-            system_prompt=PlanningPromptBuilder().system_prompt(),
+            system_prompt=render_planning_system_prompt(),
             response_model=OsaAdvisorOutput,
             max_iterations=12,
             max_calls_per_tool=2,
@@ -395,6 +499,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 },
                 recent_tool_results_per_tool=1,
             ),
+            capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
         )
         messages = [{"role": "user", "content": prompt}]
         context_components = measure_context_components(

@@ -13,7 +13,6 @@ from .memory import (
 from .grounding_decision import GroundingDecisionProjector
 from .planning_context import PlanningContextProjector
 from .policy_plan import PolicyPlanDraftProjector
-from .registry import ProjectorRegistry
 from .shared_context import SharedControlContextProjector
 
 __all__ = [
@@ -25,7 +24,6 @@ __all__ = [
     "GroundingDecisionProjector",
     "PlanningContextProjector",
     "PolicyPlanDraftProjector",
-    "ProjectorRegistry",
     "SharedControlContextProjector",
     "exclude",
     "field",

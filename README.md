@@ -6,13 +6,14 @@
 
 ```text
 Multiagents/
-  agent_runtime/
   database/
   model/
   src/
     control_runtime/
     knowledge_runtime/
     shared/
+      agents/
+      runtime/
   experiments/
     configs/
     scenarios/
@@ -38,7 +39,7 @@ Multiagents/
 2. `IEA`
    - 负责实体解析和语义 grounding
    - 必须把 app/flow/AM target 绑定到工具或缓存证据
-   - 产出可复用的 `OperationIntent`
+   - 产出可复用的 `GroundingDecision`
 3. `OSA`
    - 负责优化预览、策略参数选择、修订轮策略生成
    - 输出必须和 optimizer preview / runtime evidence 交叉一致

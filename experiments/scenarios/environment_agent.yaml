@@ -20,6 +20,29 @@ motivation:
     - Generate only closed-world network scenarios that can be represented by the existing YAML schema.
     - Treat ns3/free5gc startup and graph snapshot creation as the executable verifier.
     - Keep user-facing task generation separate from environment validation, but preserve hooks for QueryGen-style data growth.
+    - Treat S3 as the mandatory production quality floor; do not accept lower-complexity generated scenarios.
+
+production_quality_profile:
+  name: s3
+  reference_scenario: experiments/scenarios/s3_high_complexity.yaml
+  minimum_counts:
+    slices: 5
+    upfs: 4
+    gnbs: 5
+    ues: 10
+    apps: 10
+    flows: 15
+  topology_requirements:
+    free5gc_mode: ulcl
+    split_mode_overlay: required
+    slice_isolation: true
+    inline_harness: true
+    min_slices_per_gnb: 2
+    min_gnbs_per_slice: 2
+    min_multi_session_ues: 5
+  traffic_requirements:
+    required_service_types: [eMBB, URLLC, mMTC]
+    allocated_bandwidth_must_cover_guarantees: true
 
 repository_context:
   scenario_root: experiments/scenarios
@@ -59,6 +82,7 @@ role:
     - Confirm graph snapshot creation and policy gateway health before marking an environment valid.
     - Produce repair patches from validation errors, simulator logs, and manifest state.
     - Save a compact validation report for each candidate scenario.
+    - Enforce the S3 production quality profile before writing generated artifacts.
   non_responsibilities:
     - Do not change core runtime agent prompts while generating environments.
     - Do not silently edit existing S1/S2/S3 seed scenarios.
@@ -392,6 +416,8 @@ trajectory_generation_hooks:
 acceptance_criteria:
   - Generated YAML parses as a mapping.
   - Static validation reports no missing references.
+  - Generated environment meets every S3 production-quality minimum.
+  - Every flow allocation covers its SLA guarantee and every flow resolves to a UE session.
   - Direct simulator startup creates a live graph snapshot.
   - Policy gateway healthcheck responds before startup_timeout_seconds.
   - Cleanup command is available from the run manifest.

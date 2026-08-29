@@ -7,7 +7,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -25,24 +25,20 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
 
-from database.langchain_pg import (
-    PCF_AM_POLICY_CLAUSES_COLLECTION,
-    PCF_AM_POLICY_SCHEMA_COLLECTION,
-    PCF_POLICY_GLOSSARY_COLLECTION,
-    PCF_SM_POLICY_CLAUSES_COLLECTION,
-    PCF_SM_POLICY_SCHEMA_COLLECTION,
-    PCF_URSP_CLAUSES_COLLECTION,
-    PCF_URSP_SCHEMA_COLLECTION,
-    build_pgvector_document,
-    rebuild_pgvector_collection,
-)
 from shared.logging import setup_logger
+from knowledge_build.rag_release import (
+    COLLECTIONS,
+    CORPUS_ID,
+    DATA_ROOT,
+    PROCESSED_ROOT,
+    RAW_ROOT,
+    RELEASE,
+    ReleaseSource,
+    SOURCE_CONFIGS,
+)
 
 logger = setup_logger(__name__)
 
-DATA_ROOT = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_r18"
-RAW_ROOT = DATA_ROOT / "raw"
-PROCESSED_ROOT = DATA_ROOT / "processed"
 MANIFEST_PATH = PROCESSED_ROOT / "source_manifest.json"
 CLAUSE_JSONL = PROCESSED_ROOT / "clauses.jsonl"
 SCHEMA_JSONL = PROCESSED_ROOT / "schema.jsonl"
@@ -52,7 +48,6 @@ TERM_ALIAS_MAP_JSON = PROCESSED_ROOT / "term_alias_map.json"
 CLAUSE_EXACT_INDEX_JSON = PROCESSED_ROOT / "clause_exact_index.json"
 SCHEMA_EXACT_INDEX_JSON = PROCESSED_ROOT / "schema_exact_index.json"
 GLOSSARY_EXACT_INDEX_JSON = PROCESSED_ROOT / "glossary_exact_index.json"
-RETRIEVAL_EVAL_JSON = PROCESSED_ROOT / "retrieval_eval_queries.json"
 
 MIN_CHUNK_TOKENS = 120
 MAX_CHUNK_TOKENS = 280
@@ -64,18 +59,6 @@ HEADING_RE = re.compile(r"^(?P<num>\d+(?:\.\d+){0,5})\s+(?P<title>.+)$")
 TABLE_RE = re.compile(r"^(Table\s+\d+(?:\.\d+)?(?:[-:]\d+)?[^\n]*)$", re.MULTILINE)
 TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]+")
 CHANGE_REQUEST_RE = re.compile(r"\bC\d-\d+\b", re.IGNORECASE)
-
-MINIMAL_KB_SOURCE_IDS = {
-    "ts_23503_pdf",
-    "ts_24526_pdf",
-    "ts_29507_pdf",
-    "ts_29507_yaml",
-    "ts_29512_pdf",
-    "ts_29512_yaml",
-    "ts_29525_pdf",
-    "ts_29525_yaml",
-    "ts_29571_yaml",
-}
 
 AM_POLICY_RELEVANCE_TERMS = (
     "ampolicy",
@@ -300,39 +283,12 @@ for _canonical_term, _config in CANONICAL_TERM_ALIASES.items():
         OBJECT_POLICY_DOMAIN_MAP.setdefault(_related_object, _config["policy_domain"])
 
 
-@dataclass(frozen=True)
-class CorpusSource:
-    source_id: str
-    spec_id: str
-    title: str
-    release: str
-    version: str
-    source_url: str
-    doc_type: str
-    policy_domain: str
-    local_name: str
-
-
 def _utcnow() -> str:
     return datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
-def default_sources() -> List[CorpusSource]:
-    return [
-        CorpusSource("ts_23503_pdf", "23.503", "Policy and charging control framework for the 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/123500_123599/123503/18.08.00_60/ts_123503v180800p.pdf", "stage2", "shared", "ts_123503_v18_8_0.pdf"),
-        CorpusSource("ts_29507_pdf", "29.507", "Access and Mobility Policy Control Service", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129507/18.08.00_60/ts_129507v180800p.pdf", "stage3", "am_policy", "ts_129507_v18_8_0.pdf"),
-        CorpusSource("ts_29512_pdf", "29.512", "Session Management Policy Control Service", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129512/18.08.00_60/ts_129512v180800p.pdf", "stage3", "sm_policy", "ts_129512_v18_8_0.pdf"),
-        CorpusSource("ts_29514_pdf", "29.514", "Policy Authorization Service", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129514/18.08.00_60/ts_129514v180800p.pdf", "stage3", "sm_policy", "ts_129514_v18_8_0.pdf"),
-        CorpusSource("ts_24526_pdf", "24.526", "UE policies for 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/124500_124599/124526/18.08.00_60/ts_124526v180800p.pdf", "stage3", "ursp", "ts_124526_v18_8_0.pdf"),
-        CorpusSource("ts_29525_pdf", "29.525", "UE Policy Control Service", "18", "18.6.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129525/18.06.00_60/ts_129525v180600p.pdf", "stage3", "ursp", "ts_129525_v18_6_0.pdf"),
-        CorpusSource("ts_29519_pdf", "29.519", "UDR policy data definitions", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/129500_129599/129519/18.08.00_60/ts_129519v180800p.pdf", "stage3", "ursp", "ts_129519_v18_8_0.pdf"),
-        CorpusSource("ts_24501_pdf", "24.501", "NAS protocol for 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/124500_124599/124501/18.08.00_60/ts_124501v180800p.pdf", "stage3", "shared", "ts_124501_v18_8_0.pdf"),
-        CorpusSource("ts_23501_pdf", "23.501", "System architecture for the 5GS", "18", "18.8.0", "https://www.etsi.org/deliver/etsi_ts/123500_123599/123501/18.08.00_60/ts_123501v180800p.pdf", "stage2", "shared", "ts_123501_v18_8_0.pdf"),
-        CorpusSource("ts_29507_yaml", "29.507", "Npcf_AMPolicyControl OpenAPI", "18", "1.0.7", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29507_Npcf_AMPolicyControl.yaml", "openapi", "am_policy", "TS29507_Npcf_AMPolicyControl.yaml"),
-        CorpusSource("ts_29512_yaml", "29.512", "Npcf_SMPolicyControl OpenAPI", "18", "1.3.4", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29512_Npcf_SMPolicyControl.yaml", "openapi", "sm_policy", "TS29512_Npcf_SMPolicyControl.yaml"),
-        CorpusSource("ts_29525_yaml", "29.525", "Npcf_UEPolicyControl OpenAPI", "18", "1.3.3", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29525_Npcf_UEPolicyControl.yaml", "openapi", "ursp", "TS29525_Npcf_UEPolicyControl.yaml"),
-        CorpusSource("ts_29571_yaml", "29.571", "Common Data Types OpenAPI", "18", "1.5.4", "https://forge.3gpp.org/rep/all/5G_APIs/-/raw/REL-18/TS29571_CommonData.yaml", "openapi", "shared", "TS29571_CommonData.yaml"),
-    ]
+def default_sources() -> List[ReleaseSource]:
+    return list(SOURCE_CONFIGS)
 
 
 def ensure_directories() -> None:
@@ -404,16 +360,82 @@ def fetch_sources(*, force: bool = False) -> List[Dict[str, Any]]:
             target.write_bytes(response.content)
             logger.info("Fetched %s -> %s", source.source_id, target)
         record = asdict(source)
-        record.update({"local_path": str(target), "sha256": sha256_file(target), "fetched_at": _utcnow()})
+        source_hash = sha256_file(target)
+        record.update(
+            {
+                "local_path": str(target),
+                "sha256": source_hash,
+                "hash": source_hash,
+                "fetched_at": _utcnow(),
+            }
+        )
         manifest.append(record)
+    validate_manifest(manifest, verify_file_hashes=True)
     MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
 
-def load_manifest() -> List[Dict[str, Any]]:
+def validate_manifest(
+    manifest: Iterable[Dict[str, Any]],
+    *,
+    verify_file_hashes: bool = False,
+) -> List[Dict[str, Any]]:
+    """Reject every source manifest that is not the canonical Release 19 set."""
+    records = list(manifest)
+    expected_by_id = {source.source_id: source for source in SOURCE_CONFIGS}
+    actual_ids = [str(record.get("source_id") or "").strip() for record in records]
+    if len(actual_ids) != len(set(actual_ids)):
+        raise ValueError("Source manifest contains duplicate source_id values.")
+    if set(actual_ids) != set(expected_by_id):
+        missing = sorted(set(expected_by_id) - set(actual_ids))
+        unknown = sorted(set(actual_ids) - set(expected_by_id))
+        raise ValueError(f"Source manifest must contain exactly the canonical R{RELEASE} sources; missing={missing}, unknown={unknown}.")
+
+    normalized: List[Dict[str, Any]] = []
+    configured_fields = tuple(ReleaseSource.__dataclass_fields__)
+    for record in records:
+        source_id = str(record["source_id"])
+        expected = expected_by_id[source_id]
+        for field_name in configured_fields:
+            actual_value = record.get(field_name)
+            expected_value = getattr(expected, field_name)
+            if actual_value != expected_value:
+                raise ValueError(
+                    f"Source manifest field {field_name!r} for {source_id!r} does not match the canonical R{RELEASE} configuration."
+                )
+
+        explicit_sha256 = str(record.get("sha256") or "").strip().lower()
+        explicit_hash = str(record.get("hash") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", explicit_sha256):
+            raise ValueError(f"Source manifest sha256 for {source_id!r} must be a SHA-256 hex digest.")
+        if not re.fullmatch(r"[0-9a-f]{64}", explicit_hash):
+            raise ValueError(f"Source manifest hash for {source_id!r} must be a SHA-256 hex digest.")
+        if explicit_hash != explicit_sha256:
+            raise ValueError(f"Source manifest hash for {source_id!r} is inconsistent with sha256.")
+
+        if verify_file_hashes:
+            local_path = Path(str(record.get("local_path") or "")).resolve()
+            expected_local_path = (RAW_ROOT / expected.local_name).resolve()
+            if local_path != expected_local_path:
+                raise ValueError(
+                    f"Source manifest local_path for {source_id!r} must be {expected_local_path}."
+                )
+            if not local_path.is_file():
+                raise FileNotFoundError(f"Source file for {source_id!r} is missing: {local_path}")
+            if sha256_file(local_path) != explicit_sha256:
+                raise ValueError(f"Source file hash for {source_id!r} does not match source_manifest.json.")
+        normalized.append(record)
+
+    return normalized
+
+
+def load_manifest(*, verify_file_hashes: bool = True) -> List[Dict[str, Any]]:
     if not MANIFEST_PATH.exists():
         raise FileNotFoundError(f"Source manifest not found: {MANIFEST_PATH}")
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    return validate_manifest(
+        json.loads(MANIFEST_PATH.read_text(encoding="utf-8")),
+        verify_file_hashes=verify_file_hashes,
+    )
 
 
 def infer_object_tags(text: str, *, schema_name: str = "", operation_id: str = "") -> List[str]:
@@ -472,10 +494,6 @@ def infer_object_tags(text: str, *, schema_name: str = "", operation_id: str = "
     return sorted(set(tags))
 
 
-def is_minimal_source(source: Dict[str, Any]) -> bool:
-    return str(source.get("source_id") or "").strip() in MINIMAL_KB_SOURCE_IDS
-
-
 def _infer_strategy_domains(
     *,
     source_policy_domain: str,
@@ -501,30 +519,6 @@ def _infer_strategy_domains(
     return sorted(domains)
 
 
-def _should_keep_record(
-    *,
-    source: Dict[str, Any],
-    object_tags: List[str],
-    searchable_text: str,
-    strategy_domains: List[str],
-) -> bool:
-    if not is_minimal_source(source):
-        return False
-    if not strategy_domains:
-        return False
-    if object_tags:
-        return True
-
-    lowered = searchable_text.lower()
-    if "am_policy" in strategy_domains and any(term in lowered for term in AM_POLICY_RELEVANCE_TERMS):
-        return True
-    if "sm_policy" in strategy_domains and any(term in lowered for term in SM_POLICY_RELEVANCE_TERMS):
-        return True
-    if "ursp" in strategy_domains and any(term in lowered for term in URSP_RELEVANCE_TERMS):
-        return True
-    return False
-
-
 def make_metadata(
     *,
     source: Dict[str, Any],
@@ -543,12 +537,18 @@ def make_metadata(
     normalized_terms: Optional[List[str]] = None,
     strategy_domains: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
+    source_hash = str(source.get("sha256") or source.get("hash") or "").strip().lower() or None
     return {
         "source_id": source["source_id"],
         "spec_id": source["spec_id"],
         "release": source["release"],
+        "corpus_id": CORPUS_ID,
+        "spec_version": source["spec_version"],
         "version": source["version"],
         "source_url": source["source_url"],
+        "archive_url": source["archive_url"],
+        "sha256": source_hash,
+        "hash": source_hash,
         "doc_type": doc_type,
         "policy_domain": source["policy_domain"],
         "clause_path": clause_path,
@@ -780,13 +780,6 @@ def extract_pdf_sections(source: Dict[str, Any]) -> List[Dict[str, Any]]:
                 object_tags=object_tags,
                 searchable_text=searchable_text,
             )
-            if not _should_keep_record(
-                source=source,
-                object_tags=object_tags,
-                searchable_text=searchable_text,
-                strategy_domains=strategy_domains,
-            ):
-                continue
             related_specs = [source["spec_id"]]
             if source["policy_domain"] == "shared":
                 related_specs.extend(["29.512", "29.525", "23.503", "24.526"])
@@ -881,13 +874,6 @@ def build_openapi_operation_chunks(source: Dict[str, Any], document: Dict[str, A
                 object_tags=object_tags,
                 searchable_text=searchable_text,
             )
-            if not _should_keep_record(
-                source=source,
-                object_tags=object_tags,
-                searchable_text=searchable_text,
-                strategy_domains=strategy_domains,
-            ):
-                continue
             metadata = make_metadata(
                 source=source,
                 doc_type="openapi",
@@ -920,13 +906,6 @@ def build_openapi_schema_chunks(source: Dict[str, Any], document: Dict[str, Any]
             object_tags=object_tags,
             searchable_text=searchable_text,
         )
-        if not _should_keep_record(
-            source=source,
-            object_tags=object_tags,
-            searchable_text=searchable_text,
-            strategy_domains=strategy_domains,
-        ):
-            continue
         metadata = make_metadata(
             source=source,
             doc_type="openapi",
@@ -996,10 +975,16 @@ def build_glossary_records(clause_records: List[Dict[str, Any]], schema_records:
             f"Citations: {', '.join(citations)}"
         )
         metadata = {
+            "source_id": "glossary",
             "spec_id": "glossary",
-            "release": "18",
-            "version": "r18",
+            "release": RELEASE,
+            "corpus_id": CORPUS_ID,
+            "spec_version": f"r{RELEASE}",
+            "version": f"r{RELEASE}",
             "source_url": None,
+            "archive_url": None,
+            "sha256": None,
+            "hash": None,
             "doc_type": "glossary",
             "policy_domain": payload["policy_domain"],
             "clause_path": canonical,
@@ -1080,7 +1065,8 @@ def build_exact_index(records: List[Dict[str, Any]], *, index_name: str) -> Dict
         )
     return {
         "index_name": index_name,
-        "release": "18",
+        "release": RELEASE,
+        "corpus_id": CORPUS_ID,
         "doc_count": len(documents),
         "document_frequency": df,
         "documents": documents,
@@ -1141,26 +1127,8 @@ def build_auxiliary_maps(clause_records: List[Dict[str, Any]], schema_records: L
     TERM_ALIAS_MAP_JSON.write_text(json.dumps(term_alias_map, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def build_eval_queries() -> List[Dict[str, str]]:
-    return [
-        {"query": "Which AM policy fields carry allowed NSSAI target NSSAI and RFSP", "target_collection": PCF_AM_POLICY_SCHEMA_COLLECTION},
-        {"query": "What request triggers are defined for AM Policy Control", "target_collection": PCF_AM_POLICY_SCHEMA_COLLECTION},
-        {"query": "How does Npcf_AMPolicyControl relate to service area restriction and presence reporting area", "target_collection": PCF_POLICY_GLOSSARY_COLLECTION},
-        {"query": "What core objects are included in SmPolicyDecision", "target_collection": PCF_SM_POLICY_SCHEMA_COLLECTION},
-        {"query": "What is the responsibility boundary between Npcf_SMPolicyControl and Npcf_UEPolicyControl", "target_collection": PCF_POLICY_GLOSSARY_COLLECTION},
-        {"query": "What descriptors make up a URSP rule", "target_collection": PCF_URSP_CLAUSES_COLLECTION},
-        {"query": "What are the standard sources for Traffic descriptor and Route selection descriptor", "target_collection": PCF_URSP_CLAUSES_COLLECTION},
-        {"query": "What is the relationship among PccRule QosData and SessionRule", "target_collection": PCF_SM_POLICY_SCHEMA_COLLECTION},
-        {"query": "Under what conditions are OS Id and OS App Id used in URSP", "target_collection": PCF_URSP_CLAUSES_COLLECTION},
-        {"query": "Does URSP belong to the SM Policy Control API", "target_collection": PCF_POLICY_GLOSSARY_COLLECTION},
-        {"query": "Where does access traffic steering switching and splitting appear in the control chain", "target_collection": PCF_URSP_CLAUSES_COLLECTION},
-    ]
-
-
 def build_processed_corpus() -> Dict[str, int]:
-    manifest = [source for source in load_manifest() if is_minimal_source(source)]
-    if not manifest:
-        raise RuntimeError("No minimal knowledge-base sources found in manifest. Run fetch first.")
+    manifest = load_manifest(verify_file_hashes=True)
     clause_records: List[Dict[str, Any]] = []
     schema_records: List[Dict[str, Any]] = []
     for source in manifest:
@@ -1179,12 +1147,22 @@ def build_processed_corpus() -> Dict[str, int]:
     CLAUSE_EXACT_INDEX_JSON.write_text(json.dumps(clause_exact, ensure_ascii=False, indent=2), encoding="utf-8")
     SCHEMA_EXACT_INDEX_JSON.write_text(json.dumps(schema_exact, ensure_ascii=False, indent=2), encoding="utf-8")
     GLOSSARY_EXACT_INDEX_JSON.write_text(json.dumps(glossary_exact, ensure_ascii=False, indent=2), encoding="utf-8")
-    RETRIEVAL_EVAL_JSON.write_text(json.dumps(build_eval_queries(), ensure_ascii=False, indent=2), encoding="utf-8")
     return {"clauses": len(clause_records), "schema": len(schema_records), "glossary": len(glossary_records)}
 
 
 def records_to_documents(records: Iterable[Dict[str, Any]]) -> List[Any]:
-    return [build_pgvector_document(page_content=record["page_content"], metadata=record["metadata"]) for record in records]
+    from langchain_core.documents import Document
+
+    documents: List[Any] = []
+    for record in records:
+        page_content = str(record["page_content"] or "").strip()
+        metadata = record["metadata"]
+        if not page_content:
+            raise ValueError("page_content must not be empty.")
+        if not isinstance(metadata, dict):
+            raise TypeError("metadata must be a dictionary.")
+        documents.append(Document(page_content=page_content, metadata=metadata))
+    return documents
 
 
 def collection_scoped_ids(collection_name: str, records: Iterable[Dict[str, Any]]) -> List[str]:
@@ -1214,6 +1192,8 @@ def normalize_records_for_embedding(records: Iterable[Dict[str, Any]]) -> List[D
 
 
 def ingest_processed_corpus() -> Dict[str, int]:
+    from database.langchain_pg import rebuild_pgvector_collection
+
     clause_records = normalize_records_for_embedding(load_jsonl(CLAUSE_JSONL))
     schema_records = normalize_records_for_embedding(load_jsonl(SCHEMA_JSONL))
     glossary_records = normalize_records_for_embedding(load_jsonl(GLOSSARY_JSONL))
@@ -1228,13 +1208,13 @@ def ingest_processed_corpus() -> Dict[str, int]:
     ursp_schema_records = [record for record in schema_records if "ursp" in (record["metadata"].get("strategy_domains") or [])]
 
     targets = [
-        (PCF_AM_POLICY_CLAUSES_COLLECTION, am_clause_records),
-        (PCF_AM_POLICY_SCHEMA_COLLECTION, am_schema_records),
-        (PCF_SM_POLICY_CLAUSES_COLLECTION, sm_clause_records),
-        (PCF_SM_POLICY_SCHEMA_COLLECTION, sm_schema_records),
-        (PCF_URSP_CLAUSES_COLLECTION, ursp_clause_records),
-        (PCF_URSP_SCHEMA_COLLECTION, ursp_schema_records),
-        (PCF_POLICY_GLOSSARY_COLLECTION, glossary_records),
+        (COLLECTIONS["am_clause"], am_clause_records),
+        (COLLECTIONS["am_schema"], am_schema_records),
+        (COLLECTIONS["sm_clause"], sm_clause_records),
+        (COLLECTIONS["sm_schema"], sm_schema_records),
+        (COLLECTIONS["ursp_clause"], ursp_clause_records),
+        (COLLECTIONS["ursp_schema"], ursp_schema_records),
+        (COLLECTIONS["glossary"], glossary_records),
     ]
     stats: Dict[str, int] = {}
     for collection_name, records in targets:

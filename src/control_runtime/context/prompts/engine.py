@@ -5,9 +5,6 @@ from typing import Any
 
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
-from ..budget import TokenBudget
-
-
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
@@ -29,14 +26,3 @@ class PromptEngine:
     def render(self, template_name: str, **context: Any) -> str:
         template = self._env.get_template(template_name)
         return template.render(**context)
-
-    def render_with_budget(
-        self,
-        template_name: str,
-        budget: TokenBudget,
-        **context: Any,
-    ) -> str:
-        rendered = self.render(template_name, **context)
-        if budget.estimate(rendered) <= budget.limit:
-            return rendered
-        return rendered[: max(0, budget.limit * 4)]

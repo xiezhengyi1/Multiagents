@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...domain.collaboration import PlanningContext
+from ...agents.planning.contracts import PlanningContext
 from .base import BaseProjector, field, json_mapping, without_empty_values
 from .shared_context import SharedControlContextProjector
 

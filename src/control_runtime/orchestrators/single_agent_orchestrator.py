@@ -1,36 +1,27 @@
 from __future__ import annotations
 
-import json
 from typing import Any, Dict, List, Optional
 
-# Inject database dependencies into the generic runtime storage layer
-# (mirrors the same call in main_control_orchestrator.py — needed when this
-# orchestrator is used standalone by experiment scripts).
-from database.connection import SessionLocal  # noqa: E402
-import database.models as _db_models  # noqa: E402
-from agent_runtime.storage.runtime_store import configure as _configure_runtime_store  # noqa: E402
+from shared.runtime import RuntimePersistence
+from application_runtime.persistence import create_runtime_persistence
 
-_configure_runtime_store(session_factory=SessionLocal, orm_module=_db_models)
-
-from ..agents.dispatch import PolicyDispatchAgent
-from ..agents.single import SingleControlAgent
+from ..agents.dispatch.agent import PolicyDispatchAgent
+from ..agents.single.agent import SingleControlAgent
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool
 from ..diagnostics.mediation import ConflictResolutionTool
-from ..context import (
+from ..agents.planning.contracts import PolicyPlanDraft
+from .contracts import ControlRoundResult, ControlRoundTrace
+from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
+from .round_context import (
     build_feedback_context_from_snapshots,
     build_main_context,
     build_round_feedback_block,
 )
-from ..domain.policy_plan import PolicyPlanDraft
-from .contracts import ControlRoundResult, ControlRoundTrace
-from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
 from .round_execution import execute_planned_round
 from shared.logging import log_event
 
 
 class SingleAgentOrchestrator:
-    _startup_banner_printed = False
-
     def __init__(
         self,
         *,
@@ -42,6 +33,7 @@ class SingleAgentOrchestrator:
         use_local_model: bool = False,
         rag_enabled: bool = True,
         single_model_name: str = "",
+        persistence: RuntimePersistence | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be at least 1")
@@ -51,20 +43,18 @@ class SingleAgentOrchestrator:
         }
         if str(single_model_name or "").strip():
             single_agent_kwargs["model_name"] = str(single_model_name).strip()
-        self.single_agent = single_agent or SingleControlAgent(**single_agent_kwargs)
-        self.pd_agent = pd_agent or PolicyDispatchAgent(use_local_model=use_local_model)
-        self.cr_tool = cr_tool or ConflictResolutionTool()
-        self.ad_tool = ad_tool or AssuranceDiagnosisTool()
+        self.runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.single_agent = single_agent or SingleControlAgent(
+            persistence=self.runtime_persistence,
+            **single_agent_kwargs,
+        )
+        self.pd_agent = pd_agent or PolicyDispatchAgent(
+            use_local_model=use_local_model,
+            persistence=self.runtime_persistence,
+        )
+        self.cr_tool = cr_tool or ConflictResolutionTool(persistence=self.runtime_persistence)
+        self.ad_tool = ad_tool or AssuranceDiagnosisTool(persistence=self.runtime_persistence)
         self.max_rounds = max_rounds
-        if not SingleAgentOrchestrator._startup_banner_printed:
-            print(
-                "[single-agent] "
-                f"model={getattr(self.single_agent, 'model_name', '<unknown>')} "
-                f"rag_enabled={rag_enabled} "
-                f"use_local_model={use_local_model}",
-                flush=True,
-            )
-            SingleAgentOrchestrator._startup_banner_printed = True
 
     @staticmethod
     def _build_round_exception_diagnosis(exc: Exception) -> Dict[str, Any]:
@@ -141,11 +131,10 @@ class SingleAgentOrchestrator:
                 retry_count=max(0, round_index - 1),
             )
             policy_plan = None
-            mediator_decision_payload = None
+            round_execution = None
             report = None
             qos_feedback: Dict[str, Any] = {}
             mobility_feedback: Dict[str, Any] = {}
-            domain_verdicts: List[Dict[str, Any]] = []
             diagnosis: Dict[str, Any] = {}
             exception_feedback: Dict[str, Any] = {}
             try:
@@ -175,8 +164,6 @@ class SingleAgentOrchestrator:
                 qos_feedback = round_execution.qos_feedback
                 mobility_feedback = round_execution.mobility_feedback
                 diagnosis = round_execution.diagnosis
-                mediator_decision_payload = dict(round_execution.mediator_decision_payload)
-                domain_verdicts = list(round_execution.domain_verdict_payloads)
                 state.latest_result = ControlRoundResult(
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -215,18 +202,17 @@ class SingleAgentOrchestrator:
                     error_type=exc.__class__.__name__,
                     error=str(exc),
                 )
-            trace = ControlRoundTrace(
-                round_index=round_index,
-                global_intent={},
-                grounding_decision={},
-                policy_plan=policy_plan.model_dump(mode="json") if policy_plan is not None else {},
-                domain_verdicts=domain_verdicts,
-                pda_feedback=report.model_dump(mode="json") if report is not None else exception_feedback if diagnosis.get("root_cause_category") == "single_control_round_exception" else {},
-                qos_feedback=qos_feedback,
-                mobility_feedback=mobility_feedback,
-                diagnosis=diagnosis,
-                single_agent_detail=dict(getattr(self.single_agent, "last_round_detail", {}) or {}),
-            )
+            single_agent_detail = dict(getattr(self.single_agent, "last_round_detail", {}) or {})
+            if round_execution is None:
+                trace = ControlRoundTrace(
+                    round_index=round_index,
+                    policy_plan=policy_plan.model_dump(mode="json") if policy_plan is not None else {},
+                    pda_feedback=exception_feedback,
+                    diagnosis=diagnosis,
+                    single_agent_detail=single_agent_detail,
+                )
+            else:
+                trace = round_execution.trace.with_single_agent_detail(single_agent_detail)
             log_event(
                 self.single_agent.logger,
                 "single_control_round_complete",
@@ -239,29 +225,28 @@ class SingleAgentOrchestrator:
             if state.completed:
                 append_round_trace(
                     state,
-                    trace_payload=json.loads(json.dumps(trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
+                    trace=trace,
                 )
                 break
 
-            if mediator_decision_payload is not None:
-                trace.mediator_decision = dict(mediator_decision_payload)
-            report_payload = report.model_dump(mode="json") if report is not None else exception_feedback or {
-                "execution_status": "Failed",
-                "violation_details": diagnosis.get("reason_summary") or "round execution failed",
-                "correction_suggestion": "; ".join(diagnosis.get("recommended_actions") or []),
-                "recommended_consumer": "single_control",
-            }
-            trace.pda_feedback = dict(report_payload)
+            if round_execution is not None:
+                trace = round_execution.retry_trace(
+                    prefer_execution_reentry=False,
+                    fallback_consumer="single_control",
+                ).with_single_agent_detail(single_agent_detail)
+            report_payload = trace.pda_feedback
             feedback_added = build_round_feedback_block(
                 pda_feedback=report_payload,
-                diagnosis=diagnosis,
-                domain_verdicts=domain_verdicts,
-                mediator_decision=mediator_decision_payload,
+                diagnosis=trace.diagnosis,
+                domain_verdicts=trace.domain_verdicts,
+                mediator_decision=trace.mediator_decision,
+                planning_blocker=trace.planning_blocker,
+                execution_reentry=trace.execution_reentry,
                 round_index=round_index,
             )
             append_round_trace(
                 state,
-                trace_payload=json.loads(json.dumps(trace, default=lambda obj: obj.__dict__, ensure_ascii=False)),
+                trace=trace,
                 feedback_added=feedback_added,
             )
             log_event(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...domain.control_plane import GlobalControlIntent
+from ...agents.main.contracts import GlobalControlIntent
 from .base import BaseProjector, field
 
 
@@ -13,6 +13,7 @@ class GlobalControlIntentProjector(BaseProjector):
         field("round_strategy"),
         field("next_agent"),
         field("requested_domains"),
+        field("serving_slice_change_requested"),
         field("domain_evidence"),
         field("control_semantics"),
         field("objective_profile"),

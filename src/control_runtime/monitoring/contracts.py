@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
@@ -76,21 +77,41 @@ class RequirementDraft:
         }
 
 
+class IntentStatus(str, Enum):
+    ACTIVE = "active"
+    DEGRADED = "degraded"
+    REPLANNING = "replanning"
+    SATISFIED = "satisfied"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
-class ReentryLoopResult:
-    snapshot_id: str
-    monitor_result: MonitorResult
-    reentry_triggered: bool
-    requirement: Optional[RequirementDraft] = None
-    control_result: Any = None
+class IntentBinding:
+    supi: str
+    app_id: str
+    flow_id: str
+
+
+@dataclass
+class IntentLifecycle:
+    intent_id: str
+    bindings: List[IntentBinding]
+    status: IntentStatus
+    origin: str = "user"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "snapshot_id": self.snapshot_id,
-            "monitor_result": self.monitor_result.to_dict(),
-            "reentry_triggered": self.reentry_triggered,
-            "requirement": self.requirement.to_dict() if self.requirement is not None else None,
-            "control_result": self.control_result,
+            "intent_id": self.intent_id,
+            "bindings": [
+                {
+                    "supi": binding.supi,
+                    "app_id": binding.app_id,
+                    "flow_id": binding.flow_id,
+                }
+                for binding in self.bindings
+            ],
+            "status": self.status.value,
+            "origin": self.origin,
         }
 
 
@@ -100,8 +121,8 @@ class WatchLoopTriggerRecord:
     snapshot_id: str
     user_input: str
     source_alert_id: str = ""
-    previous_context: str = ""
-    context_truncated: bool = False
+    intent_id: str = ""
+    lifecycle_status: str = ""
     routing_hint: Dict[str, Any] = field(default_factory=dict)
     control_result: Any = None
     data_flywheel: Dict[str, Any] = field(default_factory=dict)
@@ -112,8 +133,8 @@ class WatchLoopTriggerRecord:
             "snapshot_id": self.snapshot_id,
             "user_input": self.user_input,
             "source_alert_id": self.source_alert_id,
-            "previous_context": self.previous_context,
-            "context_truncated": self.context_truncated,
+            "intent_id": self.intent_id,
+            "lifecycle_status": self.lifecycle_status,
             "routing_hint": dict(self.routing_hint),
             "control_result": self.control_result,
             "data_flywheel": dict(self.data_flywheel),
@@ -127,6 +148,7 @@ class WatchLoopIterationResult:
     records: List[WatchLoopTriggerRecord] = field(default_factory=list)
     user_input_seen: bool = False
     pending_monitor_alerts: List[Dict[str, Any]] = field(default_factory=list)
+    lifecycles: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def pending_monitor_alert_count(self) -> int:
@@ -140,4 +162,5 @@ class WatchLoopIterationResult:
             "user_input_seen": self.user_input_seen,
             "pending_monitor_alert_count": self.pending_monitor_alert_count,
             "pending_monitor_alerts": [dict(alert) for alert in self.pending_monitor_alerts],
+            "lifecycles": [dict(lifecycle) for lifecycle in self.lifecycles],
         }

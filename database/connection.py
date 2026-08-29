@@ -6,7 +6,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, event
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import sessionmaker
+
+from .base import Base
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PACKAGE_ROOT / "src"
@@ -45,9 +47,6 @@ def to_sqlalchemy_url(database_url: str) -> str:
 
 DATABASE_URL = to_sqlalchemy_url(RAW_DATABASE_URL)
 WORKER_SCHEMA = _validated_worker_schema(WORKER_SCHEMA)
-
-Base = declarative_base()
-
 
 def _redact_database_url(database_url: str) -> str:
     if not database_url:
@@ -92,7 +91,6 @@ def get_db():
 
 
 __all__ = [
-    "Base",
     "DATABASE_URL",
     "RAW_DATABASE_URL",
     "SessionLocal",

@@ -3,15 +3,15 @@
 Usage:
     python knowledge_build/scripts/build_colbert_index.py [--batch-size 32] [--device cpu|cuda]
 
-The index is saved under knowledge_build/data/pcf_policy_r18/colbert_index/ as:
+The index is saved under knowledge_build/data/pcf_policy_r19/colbert_index/ as:
     embeddings/    — one .npz per record (compressed numpy)
     index_meta.json — record metadata map
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -27,15 +27,15 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, candidate_text)
 
 import numpy as np
+from knowledge_build.rag_release import COLBERT_INDEX_ROOT, CORPUS_ID, PROCESSED_ROOT, RELEASE
 
-DATA_ROOT = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_r18"
-PROCESSED_ROOT = DATA_ROOT / "processed"
 CLAUSE_JSONL = PROCESSED_ROOT / "clauses.jsonl"
 SCHEMA_JSONL = PROCESSED_ROOT / "schema.jsonl"
 GLOSSARY_JSONL = PROCESSED_ROOT / "glossary.jsonl"
-COLBERT_INDEX_ROOT = DATA_ROOT / "colbert_index"
 EMBEDDINGS_DIR = COLBERT_INDEX_ROOT / "embeddings"
 INDEX_META = COLBERT_INDEX_ROOT / "index_meta.json"
+MANIFEST_PATH = PROCESSED_ROOT / "source_manifest.json"
+PROCESSED_CORPUS_FILES = (CLAUSE_JSONL, SCHEMA_JSONL, GLOSSARY_JSONL)
 
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -48,11 +48,35 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def processed_corpus_sha256(paths: tuple[Path, ...] = PROCESSED_CORPUS_FILES) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Processed corpus file not found: {path}")
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_colbert_index(
     batch_size: int = 32,
     device: Optional[str] = None,
 ) -> None:
     from knowledge_runtime.retrieval.colbert_encoder import ColBERTEncoder
+
+    if not MANIFEST_PATH.is_file():
+        raise FileNotFoundError(f"Source manifest not found: {MANIFEST_PATH}. Run build_pcf_policy_kb.py fetch first.")
 
     print(f"Loading corpus from {PROCESSED_ROOT}")
     records = (
@@ -61,6 +85,8 @@ def build_colbert_index(
         + load_jsonl(GLOSSARY_JSONL)
     )
     print(f"Total records: {len(records)}")
+    if not records:
+        raise RuntimeError("Processed corpus is empty. Run build_pcf_policy_kb.py build before building the ColBERT index.")
 
     encoder = ColBERTEncoder(device=device)
     print(f"Encoder: {encoder.model_name}, device: {encoder._device}, dim: {encoder.dim}")
@@ -75,6 +101,11 @@ def build_colbert_index(
     print(f"Encoding done in {elapsed:.2f}s ({len(records) / elapsed:.1f} docs/s)")
 
     index_meta: Dict[str, Any] = {
+        "release": RELEASE,
+        "corpus_id": CORPUS_ID,
+        "source_manifest_sha256": sha256_file(MANIFEST_PATH),
+        "processed_corpus_sha256": processed_corpus_sha256(),
+        "model": encoder.model_name,
         "model_name": encoder.model_name,
         "dim": encoder.dim,
         "total_records": len(records),
@@ -107,7 +138,8 @@ def build_colbert_index(
 
     print(f"Index written to {COLBERT_INDEX_ROOT}")
     print(f"  Records:  {len(records)}")
-    print(f"  Tokens:   {total_tokens} (avg {total_tokens / len(records):.1f}/doc)")
+    average_tokens = total_tokens / len(records) if records else 0.0
+    print(f"  Tokens:   {total_tokens} (avg {average_tokens:.1f}/doc)")
     print(f"  Size:     {total_size / (1024 * 1024):.1f} MB")
 
 

@@ -358,7 +358,7 @@ def _load_graph_scenario_strict(snapshot_id: str) -> Tuple[List[App], List[Slice
     snapshot_data = get_graph_snapshot_payload(normalized_snapshot_id)
     if not isinstance(snapshot_data, dict):
         raise RuntimeError(f"graph snapshot not found: snapshot_id={normalized_snapshot_id}")
-    snapshot_data = NetworkGraph.from_payload(snapshot_data).to_compatibility_snapshot()
+    snapshot_data = NetworkGraph.from_payload(snapshot_data).to_scenario_snapshot()
     if not snapshot_uses_new_schema(snapshot_data):
         raise RuntimeError(f"graph snapshot does not contain a valid scenario payload: snapshot_id={normalized_snapshot_id}")
 

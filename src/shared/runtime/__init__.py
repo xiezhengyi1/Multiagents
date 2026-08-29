@@ -1,16 +1,55 @@
 from __future__ import annotations
 
-"""Stable import boundary for shared agent runtime primitives.
+"""Canonical shared implementation of agent-runtime primitives.
 
-The implementation lives in :mod:`agent_runtime`. Control-runtime agents import
-through this module so application code does not depend on the package layout of
-the lower-level runtime library.
+Application code should import runtime services from this package.  It is the
+only supported runtime namespace.
 """
 
-from importlib import import_module
-from typing import Any
-
-from agent_runtime.messages import build_tool_specs, extract_tool_calls, extract_tool_results
+from .core import (
+    AgentRuntimeContext,
+    AgentWorkspace,
+    ContextPolicy,
+    RuntimeCache,
+    TokenBudget,
+    TokenCounter,
+    project_root,
+    runtime_root,
+)
+from .execution import StructuredToolLoop, ToolLoopExecutionError
+from .messages import (
+    build_tool_specs,
+    extract_tool_calls,
+    extract_tool_results,
+    format_tool_call,
+    format_tool_result,
+    json_friendly,
+    normalize_message_role,
+    serialize_base_model_schema,
+    serialize_message,
+    stringify_message_content,
+)
+from .storage import (
+    ArtifactCache,
+    ArtifactEnvelope,
+    ArtifactStore,
+    FileTaskQueue,
+    RuntimePersistence,
+    SqlAlchemyRuntimePersistence,
+)
+from .trace import (
+    JsonlTraceWriter,
+    RunTreeEvent,
+    RunTreeTraceRecord,
+    TRACE_UNSET,
+    TracedStructuredAgent,
+    build_run_tree_record,
+    collect_descendant_ids,
+    dotted_order_key,
+    iter_runs_in_dotted_order,
+    utc_now,
+)
+from .worker import ArtifactWorkerMixin
 
 __all__ = [
     "AgentRuntimeContext",
@@ -22,38 +61,32 @@ __all__ = [
     "ContextPolicy",
     "FileTaskQueue",
     "JsonlTraceWriter",
+    "RunTreeEvent",
+    "RunTreeTraceRecord",
     "RuntimeCache",
     "StructuredToolLoop",
+    "TRACE_UNSET",
     "TokenBudget",
     "TokenCounter",
     "ToolLoopExecutionError",
     "TracedStructuredAgent",
     "build_run_tree_record",
     "build_tool_specs",
+    "collect_descendant_ids",
+    "dotted_order_key",
     "extract_tool_calls",
     "extract_tool_results",
+    "format_tool_call",
+    "format_tool_result",
+    "iter_runs_in_dotted_order",
+    "json_friendly",
+    "normalize_message_role",
+    "project_root",
+    "RuntimePersistence",
+    "SqlAlchemyRuntimePersistence",
+    "runtime_root",
+    "serialize_base_model_schema",
+    "serialize_message",
+    "stringify_message_content",
+    "utc_now",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    if name == "ArtifactWorkerMixin":
-        return import_module(".worker", __name__).ArtifactWorkerMixin
-    if name == "build_run_tree_record":
-        return import_module("agent_runtime.trace.builder").build_run_tree_record
-    if name in {
-        "AgentRuntimeContext",
-        "AgentWorkspace",
-        "ArtifactCache",
-        "ArtifactEnvelope",
-        "ContextPolicy",
-        "FileTaskQueue",
-        "JsonlTraceWriter",
-        "RuntimeCache",
-        "TokenBudget",
-        "TokenCounter",
-        "TracedStructuredAgent",
-    }:
-        return getattr(import_module("agent_runtime"), name)
-    if name in {"StructuredToolLoop", "ToolLoopExecutionError"}:
-        return getattr(import_module("agent_runtime.execution.structured_tool_loop"), name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

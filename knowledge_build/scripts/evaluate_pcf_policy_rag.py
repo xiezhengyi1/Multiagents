@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections import defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 from statistics import mean
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_BUILD_ROOT = SCRIPT_DIR.parent
@@ -20,44 +18,7 @@ for candidate in (PROJECT_ROOT, SRC_ROOT):
         sys.path.insert(0, candidate_text)
 
 from knowledge_runtime.retrieval.raw import knowledge_tool
-from database.langchain_pg import (
-    PCF_AM_POLICY_CLAUSES_COLLECTION,
-    PCF_AM_POLICY_SCHEMA_COLLECTION,
-    PCF_POLICY_GLOSSARY_COLLECTION,
-    PCF_SM_POLICY_CLAUSES_COLLECTION,
-    PCF_SM_POLICY_SCHEMA_COLLECTION,
-    PCF_URSP_CLAUSES_COLLECTION,
-    PCF_URSP_SCHEMA_COLLECTION,
-)
-from knowledge_build.scripts.build_pcf_policy_kb import (
-    CLAUSE_EXACT_INDEX_JSON,
-    CLAUSE_JSONL,
-    GLOSSARY_EXACT_INDEX_JSON,
-    GLOSSARY_JSONL,
-    RETRIEVAL_EVAL_JSON,
-    SCHEMA_EXACT_INDEX_JSON,
-    SCHEMA_JSONL,
-    SPEC_OBJECT_MAP_JSON,
-    TERM_ALIAS_MAP_JSON,
-)
-from knowledge_build.scripts.build_pcf_policy_kb_docling import (
-    DOCLING_CLAUSE_EXACT_INDEX_JSON,
-    DOCLING_CLAUSE_JSONL,
-    DOCLING_GLOSSARY_EXACT_INDEX_JSON,
-    DOCLING_GLOSSARY_JSONL,
-    DOCLING_RETRIEVAL_EVAL_JSON,
-    DOCLING_SCHEMA_EXACT_INDEX_JSON,
-    DOCLING_SCHEMA_JSONL,
-    DOCLING_SPEC_OBJECT_MAP_JSON,
-    DOCLING_TERM_ALIAS_MAP_JSON,
-    PCF_AM_POLICY_CLAUSES_DOCLING_COLLECTION,
-    PCF_AM_POLICY_SCHEMA_DOCLING_COLLECTION,
-    PCF_POLICY_GLOSSARY_DOCLING_COLLECTION,
-    PCF_SM_POLICY_CLAUSES_DOCLING_COLLECTION,
-    PCF_SM_POLICY_SCHEMA_DOCLING_COLLECTION,
-    PCF_URSP_CLAUSES_DOCLING_COLLECTION,
-    PCF_URSP_SCHEMA_DOCLING_COLLECTION,
-)
+from knowledge_build.rag_release import CORPUS_ID, RELEASE
 
 
 DEFAULT_CASES_PATH = KNOWLEDGE_BUILD_ROOT / "data" / "pcf_policy_rag_agent_expanded_cases.json"
@@ -73,49 +34,6 @@ DEFAULT_IEA_TRACE_PATHS = (
     PROJECT_ROOT / "training" / "intent_encoding" / "raw_traces" / "intent_encoding.jsonl",
     PROJECT_ROOT / "training" / "optimization_strategy" / "raw_traces" / "optimization_strategy.jsonl",
 )
-
-PROFILE_CONFIGS: Dict[str, Dict[str, Any]] = {
-    "base": {
-        "clause_jsonl": CLAUSE_JSONL,
-        "schema_jsonl": SCHEMA_JSONL,
-        "glossary_jsonl": GLOSSARY_JSONL,
-        "clause_exact_index": CLAUSE_EXACT_INDEX_JSON,
-        "schema_exact_index": SCHEMA_EXACT_INDEX_JSON,
-        "glossary_exact_index": GLOSSARY_EXACT_INDEX_JSON,
-        "spec_object_map": SPEC_OBJECT_MAP_JSON,
-        "term_alias_map": TERM_ALIAS_MAP_JSON,
-        "retrieval_eval_json": RETRIEVAL_EVAL_JSON,
-        "collections": {
-            "am_clause": PCF_AM_POLICY_CLAUSES_COLLECTION,
-            "am_schema": PCF_AM_POLICY_SCHEMA_COLLECTION,
-            "sm_clause": PCF_SM_POLICY_CLAUSES_COLLECTION,
-            "sm_schema": PCF_SM_POLICY_SCHEMA_COLLECTION,
-            "ursp_clause": PCF_URSP_CLAUSES_COLLECTION,
-            "ursp_schema": PCF_URSP_SCHEMA_COLLECTION,
-            "glossary": PCF_POLICY_GLOSSARY_COLLECTION,
-        },
-    },
-    "docling": {
-        "clause_jsonl": DOCLING_CLAUSE_JSONL,
-        "schema_jsonl": DOCLING_SCHEMA_JSONL,
-        "glossary_jsonl": DOCLING_GLOSSARY_JSONL,
-        "clause_exact_index": DOCLING_CLAUSE_EXACT_INDEX_JSON,
-        "schema_exact_index": DOCLING_SCHEMA_EXACT_INDEX_JSON,
-        "glossary_exact_index": DOCLING_GLOSSARY_EXACT_INDEX_JSON,
-        "spec_object_map": DOCLING_SPEC_OBJECT_MAP_JSON,
-        "term_alias_map": DOCLING_TERM_ALIAS_MAP_JSON,
-        "retrieval_eval_json": DOCLING_RETRIEVAL_EVAL_JSON,
-        "collections": {
-            "am_clause": PCF_AM_POLICY_CLAUSES_DOCLING_COLLECTION,
-            "am_schema": PCF_AM_POLICY_SCHEMA_DOCLING_COLLECTION,
-            "sm_clause": PCF_SM_POLICY_CLAUSES_DOCLING_COLLECTION,
-            "sm_schema": PCF_SM_POLICY_SCHEMA_DOCLING_COLLECTION,
-            "ursp_clause": PCF_URSP_CLAUSES_DOCLING_COLLECTION,
-            "ursp_schema": PCF_URSP_SCHEMA_DOCLING_COLLECTION,
-            "glossary": PCF_POLICY_GLOSSARY_DOCLING_COLLECTION,
-        },
-    },
-}
 
 QUERY_TYPES = {
     "exact_identifier",
@@ -160,24 +78,6 @@ def infer_query_type(case: Dict[str, Any]) -> str:
             return "exact_identifier"
         return "schema_relation"
     return "schema_relation"
-
-
-def debug_tool_invocation(
-    query: str,
-    *,
-    category: Optional[str] = None,
-    limit: int = 5,
-    verbose: bool = True,
-    stage_timeout_seconds: int = 30,
-) -> Dict[str, Any]:
-    """单条调试入口：拆解 knowledge_tool 的检索流水线并返回阶段计时。"""
-    return knowledge_tool.debug_search_semantic_knowledge_pipeline(
-        query=query,
-        category=category,
-        limit=limit,
-        verbose=verbose,
-        stage_timeout_seconds=stage_timeout_seconds,
-    )
 
 
 def _flatten_trace_runs(run: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -402,72 +302,6 @@ def validate_eval_cases(cases: Iterable[Dict[str, Any]]) -> None:
             raise ValueError(f"Evaluation cases do not cover non-schema knowledge for {domain}.")
 
 
-@contextmanager
-def knowledge_profile(profile_name: str) -> Iterator[None]:
-    if profile_name not in PROFILE_CONFIGS:
-        raise ValueError(f"Unsupported profile: {profile_name}")
-    config = PROFILE_CONFIGS[profile_name]
-    collections = config["collections"]
-    required_paths = (
-        config["clause_jsonl"],
-        config["schema_jsonl"],
-        config["glossary_jsonl"],
-        config["clause_exact_index"],
-        config["schema_exact_index"],
-        config["glossary_exact_index"],
-        config["spec_object_map"],
-        config["term_alias_map"],
-    )
-
-    overrides = {
-        "CLAUSE_JSONL": config["clause_jsonl"],
-        "SCHEMA_JSONL": config["schema_jsonl"],
-        "GLOSSARY_JSONL": config["glossary_jsonl"],
-        "CLAUSE_EXACT_INDEX_JSON": config["clause_exact_index"],
-        "SCHEMA_EXACT_INDEX_JSON": config["schema_exact_index"],
-        "GLOSSARY_EXACT_INDEX_JSON": config["glossary_exact_index"],
-        "SPEC_OBJECT_MAP_JSON": config["spec_object_map"],
-        "TERM_ALIAS_MAP_JSON": config["term_alias_map"],
-        "REQUIRED_KB_PATHS": required_paths,
-        "PCF_AM_POLICY_CLAUSES_COLLECTION": collections["am_clause"],
-        "PCF_AM_POLICY_SCHEMA_COLLECTION": collections["am_schema"],
-        "PCF_SM_POLICY_CLAUSES_COLLECTION": collections["sm_clause"],
-        "PCF_SM_POLICY_SCHEMA_COLLECTION": collections["sm_schema"],
-        "PCF_URSP_CLAUSES_COLLECTION": collections["ursp_clause"],
-        "PCF_URSP_SCHEMA_COLLECTION": collections["ursp_schema"],
-    }
-    original_values = {name: getattr(knowledge_tool, name) for name in overrides}
-    for name, value in overrides.items():
-        setattr(knowledge_tool, name, value)
-    for cache_func in (
-        knowledge_tool._ensure_processed_corpus,
-        knowledge_tool._record_catalog,
-        knowledge_tool._records_by_citation,
-        knowledge_tool._clause_exact_index,
-        knowledge_tool._schema_exact_index,
-        knowledge_tool._glossary_exact_index,
-        knowledge_tool._spec_object_map,
-        knowledge_tool._term_alias_map,
-    ):
-        cache_func.cache_clear()
-    try:
-        yield
-    finally:
-        for name, value in original_values.items():
-            setattr(knowledge_tool, name, value)
-        for cache_func in (
-            knowledge_tool._ensure_processed_corpus,
-            knowledge_tool._record_catalog,
-            knowledge_tool._records_by_citation,
-            knowledge_tool._clause_exact_index,
-            knowledge_tool._schema_exact_index,
-            knowledge_tool._glossary_exact_index,
-            knowledge_tool._spec_object_map,
-            knowledge_tool._term_alias_map,
-        ):
-            cache_func.cache_clear()
-
-
 def _safe_mean(values: Iterable[float]) -> float:
     values = list(values)
     return round(mean(values), 4) if values else 0.0
@@ -477,8 +311,11 @@ def evaluate_case(case: Dict[str, Any], *, limit: int) -> Dict[str, Any]:
     query = str(case["query"]).strip()
     category = str(case.get("category") or "").strip() or None
     expected_keys = [str(item).strip() for item in case["expected_result_keys"]]
-    domain = knowledge_tool._infer_policy_domain(query, category)
-    candidates, errors = knowledge_tool._assemble_response(query, domain, limit=limit)
+    candidates, errors = knowledge_tool.run_semantic_knowledge_pipeline(
+        query,
+        category=category,
+        limit=limit,
+    )
     retrieved_keys = [
         knowledge_tool._candidate_key(candidate["metadata"], candidate.get("id") or "")
         for candidate in candidates
@@ -518,7 +355,7 @@ def evaluate_case(case: Dict[str, Any], *, limit: int) -> Dict[str, Any]:
     }
 
 
-def summarize_results(results: List[Dict[str, Any]], *, profile: str, limit: int, case_source: Path) -> Dict[str, Any]:
+def summarize_results(results: List[Dict[str, Any]], *, limit: int, case_source: Path) -> Dict[str, Any]:
     by_domain: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     by_target_kind: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     by_query_type: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -545,7 +382,8 @@ def summarize_results(results: List[Dict[str, Any]], *, profile: str, limit: int
         }
 
     return {
-        "profile": profile,
+        "release": RELEASE,
+        "corpus_id": CORPUS_ID,
         "top_k": limit,
         "case_source": str(case_source),
         "overall": _group_summary(results),
@@ -558,7 +396,8 @@ def summarize_results(results: List[Dict[str, Any]], *, profile: str, limit: int
 
 def render_summary(report: Dict[str, Any]) -> str:
     lines = [
-        f"Profile: {report['profile']}",
+        f"Release: {report['release']}",
+        f"Corpus ID: {report['corpus_id']}",
         f"Cases: {len(report['results'])}",
         f"Top-K: {report['top_k']}",
         f"Case Source Type: {report.get('case_source_type', 'curated')}",
@@ -620,26 +459,8 @@ def render_summary(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_comparison(comparison: Dict[str, Any]) -> str:
-    lines = [
-        f"Case Source Type: {comparison['case_source_type']}",
-        f"Top-K: {comparison['top_k']}",
-        "",
-        "**Base Overall**",
-        json.dumps(comparison["base"], ensure_ascii=False, indent=2),
-        "",
-        "**Docling Overall**",
-        json.dumps(comparison["docling"], ensure_ascii=False, indent=2),
-        "",
-        "**Delta (Docling - Base)**",
-        json.dumps(comparison["delta_docling_minus_base"], ensure_ascii=False, indent=2),
-    ]
-    return "\n".join(lines)
-
-
 def run_evaluation(
     *,
-    profile: str,
     cases_path: Path,
     limit: int,
     case_source_type: str = "curated",
@@ -647,111 +468,71 @@ def run_evaluation(
     trace_min_frequency: int = 1,
     trace_max_cases: Optional[int] = None,
 ) -> Dict[str, Any]:
-    with knowledge_profile(profile):
-        if case_source_type == "curated":
-            cases = load_eval_cases(cases_path)
-            validate_eval_cases(cases)
-            case_source = cases_path
-        elif case_source_type == "merged":
-            cases = merge_eval_cases(
-                [
-                    DEFAULT_AGENT_EXPANDED_CASES_PATH,
-                    DEFAULT_EXTENDED_CASES_PATH,
-                    DEFAULT_STRICT_CASES_PATH,
-                    DEFAULT_IEA_GOLD_CASES_PATH,
-                    DEFAULT_EVAL_CASES_PATH,
-                    DEFAULT_AUGMENTED_CASES_PATH,
-                ]
-            )
-            validate_eval_cases(cases)
-            case_source = DEFAULT_MERGED_CASES_PATH
-        elif case_source_type == "extended":
-            cases = load_eval_cases(DEFAULT_EXTENDED_CASES_PATH)
-            validate_trace_eval_cases(cases)
-            case_source = DEFAULT_EXTENDED_CASES_PATH
-        elif case_source_type == "iea_trace":
-            cases = load_eval_cases(DEFAULT_IEA_GOLD_CASES_PATH)
-            validate_trace_eval_cases(cases)
-            case_source = DEFAULT_IEA_GOLD_CASES_PATH
-        elif case_source_type == "iea_trace_weak":
-            cases = extract_iea_trace_eval_cases(
-                trace_paths=trace_paths,
-                min_frequency=trace_min_frequency,
-                max_cases=trace_max_cases,
-            )
-            validate_trace_eval_cases(cases)
-            case_source = Path("iea_trace_weak://semantic_queries")
-        else:
-            raise ValueError(f"Unsupported case source type: {case_source_type}")
-        total_cases = len(cases)
+    knowledge_tool._ensure_processed_corpus()
+    if case_source_type == "curated":
+        cases = load_eval_cases(cases_path)
+        validate_eval_cases(cases)
+        case_source = cases_path
+    elif case_source_type == "merged":
+        cases = merge_eval_cases(
+            [
+                DEFAULT_AGENT_EXPANDED_CASES_PATH,
+                DEFAULT_EXTENDED_CASES_PATH,
+                DEFAULT_STRICT_CASES_PATH,
+                DEFAULT_IEA_GOLD_CASES_PATH,
+                DEFAULT_EVAL_CASES_PATH,
+                DEFAULT_AUGMENTED_CASES_PATH,
+            ]
+        )
+        validate_eval_cases(cases)
+        case_source = DEFAULT_MERGED_CASES_PATH
+    elif case_source_type == "extended":
+        cases = load_eval_cases(DEFAULT_EXTENDED_CASES_PATH)
+        validate_trace_eval_cases(cases)
+        case_source = DEFAULT_EXTENDED_CASES_PATH
+    elif case_source_type == "iea_trace":
+        cases = load_eval_cases(DEFAULT_IEA_GOLD_CASES_PATH)
+        validate_trace_eval_cases(cases)
+        case_source = DEFAULT_IEA_GOLD_CASES_PATH
+    elif case_source_type == "iea_trace_weak":
+        cases = extract_iea_trace_eval_cases(
+            trace_paths=trace_paths,
+            min_frequency=trace_min_frequency,
+            max_cases=trace_max_cases,
+        )
+        validate_trace_eval_cases(cases)
+        case_source = Path("iea_trace_weak://semantic_queries")
+    else:
+        raise ValueError(f"Unsupported case source type: {case_source_type}")
+    total_cases = len(cases)
+    print(
+        f"[rag-eval] release={RELEASE} corpus_id={CORPUS_ID} "
+        f"case_source={case_source_type} cases={total_cases} top_k={limit}",
+        flush=True,
+    )
+    results: List[Dict[str, Any]] = []
+    for index, case in enumerate(cases, start=1):
         print(
-            f"[rag-eval] profile={profile} case_source={case_source_type} "
-            f"cases={total_cases} top_k={limit}",
+            f"[rag-eval] ({index}/{total_cases}) start case={case['id']} "
+            f"domain={case['policy_domain']} target={case['target_kind']} "
+            f"query={case['query']}",
             flush=True,
         )
-        results: List[Dict[str, Any]] = []
-        for index, case in enumerate(cases, start=1):
-            print(
-                f"[rag-eval] ({index}/{total_cases}) start case={case['id']} "
-                f"domain={case['policy_domain']} target={case['target_kind']} "
-                f"query={case['query']}",
-                flush=True,
-            )
-            result = evaluate_case(case, limit=limit)
-            print(
-                f"[rag-eval] ({index}/{total_cases}) done case={case['id']} "
-                f"success={result['success']} top1={result['accuracy_at_1']:.0f} "
-                f"mrr={result['reciprocal_rank']:.4f}",
-                flush=True,
-            )
-            results.append(result)
-    report = summarize_results(results, profile=profile, limit=limit, case_source=case_source)
+        result = evaluate_case(case, limit=limit)
+        print(
+            f"[rag-eval] ({index}/{total_cases}) done case={case['id']} "
+            f"success={result['success']} top1={result['accuracy_at_1']:.0f} "
+            f"mrr={result['reciprocal_rank']:.4f}",
+            flush=True,
+        )
+        results.append(result)
+    report = summarize_results(results, limit=limit, case_source=case_source)
     report["case_source_type"] = case_source_type
     return report
 
 
-def compare_profiles(
-    *,
-    cases_path: Path,
-    limit: int,
-    case_source_type: str,
-    trace_min_frequency: int = 1,
-    trace_max_cases: Optional[int] = None,
-) -> Dict[str, Any]:
-    base_report = run_evaluation(
-        profile="base",
-        cases_path=cases_path,
-        limit=limit,
-        case_source_type=case_source_type,
-        trace_min_frequency=trace_min_frequency,
-        trace_max_cases=trace_max_cases,
-    )
-    docling_report = run_evaluation(
-        profile="docling",
-        cases_path=cases_path,
-        limit=limit,
-        case_source_type=case_source_type,
-        trace_min_frequency=trace_min_frequency,
-        trace_max_cases=trace_max_cases,
-    )
-    comparison = {
-        "case_source_type": case_source_type,
-        "top_k": limit,
-        "base": base_report["overall"],
-        "docling": docling_report["overall"],
-        "delta_docling_minus_base": {
-            metric: round(float(docling_report["overall"].get(metric) or 0.0) - float(base_report["overall"].get(metric) or 0.0), 4)
-            for metric in ("precision_at_k", "recall_at_k", "accuracy_at_1", "mrr", "success_rate", "wrong_domain_top1_rate", "empty_result_rate")
-        },
-        "base_report": base_report,
-        "docling_report": docling_report,
-    }
-    return comparison
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate the PCF policy RAG knowledge base retrieval quality.")
-    parser.add_argument("--profile", choices=sorted(PROFILE_CONFIGS.keys()), default="docling")
+    parser = argparse.ArgumentParser(description="Evaluate the canonical Release-19 PCF policy RAG retrieval quality.")
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
     parser.add_argument("--case-source", choices=("curated", "merged", "extended", "iea_trace", "iea_trace_weak"), default="curated")
     parser.add_argument("--top-k", type=int, default=5)
@@ -759,7 +540,6 @@ def main() -> None:
     parser.add_argument("--trace-max-cases", type=int)
     parser.add_argument("--case-output", type=Path)
     parser.add_argument("--json-output", type=Path)
-    parser.add_argument("--compare-baseline", action="store_true")
     args = parser.parse_args()
 
     if args.case_source == "iea_trace_weak" and args.case_output:
@@ -783,22 +563,7 @@ def main() -> None:
         validate_eval_cases(cases)
         write_eval_cases(args.case_output, cases)
 
-    if args.compare_baseline:
-        comparison = compare_profiles(
-            cases_path=args.cases,
-            limit=max(1, int(args.top_k)),
-            case_source_type=args.case_source,
-            trace_min_frequency=max(1, int(args.trace_min_frequency)),
-            trace_max_cases=args.trace_max_cases,
-        )
-        print(render_comparison(comparison))
-        if args.json_output:
-            args.json_output.parent.mkdir(parents=True, exist_ok=True)
-            args.json_output.write_text(json.dumps(comparison, ensure_ascii=False, indent=2), encoding="utf-8")
-        return
-
     report = run_evaluation(
-        profile=args.profile,
         cases_path=args.cases,
         limit=max(1, int(args.top_k)),
         case_source_type=args.case_source,

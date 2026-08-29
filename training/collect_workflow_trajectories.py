@@ -1,21 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
-
-from pydantic import BaseModel
-
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = PACKAGE_ROOT.parent
-SRC_ROOT = PACKAGE_ROOT / "src"
-for candidate in (WORKSPACE_ROOT, PACKAGE_ROOT, SRC_ROOT):
-    candidate_text = str(candidate)
-    if candidate_text not in sys.path:
-        sys.path.insert(0, candidate_text)
 
 from database.init_db import init_db
 from experiments.scripts.generate_user_inputs import (
@@ -29,35 +17,16 @@ from experiments.scripts.common import parse_task_ids
 from experiments.paths import default_catalog_input_path, workflow_experiment_input_path
 from control_runtime.integrations.scenario.init_scenario import rebuild_ue_related_tables_from_graph_snapshot
 from control_runtime.integrations.storage import get_latest_snapshot_metadata
-from training.common import ensure_agent_layout, processed_dir
-from training.trajectory_projection import (
+from training.artifacts import processed_dir, read_json, read_jsonl, write_json, write_jsonl
+from training.projection import (
     WORKFLOW_AGENT_NAMES,
-    build_finetuning_trace_record,
-    build_workflow_trajectory_record,
-    index_projected_traces_by_session,
-    load_projected_traces_by_agent,
+    build_finetuning_record,
+    build_workflow_record,
+    index_traces_by_session,
+    load_traces,
     sort_traces,
 )
 from control_runtime.orchestrators.main_control_orchestrator import MainControlOrchestrator
-
-
-def _read_json(path: Path) -> Any:
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            text = line.strip()
-            if not text:
-                continue
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise TypeError(f"{path}:{line_number} JSONL row must be an object")
-            rows.append(payload)
-    return rows
 
 
 def _normalize_record(record: Mapping[str, Any], index: int) -> Dict[str, Any]:
@@ -124,7 +93,7 @@ def load_user_input_records(
     if user_inputs_path is not None:
         if not user_inputs_path.exists():
             raise FileNotFoundError(user_inputs_path)
-        payload = _read_jsonl(user_inputs_path) if user_inputs_path.suffix.lower() == ".jsonl" else _read_json(user_inputs_path)
+        payload = read_jsonl(user_inputs_path) if user_inputs_path.suffix.lower() == ".jsonl" else read_json(user_inputs_path)
         if isinstance(payload, Mapping):
             raw_records = payload.get("records")
             if not isinstance(raw_records, list):
@@ -179,20 +148,6 @@ def load_user_input_records(
     if not selected_records:
         raise RuntimeError(f"No generated records available from start_index={start_index}")
     return [_normalize_record(record, index) for index, record in enumerate(selected_records, start=start_index)]
-
-
-def _write_jsonl_incremental(path: Path, record: BaseModel | Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = record.model_dump(mode="json") if isinstance(record, BaseModel) else dict(record)
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False))
-        handle.write("\n")
-        handle.flush()
-
-
-def _write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def summarize_run_results(
@@ -257,14 +212,11 @@ def _initialize_projection_outputs(
     workflow_output: Path,
     agent_output_root: Path | None,
 ) -> Dict[str, Any]:
-    workflow_output.parent.mkdir(parents=True, exist_ok=True)
-    workflow_output.write_text("", encoding="utf-8")
+    write_jsonl(workflow_output, [])
     agent_paths: Dict[str, str] = {}
     for agent_name in WORKFLOW_AGENT_NAMES:
-        ensure_agent_layout(agent_name)
         output_path = _agent_trajectory_output_path(agent_name, output_root=agent_output_root)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("", encoding="utf-8")
+        write_jsonl(output_path, [])
         agent_paths[agent_name] = str(output_path)
     return {
         "workflow_count": 0,
@@ -287,26 +239,25 @@ def _append_projected_case(
         projection_summary["skipped_without_session"] += 1
         return
 
-    traces_by_agent = load_projected_traces_by_agent(PACKAGE_ROOT, agent_names=WORKFLOW_AGENT_NAMES)
-    session_traces = index_projected_traces_by_session(traces_by_agent).get(session_id)
+    session_traces = index_traces_by_session(load_traces(WORKFLOW_AGENT_NAMES)).get(session_id)
     if session_traces is None:
         raise RuntimeError(f"Missing raw traces for workflow session {session_id}")
     if "main_control" not in session_traces:
         raise RuntimeError(f"Workflow session {session_id} is missing main_control raw trace")
 
-    workflow_record = build_workflow_trajectory_record(
+    workflow_record = build_workflow_record(
         result,
         session_traces=session_traces,
         agent_order=WORKFLOW_AGENT_NAMES,
     )
-    _write_jsonl_incremental(workflow_output, workflow_record)
+    write_jsonl(workflow_output, [workflow_record], mode="a")
     projection_summary["workflow_count"] += 1
     projection_summary["session_ids"].append(session_id)
 
     for agent_name in WORKFLOW_AGENT_NAMES:
         output_path = Path(projection_summary["agent_outputs"][agent_name])
         for trace in sort_traces(session_traces.get(agent_name, [])):
-            _write_jsonl_incremental(output_path, build_finetuning_trace_record(trace))
+            write_jsonl(output_path, [build_finetuning_record(trace)], mode="a")
             projection_summary["agent_counts"][agent_name] += 1
 
 
@@ -327,7 +278,6 @@ def collect_workflow_trajectories(
     use_deepseek: bool = False,
     case_finished_callback: Callable[[], None] | None = None,
 ) -> Dict[str, Any]:
-    ensure_agent_layout("workflow")
     init_db()
     bound_snapshot_id = str(snapshot_id or "").strip()
     if not bound_snapshot_id:
@@ -338,18 +288,16 @@ def collect_workflow_trajectories(
 
     results: List[Dict[str, Any]] = []
     if spec_output is not None:
-        spec_output.parent.mkdir(parents=True, exist_ok=True)
-        spec_output.write_text("", encoding="utf-8")
+        write_jsonl(spec_output, [])
         for record in records:
             spec_record = {
                 **record,
                 "scenario_id": _scenario_id(record, prefix=scenario_prefix),
                 "scenario_tags": _merge_tags(record.get("scenario_tags", []), scenario_tags),
             }
-            _write_jsonl_incremental(spec_output, spec_record)
+            write_jsonl(spec_output, [spec_record], mode="a")
 
-    result_output.parent.mkdir(parents=True, exist_ok=True)
-    result_output.write_text("", encoding="utf-8")
+    write_jsonl(result_output, [])
     projection_summary = _initialize_projection_outputs(
         workflow_output=workflow_output,
         agent_output_root=agent_trajectory_output_root,
@@ -457,7 +405,7 @@ def collect_workflow_trajectories(
 
         result_record["elapsed_ms"] = round((time.perf_counter() - run_started_at) * 1000, 3)
         results.append(result_record)
-        _write_jsonl_incremental(result_output, result_record)
+        write_jsonl(result_output, [result_record], mode="a")
         _append_projected_case(
             result=result_record,
             workflow_output=workflow_output,
@@ -597,7 +545,7 @@ def main() -> None:
         spec_output=args.spec_output,
         projection_summary=projection_summary,
     )
-    _write_json(args.summary_output, summary)
+    write_json(args.summary_output, summary)
 
     success_count = sum(1 for item in results if item["status"] == "success")
     completed_count = sum(1 for item in results if item["completed"])

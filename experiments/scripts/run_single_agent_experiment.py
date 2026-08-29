@@ -19,7 +19,7 @@ from control_runtime.orchestrators.single_agent_orchestrator import SingleAgentO
 from experiments.paths import default_catalog_input_path, resolve_scenario_source_path
 from experiments.scripts.common import append_jsonl, parse_task_ids, reset_simulator_state, write_json
 from training.collect_workflow_trajectories import load_user_input_records
-from training.common import processed_dir
+from training.artifacts import processed_dir
 
 
 QWEN_SINGLE_AGENT_MODEL = "qwen3-30b-a3b-instruct-2507"

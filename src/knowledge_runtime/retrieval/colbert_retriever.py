@@ -1,29 +1,87 @@
 from __future__ import annotations
 
 import json
-import os
-import time
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from knowledge_build.rag_release import COLBERT_INDEX_ROOT, CORPUS_ID, PROCESSED_ROOT, RELEASE
 
-COLBERT_INDEX_ROOT_DEFAULT = (
-    Path(__file__).resolve().parent.parent.parent.parent
-    / "knowledge_build"
-    / "data"
-    / "pcf_policy_r18"
-    / "colbert_index"
-)
+COLBERT_INDEX_ROOT_DEFAULT = COLBERT_INDEX_ROOT
 EMBEDDINGS_DIR_DEFAULT = COLBERT_INDEX_ROOT_DEFAULT / "embeddings"
 INDEX_META_DEFAULT = COLBERT_INDEX_ROOT_DEFAULT / "index_meta.json"
+MANIFEST_PATH = PROCESSED_ROOT / "source_manifest.json"
+PROCESSED_CORPUS_FILES = (
+    PROCESSED_ROOT / "clauses.jsonl",
+    PROCESSED_ROOT / "schema.jsonl",
+    PROCESSED_ROOT / "glossary.jsonl",
+)
 
 _MAXSIM_WARM_BATCH = 64
 
 
 def _index_available() -> bool:
     return INDEX_META_DEFAULT.exists() and EMBEDDINGS_DIR_DEFAULT.is_dir()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _processed_corpus_sha256() -> str:
+    digest = hashlib.sha256()
+    for path in PROCESSED_CORPUS_FILES:
+        if not path.is_file():
+            raise FileNotFoundError(f"Processed corpus file not found: {path}")
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_index_metadata(meta: Dict[str, Any]) -> None:
+    required_fields = (
+        "release",
+        "corpus_id",
+        "source_manifest_sha256",
+        "processed_corpus_sha256",
+        "model_name",
+        "dim",
+        "total_records",
+        "records",
+    )
+    missing = [field for field in required_fields if field not in meta]
+    if missing:
+        raise ValueError(f"ColBERT index metadata is incomplete; missing={missing}.")
+    if meta["release"] != RELEASE or meta["corpus_id"] != CORPUS_ID:
+        raise ValueError(
+            f"ColBERT index release/corpus mismatch: expected R{RELEASE}/{CORPUS_ID}, "
+            f"got R{meta['release']}/{meta['corpus_id']}."
+        )
+    if not isinstance(meta["records"], dict):
+        raise ValueError("ColBERT index metadata records must be a dictionary.")
+    if int(meta["total_records"]) != len(meta["records"]):
+        raise ValueError("ColBERT index metadata total_records does not match records.")
+    if not isinstance(meta["model_name"], str) or not meta["model_name"].strip():
+        raise ValueError("ColBERT index metadata model_name is required.")
+    if int(meta["dim"]) <= 0:
+        raise ValueError("ColBERT index metadata dim must be positive.")
+    if not MANIFEST_PATH.is_file():
+        raise FileNotFoundError(f"Source manifest not found: {MANIFEST_PATH}")
+    manifest_hash = _sha256_file(MANIFEST_PATH)
+    if meta["source_manifest_sha256"] != manifest_hash:
+        raise ValueError("ColBERT index source_manifest_sha256 does not match the canonical source manifest.")
+    corpus_hash = _processed_corpus_sha256()
+    if meta["processed_corpus_sha256"] != corpus_hash:
+        raise ValueError("ColBERT index processed_corpus_sha256 does not match the canonical processed corpus.")
 
 
 def _maxsim_score(
@@ -78,6 +136,7 @@ class ColBERTRetriever:
         with self._meta_path.open("r", encoding="utf-8") as f:
             self._meta: Dict[str, Any] = json.load(f)
 
+        _validate_index_metadata(self._meta)
         self._model_name: str = self._meta["model_name"]
         self._dim: int = self._meta["dim"]
         self._records_meta: Dict[str, Dict[str, Any]] = self._meta["records"]
@@ -112,6 +171,8 @@ class ColBERTRetriever:
 
         with np.load(str(filepath)) as data:
             emb = data["tokens"].astype(np.float32)
+        if emb.ndim != 2 or emb.shape[1] != self._dim:
+            raise ValueError(f"ColBERT embedding shape for {record_id!r} does not match index metadata dim={self._dim}.")
         self._cache[record_id] = emb
         return emb
 
@@ -197,7 +258,4 @@ class ColBERTRetriever:
 def get_colbert_retriever() -> Optional[ColBERTRetriever]:
     if not _index_available():
         return None
-    try:
-        return ColBERTRetriever()
-    except Exception:
-        return None
+    return ColBERTRetriever()

@@ -1,3 +1,1 @@
-from .agent import SingleControlAgent
-
-__all__ = ["SingleControlAgent"]
+"""Single-agent implementation package."""

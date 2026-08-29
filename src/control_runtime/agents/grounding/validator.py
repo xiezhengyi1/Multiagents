@@ -3,10 +3,13 @@ from __future__ import annotations
 import re
 from typing import Any, List
 
-from ...domain.intent_encoding import AM_GROUNDING_TOOLS, SM_GROUNDING_TOOLS, VALID_DOMAINS
-from .common import flow_id_is_grounded, mobility_request_mentions_specific_targets
-from .contracts import IntentEvidence
-from ...domain.policy_plan import GroundingDecision
+from .contracts import (
+    AM_GROUNDING_TOOLS,
+    SM_GROUNDING_TOOLS,
+    VALID_DOMAINS,
+    GroundingDecision,
+    IntentEvidence,
+)
 
 
 class IntentGroundingValidator:
@@ -46,7 +49,7 @@ class IntentGroundingValidator:
             decision_has_am_context = self._grounding_decision_has_grounded_am_policy(grounding_decision)
             if not evidence.am_context_summary and not decision_has_am_context:
                 errors.append("mobility-only intent requires grounded AM policy context before returning final intent")
-            if mobility_request_mentions_specific_targets(evidence.user_input):
+            if _mobility_request_mentions_specific_targets(evidence.user_input):
                 if not evidence.am_policy_candidates and not decision_has_am_context:
                     errors.append(
                         "mobility intent that names association/RFSP/NSSAI/service-area/access targets requires search_am_policy_targets evidence"
@@ -194,7 +197,7 @@ class IntentGroundingValidator:
             flow_id = str(flow.flow_id or "").strip()
             if resolution_status == "resolved" and not flow_id:
                 errors.append(f"QoS GroundingDecision flow[{index}] is resolved but missing flow_id.")
-            if resolution_status == "resolved" and flow_id and not flow_id_is_grounded(
+            if resolution_status == "resolved" and flow_id and not _flow_id_is_grounded(
                 flow_id=flow_id,
                 evidence=evidence,
             ):
@@ -246,3 +249,68 @@ class IntentGroundingValidator:
 
 def _missing_baseline_value(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
+
+
+def validate_grounding(
+    *,
+    validator: IntentGroundingValidator,
+    evidence: IntentEvidence,
+    grounding_decision: GroundingDecision,
+    grounding_tools: List[str],
+) -> tuple[List[str], List[str], GroundingDecision | None]:
+    decision_errors = validator.validate_grounding_decision(
+        evidence=evidence,
+        grounding_decision=grounding_decision,
+    )
+    grounding_errors = validator.validate_intent_grounding(
+        evidence=evidence,
+        grounding_tools=grounding_tools,
+        grounding_decision=grounding_decision,
+    )
+    if decision_errors or grounding_errors:
+        return list(decision_errors), list(grounding_errors), None
+    return [], [], grounding_decision
+
+
+def _mobility_request_mentions_specific_targets(user_input: str) -> bool:
+    text = str(user_input or "").strip().lower()
+    if not text:
+        return False
+    patterns = (
+        r"\bassociation\b",
+        r"\brfsp\b",
+        r"\bnssai\b",
+        r"\bs-nssai\b",
+        r"\ballowed\s*nssai\b",
+        r"\btarget\s*nssai\b",
+        r"\bservice[-\s]?area\b",
+        r"\bpresence\s*area\b",
+        r"\baccess\s*type\b",
+        r"\b3gpp_access\b",
+        r"\bnon_3gpp_access\b",
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _flow_id_is_grounded(*, flow_id: str, evidence: IntentEvidence) -> bool:
+    normalized_flow_id = str(flow_id or "").strip()
+    if not normalized_flow_id:
+        return False
+    if any(
+        str(item.flow_id or "").strip() == normalized_flow_id
+        for item in (evidence.candidate_flows or [])
+    ):
+        return True
+    catalog_payload = evidence.catalog_payload or {}
+    flow_catalog = catalog_payload.get("flow_catalog") or []
+    if any(
+        str(item.get("flow_id") or "").strip() == normalized_flow_id
+        for item in flow_catalog
+        if isinstance(item, dict)
+    ):
+        return True
+    return any(
+        str(item.get("flow_id") or "").strip() == normalized_flow_id
+        for item in (evidence.semantic_candidates or [])
+        if isinstance(item, dict)
+    )

@@ -3,20 +3,15 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...domain.control_plane import (
-    ControlDomain,
-    DomainStatus,
-    DomainVerdict,
-    JointOptimizationRequest,
-    JointOptimizationResult,
-    ObjectiveProfile,
-    OptimizationProblemConfig,
-)
+from ...contracts import ControlDomain, ObjectiveProfile
+from ...diagnostics.mediation.contracts import DomainStatus, DomainVerdict
 
 from .models import AMPolicyState
 from .interface import optimize_network_slices
+from .contracts import JointOptimizationRequest, JointOptimizationResult, OptimizationProblemConfig
 from .joint_mobility import build_mobility_draft, build_mobility_snapshot, run_cross_domain_checks
 from .joint_problem import resolve_problem_config
+from .objective_weights import build_qos_optimizer_weights
 
 
 def _relax_upper_bound(value: Any, ratio: float) -> Any:
@@ -126,13 +121,10 @@ def _run_qos_subproblem(
     if "slice_assignment" not in problem_config.decision_variables:
         return {}, ["QoS optimization disabled by problem configuration"]
 
-    legacy_weights = objective_profile.to_legacy_qos_weights()
+    optimizer_weights = build_qos_optimizer_weights(objective_profile)
     result = optimize_network_slices(
         target_app,
-        legacy_weights["w1"],
-        legacy_weights["w2"],
-        legacy_weights["w3"],
-        legacy_weights["w4"],
+        *optimizer_weights.solver_arguments(),
         mode=problem_config.solver_mode,
         return_json=True,
         am_policy_state=am_policy_state,
@@ -354,7 +346,7 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
             "decision_variables": list(problem_config.decision_variables),
             "grouped_decision_variables": problem_config.grouped_decision_variables(),
             "grouped_constraints": problem_config.grouped_constraints(),
-            "legacy_qos_weights": objective_profile.to_legacy_qos_weights(),
+            "qos_optimizer_weights": build_qos_optimizer_weights(objective_profile).to_payload(),
             "mobility_risk_cost": objective_profile.mobility_risk_cost,
             "session_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("session_cost", 0.0),
             "mobility_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("mobility_cost", 0.0),

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ...domain.policy_plan import FlowSelector
+from ...agents.grounding.contracts import FlowSelector
 from .base import BaseProjector, exclude, field
 
 

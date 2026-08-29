@@ -4,7 +4,6 @@ from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
-from database.connection import SessionLocal
 from database.models import SessionContext
 from shared.logging import setup_logger
 
@@ -19,6 +18,8 @@ logger = setup_logger(__name__)
 @contextmanager
 def session_scope():
     """Provide a transactional scope around a series of operations."""
+    from database.connection import SessionLocal
+
     session = SessionLocal()
     try:
         yield session
@@ -66,7 +67,7 @@ def _get_latest_graph_snapshot_payload() -> Optional[Dict[str, Any]]:
         graph = get_latest_graph()
         if graph is None:
             return None
-        payload = graph.to_compatibility_snapshot()
+        payload = graph.to_scenario_snapshot()
         if not _payload_has_scenario_entities(payload):
             return None
         return {
@@ -163,7 +164,7 @@ def get_snapshot_data_by_id(snapshot_id: Union[str, int]) -> Optional[Dict[str, 
         payload = get_graph_snapshot_payload(normalized_snapshot_id)
         if isinstance(payload, dict) and payload:
             graph = NetworkGraph.from_payload(payload)
-            return graph.to_compatibility_snapshot()
+            return graph.to_scenario_snapshot()
     except Exception as e:
         logger.warning(f"Failed to load graph snapshot {snapshot_id}: {e}")
     return None
@@ -199,7 +200,7 @@ def get_latest_session_context(status: Optional[str] = None) -> Optional[Dict[st
             )
             return {
                 "session_id": latest_session.session_id,
-                "current_step": latest_session.current_step,
+                "current_stage": latest_session.current_stage,
                 "intent_data": latest_session.intent_data,
                 "policy_data": latest_session.policy_data,
                 "status": latest_session.status,
@@ -213,7 +214,7 @@ def get_latest_session_context(status: Optional[str] = None) -> Optional[Dict[st
 
 def create_session_context(
     *,
-    current_step: str = "intent",
+    current_stage: str = "intent",
     intent_data: Optional[Dict[str, Any]] = None,
     policy_data: Optional[Dict[str, Any]] = None,
     status: str = "active",
@@ -222,8 +223,7 @@ def create_session_context(
     try:
         with session_scope() as session:
             row = SessionContext(
-                current_step=current_step,
-                current_stage=current_step,
+                current_stage=current_stage,
                 intent_data=intent_data,
                 policy_data=policy_data,
                 status=status,
@@ -241,7 +241,7 @@ def create_session_context(
 def update_session_context(
     session_id: str,
     *,
-    current_step: Optional[str] = None,
+    current_stage: Optional[str] = None,
     current_snapshot_id: Optional[str] = None,
     intent_data: Optional[Dict[str, Any]] = None,
     policy_data: Optional[Dict[str, Any]] = None,
@@ -259,9 +259,8 @@ def update_session_context(
                 logger.warning(f"update_session_context skipped: session_id not found: {session_id}")
                 return False
 
-            if current_step is not None:
-                row.current_step = current_step
-                row.current_stage = current_step
+            if current_stage is not None:
+                row.current_stage = current_stage
             if current_snapshot_id is not None:
                 row.current_snapshot_id = str(current_snapshot_id or "").strip() or None
             if intent_data is not None:

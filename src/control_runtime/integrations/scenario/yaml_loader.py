@@ -223,65 +223,11 @@ def _build_apps_from_yaml(
             )
         )
 
-    referenced_app_ids = [app_id for app_id in flows_by_app_id if app_id not in seen_app_ids]
-    for raw_app_id in referenced_app_ids:
-        flow_objects: List[Flow] = []
-        app_name = raw_app_id or "app_unknown"
-        app_supi = None
-        for flow_payload in flows_by_app_id.get(raw_app_id, []):
-            service_type = str(flow_payload.get("service_type") or "").strip() or _service_type_id_to_name(
-                int(flow_payload.get("service_type_id") or 1)
-            )
-            service_type_id = int(flow_payload.get("service_type_id") or _service_type_name_to_id(service_type) or 1)
-            sla_target = flow_payload.get("sla_target") if isinstance(flow_payload.get("sla_target"), dict) else {}
-            current_slice_snssai = str(flow_payload.get("current_slice_snssai") or "").strip()
-            if not current_slice_snssai:
-                current_slice_snssai = label_to_snssai.get(str(flow_payload.get("slice_ref") or "").strip(), "")
-            if app_supi is None:
-                app_supi = _normalize_supi(flow_payload.get("supi"))
-            app_name = str(flow_payload.get("app_name") or app_name)
-            flow_objects.append(
-                Flow(
-                    id=_normalize_or_generate_id(flow_payload.get("flow_id"), "flow", used_suffixes),
-                    name=str(flow_payload.get("name") or flow_payload.get("flow_id") or "flow_unknown"),
-                    service=FlowService(service_type=service_type, service_type_id=service_type_id),
-                    sla=FlowSLA(
-                        bandwidth_ul=float(
-                            sla_target.get("bandwidth_ul_mbps", flow_payload.get("allocated_bandwidth_ul_mbps", 0.0)) or 0.0
-                        ),
-                        bandwidth_dl=float(
-                            sla_target.get("bandwidth_dl_mbps", flow_payload.get("allocated_bandwidth_dl_mbps", 0.0)) or 0.0
-                        ),
-                        guaranteed_bandwidth_ul=float(
-                            sla_target.get("guaranteed_bandwidth_ul_mbps", flow_payload.get("allocated_bandwidth_ul_mbps", 0.0)) or 0.0
-                        ),
-                        guaranteed_bandwidth_dl=float(
-                            sla_target.get("guaranteed_bandwidth_dl_mbps", flow_payload.get("allocated_bandwidth_dl_mbps", 0.0)) or 0.0
-                        ),
-                        latency=float(sla_target.get("latency_ms", 0.0) or 0.0),
-                        jitter=float(sla_target.get("jitter_ms", 0.0) or 0.0),
-                        loss_rate=float(sla_target.get("loss_rate", 0.0) or 0.0),
-                        priority=int(sla_target.get("priority", 1) or 1),
-                    ),
-                    traffic=FlowTraffic(
-                        packet_size=float(flow_payload.get("packet_size_bytes", 0.0) or 0.0),
-                        arrival_rate=float(flow_payload.get("arrival_rate_pps", 0.0) or 0.0),
-                    ),
-                    allocation=FlowAllocation(
-                        current_slice_snssai=current_slice_snssai or None,
-                        allocated_bandwidth_ul=float(flow_payload.get("allocated_bandwidth_ul_mbps", 0.0) or 0.0),
-                        allocated_bandwidth_dl=float(flow_payload.get("allocated_bandwidth_dl_mbps", 0.0) or 0.0),
-                        optimize_requested=bool(flow_payload.get("optimize_requested", False)),
-                    ),
-                )
-            )
-        apps.append(
-            App(
-                id=_normalize_or_generate_id(raw_app_id, "app", used_suffixes),
-                name=app_name,
-                flows=flow_objects,
-                supi=app_supi,
-            )
+    orphan_app_ids = sorted(app_id for app_id in flows_by_app_id if app_id not in seen_app_ids)
+    if orphan_app_ids:
+        raise ValueError(
+            "flows reference app_id values that are not declared in apps: "
+            + ", ".join(orphan_app_ids)
         )
 
     return apps

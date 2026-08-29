@@ -16,6 +16,7 @@ from .session_store import (
     update_session_context,
 )
 from .ue_store import (
+    commit_applied_policy_plan,
     get_ue_context_by_supi,
     get_ue_flow_catalog_by_supi,
     list_am_policy_associations_by_supi,
@@ -30,6 +31,7 @@ from .ue_store import (
 __all__ = [
     "build_flow_description_from_five_tuple",
     "build_flow_info_from_five_tuple",
+    "commit_applied_policy_plan",
     "create_session_context",
     "get_latest_session_context",
     "get_latest_snapshot_data",

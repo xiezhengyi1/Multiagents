@@ -63,7 +63,7 @@ def get_network_status_summary(flow_type_id: int = None, snapshot_id: Optional[s
     if requested_snapshot_id and graph is None:
         raise RuntimeError(f"Network graph snapshot not found: snapshot_id={requested_snapshot_id}")
     if graph is not None:
-        snapshot = graph.to_compatibility_snapshot()
+        snapshot = graph.to_scenario_snapshot()
         apps = snapshot.get("apps", [])
         slices = snapshot.get("slices", [])
         nodes = snapshot.get("nodes", [])
@@ -153,9 +153,6 @@ def get_network_status_summary(flow_type_id: int = None, snapshot_id: Optional[s
         "slices": slice_status_list,
         "apps": app_summary_list
     }, ensure_ascii=False, indent=2)
-
-# 兼容旧代码调用
-get_network_status = get_network_status_full
 
 if __name__ == "__main__":
     save_network_status_snapshot(trigger_event="Manual-Test")

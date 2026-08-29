@@ -17,7 +17,7 @@
 - Modify `src/environment/prompts.py`: require the progressive workflow and prohibit full-scenario repair payloads.
 - Modify `src/environment/agent.py`: reload the written YAML when constructing
   the returned candidate so final model output remains compact.
-- Modify `agent_runtime/execution/structured_tool_loop.py`: allow selected tools
+- Modify `src/shared/runtime/execution/structured_tool_loop.py`: allow selected tools
   to override the default per-tool call limit.
 - Modify `src/shared/agents/base.py`: forward selected tool call limits.
 - Modify `tests/test_environment_agent.py`: add store, tool, prompt, and gating regression tests.

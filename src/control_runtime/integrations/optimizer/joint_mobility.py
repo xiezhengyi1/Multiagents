@@ -2,15 +2,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...domain.control_plane import (
-    ControlDomain,
-    DomainStatus,
-    DomainVerdict,
-    JointOptimizationRequest,
-    MobilityContextSnapshot,
-    MobilityPolicyDraft,
-    OptimizationProblemConfig,
-)
+from pydantic import BaseModel, Field
+
+from ...contracts import ControlDomain
+from ...diagnostics.mediation.contracts import DomainStatus, DomainVerdict
 from model.PcfAmPolicyControl import (
     AccessType,
     Ambr,
@@ -18,6 +13,7 @@ from model.PcfAmPolicyControl import (
     PcfAmPolicyControlPolicyAssociation,
     PcfAmPolicyControlPolicyAssociationRequest,
     PcfAmPolicyControlRequestTrigger,
+    PlmnIdNid,
     PresenceInfo,
     RatType,
     ServiceAreaRestriction,
@@ -27,8 +23,42 @@ from model.PcfAmPolicyControl import (
     WirelineServiceAreaRestriction,
 )
 
+from .contracts import JointOptimizationRequest, OptimizationProblemConfig
+
 
 REQUIRED_MOBILITY_FIELDS = ("accessType", "userLoc", "guami", "servingPlmn")
+
+
+class MobilityContextSnapshot(BaseModel):
+    supi: str
+    accessType: Optional[AccessType] = None
+    accessTypes: Optional[List[AccessType]] = None
+    ratType: Optional[RatType] = None
+    ratTypes: Optional[List[RatType]] = None
+    userLoc: Optional[UserLocation] = None
+    guami: Optional[Guami] = None
+    servingPlmn: Optional[PlmnIdNid] = None
+    timeZone: Optional[str] = None
+    presenceAreas: Dict[str, PresenceInfo] = Field(default_factory=dict)
+    allowedSnssais: List[Snssai] = Field(default_factory=list)
+    targetSnssais: List[Snssai] = Field(default_factory=list)
+    mappingSnssais: List[MappingOfSnssai] = Field(default_factory=list)
+    currentAssociationId: Optional[str] = None
+    currentTriggers: List[PcfAmPolicyControlRequestTrigger] = Field(default_factory=list)
+    currentServAreaRes: Optional[ServiceAreaRestriction] = None
+    currentWlServAreaRes: Optional[WirelineServiceAreaRestriction] = None
+    currentRfsp: Optional[int] = None
+    currentSmfSelInfo: Optional[SmfSelectionData] = None
+    missing_fields: List[str] = Field(default_factory=list)
+
+
+class MobilityPolicyDraft(BaseModel):
+    association_id: str
+    request: PcfAmPolicyControlPolicyAssociationRequest
+    policy: PcfAmPolicyControlPolicyAssociation
+    rationale: str
+    trigger_event: str
+    expected_benefits: List[str] = Field(default_factory=list)
 
 
 def _is_empty_mobility_value(value: Any) -> bool:

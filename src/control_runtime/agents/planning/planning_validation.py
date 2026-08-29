@@ -6,13 +6,12 @@ import json
 import re
 from typing import Any, Dict, List
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from ...domain.collaboration import PlanningRequest
-from ...domain.control_plane import ControlDomain, DomainStatus
-from ...domain.policy_plan import PolicyDraft, PolicyPlanDraft
-from ...context.evidence import build_slice_snssai
-from .response_models import OsaAdvisorOutput
+from ...diagnostics.mediation.contracts import DomainStatus
+from ..main.contracts import ControlDomain
+from .contracts import PlanningRequest, PolicyDraft, PolicyPlanDraft
+from .response_models import OsaAdvisorOutput, SnssaiSpec
 from model.PcfAmPolicyControl import PcfAmPolicyControlPolicyAssociation
 from model.SmPolicyDecision import SmPolicyDecision
 from model.UrspRuleRequest import UrspRuleRequest
@@ -32,6 +31,13 @@ def json_friendly(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _build_slice_snssai(slice_code: str) -> Dict[str, Any] | None:
+    try:
+        return SnssaiSpec.model_validate(slice_code).model_dump(mode="json")
+    except ValidationError:
+        return None
 
 
 def normalize_app_id(app_id: Any) -> str:
@@ -591,7 +597,7 @@ class PlanningAdvisorValidator:
                 selected_slice = str(allocation.get("current_slice_snssai") or "").strip()
                 if selected_slice:
                     keys.append(f"slice:{selected_slice}")
-                    snssai = build_slice_snssai(selected_slice)
+                    snssai = _build_slice_snssai(selected_slice)
                     if snssai is not None:
                         keys.append(f"snssai:{json.dumps(snssai, sort_keys=True, ensure_ascii=False)}")
         summary_assignments = joint_result.get("qos_flow_assignments") if isinstance(joint_result, dict) else []
@@ -609,7 +615,7 @@ class PlanningAdvisorValidator:
                 ).strip()
                 if selected_slice:
                     keys.append(f"slice:{selected_slice}")
-                    snssai = build_slice_snssai(selected_slice)
+                    snssai = _build_slice_snssai(selected_slice)
                     if snssai is not None:
                         keys.append(f"snssai:{json.dumps(snssai, sort_keys=True, ensure_ascii=False)}")
         return list(dict.fromkeys(keys))

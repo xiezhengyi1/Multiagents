@@ -24,7 +24,6 @@ experiments/results
 runtime
 docs/
 tmp/
-tests
 training/intent_encoding
 training/main_control
 training/optimization_strategy

@@ -150,49 +150,6 @@ class OsaAdvisorOutput(BaseModel):
     ursp_policies: List[UrspPolicySpec] = Field(default_factory=list)
     partial_policies: List[Dict[str, Any]] = Field(default_factory=list)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_code_owned_wire_fields(cls, value: Any) -> Any:
-        """Accept harmless LLM wire-shape noise without expanding the contract.
-
-        SUPI is inherited from Main's shared context when compiling an AM policy, and
-        optional policy collections are always represented as empty lists
-        internally.  Normalizing only these code-owned fields avoids burning a
-        planning retry after the optimizer has already produced evidence.
-        """
-        if not isinstance(value, dict):
-            return value
-        normalized = dict(value)
-        for field_name in ("sm_policies", "ursp_policies", "partial_policies"):
-            if normalized.get(field_name) is None:
-                normalized[field_name] = []
-        code_owned_policy_fields = {
-            "policy_id",
-            "policy_type",
-            "supi",
-            "target_type",
-            "slice_snssai",
-            "new_slice",
-            "current_slice",
-            "status",
-        }
-        sm_policies = normalized.get("sm_policies")
-        if isinstance(sm_policies, list):
-            normalized["sm_policies"] = [
-                {key: item for key, item in policy.items() if key not in code_owned_policy_fields}
-                if isinstance(policy, dict)
-                else policy
-                for policy in sm_policies
-            ]
-        am_policy = normalized.get("am_policy")
-        if isinstance(am_policy, dict):
-            normalized["am_policy"] = {
-                key: item
-                for key, item in am_policy.items()
-                if key not in code_owned_policy_fields
-            }
-        return normalized
-
     @model_validator(mode="after")
     def _validate_policy_collections(self) -> "OsaAdvisorOutput":
         seen_flow_ids: set[str] = set()

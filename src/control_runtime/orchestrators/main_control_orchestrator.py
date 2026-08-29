@@ -6,50 +6,37 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-from control_runtime.tool_capabilities import register  # noqa: F401 — side-effect: registers 6G tool aliases
-from knowledge_runtime.retrieval.raw import warmup_knowledge_tool_models
 from shared.memory import MemoryManager
-from shared.runtime import ContextPolicy, TokenBudget, TokenCounter
+from shared.runtime import ContextPolicy, RuntimePersistence, TokenBudget, TokenCounter
+from application_runtime.persistence import create_runtime_persistence
 
-# Inject database dependencies into the generic runtime storage layer.
-# Must happen before any artifact / task queue operations.
-from database.connection import SessionLocal  # noqa: E402
-import database.models as _db_models  # noqa: E402
-from agent_runtime.storage.runtime_store import configure as _configure_runtime_store  # noqa: E402
-
-_configure_runtime_store(session_factory=SessionLocal, orm_module=_db_models)
-
-from ..context import (
-    DefaultIntentContextBuilder,
-    IntentContextBuilder,
-    build_feedback_context_from_snapshots,
-    build_main_context,
-    build_memory_context,
-    build_round_feedback_block,
-    project_memory_payload,
-)
-
-from ..agents.dispatch import PolicyDispatchAgent
-from ..agents.grounding import IntentEncodingAgent
-from ..agents.main import MainControlAgent
-from ..agents.planning import OptimizationStrategyAgent
+from ..agents.dispatch.agent import PolicyDispatchAgent
+from ..agents.grounding.agent import IntentEncodingAgent
+from ..agents.main.agent import MainControlAgent
+from ..agents.planning.agent import OptimizationStrategyAgent
+from ..context.projectors import project_memory_payload
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool
 from ..diagnostics.mediation import ConflictResolutionTool
-from ..domain.collaboration import (
-    DomainNegotiationRequest,
-    PlanningRequest,
-)
-from ..domain.control_plane import GlobalControlIntent
-from ..domain.policy_plan import GroundingDecision
-from .contracts import ControlRoundResult
+from ..agents.grounding.contracts import GroundingDecision
+from ..agents.main.contracts import GlobalControlIntent
+from ..agents.planning.contracts import PlanningRequest
+from .contracts import ControlRoundResult, ControlRoundTrace, DomainNegotiationRequest
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
+from .round_context import (
+    build_feedback_context_from_snapshots,
+    build_intent_encoding_context,
+    build_main_context,
+    build_memory_context,
+    build_planning_context,
+    build_round_feedback_block,
+)
 from .round_execution import execute_planned_round
 from .round_transitions import (
     build_negotiation_diagnosis,
     build_negotiation_request,
     build_planning_failure_payload,
-    build_reentry_report_payload,
     has_supi_scope,
+    scope_global_intent_for_intent_encoding,
     should_reuse_grounding_decision,
 )
 from shared.logging import log_event
@@ -68,27 +55,43 @@ class MainControlOrchestrator:
         cr_tool: Optional[ConflictResolutionTool] = None,
         ad_tool: Optional[AssuranceDiagnosisTool] = None,
         memory_manager: Optional[MemoryManager] = None,
-        intent_context_builder: Optional[IntentContextBuilder] = None,
         max_rounds: int = 3,
         use_local_model: bool = False,
         use_deepseek: bool = False,
         preload_models: bool = True,
         rag_enabled: bool = True,
+        persistence: RuntimePersistence | None = None,
     ) -> None:
         if max_rounds < 1:
             raise ValueError("max_rounds must be at least 1")
         _deepseek_kwargs = {"model_name": self._DEEPSEEK_MODEL} if use_deepseek else {}
-        self.main_agent = main_agent or MainControlAgent(use_local_model=use_local_model, **_deepseek_kwargs)
-        self.ie_agent = ie_agent or IntentEncodingAgent(use_local_model=use_local_model, **_deepseek_kwargs)
-        self.os_agent = os_agent or OptimizationStrategyAgent(use_local_model=use_local_model, rag_enabled=rag_enabled, **_deepseek_kwargs)
-        self.pd_agent = pd_agent or PolicyDispatchAgent(use_local_model=use_local_model, **_deepseek_kwargs)
-        self.cr_tool = cr_tool or ConflictResolutionTool()
-        self.ad_tool = ad_tool or AssuranceDiagnosisTool()
+        self.runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.main_agent = main_agent or MainControlAgent(
+            use_local_model=use_local_model,
+            **_deepseek_kwargs,
+        )
+        self.ie_agent = ie_agent or IntentEncodingAgent(
+            use_local_model=use_local_model,
+            persistence=self.runtime_persistence,
+            **_deepseek_kwargs,
+        )
+        self.os_agent = os_agent or OptimizationStrategyAgent(
+            use_local_model=use_local_model,
+            rag_enabled=rag_enabled,
+            persistence=self.runtime_persistence,
+            **_deepseek_kwargs,
+        )
+        self.pd_agent = pd_agent or PolicyDispatchAgent(
+            use_local_model=use_local_model,
+            persistence=self.runtime_persistence,
+            **_deepseek_kwargs,
+        )
+        self.cr_tool = cr_tool or ConflictResolutionTool(persistence=self.runtime_persistence)
+        self.ad_tool = ad_tool or AssuranceDiagnosisTool(persistence=self.runtime_persistence)
         self.memory_manager = memory_manager or MemoryManager(
             short_term_limit=max(20, max_rounds * 8),
             enable_llm_summarization=True,
         )
-        self.intent_context_builder = intent_context_builder or DefaultIntentContextBuilder()
         self.max_rounds = max_rounds
         self.rag_enabled = rag_enabled
         self._token_counter = TokenCounter()
@@ -111,7 +114,11 @@ class MainControlOrchestrator:
                     get_llm()
                     preloaded_llm_agents.append(str(getattr(agent, "agent_name", agent.__class__.__name__) or agent.__class__.__name__))
 
-            knowledge_models = warmup_knowledge_tool_models() if self.rag_enabled else {}
+            knowledge_models: Dict[str, Any] = {}
+            if self.rag_enabled:
+                from knowledge_runtime.retrieval.raw import warmup_knowledge_tool_models
+
+                knowledge_models = warmup_knowledge_tool_models()
             log_event(
                 self.main_agent.logger,
                 "runtime_model_preload_complete",
@@ -201,6 +208,7 @@ class MainControlOrchestrator:
                     previous_execution_reentry=previous_execution_reentry,
                     external_routing_hint=routing_hint,
                 ),
+                round_index=round_index,
                 trace_metadata=trace_metadata,
             )
         finally:
@@ -233,7 +241,7 @@ class MainControlOrchestrator:
                 selected_next_agent=selected_next_agent,
             )
         else:
-            ie_scoped_intent = self.intent_context_builder.scope_global_intent_for_intent_encoding(
+            ie_scoped_intent = scope_global_intent_for_intent_encoding(
                 global_intent=global_intent,
                 round_index=round_index,
             )
@@ -241,7 +249,7 @@ class MainControlOrchestrator:
             try:
                 grounding_decision = self.ie_agent.analyze_grounding_decision(
                     user_input=user_input,
-                    context=self.intent_context_builder.build_intent_encoding_context(
+                    context=build_intent_encoding_context(
                         global_intent=ie_scoped_intent.model_dump(mode="json"),
                         round_index=round_index,
                         diagnosis=previous_diagnosis,
@@ -262,7 +270,7 @@ class MainControlOrchestrator:
 
         planning_request = PlanningRequest(
             grounding_decision=grounding_decision,
-            context=self.intent_context_builder.build_planning_context(
+            context=build_planning_context(
                 global_intent,
                 session_id,
                 snapshot_id,
@@ -325,7 +333,6 @@ class MainControlOrchestrator:
             feedback_context = build_feedback_context_from_snapshots(
                 state.rounds,
                 token_counter=self._token_counter,
-                summarizer_llm=getattr(self.memory_manager, "summarizer_llm", None),
             )
             trace_metadata = self._trace_metadata(scenario_id=scenario_id, scenario_tags=scenario_tags)
             round_agent_elapsed_ms: Dict[str, float] = {}
@@ -363,21 +370,12 @@ class MainControlOrchestrator:
                     exc,
                     debug_context=debug_context,
                 )
-                trace_payload = {
-                    "round_index": round_index,
-                    "global_intent": {},
-                    "grounding_decision": {},
-                    "policy_plan": {},
-                    "domain_verdicts": [],
-                    "pda_feedback": report_payload,
-                    "qos_feedback": {},
-                    "mobility_feedback": {},
-                    "diagnosis": diagnosis,
-                    "negotiation_request": {},
-                    "planning_blocker": {},
-                    "execution_reentry": {},
-                    "agent_elapsed_ms": dict(round_agent_elapsed_ms),
-                }
+                trace = ControlRoundTrace(
+                    round_index=round_index,
+                    pda_feedback=report_payload,
+                    diagnosis=diagnosis,
+                    agent_elapsed_ms=round_agent_elapsed_ms,
+                )
                 feedback_added = build_round_feedback_block(
                     pda_feedback=report_payload,
                     diagnosis=diagnosis,
@@ -388,7 +386,7 @@ class MainControlOrchestrator:
                     execution_reentry={},
                     round_index=round_index,
                 )
-                append_round_trace(state, trace_payload=trace_payload, feedback_added=feedback_added)
+                append_round_trace(state, trace=trace, feedback_added=feedback_added)
                 state.latest_result = ControlRoundResult(
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -431,27 +429,20 @@ class MainControlOrchestrator:
             if negotiation_request is not None:
                 diagnosis = build_negotiation_diagnosis(negotiation_request)
                 negotiation_payload = negotiation_request.model_dump(mode="json")
-                trace_payload = {
-                    "round_index": round_index,
-                    "global_intent": global_intent.model_dump(mode="json"),
-                    "grounding_decision": grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
-                    "policy_plan": {},
-                    "domain_verdicts": [],
-                    "pda_feedback": {},
-                    "qos_feedback": {},
-                    "mobility_feedback": {},
-                    "diagnosis": diagnosis,
-                    "negotiation_request": negotiation_payload,
-                    "planning_blocker": {},
-                    "execution_reentry": {},
-                    "agent_elapsed_ms": dict(round_agent_elapsed_ms),
-                }
+                trace = ControlRoundTrace(
+                    round_index=round_index,
+                    global_intent=global_intent.model_dump(mode="json"),
+                    grounding_decision=grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
+                    diagnosis=diagnosis,
+                    negotiation_request=negotiation_payload,
+                    agent_elapsed_ms=round_agent_elapsed_ms,
+                )
                 feedback_added = build_round_feedback_block(
                     diagnosis=diagnosis,
                     negotiation_request=negotiation_payload,
                     round_index=round_index,
                 )
-                append_round_trace(state, trace_payload=trace_payload, feedback_added=feedback_added)
+                append_round_trace(state, trace=trace, feedback_added=feedback_added)
                 state.latest_result = ControlRoundResult(
                     session_id=session_id,
                     snapshot_id=snapshot_id,
@@ -491,6 +482,7 @@ class MainControlOrchestrator:
             qos_feedback = round_execution.qos_feedback
             mobility_feedback = round_execution.mobility_feedback
             diagnosis = round_execution.diagnosis
+            round_trace = round_execution.trace.with_agent_elapsed_ms(round_agent_elapsed_ms)
             self._remember("AD", diagnosis)
             state.latest_result = ControlRoundResult(
                 session_id=session_id,
@@ -502,16 +494,8 @@ class MainControlOrchestrator:
                 mobility_feedback=mobility_feedback,
                 diagnosis=diagnosis,
                 negotiation_request={},
-                planning_blocker=(
-                    round_execution.planning_blocker.model_dump(mode="json")
-                    if round_execution.planning_blocker is not None
-                    else {}
-                ),
-                execution_reentry=(
-                    round_execution.execution_reentry.model_dump(mode="json")
-                    if round_execution.execution_reentry is not None
-                    else {}
-                ),
+                planning_blocker=round_trace.planning_blocker,
+                execution_reentry=round_trace.execution_reentry,
                 round_count=round_index,
                 retry_count=max(0, round_index - 1),
                 round_traces=state.round_traces,
@@ -527,13 +511,9 @@ class MainControlOrchestrator:
                 execution_status=report.execution_status if report is not None else "blocked",
             )
             if state.completed:
-                completed_trace_payload = json.loads(
-                    json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False)
-                )
-                completed_trace_payload["agent_elapsed_ms"] = dict(round_agent_elapsed_ms)
                 append_round_trace(
                     state,
-                    trace_payload=completed_trace_payload,
+                    trace=round_trace,
                 )
                 break
 
@@ -543,54 +523,20 @@ class MainControlOrchestrator:
                 and report.feedback_payload.get("retry_forbidden")
             )
 
-            if retry_forbidden and report is not None:
-                report_payload = report.model_dump(mode="json")
-            elif round_execution.execution_reentry is not None:
-                report_payload = build_reentry_report_payload(round_execution.execution_reentry)
-            elif round_execution.planning_blocker is not None:
-                report_payload = {
-                    "execution_status": "Failed",
-                    "violation_details": round_execution.planning_blocker.summary,
-                    "feedback_payload": {
-                        "missing_evidence": list(round_execution.planning_blocker.missing_evidence or []),
-                        "blocked_targets": list(round_execution.planning_blocker.blocked_targets or []),
-                        "upstream_requests": list(round_execution.planning_blocker.upstream_requests or []),
-                        "planner_conflicts": list(round_execution.planning_blocker.planner_conflicts or []),
-                    },
-                }
-            elif report is not None:
-                report_payload = report.model_dump(mode="json")
-            else:
-                report_payload = {
-                    "execution_status": "Failed",
-                    "violation_details": diagnosis.get("reason_summary") or "round execution failed",
-                }
-            previous_planning_blocker = (
-                round_execution.planning_blocker.model_dump(mode="json")
-                if round_execution.planning_blocker is not None
-                else {}
-            )
-            previous_execution_reentry = (
-                round_execution.execution_reentry.model_dump(mode="json")
-                if round_execution.execution_reentry is not None
-                else {}
-            )
-            trace_payload = json.loads(json.dumps(round_execution.trace, default=lambda obj: obj.__dict__, ensure_ascii=False))
-            trace_payload["agent_elapsed_ms"] = dict(round_agent_elapsed_ms)
-            trace_payload["pda_feedback"] = dict(report_payload)
-            trace_payload["mediator_decision"] = dict(round_execution.mediator_decision_payload)
-            trace_payload["planning_blocker"] = previous_planning_blocker
-            trace_payload["execution_reentry"] = previous_execution_reentry
+            retry_trace = round_execution.retry_trace(
+                prefer_execution_reentry=True,
+            ).with_agent_elapsed_ms(round_agent_elapsed_ms)
+            report_payload = retry_trace.pda_feedback
             feedback_added = build_round_feedback_block(
                 pda_feedback=report_payload,
                 diagnosis=diagnosis,
-                domain_verdicts=round_execution.domain_verdict_payloads,
-                mediator_decision=round_execution.mediator_decision_payload,
-                planning_blocker=previous_planning_blocker,
-                execution_reentry=previous_execution_reentry,
+                domain_verdicts=retry_trace.domain_verdicts,
+                mediator_decision=retry_trace.mediator_decision,
+                planning_blocker=retry_trace.planning_blocker,
+                execution_reentry=retry_trace.execution_reentry,
                 round_index=round_index,
             )
-            append_round_trace(state, trace_payload=trace_payload, feedback_added=feedback_added)
+            append_round_trace(state, trace=retry_trace, feedback_added=feedback_added)
             if retry_forbidden:
                 log_event(
                     self.main_agent.logger,
@@ -690,13 +636,6 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Maximum guard-loop ticks. Use 0 for continuous guarding.",
     )
     parser.add_argument(
-        "--monitor-context-chars",
-        dest="monitor_context_chars",
-        type=int,
-        default=4000,
-        help="Maximum previous-control context characters passed to monitor reentry.",
-    )
-    parser.add_argument(
         "--monitor-max-reentries",
         dest="monitor_max_reentries",
         type=int,
@@ -722,7 +661,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         orchestrator = MainControlOrchestrator(max_rounds=args.max_rounds, use_local_model=True, use_deepseek=args.use_deepseek)
         if args.watch:
-            from control_runtime.monitoring import ConsoleUserInputSource, build_default_autonomous_watch_loop
+            from control_runtime.monitoring.watch_loop import ConsoleUserInputSource, build_default_autonomous_watch_loop
 
             console_source = ConsoleUserInputSource(prompt="control> ")
             initial_user_input = str(args.user_input or "").strip()
@@ -738,7 +677,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             watch_loop = build_default_autonomous_watch_loop(
                 orchestrator=orchestrator,
                 user_input_source=user_input_source,
-                previous_context_max_chars=args.monitor_context_chars,
                 poll_interval_seconds=args.watch_interval,
                 max_monitor_reentries_per_iteration=args.monitor_max_reentries,
             )

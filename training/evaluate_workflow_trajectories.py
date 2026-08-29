@@ -2,22 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_ROOT = PACKAGE_ROOT.parent
-SRC_ROOT = PACKAGE_ROOT / "src"
-for candidate in (WORKSPACE_ROOT, PACKAGE_ROOT, SRC_ROOT):
-    candidate_text = str(candidate)
-    if candidate_text not in sys.path:
-        sys.path.insert(0, candidate_text)
-
-from agents.BaseAgent import BaseAgent
-from training.common import ensure_agent_layout, load_projected_trace_records, processed_dir, repo_root
+from shared.agents import BaseAgent
+from training.artifacts import PROJECT_ROOT, processed_dir, read_jsonl, write_json, write_jsonl
+from training.projection import load_projected_trace_records
 from training.schemas import ProjectedTraceRecord
 
 
@@ -88,33 +80,6 @@ Rules:
 
 Return only the requested structured JSON.
 """.strip()
-
-
-def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    if not path.exists():
-        return rows
-    with path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            text = line.strip()
-            if not text:
-                continue
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise TypeError(f"{path}:{line_number} JSONL row must be an object")
-            rows.append(payload)
-    return rows
-
-
-def _write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    count = 0
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False))
-            handle.write("\n")
-            count += 1
-    return count
 
 
 def discover_trace_files(root: Path) -> Dict[str, Path]:
@@ -335,9 +300,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    ensure_agent_layout("workflow")
-    run_records = _read_jsonl(args.run_records)
-    session_traces = load_traces_by_session(repo_root())
+    run_records = read_jsonl(args.run_records)
+    session_traces = load_traces_by_session(PROJECT_ROOT)
     llm = BaseAgent(model_name=args.model, temperature=0.0).get_llm()
 
     evaluation_rows: List[Dict[str, Any]] = []
@@ -368,7 +332,7 @@ def main() -> None:
             evaluate_workflow_record(record, session_traces.get(session_id, {}), llm)
         )
 
-    _write_jsonl(args.output, evaluation_rows)
+    write_jsonl(args.output, evaluation_rows)
 
     total = len(evaluation_rows)
     workflow_passed = sum(1 for row in evaluation_rows if (row.get("workflow_judgement") or {}).get("passed"))
@@ -392,8 +356,7 @@ def main() -> None:
         "tool_eval_pass_rate": round(tool_eval_passed / tool_eval_total, 4) if tool_eval_total else 0.0,
         "output": str(args.output),
     }
-    args.summary_output.parent.mkdir(parents=True, exist_ok=True)
-    args.summary_output.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(args.summary_output, summary)
 
     print(f"Evaluated {total} workflow records")
     print(f"Workflow pass rate: {summary['workflow_pass_rate']:.2%}")

@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
-from ..domain.collaboration import DomainNegotiationRequest, ExecutionReentryRequest
-from ..domain.control_plane import GlobalControlIntent
-from ..domain.policy_plan import GroundingDecision
+from ..agents.grounding.contracts import GroundingDecision
+from ..agents.main.contracts import GlobalControlIntent
+from .contracts import DomainNegotiationRequest, ExecutionReentryRequest
 
 
 def build_planning_failure_payload(
@@ -36,6 +36,32 @@ def build_planning_failure_payload(
         "debug_context": dict(debug_context or {}),
     }
     return report_payload, diagnosis
+
+
+def scope_global_intent_for_intent_encoding(
+    *,
+    global_intent: GlobalControlIntent,
+    round_index: int,
+) -> GlobalControlIntent:
+    semantics = global_intent.control_semantics
+    stages = list(semantics.stages or [])
+    if not stages:
+        return global_intent
+
+    ordered_stages = sorted(stages, key=lambda stage: int(stage.stage_index or 0))
+    scoped_position = min(max(1, int(round_index or 1)), len(ordered_stages)) - 1
+    scoped_stage = ordered_stages[scoped_position].model_copy(deep=True)
+    scoped_semantics = semantics.model_copy(
+        update={
+            "current_stage": 1,
+            "stages": [scoped_stage.model_copy(update={"stage_index": 1}, deep=True)],
+        },
+        deep=True,
+    )
+    return global_intent.model_copy(
+        update={"control_semantics": scoped_semantics},
+        deep=True,
+    )
 
 
 def has_supi_scope(global_intent: GlobalControlIntent) -> bool:
@@ -153,5 +179,6 @@ __all__ = [
     "build_planning_failure_payload",
     "build_reentry_report_payload",
     "has_supi_scope",
+    "scope_global_intent_for_intent_encoding",
     "should_reuse_grounding_decision",
 ]

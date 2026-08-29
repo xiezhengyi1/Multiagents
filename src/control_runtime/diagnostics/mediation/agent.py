@@ -3,19 +3,21 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, List, Set
 
-from shared.runtime import ArtifactEnvelope
+from shared.runtime import ArtifactEnvelope, RuntimePersistence
 from shared.runtime import ArtifactWorkerMixin
-from ...domain.control_plane import ControlDomain, RevisionRequest, UnifiedConstraintSet
+from application_runtime.persistence import create_runtime_persistence
+from ...contracts import ControlDomain
 
-from .contracts import ConflictResolutionRequest, ConflictResolutionResult
+from .contracts import ConflictResolutionRequest, ConflictResolutionResult, RevisionRequest, UnifiedConstraintSet
 
 
 class ConflictResolutionTool(ArtifactWorkerMixin):
     AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
 
-    def __init__(self) -> None:
+    def __init__(self, *, persistence: RuntimePersistence | None = None) -> None:
         self.agent_name = "conflict_resolution"
-        self.init_worker_runtime()
+        runtime_persistence = persistence if persistence is not None else create_runtime_persistence()
+        self.init_worker_runtime(persistence=runtime_persistence)
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> ConflictResolutionResult:
         request = ConflictResolutionRequest.model_validate(envelope.payload)
@@ -629,14 +631,12 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
 
         if not conflicts:
             return ConflictResolutionResult(
-                status="no_conflict",
                 mediator_status="approved",
                 reason_summary="No policy conflicts were detected from explicit planner, binding, or cross-domain evidence.",
                 unified_constraints=UnifiedConstraintSet(),
             )
 
         mediator_status = "revise" if unresolved_conflicts else "approved"
-        status = "unresolved" if unresolved_conflicts else "resolved"
         if unresolved_conflicts:
             reason_summary = f"Detected {len(unresolved_conflicts)} blocking conflict(s) that require planner revision before execution."
         else:
@@ -652,7 +652,6 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
         )
 
         return ConflictResolutionResult(
-            status=status,
             mediator_status=mediator_status,
             conflicts=conflicts,
             affected_policy_ids=affected_policy_ids,

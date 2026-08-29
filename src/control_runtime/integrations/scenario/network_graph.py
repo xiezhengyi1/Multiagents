@@ -147,7 +147,7 @@ class NetworkGraph:
             "metric_count": len(self.graph.graph.get("metrics", [])),
         }
 
-    def to_compatibility_snapshot(self) -> Dict[str, Any]:
+    def to_scenario_snapshot(self) -> Dict[str, Any]:
         apps: Dict[str, Dict[str, Any]] = {}
         slices: List[Dict[str, Any]] = []
         nodes: List[Dict[str, Any]] = []

@@ -11,6 +11,5 @@ class FeedbackReport(BaseModel):
     failure_scope: str = Field(default="none", description="Raw failure scope observed during execution: qos, mobility, mixed, compile, or none")
     feedback_payload: Dict[str, Any] = Field(default_factory=dict, description="Machine-readable execution facts for upstream agents")
     dispatch_attempts: int = Field(default=0, description="How many dispatch attempts the execution controller used in this round")
-    committed_snapshot_id: str = Field(default="", description="Snapshot id produced by the final commit writeback")
 
 __all__ = ["FeedbackReport"]

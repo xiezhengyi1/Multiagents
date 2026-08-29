@@ -3,10 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -18,19 +17,15 @@ from shared.tools import tool_with_reason
 
 from shared.runtime import AgentRuntimeContext
 from database.langchain_pg import (
-    PCF_AM_POLICY_CLAUSES_COLLECTION,
-    PCF_AM_POLICY_SCHEMA_COLLECTION,
-    PCF_SM_POLICY_CLAUSES_COLLECTION,
-    PCF_SM_POLICY_SCHEMA_COLLECTION,
-    PCF_URSP_CLAUSES_COLLECTION,
-    PCF_URSP_SCHEMA_COLLECTION,
     get_pgvector_store,
 )
+from knowledge_build.rag_release import COLLECTIONS, CORPUS_ID, RELEASE, SOURCE_CONFIGS
 from knowledge_build.scripts.build_pcf_policy_kb import (
     CLAUSE_EXACT_INDEX_JSON,
     CLAUSE_JSONL,
     GLOSSARY_EXACT_INDEX_JSON,
     GLOSSARY_JSONL,
+    MANIFEST_PATH,
     SCHEMA_EXACT_INDEX_JSON,
     SCHEMA_JSONL,
     SPEC_OBJECT_MAP_JSON,
@@ -45,6 +40,14 @@ from knowledge_runtime.retrieval.colbert_retriever import get_colbert_retriever
 logger = setup_logger(__name__)
 
 
+PCF_AM_POLICY_CLAUSES_COLLECTION = COLLECTIONS["am_clause"]
+PCF_AM_POLICY_SCHEMA_COLLECTION = COLLECTIONS["am_schema"]
+PCF_SM_POLICY_CLAUSES_COLLECTION = COLLECTIONS["sm_clause"]
+PCF_SM_POLICY_SCHEMA_COLLECTION = COLLECTIONS["sm_schema"]
+PCF_URSP_CLAUSES_COLLECTION = COLLECTIONS["ursp_clause"]
+PCF_URSP_SCHEMA_COLLECTION = COLLECTIONS["ursp_schema"]
+
+
 DEFAULT_RETURNED_RESULTS = 10
 MAX_RETURNED_RESULTS = 30
 MAX_CONTENT_CHARS = 1200
@@ -54,10 +57,6 @@ BGE_RERANK_INPUT_CHARS = 3200
 BGE_RERANK_TERM_CHARS = 700
 RRF_K = 60.0
 RRF_SCORE_SCALE = 1000.0
-DEBUG_STAGE_TIMEOUT_SECONDS = max(
-    1,
-    int(str(os.getenv("KNOWLEDGE_DEBUG_STAGE_TIMEOUT_SECONDS", "30")).strip() or "30"),
-)
 LEXICAL_CANDIDATE_LIMIT = 24
 MAX_RERANK_POOL = 24
 CROSS_SPEC_SEED_LIMIT = 4
@@ -302,6 +301,7 @@ OPERATION_QUERY_KEYWORDS = (
     "patch",
 )
 REQUIRED_KB_PATHS = (
+    MANIFEST_PATH,
     CLAUSE_JSONL,
     SCHEMA_JSONL,
     GLOSSARY_JSONL,
@@ -325,7 +325,7 @@ def _log_prefix(runtime: ToolRuntime[AgentRuntimeContext] = None) -> str:
     )
 
 
-def _load_json(path: Path) -> Dict[str, Any]:
+def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -725,10 +725,80 @@ def _ensure_processed_corpus() -> Tuple[Path, ...]:
     missing = [path for path in REQUIRED_KB_PATHS if not Path(path).exists()]
     if missing:
         raise FileNotFoundError(
-            "PCF policy knowledge base is not built. Missing files: "
+            f"Release-{RELEASE} PCF policy corpus {CORPUS_ID} is not built. Missing files: "
             + ", ".join(str(path) for path in missing)
             + ". Run `python knowledge_build/scripts/build_pcf_policy_kb.py build` first."
         )
+
+    manifest = _load_json(MANIFEST_PATH)
+    if not isinstance(manifest, list):
+        raise RuntimeError(
+            f"Release-{RELEASE} PCF policy corpus {CORPUS_ID} has an invalid source manifest: "
+            f"{MANIFEST_PATH} must contain a JSON list."
+        )
+
+    expected_source_ids = [source.source_id for source in SOURCE_CONFIGS]
+    if len(expected_source_ids) != len(set(expected_source_ids)):
+        raise RuntimeError(
+            f"Release-{RELEASE} PCF policy corpus {CORPUS_ID} has duplicate canonical source IDs."
+        )
+    expected_sources = {source.source_id: source for source in SOURCE_CONFIGS}
+
+    manifest_source_ids: List[str] = []
+    invalid_sources: List[str] = []
+    for source in manifest:
+        if not isinstance(source, dict):
+            invalid_sources.append("non-object entry")
+            continue
+        source_id = str(source.get("source_id") or "").strip()
+        if not source_id:
+            invalid_sources.append("missing source_id")
+            continue
+        manifest_source_ids.append(source_id)
+        source_release = str(source.get("release") or "").strip()
+        if source_release != str(RELEASE):
+            invalid_sources.append(
+                f"{source_id}: release={source_release or '<missing>'} expected={RELEASE}"
+            )
+        expected_source = expected_sources.get(source_id)
+        if expected_source is None:
+            continue
+        for field_name in ("spec_version", "version", "source_url", "archive_url"):
+            actual_value = str(source.get(field_name) or "").strip()
+            expected_value = str(getattr(expected_source, field_name)).strip()
+            if actual_value != expected_value:
+                invalid_sources.append(
+                    f"{source_id}: {field_name}={actual_value or '<missing>'} "
+                    f"expected={expected_value}"
+                )
+
+    expected_source_id_set = set(expected_source_ids)
+    manifest_source_id_set = set(manifest_source_ids)
+    duplicate_source_ids = sorted(
+        source_id for source_id in manifest_source_id_set if manifest_source_ids.count(source_id) > 1
+    )
+    if (
+        invalid_sources
+        or duplicate_source_ids
+        or manifest_source_id_set != expected_source_id_set
+        or len(manifest_source_ids) != len(expected_source_ids)
+    ):
+        details: List[str] = []
+        if invalid_sources:
+            details.append("invalid=" + ", ".join(invalid_sources))
+        if duplicate_source_ids:
+            details.append("duplicate=" + ", ".join(duplicate_source_ids))
+        missing_source_ids = sorted(expected_source_id_set - manifest_source_id_set)
+        if missing_source_ids:
+            details.append("missing=" + ", ".join(missing_source_ids))
+        unexpected_source_ids = sorted(manifest_source_id_set - expected_source_id_set)
+        if unexpected_source_ids:
+            details.append("unexpected=" + ", ".join(unexpected_source_ids))
+        raise RuntimeError(
+            f"Release-{RELEASE} PCF policy corpus {CORPUS_ID} source manifest does not match "
+            f"the canonical Release-{RELEASE} source set ({'; '.join(details)})."
+        )
+
     return tuple(Path(path) for path in REQUIRED_KB_PATHS)
 
 
@@ -2096,62 +2166,143 @@ def _render_result(candidate: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _assemble_response(query: str, domain: str, *, limit: int = DEFAULT_RETURNED_RESULTS) -> Tuple[List[Dict[str, Any]], List[str]]:
-    intent = _query_intent(query, domain)
-    direct = _direct_record_matches(query, domain)
-    glossary = _glossary_strong_candidates(query, domain)
-    domain_special = [
-        *_schema_object_graph_candidates(query, domain),
-        *_schema_definition_candidates(query, domain),
-        *_sm_qos_requirement_candidates(query, domain),
-        *_am_rfsp_clause_candidates(query, domain),
-        *_operation_intent_candidates(query, domain),
-    ]
-    exact = _exact_search_candidates(query, domain)
-    rerank_pool_limit = max(limit * 4, MAX_RERANK_POOL)
-    dense: List[Dict[str, Any]] = []
-    cross_spec: List[Dict[str, Any]] = []
-    errors: List[str] = []
+@dataclass(frozen=True)
+class RetrievalStage:
+    name: str
+    duration_ms: float
+    candidate_count: Optional[int] = None
+    errors: Tuple[str, ...] = ()
+    skipped: bool = False
 
+
+RetrievalObserver = Callable[[RetrievalStage], None]
+
+
+def _emit_retrieval_stage(
+    observer: Optional[RetrievalObserver],
+    stage: str,
+    duration_ms: float,
+    candidate_count: Optional[int] = None,
+    errors: Iterable[str] = (),
+    skipped: bool = False,
+) -> None:
+    if observer is None:
+        return
+    try:
+        observer(RetrievalStage(
+            stage, round(duration_ms, 2), candidate_count, tuple(errors), skipped
+        ))
+    except Exception:
+        logger.debug("knowledge retrieval observer failed: %s", stage, exc_info=True)
+
+
+def _observe_retrieval_stage(
+    observer: Optional[RetrievalObserver],
+    stage: str,
+    operation: Callable[[], Any],
+    *,
+    candidates: bool = False,
+    result_errors: bool = False,
+) -> Any:
+    started = time.perf_counter()
+    try:
+        result = operation()
+    except Exception as exc:
+        _emit_retrieval_stage(observer, stage, (time.perf_counter() - started) * 1000.0, errors=(str(exc),))
+        raise
+    _emit_retrieval_stage(
+        observer,
+        stage,
+        (time.perf_counter() - started) * 1000.0,
+        candidate_count=len(result[0]) if result_errors else len(result) if candidates else None,
+        errors=result[1] if result_errors else (),
+    )
+    return result
+
+
+def _observe_retrieval_skip(
+    observer: Optional[RetrievalObserver],
+    stage: str,
+    *,
+    candidate_count: int = 0,
+) -> None:
+    _emit_retrieval_stage(observer, stage, 0.0, candidate_count, skipped=True)
+
+
+def _run_retrieval_pipeline(
+    query: str,
+    domain: str,
+    *,
+    limit: int = DEFAULT_RETURNED_RESULTS,
+    observer: Optional[RetrievalObserver] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    def stage(name: str, operation: Callable[[], Any], **options: Any) -> Any:
+        return _observe_retrieval_stage(observer, name, operation, **options)
+
+    intent = stage("query_intent", lambda: _query_intent(query, domain))
+    direct = stage("direct_record_matches", lambda: _direct_record_matches(query, domain), candidates=True)
+    glossary = stage("glossary_strong_candidates", lambda: _glossary_strong_candidates(query, domain), candidates=True)
+    domain_special = stage(
+        "domain_special_candidates",
+        lambda: [
+            *_schema_object_graph_candidates(query, domain),
+            *_schema_definition_candidates(query, domain),
+            *_sm_qos_requirement_candidates(query, domain),
+            *_am_rfsp_clause_candidates(query, domain),
+            *_operation_intent_candidates(query, domain),
+        ],
+        candidates=True,
+    )
+    exact = stage("exact_search_candidates", lambda: _exact_search_candidates(query, domain), candidates=True)
+    rerank_pool_limit = max(limit * 4, MAX_RERANK_POOL)
     use_colbert = _colbert_available()
 
-    def _dense_search(q: str, d: str) -> Tuple[List[Dict[str, Any]], List[str]]:
-        if use_colbert:
-            return _colbert_search_candidates(q, d, top_k=20)
-        return _vector_search_candidates(q, d)
-
-    def _final_rerank(q: str, candidates: Iterable[Dict[str, Any]], *, n: int) -> List[Dict[str, Any]]:
-        if use_colbert:
-            return _colbert_rerank_candidates(q, candidates, limit=n)
-        return _bge_rerank_candidates(q, domain, candidates, limit=n)
-
     if intent == "exact_identifier":
-        seeds = _dedupe_candidates([*direct, *glossary, *exact], limit=rerank_pool_limit)
-        if len(seeds) < limit:
-            dense, errors = _dense_search(query, domain)
-        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
+        seed_inputs = [*direct, *glossary, *exact]
     elif intent == "glossary_term":
-        seeds = _dedupe_candidates([*glossary, *direct, *exact], limit=rerank_pool_limit)
-        dense, errors = _dense_search(query, domain)
-        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
-    elif intent == "operation_lookup":
-        seeds = _dedupe_candidates([*domain_special, *direct, *exact], limit=rerank_pool_limit)
-        dense, errors = _dense_search(query, domain)
-        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
-    elif intent == "clause_location":
-        seeds = _dedupe_candidates([*domain_special, *direct, *exact], limit=rerank_pool_limit)
-        dense, errors = _dense_search(query, domain)
-        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
+        seed_inputs = [*glossary, *direct, *exact]
+    elif intent in {"operation_lookup", "clause_location"}:
+        seed_inputs = [*domain_special, *direct, *exact]
     elif intent == "schema_relation":
-        seeds = _dedupe_candidates([*domain_special, *direct, *exact, *glossary], limit=rerank_pool_limit)
-        cross_spec = _expand_cross_spec_candidates(seeds, domain, query)
-        dense, errors = _dense_search(query, domain)
-        combined = _dedupe_candidates([*seeds, *cross_spec, *dense], limit=rerank_pool_limit)
+        seed_inputs = [*domain_special, *direct, *exact, *glossary]
     else:
-        seeds = _dedupe_candidates([*direct, *glossary, *domain_special, *exact], limit=rerank_pool_limit)
-        dense, errors = _dense_search(query, domain)
-        combined = _dedupe_candidates([*seeds, *dense], limit=rerank_pool_limit)
-    return _final_rerank(query, combined, n=limit), errors
+        seed_inputs = [*direct, *glossary, *domain_special, *exact]
+    seeds = stage("seed_dedupe", lambda: _dedupe_candidates(seed_inputs, limit=rerank_pool_limit), candidates=True)
+
+    cross_spec: List[Dict[str, Any]] = []
+    if intent == "schema_relation":
+        cross_spec = stage("expand_cross_spec_candidates", lambda: _expand_cross_spec_candidates(seeds, domain, query), candidates=True)
+    else:
+        _observe_retrieval_skip(observer, "expand_cross_spec_candidates")
+
+    dense: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    dense_stage = "colbert_search_candidates" if use_colbert else "vector_search_candidates"
+    if intent != "exact_identifier" or len(seeds) < limit:
+        dense, errors = stage(
+            dense_stage,
+            lambda: (
+                _colbert_search_candidates(query, domain, top_k=20)
+                if use_colbert
+                else _vector_search_candidates(query, domain)
+            ),
+            result_errors=True,
+        )
+    else:
+        _observe_retrieval_skip(observer, dense_stage)
+
+    combined = stage("combined_dedupe", lambda: _dedupe_candidates([*seeds, *cross_spec, *dense], limit=rerank_pool_limit), candidates=True)
+    rerank_stage = "colbert_rerank_candidates" if use_colbert else "bge_rerank_candidates"
+    reranked = stage(
+        rerank_stage,
+        lambda: (
+            _colbert_rerank_candidates(query, combined, limit=limit)
+            if use_colbert
+            else _bge_rerank_candidates(query, domain, combined, limit=limit)
+        ),
+        candidates=True,
+    )
+    return reranked, errors
 
 
 def _format_results(
@@ -2185,246 +2336,42 @@ def _format_results(
     return "\n\n---\n\n".join(blocks)
 
 
-def debug_search_semantic_knowledge_pipeline(
+def run_semantic_knowledge_pipeline(
     query: str,
     category: Optional[str] = None,
     limit: int = DEFAULT_RETURNED_RESULTS,
     *,
-    verbose: bool = True,
-    stage_timeout_seconds: int = DEBUG_STAGE_TIMEOUT_SECONDS,
-) -> Dict[str, Any]:
-    """
-    调试 search_semantic_knowledge 的内部链路。
-
-    返回每个阶段的耗时、候选数、错误信息和最终结果预览，用于定位是
-    exact/glossary、PGVector embedding 检索，还是 BGE rerank 出现阻塞。
-    """
+    observer: Optional[RetrievalObserver] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Run the canonical retrieval path, optionally emitting stage diagnostics."""
     normalized_query = str(query or "").strip()
     if not normalized_query:
         raise ValueError("query must not be empty")
 
-    sanitized_limit = _sanitize_limit(limit)
-    timings_ms: Dict[str, float] = {}
-    counts: Dict[str, int] = {}
-    debug_errors: List[str] = []
     total_start = time.perf_counter()
-
-    def _emit(message: str) -> None:
-        if verbose:
-            print(f"[knowledge-debug] {message}", flush=True)
-
-    class _StageTimeoutError(TimeoutError):
-        pass
-
-    def _run_with_timeout(stage_name: str, func):
-        if stage_timeout_seconds <= 0:
-            return func()
-        previous_handler = signal.getsignal(signal.SIGALRM)
-
-        def _handle_timeout(_signum, _frame):
-            raise _StageTimeoutError(f"{stage_name} timed out after {stage_timeout_seconds}s")
-
-        signal.signal(signal.SIGALRM, _handle_timeout)
-        signal.alarm(stage_timeout_seconds)
-        try:
-            return func()
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, previous_handler)
-
-    stage_start = time.perf_counter()
-    _emit("stage=ensure_processed_corpus start")
-    _ensure_processed_corpus()
-    timings_ms["ensure_processed_corpus"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=ensure_processed_corpus done duration_ms={timings_ms['ensure_processed_corpus']}")
-
-    stage_start = time.perf_counter()
-    _emit("stage=infer_policy_domain start")
-    domain = _infer_policy_domain(normalized_query, category)
-    timings_ms["infer_policy_domain"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=infer_policy_domain done duration_ms={timings_ms['infer_policy_domain']} domain={domain}")
-
-    stage_start = time.perf_counter()
-    _emit("stage=query_intent start")
-    intent = _query_intent(normalized_query, domain)
-    timings_ms["query_intent"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=query_intent done duration_ms={timings_ms['query_intent']} intent={intent}")
-
-    stage_start = time.perf_counter()
-    _emit("stage=direct_record_matches start")
-    direct = _direct_record_matches(normalized_query, domain)
-    counts["direct"] = len(direct)
-    timings_ms["direct_record_matches"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=direct_record_matches done duration_ms={timings_ms['direct_record_matches']} count={counts['direct']}")
-
-    stage_start = time.perf_counter()
-    _emit("stage=glossary_strong_candidates start")
-    glossary = _glossary_strong_candidates(normalized_query, domain)
-    counts["glossary"] = len(glossary)
-    timings_ms["glossary_strong_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=glossary_strong_candidates done duration_ms={timings_ms['glossary_strong_candidates']} count={counts['glossary']}")
-
-    stage_start = time.perf_counter()
-    _emit("stage=domain_special_candidates start")
-    domain_special = [
-        *_schema_object_graph_candidates(normalized_query, domain),
-        *_schema_definition_candidates(normalized_query, domain),
-        *_sm_qos_requirement_candidates(normalized_query, domain),
-        *_am_rfsp_clause_candidates(normalized_query, domain),
-        *_operation_intent_candidates(normalized_query, domain),
-    ]
-    counts["domain_special"] = len(domain_special)
-    timings_ms["domain_special_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=domain_special_candidates done duration_ms={timings_ms['domain_special_candidates']} count={counts['domain_special']}")
-
-    stage_start = time.perf_counter()
-    _emit("stage=exact_search_candidates start")
-    exact = _exact_search_candidates(normalized_query, domain)
-    counts["exact"] = len(exact)
-    timings_ms["exact_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=exact_search_candidates done duration_ms={timings_ms['exact_search_candidates']} count={counts['exact']}")
-
-    rerank_pool_limit = max(sanitized_limit * 4, 20)
-    stage_start = time.perf_counter()
-    _emit("stage=seed_dedupe start")
-    if intent == "exact_identifier":
-        seed_inputs = [*direct, *glossary, *exact]
-    elif intent == "glossary_term":
-        seed_inputs = [*glossary, *direct, *exact]
-    elif intent in {"operation_lookup", "clause_location"}:
-        seed_inputs = [*domain_special, *direct, *exact]
-    elif intent == "schema_relation":
-        seed_inputs = [*domain_special, *direct, *exact, *glossary]
-    else:
-        seed_inputs = [*direct, *glossary, *domain_special, *exact]
-    seeds = _dedupe_candidates(seed_inputs, limit=rerank_pool_limit)
-    counts["seeds"] = len(seeds)
-    timings_ms["seed_dedupe"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=seed_dedupe done duration_ms={timings_ms['seed_dedupe']} count={counts['seeds']}")
-
-    cross_spec: List[Dict[str, Any]] = []
-    if intent == "schema_relation":
-        stage_start = time.perf_counter()
-        _emit("stage=expand_cross_spec_candidates start")
-        cross_spec = _run_with_timeout(
-            "expand_cross_spec_candidates",
-            lambda: _expand_cross_spec_candidates(seeds, domain, normalized_query, emit=_emit),
+    try:
+        _observe_retrieval_stage(
+            observer,
+            "ensure_processed_corpus",
+            _ensure_processed_corpus,
         )
-        counts["cross_spec"] = len(cross_spec)
-        timings_ms["expand_cross_spec_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-        _emit(f"stage=expand_cross_spec_candidates done duration_ms={timings_ms['expand_cross_spec_candidates']} count={counts['cross_spec']}")
-    else:
-        counts["cross_spec"] = 0
-        timings_ms["expand_cross_spec_candidates"] = 0.0
-
-    use_colbert = _colbert_available()
-    dense_errors: List[str] = []
-    stage_start = time.perf_counter()
-    if use_colbert:
-        _emit("stage=colbert_search_candidates start")
-        try:
-            dense, dense_errors = _run_with_timeout(
-                "colbert_search_candidates",
-                lambda: _colbert_search_candidates(normalized_query, domain, top_k=20),
-            )
-        except Exception as exc:
-            dense_errors = [f"colbert_search_exception: {exc}"]
-        counts["colbert"] = len(dense)
-        debug_errors.extend(dense_errors)
-        timings_ms["colbert_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-        _emit(
-            f"stage=colbert_search_candidates done duration_ms={timings_ms['colbert_search_candidates']} count={counts['colbert']} errors={len(dense_errors)}"
+        domain = _observe_retrieval_stage(
+            observer,
+            "infer_policy_domain",
+            lambda: _infer_policy_domain(normalized_query, category),
         )
-    else:
-        _emit("stage=vector_search_candidates start")
-        try:
-            dense, dense_errors = _run_with_timeout(
-                "vector_search_candidates",
-                lambda: _vector_search_candidates(normalized_query, domain),
-            )
-        except Exception as exc:
-            dense_errors = [f"vector_search_exception: {exc}"]
-        counts["vector"] = len(dense)
-        debug_errors.extend(dense_errors)
-        timings_ms["vector_search_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-        _emit(
-            f"stage=vector_search_candidates done duration_ms={timings_ms['vector_search_candidates']} count={counts['vector']} errors={len(dense_errors)}"
+        return _run_retrieval_pipeline(
+            normalized_query,
+            domain,
+            limit=limit,
+            observer=observer,
         )
-
-    stage_start = time.perf_counter()
-    _emit("stage=combined_dedupe start")
-    combined = _dedupe_candidates([*seeds, *cross_spec, *dense], limit=rerank_pool_limit)
-    counts["combined"] = len(combined)
-    timings_ms["combined_dedupe"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    _emit(f"stage=combined_dedupe done duration_ms={timings_ms['combined_dedupe']} count={counts['combined']}")
-
-    reranked: List[Dict[str, Any]] = []
-    rerank_error = ""
-    stage_start = time.perf_counter()
-    if use_colbert:
-        _emit("stage=colbert_rerank_candidates start")
-        try:
-            reranked = _run_with_timeout(
-                "colbert_rerank_candidates",
-                lambda: _colbert_rerank_candidates(normalized_query, combined, limit=sanitized_limit),
-            )
-        except Exception as exc:
-            rerank_error = str(exc)
-            debug_errors.append(f"colbert_rerank_exception: {exc}")
-        counts["reranked"] = len(reranked)
-        timings_ms["colbert_rerank_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-        _emit(
-            f"stage=colbert_rerank_candidates done duration_ms={timings_ms['colbert_rerank_candidates']} count={counts['reranked']} error={'yes' if rerank_error else 'no'}"
+    finally:
+        _emit_retrieval_stage(
+            observer,
+            "total",
+            duration_ms=(time.perf_counter() - total_start) * 1000.0,
         )
-    else:
-        _emit("stage=bge_rerank_candidates start")
-        try:
-            reranked = _run_with_timeout(
-                "bge_rerank_candidates",
-                lambda: _bge_rerank_candidates(normalized_query, domain, combined, limit=sanitized_limit),
-            )
-        except Exception as exc:
-            rerank_error = str(exc)
-            debug_errors.append(f"rerank_exception: {exc}")
-        counts["reranked"] = len(reranked)
-        timings_ms["bge_rerank_candidates"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-        _emit(
-            f"stage=bge_rerank_candidates done duration_ms={timings_ms['bge_rerank_candidates']} count={counts['reranked']} error={'yes' if rerank_error else 'no'}"
-        )
-
-    stage_start = time.perf_counter()
-    _emit("stage=format_results start")
-    formatted_result = _format_results(
-        normalized_query,
-        reranked,
-        debug_errors,
-        include_selection_guide=True,
-    )
-    timings_ms["format_results"] = round((time.perf_counter() - stage_start) * 1000.0, 2)
-    timings_ms["total"] = round((time.perf_counter() - total_start) * 1000.0, 2)
-    _emit(f"stage=format_results done duration_ms={timings_ms['format_results']}")
-    _emit(f"stage=total done duration_ms={timings_ms['total']}")
-
-    def _candidate_keys(items: List[Dict[str, Any]], *, top_k: int = 5) -> List[str]:
-        keys: List[str] = []
-        for candidate in items[:top_k]:
-            keys.append(_candidate_key(candidate["metadata"], candidate.get("id") or ""))
-        return keys
-
-    return {
-        "query": normalized_query,
-        "category": category,
-        "domain": domain,
-        "limit": sanitized_limit,
-        "counts": counts,
-        "timings_ms": timings_ms,
-        "errors": debug_errors,
-        "rerank_error": rerank_error,
-        "seed_keys": _candidate_keys(seeds),
-        "combined_keys": _candidate_keys(combined),
-        "reranked_keys": _candidate_keys(reranked),
-        "result_preview": formatted_result[:2000],
-    }
 
 
 @tool_with_reason
@@ -2435,7 +2382,7 @@ def search_semantic_knowledge(
     runtime: ToolRuntime[AgentRuntimeContext] = None,
 ) -> str:
     """
-    Search the Release-18 PCF policy standards knowledge base with exact and dense retrieval.
+    Search the canonical Release-19 PCF policy standards knowledge base with exact and dense retrieval.
     The optional `category` is treated as a domain hint (`sm_policy` or `ursp`), not the old business category field.
     """
     normalized_query = str(query or "").strip()
@@ -2443,11 +2390,9 @@ def search_semantic_knowledge(
         return "No relevant knowledge found for an empty query."
 
     try:
-        _ensure_processed_corpus()
-        domain = _infer_policy_domain(normalized_query, category)
-        candidates, errors = _assemble_response(
+        candidates, errors = run_semantic_knowledge_pipeline(
             normalized_query,
-            domain,
+            category=category,
             limit=_sanitize_limit(limit),
         )
         return _format_results(
@@ -2500,8 +2445,9 @@ def get_knowledge_by_key(
 
 
 __all__ = [
-    "debug_search_semantic_knowledge_pipeline",
     "get_knowledge_by_key",
+    "RetrievalStage",
+    "run_semantic_knowledge_pipeline",
     "search_semantic_knowledge",
 ]
 

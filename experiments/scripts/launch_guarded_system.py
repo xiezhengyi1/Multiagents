@@ -27,7 +27,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=3, help="Max rounds inside MainControlOrchestrator.")
     parser.add_argument("--watch-interval", type=float, default=1.0, help="Seconds between watch-loop ticks.")
     parser.add_argument("--watch-iterations", type=int, default=0, help="0 means guard continuously.")
-    parser.add_argument("--monitor-context-chars", type=int, default=4000, help="Context budget for monitor-triggered reentry.")
     parser.add_argument("--deepseek", action="store_true", help="Use deepseek-v4-flash for all control agents.")
     parser.add_argument("--keep-live-graph", action="store_true", help="Do not delete the previous live graph snapshot before startup.")
     return parser.parse_args()
@@ -73,8 +72,6 @@ def main() -> None:
             str(args.max_rounds),
             "--watch-interval",
             str(args.watch_interval),
-            "--monitor-context-chars",
-            str(args.monitor_context_chars),
         ]
         if int(args.watch_iterations or 0) > 0:
             command.extend(["--watch-iterations", str(args.watch_iterations)])

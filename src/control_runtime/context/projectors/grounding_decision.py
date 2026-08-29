@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...domain.policy_plan import GroundingDecision
+from ...agents.grounding.contracts import GroundingDecision
 from .base import BaseProjector, exclude, field, json_mapping, without_empty_values
 from .flow_selector import FlowSelectorProjector
 

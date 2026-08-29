@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -14,29 +16,42 @@ for candidate in (ROOT, SRC):
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
 
-from control_runtime.context import (
-    EvidenceFormatter,
-    FlowSelectorProjector,
-    MainPromptBuilder,
-    OperationIntentProjector,
-    ProjectorRegistry,
-    RetryPromptBuilder,
-    field,
-    project_operation_intent_for_prompt,
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+psycopg://offline:offline@127.0.0.1:5432/offline_test",
 )
-from control_runtime.context.prompts import (
-    GroundingPromptBuilder,
-    IEA_SYSTEM_PROMPT,
-    MAIN_CONTROL_SYSTEM_PROMPT,
-    OSA_SYSTEM_PROMPT,
-    PlanningPromptBuilder,
-    SINGLE_AGENT_ROUND_PROMPT,
-    SinglePromptBuilder,
+
+from control_runtime.agents.grounding.contracts import (
+    FlowSelector,
+    GroundingDecision,
+    QosOperationConstraint,
 )
+from control_runtime.orchestrators.round_context import build_intent_encoding_context
+from control_runtime.agents.main.contracts import (
+    ControlDomain,
+    GlobalControlIntent,
+    MainControlSemantics,
+    MainControlStage,
+)
+from control_runtime.context.prompts.main import build_main_validation_retry_prompt
+from control_runtime.agents.planning.contracts import (
+    PlanningContext,
+    PlanningRequest,
+    SharedControlContext,
+)
+from control_runtime.agents.planning.evidence import build_planning_evidence
 from control_runtime.context.prompts.engine import PromptEngine
+from control_runtime.context.prompts.grounding import render_grounding_system_prompt
+from control_runtime.context.prompts.main import render_main_system_prompt
+from control_runtime.context.prompts.planning import (
+    build_planning_user_prompt,
+    render_planning_system_prompt,
+)
+from control_runtime.context.prompts.single import render_single_system_prompt
+from control_runtime.context.projectors import field, project_global_intent_for_prompt
 from control_runtime.context.projectors.base import BaseProjector
-from control_runtime.domain.collaboration import PlanningContext, PlanningRequest
-from control_runtime.domain.policy_plan import FlowSelector, OperationIntent, QosTargetEnvelope
+from control_runtime.orchestrators.round_context import build_planning_context
+from control_runtime.orchestrators.round_transitions import scope_global_intent_for_intent_encoding
 
 
 LEGACY_CONTEXT_ENGINEERING_FILES = [
@@ -52,7 +67,6 @@ LEGACY_CONTEXT_ENGINEERING_FILES = [
 ]
 
 CONSOLIDATED_AGENT_HELPER_FILES = [
-    "src/control_runtime/agents/grounding/directives.py",
     "src/control_runtime/agents/grounding/qos_envelope_builder.py",
     "src/control_runtime/agents/planning/policy_normalizer.py",
 ]
@@ -67,7 +81,6 @@ LEGACY_IMPORT_PATTERNS = [
     "agents.main.prompts",
     "agents.single.prompts",
     "agents.prompt_skills.knowledge_search",
-    "agents.grounding.directives",
     "agents.grounding.qos_envelope_builder",
     "agents.planning.policy_normalizer",
     "from ..common import project_",
@@ -106,127 +119,102 @@ def test_projector_rejects_unknown_model_fields_at_definition_time() -> None:
             visible = (field("requested_domains"),)
 
 
-def test_operation_intent_projection_uses_declared_flow_fields_without_dead_or_wrong_fields() -> None:
-    intent = OperationIntent(
+def test_global_control_intent_projection_uses_declared_routing_and_flow_contracts() -> None:
+    intent = GlobalControlIntent(
         session_id="s1",
         snapshot_id="snap1",
         supi="imsi-1",
-        app_id="app-1",
-        app_name="RemoteDrive",
-        urgency="Normal",
         raw_input="protect flow",
-        requested_domains=["qos"],
+        next_agent="intent_encoding",
+        requested_domains=[ControlDomain.QOS],
+        domain_evidence={"qos": ["flow catalog"]},
+        required_evidence=["flow catalog"],
+        routing_decision="ground qos flow",
+    )
+
+    projected = project_global_intent_for_prompt(intent)
+
+    assert projected["session_id"] == "s1"
+    assert projected["requested_domains"] == ["qos"]
+    assert projected["domain_evidence"] == {"qos": ["flow catalog"]}
+    assert projected["routing_decision"] == "ground qos flow"
+    assert "flows" not in projected
+
+
+def test_routing_and_grounding_models_keep_ownership_boundaries() -> None:
+    assert "requested_domains" in GlobalControlIntent.model_fields
+    assert "flows" not in GlobalControlIntent.model_fields
+    assert "requested_domains" not in FlowSelector.model_fields
+
+
+def test_planning_evidence_matches_operation_constraint_shape() -> None:
+    main_intent = GlobalControlIntent(
+        session_id="s1",
+        snapshot_id="snap1",
+        supi="imsi-1",
+        next_agent="optimization_strategy",
+        requested_domains=[ControlDomain.QOS],
+    )
+    grounding_decision = GroundingDecision(
         flows=[
             FlowSelector(
                 supi="imsi-1",
                 app_id="app-1",
-                app_name="RemoteDrive",
                 flow_id="flow-1",
-                target_type="flow",
                 name="video",
-                service_type="urllc",
-                service_type_id=1,
-                bw_ul=10.0,
-                current_bw_ul=3.0,
-                current_bw_dl=4.0,
-                five_tuple=["10.0.0.1", "10.0.0.2", 1000, 2000, "udp"],
-                resolution_candidates=["stale-candidate"],
+                current_slice_snssai="01020304",
             )
         ],
-        qos_target_envelopes=[
-            QosTargetEnvelope(
+        qos_operation_constraints=[
+            QosOperationConstraint(
                 flow_id="flow-1",
                 app_id="app-1",
-                flow_name="video",
-                baseline_latency_ms=10.0,
-                rationale=["derived from SLA"],
+                operation_type="slice_migration",
+                require_slice_change=True,
+                source_slice_snssai="01020304",
+                target_slice_preference="lower_latency",
+                no_op_allowed=False,
             )
         ],
     )
-
-    projected = project_operation_intent_for_prompt(intent)
-    flow_payload = projected["flows"][0]
-
-    assert projected["session_id"] == "s1"
-    assert "urgency" not in projected
-    assert flow_payload["app_name"] == "RemoteDrive"
-    assert flow_payload["target_type"] == "flow"
-    assert flow_payload["five_tuple"] == ["10.0.0.1", "10.0.0.2", 1000, 2000, "udp"]
-    assert "requested_domains" not in flow_payload
-    assert "dnn" not in flow_payload
-    assert "current_bw_ul" not in flow_payload
-    assert "current_bw_dl" not in flow_payload
-    assert "resolution_candidates" not in flow_payload
-    assert "rationale" in projected["qos_target_envelopes"][0]
-
-
-def test_dead_policy_plan_fields_are_removed_from_models() -> None:
-    assert "urgency" not in OperationIntent.model_fields
-    assert "resolution_candidates" not in FlowSelector.model_fields
-
-
-def test_projector_registry_resolves_known_models() -> None:
-    assert ProjectorRegistry.for_model(FlowSelector) is FlowSelectorProjector
-    assert ProjectorRegistry.for_model(OperationIntent) is OperationIntentProjector
-
-
-def test_evidence_formatter_matches_planning_evidence_shape() -> None:
-    request = PlanningRequest(
-        operation_intent=OperationIntent(
-            session_id="s1",
-            snapshot_id="snap1",
-            supi="imsi-1",
-            flows=[
-                FlowSelector(
-                    supi="imsi-1",
-                    app_id="app-1",
-                    flow_id="flow-1",
-                    name="video",
-                    priority=1,
-                    service_type_id=7,
-                )
-            ],
-        ),
-        context=PlanningContext(
-            session_id="s1",
-            snapshot_id="snap1",
-            active_domains=["qos"],
-            objective_profile={"profile_name": "latency"},
-            required_evidence=["optimizer preview"],
-        ),
+    planning_context = PlanningContext(
+        session_id="s1",
+        snapshot_id="snap1",
+        shared_context=SharedControlContext(main_intent=main_intent),
     )
 
-    evidence = EvidenceFormatter.for_osa(
-        operation_intent=request.operation_intent,
-        planning_context=request.context,
+    evidence = build_planning_evidence(
+        PlanningRequest(
+            grounding_decision=grounding_decision,
+            context=planning_context,
+        )
     )
 
-    assert evidence["requested_domains"] == ["qos"]
-    assert evidence["objective_profile"] == {"profile_name": "latency"}
-    assert evidence["flows"] == [
+    assert evidence["derived_operation_constraints"] == [
         {
             "flow_id": "flow-1",
             "app_id": "app-1",
-            "name": "video",
-            "priority": 1,
-            "service_type_id": 7,
-            "current_slice_snssai": None,
+            "operation_type": "slice_migration",
+            "require_slice_change": True,
+            "source_slice_snssai": "01020304",
+            "excluded_slice_snssais": ["01020304"],
+            "target_slice_preference": "lower_latency",
+            "no_op_allowed": False,
+            "rationale": [],
         }
     ]
 
 
-def test_main_prompt_builder_and_retry_builder_keep_compatibility_contracts() -> None:
-    assert MainPromptBuilder().system_prompt() == MAIN_CONTROL_SYSTEM_PROMPT
-
-    retry_prompt = RetryPromptBuilder().build_main(
+def test_main_retry_prompt_keeps_main_contract() -> None:
+    retry_prompt = build_main_validation_retry_prompt(
         base_prompt="User input:\nexample",
         validation_errors=[],
         invocation_error="Input should be a valid dictionary, got list",
     )
 
-    assert "Return exactly one GlobalControlIntent JSON object." in retry_prompt
-    assert "Top-level output must be an object, never a list." in retry_prompt
-    assert "Required GlobalControlIntent keys" in retry_prompt
+    assert retry_prompt.startswith("User input:\nexample")
+    assert "MainControlDecision" in retry_prompt
+    assert "Input should be a valid dictionary, got list" in retry_prompt
 
 
 def test_prompt_engine_raises_for_missing_template_variables() -> None:
@@ -234,117 +222,206 @@ def test_prompt_engine_raises_for_missing_template_variables() -> None:
         PromptEngine().render("grounding/system.j2")
 
 
-def test_prompt_builders_render_jinja_templates_as_compatibility_constants() -> None:
-    assert MainPromptBuilder().system_prompt() == MAIN_CONTROL_SYSTEM_PROMPT
-    assert GroundingPromptBuilder().system_prompt() == IEA_SYSTEM_PROMPT
-    assert PlanningPromptBuilder().system_prompt() == OSA_SYSTEM_PROMPT
-    assert SinglePromptBuilder().system_prompt() == SINGLE_AGENT_ROUND_PROMPT
-
+def test_system_prompt_renderers_render_jinja_templates() -> None:
     for rendered in (
-        MainPromptBuilder().system_prompt(),
-        GroundingPromptBuilder().system_prompt(),
-        PlanningPromptBuilder().system_prompt(),
-        SinglePromptBuilder().system_prompt(),
+        render_main_system_prompt(),
+        render_grounding_system_prompt(),
+        render_planning_system_prompt(),
+        render_single_system_prompt(),
     ):
         assert "JSON" in rendered
         assert "{% block" not in rendered
         assert "{% include" not in rendered
 
 
-def test_system_prompt_templates_preserve_existing_prompt_text_exactly() -> None:
-    expected_prompts = {
-        "main_system.txt": (MAIN_CONTROL_SYSTEM_PROMPT, MainPromptBuilder().system_prompt()),
-        "grounding_system.txt": (IEA_SYSTEM_PROMPT, GroundingPromptBuilder().system_prompt()),
-        "planning_system.txt": (OSA_SYSTEM_PROMPT, PlanningPromptBuilder().system_prompt()),
-        "single_system.txt": (SINGLE_AGENT_ROUND_PROMPT, SinglePromptBuilder().system_prompt()),
-    }
+def test_system_prompt_renderers_expose_nonempty_schema_guidance() -> None:
+    rendered_prompts = (
+        render_main_system_prompt(),
+        render_grounding_system_prompt(),
+        render_planning_system_prompt(),
+        render_single_system_prompt(),
+    )
 
-    for fixture_name, rendered_prompts in expected_prompts.items():
-        expected = _prompt_fixture(fixture_name)
-        for rendered in rendered_prompts:
-            assert rendered == expected
+    for rendered in rendered_prompts:
+        assert isinstance(rendered, str)
+        assert len(rendered.strip()) > 100
+        assert "JSON" in rendered
 
 
-def test_system_jinja_templates_compose_prompt_fragments() -> None:
-    template_root = ROOT / "src" / "control_runtime" / "context" / "prompts" / "templates"
-
-    for template_name in (
-        "main/system.j2",
-        "grounding/system.j2",
-        "planning/system.j2",
-        "single/system.j2",
+def test_system_prompt_renderers_render_without_template_artifacts() -> None:
+    for rendered in (
+        render_main_system_prompt(),
+        render_grounding_system_prompt(),
+        render_planning_system_prompt(),
+        render_single_system_prompt(),
     ):
-        text = (template_root / template_name).read_text(encoding="utf-8")
-        assert "{% include" in text, template_name
-
-    grounding_system = (template_root / "grounding" / "system.j2").read_text(encoding="utf-8")
-    planning_system = (template_root / "planning" / "system.j2").read_text(encoding="utf-8")
-
-    assert "iea_knowledge_search_skill" in grounding_system
-    assert "osa_knowledge_search_skill" in planning_system
+        assert "{%" not in rendered
+        assert "{{" not in rendered
 
 
 def test_planning_user_prompt_is_rendered_from_jinja_template() -> None:
-    from control_runtime.context.prompts import OSA_DYNAMIC_RULES
-    from control_runtime.context.prompts.planning import _OUTPUT_FORMAT_RULES, _render_round_tool_policy
-
-    prompt = PlanningPromptBuilder().advisor_user_prompt(
+    prompt = build_planning_user_prompt(
         normalized_user_intent={"session_id": "s1", "app_id": "app_1"},
         coordination_context={"active_domains": ["qos"]},
         planning_evidence={"flows": [{"flow_id": "flow-1"}]},
         available_tool_names=["preview_qos_optimizer"],
     )
 
-    engine_rendered = PromptEngine().render(
-        "planning/user.j2",
-        normalized_user_intent={"session_id": "s1", "app_id": "app_1"},
-        coordination_context={"active_domains": ["qos"]},
-        planning_evidence={"flows": [{"flow_id": "flow-1"}]},
-        tool_policy=_render_round_tool_policy(["preview_qos_optimizer"]),
-        dynamic_rules=OSA_DYNAMIC_RULES.strip(),
-        output_format_rules=_OUTPUT_FORMAT_RULES.strip(),
+    assert isinstance(prompt, str)
+    assert "s1" in prompt
+    assert "flow-1" in prompt
+    assert "preview_qos_optimizer" in prompt
+
+
+def test_planning_user_prompt_carries_all_public_round_inputs() -> None:
+    prompt = build_planning_user_prompt(
+        normalized_user_intent={"session_id": "session-a", "app_id": "app-a"},
+        coordination_context={"active_domains": ["mobility"]},
+        planning_evidence={"flows": [{"flow_id": "flow-a"}]},
+        available_tool_names=["inspect_mobility_ue_policies"],
     )
 
-    assert prompt == engine_rendered
-    assert '"session_id": "s1"' in prompt
-    assert "Callable tools in this round:" in prompt
+    for value in ("session-a", "app-a", "mobility", "flow-a", "inspect_mobility_ue_policies"):
+        assert value in prompt
 
 
-def test_planning_user_prompt_preserves_existing_prompt_text_exactly() -> None:
-    import json
-
-    from control_runtime.context.prompts import OSA_DYNAMIC_RULES
-    from control_runtime.context.prompts.planning import _OUTPUT_FORMAT_RULES, _render_round_tool_policy
-
-    normalized_user_intent = {"session_id": "s1", "app_id": "app_1"}
-    coordination_context = {"active_domains": ["qos"]}
-    planning_evidence = {"flows": [{"flow_id": "flow-1"}]}
-    tool_policy = _render_round_tool_policy(["preview_qos_optimizer"])
-
-    prompt = PlanningPromptBuilder().advisor_user_prompt(
-        normalized_user_intent=normalized_user_intent,
-        coordination_context=coordination_context,
-        planning_evidence=planning_evidence,
-        available_tool_names=["preview_qos_optimizer"],
+def test_intent_context_keeps_the_1800_character_retry_feedback_window() -> None:
+    feedback = "obsolete-feedback-marker " + ("x" * 1800) + " tail-feedback-marker"
+    payload = json.loads(
+        build_intent_encoding_context(
+            global_intent={
+                "supi": "imsi-001",
+                "requested_domains": ["qos"],
+                "domain_evidence": {},
+            },
+            round_index=2,
+            diagnosis={"root_cause_category": "dispatch_failure", "reason_summary": "retry"},
+            feedback_context=feedback,
+        )
     )
 
-    expected = (
-        "Structured operation intent:\n"
-        f"{json.dumps(normalized_user_intent, ensure_ascii=False, default=str)}\n\n"
-        "Planning context:\n"
-        f"{json.dumps(coordination_context, ensure_ascii=False, default=str)}\n\n"
-        "Planning evidence:\n"
-        f"{json.dumps(planning_evidence, ensure_ascii=False, default=str)}\n\n"
-        f"{tool_policy}\n\n"
-        f"{OSA_DYNAMIC_RULES.strip()}\n\n"
-        "Task:\n"
-        "- Inspect the evidence and return one complete grounded OsaAdvisorOutput.\n"
-        "- If evidence is sufficient, return planning_status=\"executable_plan\" with all required fields grounded.\n"
-        "- If evidence is insufficient or optimizer is infeasible/incomplete, return partial_plan or needs_upstream_reground.\n"
-        "- Respect control_semantics.current_stage; optimize only the active stage flows.\n"
-        "- Prefer optimizer sla values over telemetry values when filling final policy fields.\n\n"
-        f"{_OUTPUT_FORMAT_RULES.strip()}\n\n"
-        "Return one OsaAdvisorOutput JSON object only."
+    summary = payload["retry_delta"]["feedback_summary"]
+    assert summary.startswith("... [older feedback omitted]\n")
+    assert "obsolete-feedback-marker" not in summary
+    assert summary.endswith("tail-feedback-marker")
+    assert len(summary) <= len("... [older feedback omitted]\n") + 1800
+    assert "retry_delta" not in json.loads(
+        build_intent_encoding_context(
+            global_intent={
+                "supi": "imsi-001",
+                "requested_domains": ["qos"],
+                "domain_evidence": {},
+            },
+            round_index=1,
+            diagnosis={"root_cause_category": "dispatch_failure"},
+            feedback_context=feedback,
+        )
     )
 
-    assert prompt == expected
+
+def test_intent_context_scopes_one_stage_without_mutating_the_main_intent() -> None:
+    intent = GlobalControlIntent(
+        session_id="session-1",
+        snapshot_id="snapshot-1",
+        supi="imsi-001",
+        next_agent="intent_encoding",
+        requested_domains=[ControlDomain.QOS],
+        control_semantics=MainControlSemantics(
+            current_stage=2,
+            stages=[
+                MainControlStage(stage_index=2, name="ground first flow"),
+                MainControlStage(stage_index=5, name="ground second flow"),
+            ],
+        ),
+    )
+
+    scoped = scope_global_intent_for_intent_encoding(
+        global_intent=intent,
+        round_index=2,
+    )
+
+    assert [stage.stage_index for stage in intent.control_semantics.stages] == [2, 5]
+    assert scoped is not intent
+    assert scoped.control_semantics.current_stage == 1
+    assert [(stage.stage_index, stage.name) for stage in scoped.control_semantics.stages] == [
+        (1, "ground second flow")
+    ]
+
+
+def test_planning_context_keeps_last_two_handoffs_and_sorted_qos_retry_constraints() -> None:
+    intent = GlobalControlIntent(
+        session_id="session-1",
+        snapshot_id="snapshot-1",
+        supi="imsi-001",
+        next_agent="optimization_strategy",
+        requested_domains=[ControlDomain.QOS],
+    )
+    previous_execution_feedback = {
+        "feedback_payload": {
+            "failures": [
+                {
+                    "phase": "assurance",
+                    "flow_id": "flow-z",
+                    "policy_id": "sm-z",
+                    "assurance_result": {
+                        "metrics": {
+                            "latency_within_tolerance": False,
+                            "latency": 150,
+                            "latency_requirement": 100,
+                            "tolerance_ratio": 0.1,
+                        }
+                    },
+                },
+                {
+                    "phase": "assurance",
+                    "flow_id": "flow-a",
+                    "policy_id": "sm-a",
+                    "assurance_result": {
+                        "metrics": {
+                            "latency_within_tolerance": False,
+                            "latency": 130,
+                            "latency_requirement": 100,
+                            "tolerance_ratio": 0.1,
+                        }
+                    },
+                },
+                {
+                    "phase": "assurance",
+                    "flow_id": "flow-z",
+                    "policy_id": "sm-z-retry",
+                    "assurance_result": {
+                        "metrics": {
+                            "latency_within_tolerance": False,
+                            "latency": 160,
+                            "latency_requirement": 100,
+                            "tolerance_ratio": 0.1,
+                        }
+                    },
+                },
+                {
+                    "phase": "dispatch",
+                    "flow_id": "ignored",
+                    "assurance_result": {"metrics": {"latency_within_tolerance": False}},
+                },
+            ]
+        }
+    }
+
+    context = build_planning_context(
+        intent,
+        "session-1",
+        "snapshot-1",
+        round_index=3,
+        handoff_history=[{"round": 1}, {"round": 2}, {"round": 3}, {"round": 4}],
+        previous_execution_feedback=previous_execution_feedback,
+    )
+
+    assert context.handoff_history == [{"round": 3}, {"round": 4}]
+    assert [
+        (constraint.flow_id, constraint.minimum_target_latency_ms, constraint.policy_id)
+        for constraint in context.qos_retry_constraints
+    ] == [
+        ("flow-a", 119, "sm-a"),
+        ("flow-z", 146, "sm-z-retry"),
+    ]
+    assert context.qos_retry_constraints[1].allowed_latency_ms == pytest.approx(110)

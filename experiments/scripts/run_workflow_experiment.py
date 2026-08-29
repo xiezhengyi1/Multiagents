@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from training.collect_workflow_trajectories import collect_workflow_trajectories, load_user_input_records
-from training.common import processed_dir
+from training.artifacts import processed_dir
 from experiments.scripts.common import parse_task_ids, reset_simulator_state, write_json
 
 

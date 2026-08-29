@@ -4,7 +4,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from .api import AgentWorkspace, ArtifactCache, ArtifactEnvelope, ArtifactStore, FileTaskQueue
+from .core import AgentWorkspace
+from .storage import ArtifactCache, ArtifactEnvelope, ArtifactStore, FileTaskQueue, RuntimePersistence
 
 
 class ArtifactWorkerMixin:
@@ -13,19 +14,29 @@ class ArtifactWorkerMixin:
     cache: ArtifactCache
     artifact_store: ArtifactStore
     queue: FileTaskQueue
+    runtime_persistence: RuntimePersistence
 
-    def init_worker_runtime(self, *, lease_seconds: int = 60) -> None:
+    def init_worker_runtime(self, *, persistence: RuntimePersistence, lease_seconds: int = 60) -> None:
+        self.runtime_persistence = persistence
         self.workspace = AgentWorkspace.for_agent(self.agent_name)
         self.cache = ArtifactCache(self.workspace)
-        self.artifact_store = ArtifactStore()
-        self.queue = FileTaskQueue(self.agent_name, lease_seconds=lease_seconds)
+        self.artifact_store = ArtifactStore(persistence=persistence)
+        self.queue = FileTaskQueue(
+            self.agent_name,
+            persistence=persistence,
+            lease_seconds=lease_seconds,
+            artifact_store=self.artifact_store,
+        )
 
     def ensure_worker_runtime_initialized(self) -> None:
         agent_name = str(getattr(self, "agent_name", "") or "").strip()
         if not agent_name:
             raise RuntimeError("agent_name must be defined before worker runtime initialization")
         if not hasattr(self, "workspace") or not hasattr(self, "cache") or not hasattr(self, "artifact_store") or not hasattr(self, "queue"):
-            self.init_worker_runtime()
+            persistence = getattr(self, "runtime_persistence", None)
+            if persistence is None:
+                raise RuntimeError("worker runtime requires an explicit RuntimePersistence instance")
+            self.init_worker_runtime(persistence=persistence)
 
     def expected_request_type(self) -> str:
         raise NotImplementedError
@@ -44,6 +55,55 @@ class ArtifactWorkerMixin:
         if isinstance(result, dict):
             return result
         raise TypeError(f"Unsupported worker result payload: {type(result).__name__}")
+
+    def cache_received_artifact(
+        self,
+        *,
+        artifact_type: str,
+        payload: Any,
+        source_agent: str = "coordinator",
+        session_id: str = "",
+        snapshot_id: str = "",
+        target_agent: Optional[str] = None,
+    ) -> ArtifactEnvelope:
+        if not hasattr(self, "cache"):
+            raise RuntimeError("cache_received_artifact() requires initialized worker runtime")
+
+        envelope = ArtifactEnvelope(
+            artifact_type=str(artifact_type or "").strip(),
+            source_agent=str(source_agent or "").strip(),
+            target_agent=str(target_agent or getattr(self, "agent_name", "") or "").strip(),
+            session_id=str(session_id or "").strip(),
+            snapshot_id=str(snapshot_id or "").strip(),
+            payload=self.build_response_payload(payload),
+        )
+        self.cache.cache_received(envelope)
+        return envelope
+
+    def cache_produced_artifact(
+        self,
+        *,
+        artifact_type: str,
+        request_envelope: ArtifactEnvelope,
+        payload: Any,
+        source_agent: Optional[str] = None,
+        target_agent: Optional[str] = None,
+    ) -> ArtifactEnvelope:
+        if not hasattr(self, "cache"):
+            raise RuntimeError("cache_produced_artifact() requires initialized worker runtime")
+
+        envelope = ArtifactEnvelope(
+            artifact_type=str(artifact_type or "").strip(),
+            source_agent=str(source_agent or getattr(self, "agent_name", "") or "").strip(),
+            target_agent=str(target_agent or request_envelope.source_agent or "").strip(),
+            session_id=request_envelope.session_id,
+            snapshot_id=request_envelope.snapshot_id,
+            correlation_id=request_envelope.correlation_id,
+            upstream_artifact_ids=[request_envelope.artifact_id],
+            payload=self.build_response_payload(payload),
+        )
+        self.cache.cache_produced(envelope)
+        return envelope
 
     def consume_request_artifact(self, request_path: Path) -> Path:
         self.ensure_worker_runtime_initialized()

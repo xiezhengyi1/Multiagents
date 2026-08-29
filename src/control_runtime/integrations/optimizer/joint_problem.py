@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Tuple
 
-from ...domain.control_plane import JointOptimizationRequest, ObjectiveProfile, OptimizationProblemConfig, OptimizationTemplate
+from ...contracts import ObjectiveProfile
+from .contracts import JointOptimizationRequest, OptimizationProblemConfig, OptimizationTemplate
 
 
 def resolve_problem_config(request: JointOptimizationRequest) -> Tuple[OptimizationProblemConfig, ObjectiveProfile]:

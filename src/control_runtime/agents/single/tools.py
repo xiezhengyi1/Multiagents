@@ -8,13 +8,18 @@ from langchain.tools import ToolRuntime
 from shared.runtime import AgentRuntimeContext
 from shared.tools.wrapper_think import tool_with_reason
 
-from ...context.evidence import EvidenceFormatter
-from ...domain.collaboration import PlanningContext, PlanningRequest, SharedControlContext
-from ...domain.control_plane import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
-from ...domain.policy_plan import FlowSelector, GroundingDecision
 from ...integrations.scenario.network_status import get_network_status_summary
 from ...integrations.storage import get_ue_context_by_supi, get_ue_flow_catalog_by_supi
-from ..planning.tools import _serialize_optimizer_result, _summarize_optimizer_result
+from ...integrations.optimizer.contracts import OptimizerInput
+from ...integrations.optimizer.request_factory import build_optimizer_request
+from ...integrations.optimizer.result_view import (
+    serialize_optimizer_result,
+    summarize_optimizer_result,
+)
+from ..grounding.contracts import FlowSelector, GroundingDecision
+from ...contracts import ControlDomain, ObjectiveProfile
+from ..main.contracts import GlobalControlIntent, MainRoundStrategy
+from ..planning.contracts import PlanningContext, PlanningRequest, SharedControlContext
 
 
 FLOW_CATALOG_KEYS = ("supi", "app_id", "app_name", "flow_id", "flow_name")
@@ -176,72 +181,6 @@ def _flow_selector_from_catalog(flow: Dict[str, Any], supi: str) -> FlowSelector
     )
 
 
-def _profile_request_signals(objective_profile: str) -> Dict[str, bool]:
-    lowered = str(objective_profile or "").strip().lower()
-    return {
-        "latency": any(token in lowered for token in ("latency", "low_latency", "delay", "fast")),
-        "jitter": any(token in lowered for token in ("stability", "stable", "jitter")),
-        "reliability": any(token in lowered for token in ("stability", "stable", "reliability", "control")),
-        "throughput": any(token in lowered for token in ("throughput", "bandwidth", "capacity")),
-        "uplink_only": "uplink" in lowered,
-        "downlink_only": "downlink" in lowered,
-        "strong_control": any(token in lowered for token in ("stability", "control", "medical", "industrial")),
-    }
-
-
-def _derive_strictest_latency(baseline: Optional[float], request_signals: Dict[str, bool]) -> Optional[float]:
-    if baseline is None:
-        return None
-    factor = 1.0
-    if request_signals.get("latency"):
-        factor = 0.9
-    if request_signals.get("strong_control"):
-        factor = min(factor, 0.85)
-    return round(max(baseline * factor, 1.0), 3)
-
-
-def _derive_strictest_jitter(baseline: Optional[float], request_signals: Dict[str, bool]) -> Optional[float]:
-    if baseline is None:
-        return None
-    factor = 1.0
-    if request_signals.get("jitter") or request_signals.get("reliability"):
-        factor = 0.9
-    if request_signals.get("strong_control"):
-        factor = min(factor, 0.85)
-    return round(max(baseline * factor, 0.0), 3)
-
-
-def _derive_strictest_loss(baseline: Optional[float], request_signals: Dict[str, bool]) -> Optional[float]:
-    if baseline is None:
-        return None
-    factor = 1.0
-    if request_signals.get("reliability") or request_signals.get("jitter"):
-        factor = 0.9
-    if request_signals.get("strong_control"):
-        factor = min(factor, 0.85)
-    return round(max(baseline * factor, 0.0), 6)
-
-
-def _derive_strictest_bandwidth(
-    baseline: Optional[float],
-    request_signals: Dict[str, bool],
-    *,
-    direction: str,
-) -> Optional[float]:
-    if baseline is None:
-        return None
-    if not request_signals.get("throughput"):
-        return round(max(baseline, 0.0), 3)
-    if request_signals.get("uplink_only") and direction == "dl":
-        return round(max(baseline, 0.0), 3)
-    if request_signals.get("downlink_only") and direction == "ul":
-        return round(max(baseline, 0.0), 3)
-    factor = 1.1
-    if request_signals.get("strong_control"):
-        factor = 1.05
-    return round(max(baseline * factor, 0.0), 3)
-
-
 def _build_runtime_planning_request(
     *,
     supi: str,
@@ -279,6 +218,33 @@ def _build_runtime_planning_request(
     )
 
 
+def _optimizer_input_from_planning_request(planning_request: PlanningRequest) -> OptimizerInput:
+    main_intent = planning_request.context.shared_context.main_intent
+    candidates = [main_intent.supi]
+    candidates.extend(
+        target.supi
+        for stage in main_intent.control_semantics.stages
+        for target in stage.targets
+    )
+    candidates.extend(flow.supi for flow in planning_request.grounding_decision.flows)
+    target_supis = list(
+        dict.fromkeys(
+            normalized
+            for candidate in candidates
+            if (normalized := str(candidate or "").strip())
+        )
+    )
+    return OptimizerInput(
+        session_id=planning_request.context.session_id,
+        snapshot_id=planning_request.context.snapshot_id,
+        target_supis=target_supis,
+        requested_domains=main_intent.requested_domains,
+        grounding_decision=planning_request.grounding_decision.model_dump(mode="json"),
+        objective_profile=main_intent.objective_profile,
+        raw_intent=main_intent.raw_input,
+    )
+
+
 def build_single_agent_tools(
     *,
     rag_enabled: bool,
@@ -313,17 +279,17 @@ def build_single_agent_tools(
             snapshot_id=_runtime_snapshot_id(runtime),
         )
         result = run_optimizer(
-            EvidenceFormatter.for_optimizer(
-                planning_request,
+            build_optimizer_request(
+                _optimizer_input_from_planning_request(planning_request),
                 profile_name=str(objective_profile or "").strip().lower(),
                 template_name="joint_balanced",
                 qos_relaxation_ratio=0.2,
                 slice_kpi_source="qos",
             )
         )
-        full_payload = _serialize_optimizer_result(result)
+        full_payload = serialize_optimizer_result(result)
         return json.dumps(
-            {"summary": _summarize_optimizer_result(full_payload)},
+            {"summary": summarize_optimizer_result(full_payload)},
             ensure_ascii=False,
         )
 
