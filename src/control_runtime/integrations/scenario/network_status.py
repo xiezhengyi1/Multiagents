@@ -1,38 +1,12 @@
 import json
 from typing import Optional
 
-from langchain.tools import ToolRuntime, tool
-
-from shared.tools.wrapper_think import tool_with_reason
-
-from shared.runtime import AgentRuntimeContext
 from dataclasses import asdict
 from .init_scenario import get_current_scenario
 from .network_graph import (
     NetworkGraph,
     get_graph_snapshot_payload,
 )
-
-@tool_with_reason(side_effect="write", result_format="json")
-def save_network_status_snapshot(
-    trigger_event: str = "Manual",
-    runtime: ToolRuntime[AgentRuntimeContext] = None,
-) -> str:
-    """
-    Take a snapshot of the current network status (Apps, Slices, Nodes) and save it to the history database.
-    Useful for tracking system changes before/after optimization or periodically.
-    
-    Args:
-        trigger_event: The reason for taking this snapshot (e.g., 'Before-Optimization', 'Periodic-Monitor').
-        
-    Returns:
-        Status message indicating success or failure.
-    """
-    prefix = ""
-    if runtime is not None:
-        ctx = runtime.context
-        prefix = f"[agent={ctx.agent_name}][session={ctx.session_id}][snapshot={ctx.snapshot_id}] "
-    return f"{prefix}Disabled: agent tools must read an existing network graph by snapshot_id and must not create graph snapshots."
 
 def get_network_status_full():
     """
@@ -153,8 +127,3 @@ def get_network_status_summary(flow_type_id: int = None, snapshot_id: Optional[s
         "slices": slice_status_list,
         "apps": app_summary_list
     }, ensure_ascii=False, indent=2)
-
-if __name__ == "__main__":
-    save_network_status_snapshot(trigger_event="Manual-Test")
-
-

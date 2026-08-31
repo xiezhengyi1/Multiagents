@@ -504,13 +504,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 "get_knowledge_by_key": 1,
                 "search_semantic_knowledge": 1,
             },
-            tool_result_limits={
-                "preview_qos_optimizer": 32000,
-                "fetch_qos_network_status": 32000,
-                "inspect_mobility_ue_policies": 8000,
-                "search_semantic_knowledge": 8000,
-                "get_knowledge_by_key": 8000,
-            },
             context_policy=ContextPolicy(
                 default_tool_result_chars=8000,
                 tool_result_char_limits={
@@ -520,7 +513,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     "search_semantic_knowledge": 8000,
                     "get_knowledge_by_key": 8000,
                 },
-                recent_tool_results_per_tool=1,
             ),
             capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
         )
@@ -623,7 +615,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     schema_name=PolicyPlanDraft.__name__,
                     output_schema=PolicyPlanDraft.model_json_schema(),
                     value=compiler_output,
-                    sft_eligible=False,
                 )
             )
         advisor_trace["agent"].write_trace(

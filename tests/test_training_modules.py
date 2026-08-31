@@ -77,7 +77,6 @@ def _trace(*, trace_id: str = "trace-1", day: int = 1) -> AgentTrace:
                 schema_name="Decision",
                 output_schema=schema,
                 value=response,
-                sft_eligible=True,
             ),
             TraceTarget(
                 kind="validated_output",
@@ -85,7 +84,6 @@ def _trace(*, trace_id: str = "trace-1", day: int = 1) -> AgentTrace:
                 schema_name="GroundingDecision",
                 output_schema=schema,
                 value=response,
-                sft_eligible=False,
             ),
         ],
         status="success",
@@ -159,3 +157,5 @@ def test_workflow_projection_orders_and_flattens_agent_traces() -> None:
         "intent_encoding",
         "intent_encoding",
     ]
+    assert record.scope.session_id == "session-1"
+    assert record.scope.snapshot_id == "snapshot-1"

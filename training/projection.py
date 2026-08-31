@@ -4,7 +4,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from shared.contracts import AgentMessage, AgentTrace
+from shared.contracts import AgentMessage, AgentTrace, ExecutionScope
 from shared.runtime import extract_tool_calls, extract_tool_results
 
 from training.artifacts import raw_trace_path, read_jsonl
@@ -32,11 +32,9 @@ def project_trace(trace: AgentTrace) -> ProjectedTraceRecord:
     observed_targets = [target for target in trace.targets if target.kind == "observed_model_output"]
     return ProjectedTraceRecord(
         trace_id=trace.trace_id,
-        timestamp=trace.started_at.isoformat(),
+        timestamp=trace.started_at,
         agent_name=trace.agent_name,
-        session_id=trace.scope.session_id,
-        snapshot_id=trace.scope.snapshot_id or "",
-        thread_id=trace.scope.thread_id,
+        scope=trace.scope,
         model_name=trace.model_name,
         messages=trace.messages,
         tool_calls=extract_tool_calls(trace.messages),
@@ -44,8 +42,6 @@ def project_trace(trace: AgentTrace) -> ProjectedTraceRecord:
         structured_response=observed_targets[0].value if observed_targets else None,
         status=trace.status,
         error=trace.error,
-        scenario_id=trace.scope.scenario_id,
-        scenario_tags=trace.scope.scenario_tags,
         path_label=trace.metadata.path_label,
         quality_targets=[
             target
@@ -188,19 +184,24 @@ def build_workflow_record(
     session_id = str(record.get("session_id") or "").strip()
     if not session_id:
         raise ValueError("workflow record is missing session_id")
+    snapshot_id = str(record.get("snapshot_id") or "").strip()
+    if not snapshot_id:
+        raise ValueError("workflow record is missing snapshot_id")
     agent_trajectories = {
         agent_name: sort_traces(session_traces.get(agent_name, []))
         for agent_name in agent_order
         if session_traces.get(agent_name)
     }
     return WorkflowTrajectoryRecord(
-        workflow_id=str(record.get("workflow_id") or f"workflow-{session_id}"),
+        scope=ExecutionScope(
+            session_id=session_id,
+            thread_id=session_id,
+            snapshot_id=snapshot_id,
+            scenario_id=str(record.get("scenario_id") or "").strip() or None,
+            scenario_tags=[str(item) for item in record.get("scenario_tags") or []],
+        ),
         record_index=int(record["record_index"]) if record.get("record_index") is not None else None,
-        scenario_id=str(record.get("scenario_id") or "").strip() or None,
-        scenario_tags=[str(item) for item in record.get("scenario_tags") or []],
-        session_id=session_id,
-        snapshot_id=str(record.get("snapshot_id") or ""),
-        status=str(record.get("status") or "unknown"),
+        status=str(record.get("status") or ""),
         completed=bool(record.get("completed")),
         user_input=str(record.get("user_input") or ""),
         messages=list(record.get("messages") or []),

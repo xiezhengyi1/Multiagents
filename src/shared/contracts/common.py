@@ -3,12 +3,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, field_validator
 
 
 CONTRACT_VERSION = "2.0.0"
 ContractVersion = Literal["2.0.0"]
-NonEmptyStr = Annotated[str, Field(min_length=1)]
+NonEmptyStr = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, strict=True),
+]
 
 
 def utc_now() -> datetime:

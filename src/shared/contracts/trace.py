@@ -27,7 +27,10 @@ class TraceTarget(ContractModel):
     schema_name: NonEmptyStr
     output_schema: dict[str, JsonValue]
     value: JsonValue
-    sft_eligible: bool
+
+    @property
+    def sft_eligible(self) -> bool:
+        return self.kind == "observed_model_output"
 
     @model_validator(mode="after")
     def validate_target_provenance(self) -> "TraceTarget":
@@ -39,8 +42,6 @@ class TraceTarget(ContractModel):
         }[self.kind]
         if self.producer != expected:
             raise ValueError(f"target {self.kind} must be produced by {expected}")
-        if self.sft_eligible and self.kind != "observed_model_output":
-            raise ValueError("derived targets require a dedicated prompt contract before SFT export")
         return self
 
 
@@ -59,6 +60,12 @@ class AgentInvocation(ContractModel):
     def validate_invocation_messages(self) -> "AgentInvocation":
         if any(message.role == "system" for message in self.messages):
             raise ValueError("system prompt belongs to the agent contract, not invocation messages")
+        validate_message_sequence(
+            [AgentMessage(role="system", content="runtime-owned system prompt"), *self.messages],
+            require_final_assistant=False,
+        )
+        if self.messages[-1].role != "user":
+            raise ValueError("agent invocation must end with a user message")
         return self
 
 
@@ -96,6 +103,7 @@ class AgentTrace(ContractModel):
         validate_message_sequence(
             self.messages,
             require_final_assistant=self.status == "success",
+            allow_terminal_unresolved_tool_calls=self.status == "error",
         )
         catalog_names = {tool.name for tool in self.tool_catalog.tools}
         called_names = {

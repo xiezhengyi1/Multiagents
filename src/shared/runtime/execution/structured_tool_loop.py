@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable
 
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
+from jsonschema.validators import validator_for
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
-from shared.contracts import AgentInvocation, AgentMessage, AgentRunResult
+from shared.contracts import (
+    AgentInvocation,
+    AgentMessage,
+    AgentRunResult,
+    ToolCatalog,
+    ToolResultFormat,
+)
 from shared.runtime.core.context import AgentRuntimeContext
 from shared.runtime.core.context_policy import ContextPolicy
-from shared.runtime.core.token_budget import TokenCounter, TokenBudget
+from shared.runtime.core.token_budget import TokenCounter
 from shared.runtime.messages import contract_to_message, json_friendly, message_to_contract
 
 
@@ -40,19 +48,14 @@ class StructuredToolLoop:
         *,
         llm: ChatOpenAI,
         tools: Iterable[Any],
+        tool_catalog: ToolCatalog,
         system_prompt: str,
         response_model: type[BaseModel],
         max_iterations: int = 8,
         max_calls_per_tool: int | None = None,
         tool_call_limits: dict[str, int] | None = None,
         forbid_duplicate_tool_calls: bool = False,
-        max_tool_result_chars: int = 8000,
-        tool_result_limits: dict[str, int] | None = None,
-        max_tool_result_tokens: int | None = None,
-        tool_result_token_limits: dict[str, int] | None = None,
-        token_counter: Optional[TokenCounter] = None,
-        token_budget: Optional[TokenBudget] = None,
-        context_policy: Optional[ContextPolicy] = None,
+        context_policy: ContextPolicy | None = None,
     ) -> None:
         self.system_prompt = str(system_prompt or "").strip()
         self.response_model = response_model
@@ -64,18 +67,7 @@ class StructuredToolLoop:
         if any(limit < 1 for limit in self._tool_call_limits.values()):
             raise ValueError("tool_call_limits values must be >= 1")
         self.forbid_duplicate_tool_calls = bool(forbid_duplicate_tool_calls)
-        self.max_tool_result_chars = max(1000, int(max_tool_result_chars))
-        self._tool_result_limits = dict(tool_result_limits or {})
-        self.max_tool_result_tokens = max_tool_result_tokens
-        self._tool_result_token_limits = dict(tool_result_token_limits or {})
-        self._token_counter = token_counter
-        self._token_budget = token_budget
-        self.context_policy = context_policy or ContextPolicy(
-            default_tool_result_chars=self.max_tool_result_chars,
-            default_tool_result_tokens=max_tool_result_tokens or 2000,
-            tool_result_char_limits=self._tool_result_limits,
-            tool_result_token_limits=self._tool_result_token_limits,
-        )
+        self.context_policy = context_policy or ContextPolicy()
         self.tools = list(tools)
         self.tools_by_name: dict[str, Any] = {}
         for tool in self.tools:
@@ -85,6 +77,12 @@ class StructuredToolLoop:
             if name in self.tools_by_name:
                 raise ValueError(f"duplicate tool name: {name}")
             self.tools_by_name[name] = tool
+        self.tool_contracts_by_name = {
+            contract.name: contract
+            for contract in tool_catalog.tools
+        }
+        if self.tools_by_name.keys() != self.tool_contracts_by_name.keys():
+            raise ValueError("runtime tools must exactly match the canonical tool catalog")
         self.llm = llm.bind_tools(self.tools) if self.tools else llm
 
     def _max_calls_for_tool(self, tool_name: str) -> int | None:
@@ -110,17 +108,21 @@ class StructuredToolLoop:
         return str(content)
 
     @staticmethod
-    def _tool_result_to_content(result: Any) -> str:
+    def _tool_result_to_content(result: Any, result_format: ToolResultFormat) -> str:
         if isinstance(result, ToolMessage):
-            if isinstance(result.content, str):
-                return result.content
-            return json.dumps(result.content, ensure_ascii=False)
-        if isinstance(result, str):
+            raise TypeError("tools must return domain data, not protocol-level ToolMessage objects")
+        if result_format == "text":
+            if not isinstance(result, str):
+                raise TypeError("text tools must return a string")
             return result
-        return json.dumps(result, ensure_ascii=False)
+        if isinstance(result, str):
+            parsed = json.loads(result)
+            json.dumps(parsed, ensure_ascii=False, allow_nan=False)
+            return result
+        return json.dumps(json_friendly(result), ensure_ascii=False, allow_nan=False)
 
     @staticmethod
-    def _build_tool_runtime(context: AgentRuntimeContext | None, tool_call_id: str | None):
+    def _build_tool_runtime(context: AgentRuntimeContext, tool_call_id: str | None):
         from langchain.tools import ToolRuntime
 
         return ToolRuntime(
@@ -149,7 +151,7 @@ class StructuredToolLoop:
         tool_name: str,
         args: dict[str, Any],
         *,
-        context: AgentRuntimeContext | None,
+        context: AgentRuntimeContext,
         tool_call_id: str | None,
     ) -> ToolMessage:
         tool = self.tools_by_name.get(tool_name)
@@ -162,14 +164,20 @@ class StructuredToolLoop:
         if "runtime" in inspect.signature(func).parameters:
             kwargs["runtime"] = self._build_tool_runtime(context, tool_call_id)
         result = func(**kwargs)
-        content = self._tool_result_to_content(result)
+        tool_contract = self.tool_contracts_by_name[tool_name]
+        result_format = tool_contract.result_format
+        content = self._tool_result_to_content(result, result_format)
+        if tool_contract.output_schema is not None:
+            output_value = json.loads(content) if result_format == "json" else content
+            validator_class = validator_for(tool_contract.output_schema)
+            try:
+                validator_class(tool_contract.output_schema).validate(output_value)
+            except JsonSchemaValidationError as exc:
+                raise ValueError(
+                    f"tool {tool_name} output violates output_schema: {exc.message}"
+                ) from exc
 
-        content = self.context_policy.compact_tool_result(
-            tool_name,
-            content,
-            token_counter=self._token_counter,
-            token_budget=self._token_budget,
-        )
+        content = self.context_policy.validate_tool_result(tool_name, content)
 
         return ToolMessage(
             content=content,
@@ -182,7 +190,7 @@ class StructuredToolLoop:
         self,
         invocation: AgentInvocation,
         *,
-        context: AgentRuntimeContext | None = None,
+        context: AgentRuntimeContext,
         **kwargs: Any,
     ) -> AgentRunResult:
         conversation: list[BaseMessage] = [SystemMessage(content=self.system_prompt)]
@@ -191,28 +199,24 @@ class StructuredToolLoop:
         tool_call_counts: dict[str, int] = {}
         seen_tool_calls: set[tuple[str, str]] = set()
 
-        if self._token_budget is None and context is not None and context.token_budget is not None:
-            self._token_budget = context.token_budget
-        if self._token_counter is None and context is not None and context.token_counter is not None:
-            self._token_counter = context.token_counter
-
-        if self._token_budget is not None and self._token_counter is not None:
-            sys_tokens = self._token_counter.count(self.system_prompt)
-            self._token_budget.system_prompt_tokens = max(
-                self._token_budget.system_prompt_tokens, sys_tokens
+        token_budget = context.token_budget
+        token_counter = context.token_counter
+        if token_budget is not None and token_counter is not None:
+            sys_tokens = token_counter.count(self.system_prompt)
+            token_budget.system_prompt_tokens = max(
+                token_budget.system_prompt_tokens, sys_tokens
             )
 
         try:
             for _ in range(self.max_iterations):
-                conversation = self.context_policy.compact_tool_history(conversation)
-                if self._token_budget is not None:
+                if token_budget is not None:
                     visible_tokens = (
-                        self._token_counter.count_messages(conversation)
-                        if self._token_counter is not None
+                        token_counter.count_messages(conversation)
+                        if token_counter is not None
                         else sum(self._estimate_message_tokens(message) for message in conversation)
                     )
-                    self._token_budget.record_tokens(
-                        str(getattr(context, "agent_name", "") or "default"),
+                    token_budget.record_tokens(
+                        context.agent_name,
                         visible_tokens,
                     )
                 ai_message = self.llm.invoke(conversation, **kwargs)

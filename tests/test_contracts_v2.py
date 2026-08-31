@@ -87,14 +87,44 @@ def test_execution_scope_rejects_unknown_fields_and_duplicate_tags() -> None:
         )
     with pytest.raises(ValidationError):
         ExecutionScope(session_id="session-1", thread_id="session-1", legacy_id="x")
+    with pytest.raises(ValidationError):
+        ExecutionScope(session_id="   ", thread_id="session-1")
+
+    normalized = ExecutionScope(session_id=" session-1 ", thread_id=" thread-1 ")
+    assert normalized.session_id == "session-1"
+    assert normalized.thread_id == "thread-1"
 
 
 def test_message_sequence_preserves_native_tool_call_order() -> None:
     validate_message_sequence(_messages(), require_final_assistant=True)
 
     invalid = [*_messages()[:3], _messages()[-1]]
-    with pytest.raises(ValueError, match="unresolved tool calls"):
+    with pytest.raises(ValueError, match="pending tool calls"):
         validate_message_sequence(invalid, require_final_assistant=True)
+
+
+def test_message_sequence_rejects_orphan_results_and_midstream_system_messages() -> None:
+    orphan_result = [
+        AgentMessage(role="system", content="System contract."),
+        AgentMessage(role="user", content="Run lookup."),
+        AgentMessage(
+            role="tool",
+            name="lookup_flow",
+            tool_call_id="call-1",
+            tool_status="success",
+            content="{}",
+        ),
+    ]
+    with pytest.raises(ValueError, match="no pending call"):
+        validate_message_sequence(orphan_result, require_final_assistant=False)
+
+    duplicate_system = [
+        AgentMessage(role="system", content="System contract."),
+        AgentMessage(role="user", content="Run lookup."),
+        AgentMessage(role="system", content="Replacement system contract."),
+    ]
+    with pytest.raises(ValueError, match="only appear at the start"):
+        validate_message_sequence(duplicate_system, require_final_assistant=False)
 
 
 def test_tool_catalog_fingerprint_is_content_addressed() -> None:
@@ -102,6 +132,18 @@ def test_tool_catalog_fingerprint_is_content_addressed() -> None:
     assert len(catalog.fingerprint) == 64
     with pytest.raises(ValidationError, match="fingerprint"):
         ToolCatalog(tools=catalog.tools, fingerprint="wrong")
+
+    with pytest.raises(ValidationError, match="not valid under any of the given schemas"):
+        ToolContract(
+            name="invalid_schema",
+            description="Expose an invalid schema for contract validation.",
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "not-a-json-schema-type"}},
+            },
+            side_effect="read",
+            result_format="json",
+        )
 
 
 def test_successful_observed_trace_requires_exact_observed_target() -> None:
@@ -125,7 +167,6 @@ def test_successful_observed_trace_requires_exact_observed_target() -> None:
                 schema_name="GroundingAdvisorOutput",
                 output_schema={"type": "object", "properties": {}},
                 value={"flow_id": "flow-1"},
-                sft_eligible=True,
             ),
             TraceTarget(
                 kind="validated_output",
@@ -133,7 +174,6 @@ def test_successful_observed_trace_requires_exact_observed_target() -> None:
                 schema_name="GroundingDecision",
                 output_schema={"type": "object", "properties": {}},
                 value={"flow_id": "flow-1"},
-                sft_eligible=False,
             ),
         ],
         status="success",
@@ -147,8 +187,18 @@ def test_successful_observed_trace_requires_exact_observed_target() -> None:
     assert trace.targets[1].sft_eligible is False
 
 
-def test_derived_target_cannot_be_marked_sft_eligible() -> None:
-    with pytest.raises(ValidationError, match="dedicated prompt contract"):
+def test_target_sft_eligibility_is_derived_and_cannot_be_supplied() -> None:
+    target = TraceTarget(
+        kind="compiled_output",
+        producer="compiler",
+        schema_name="PolicyPlanDraft",
+        output_schema={"type": "object"},
+        value={"policies": []},
+    )
+    assert target.sft_eligible is False
+    assert "sft_eligible" not in target.model_dump(mode="json")
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         TraceTarget(
             kind="compiled_output",
             producer="compiler",

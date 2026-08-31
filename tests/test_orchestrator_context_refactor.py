@@ -25,6 +25,15 @@ os.environ.setdefault(
 
 _IEA_TEST_CONTEXT = '{"main_intent":{"requested_domains":[],"domain_evidence":{}}}'
 
+
+def _execution_scope(round_index: int = 1) -> ExecutionScope:
+    return ExecutionScope(
+        session_id="session-1",
+        thread_id="session-1",
+        snapshot_id="snapshot-1",
+        round_index=round_index,
+    )
+
 from control_runtime.orchestrators.loop_state import (
     ControlRoundSnapshot,
     OrchestratorLoopState,
@@ -402,9 +411,7 @@ def test_execute_planned_round_returns_a_planning_blocker_without_external_execu
     )
 
     artifacts = round_execution.execute_planned_round(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        round_index=1,
+        scope=_execution_scope(),
         policy_plan=blocked_plan,
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
@@ -458,9 +465,7 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
     )
 
     artifacts = round_execution.execute_planned_round(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        round_index=1,
+        scope=_execution_scope(),
         policy_plan=_qos_plan(),
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
@@ -473,6 +478,9 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
     assert artifacts.completed is True
     assert artifacts.report == report
     assert artifacts.execution_reentry is None
+    assert artifacts.unified_plan.scope.session_id == "session-1"
+    assert artifacts.unified_plan.scope.snapshot_id == "snapshot-1"
+    assert artifacts.unified_plan.scope.supi == "imsi-001"
     assert artifacts.qos_feedback["execution_status"] == "Success"
     assert artifacts.unified_plan.execution_order == [ControlDomain.QOS]
     assert artifacts.unified_plan.approved_policies == [
@@ -513,9 +521,7 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
     )
 
     artifacts = round_execution.execute_planned_round(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        round_index=2,
+        scope=_execution_scope(2),
         policy_plan=_qos_plan(),
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
@@ -922,9 +928,13 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
             qos_feedback={"execution_status": report.execution_status},
             mobility_feedback={},
             unified_plan=UnifiedControlPlan(
-                session_id="session-1",
-                snapshot_id="snapshot-1",
-                supi="imsi-001",
+                scope=ExecutionScope(
+                    session_id="session-1",
+                    thread_id="session-1",
+                    snapshot_id="snapshot-1",
+                    round_index=round_index,
+                    supi="imsi-001",
+                ),
                 global_intent=intent,
             ),
             trace=ControlRoundTrace(
@@ -967,7 +977,7 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
     monkeypatch.setattr(
         main_orchestrator,
         "execute_planned_round",
-        lambda **kwargs: artifacts_by_round[kwargs["round_index"]],
+            lambda **kwargs: artifacts_by_round[kwargs["scope"].round_index],
     )
     monkeypatch.setattr(
         main_orchestrator,
@@ -1273,9 +1283,7 @@ def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_art
     conflict_tool = _RecordingConflictTool(ConflictResolutionResult())
 
     artifacts = round_execution.execute_planned_round(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        round_index=3,
+        scope=_execution_scope(3),
         policy_plan=_qos_plan(),
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
@@ -1312,9 +1320,7 @@ def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch
     )
 
     artifacts = round_execution.execute_planned_round(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        round_index=2,
+        scope=_execution_scope(2),
         policy_plan=_qos_plan(),
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
@@ -1364,9 +1370,7 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
     )
 
     artifacts = round_execution.execute_planned_round(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        round_index=4,
+        scope=_execution_scope(4),
         policy_plan=plan,
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
@@ -1712,6 +1716,15 @@ def test_control_round_trace_round_trip_deeply_isolates_typed_detail_payloads() 
     assert trace.to_payload()["planning_blocker"]["upstream_requests"][0]["target"] == "flow-1"
     assert trace.to_payload()["execution_reentry"]["reason_by_domain"]["qos"] == ["retry binding"]
     assert trace.to_payload()["single_agent_detail"]["attempts"][0]["stage"] == "single_control"
+
+
+def test_control_round_trace_rejects_malformed_payloads_instead_of_normalizing_them() -> None:
+    with pytest.raises(ValueError, match="greater than or equal to 1"):
+        ControlRoundTrace.from_payload({"round_index": 0})
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        ControlRoundTrace.from_payload({"round_index": 1, "legacy_trace": {}})
+    with pytest.raises(ValueError, match="Input should be a valid dictionary"):
+        ControlRoundTrace.from_payload({"round_index": 1, "domain_verdicts": ["invalid"]})
 
 
 def test_append_round_trace_is_typed_only_and_retains_complete_recent_trace_payloads() -> None:

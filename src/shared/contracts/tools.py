@@ -4,13 +4,14 @@ import hashlib
 import json
 from typing import Literal
 
+from jsonschema.exceptions import SchemaError
+from jsonschema.validators import validator_for
 from pydantic import Field, JsonValue, model_validator
 
 from .common import CONTRACT_VERSION, ContractModel, ContractVersion, NonEmptyStr
 
 
 ToolSideEffect = Literal["read", "write", "external_action"]
-ToolResultStatus = Literal["success", "error"]
 ToolResultFormat = Literal["json", "text"]
 
 
@@ -32,6 +33,18 @@ class ToolContract(ContractModel):
     def validate_schema_and_capabilities(self) -> "ToolContract":
         if self.input_schema.get("type") != "object":
             raise ValueError(f"tool {self.name} input_schema.type must be object")
+        for schema_name, schema in (
+            ("input_schema", self.input_schema),
+            ("output_schema", self.output_schema),
+        ):
+            if schema is None:
+                continue
+            try:
+                validator_for(schema).check_schema(schema)
+            except SchemaError as exc:
+                raise ValueError(
+                    f"tool {self.name} {schema_name} is invalid: {exc.message}"
+                ) from exc
         if len(self.capabilities) != len(set(self.capabilities)):
             raise ValueError(f"tool {self.name} capabilities must be unique")
         return self
@@ -58,25 +71,9 @@ class ToolCatalog(ContractModel):
         return self
 
 
-class ToolExecutionResult(ContractModel):
-    call_id: NonEmptyStr
-    name: NonEmptyStr
-    status: ToolResultStatus
-    format: ToolResultFormat
-    content: JsonValue
-
-    @model_validator(mode="after")
-    def validate_content_format(self) -> "ToolExecutionResult":
-        if self.format == "text" and not isinstance(self.content, str):
-            raise ValueError("text tool results require string content")
-        return self
-
-
 __all__ = [
     "ToolCatalog",
     "ToolContract",
-    "ToolExecutionResult",
     "ToolResultFormat",
-    "ToolResultStatus",
     "ToolSideEffect",
 ]

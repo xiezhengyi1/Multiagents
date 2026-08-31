@@ -54,6 +54,7 @@ def validate_message_sequence(
     messages: Sequence[AgentMessage],
     *,
     require_final_assistant: bool,
+    allow_terminal_unresolved_tool_calls: bool = False,
 ) -> None:
     if not messages:
         raise ValueError("message sequence must not be empty")
@@ -62,30 +63,39 @@ def validate_message_sequence(
     if not any(message.role == "user" for message in messages):
         raise ValueError("message sequence must contain a user message")
 
-    declared: dict[str, str] = {}
-    resolved: set[str] = set()
-    for message in messages:
-        for call in message.tool_calls:
-            if call.id in declared:
-                raise ValueError(f"duplicate tool_call id across conversation: {call.id}")
-            declared[call.id] = call.name
-        if message.role != "tool":
-            continue
-        call_id = str(message.tool_call_id)
-        if call_id not in declared:
-            raise ValueError(f"tool result references unknown call id: {call_id}")
-        if call_id in resolved:
-            raise ValueError(f"tool call has multiple results: {call_id}")
-        if declared[call_id] != message.name:
-            raise ValueError(
-                f"tool result name mismatch for {call_id}: expected {declared[call_id]}, got {message.name}"
-            )
-        resolved.add(call_id)
+    pending: dict[str, str] = {}
+    declared_ids: set[str] = set()
+    for index, message in enumerate(messages):
+        if index > 0 and message.role == "system":
+            raise ValueError("system message may only appear at the start")
 
+        if pending:
+            if message.role != "tool":
+                raise ValueError(
+                    "all pending tool calls must be resolved before the conversation continues"
+                )
+            call_id = str(message.tool_call_id)
+            if call_id not in pending:
+                raise ValueError(f"tool result references a non-pending call id: {call_id}")
+            expected_name = pending.pop(call_id)
+            if expected_name != message.name:
+                raise ValueError(
+                    f"tool result name mismatch for {call_id}: "
+                    f"expected {expected_name}, got {message.name}"
+                )
+            continue
+
+        if message.role == "tool":
+            raise ValueError(f"tool result has no pending call: {message.tool_call_id}")
+        for call in message.tool_calls:
+            if call.id in declared_ids:
+                raise ValueError(f"duplicate tool_call id across conversation: {call.id}")
+            declared_ids.add(call.id)
+            pending[call.id] = call.name
+
+    if pending and not allow_terminal_unresolved_tool_calls:
+        raise ValueError("conversation has unresolved tool calls: " + ", ".join(sorted(pending)))
     if require_final_assistant:
-        unresolved = sorted(set(declared) - resolved)
-        if unresolved:
-            raise ValueError("successful conversation has unresolved tool calls: " + ", ".join(unresolved))
         if messages[-1].role != "assistant" or not messages[-1].content.strip():
             raise ValueError("successful conversation must end with a textual assistant response")
 

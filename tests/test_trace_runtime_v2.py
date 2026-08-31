@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
+import pytest
+from langchain_core.messages import ToolMessage
 from pydantic import BaseModel
 
 from shared.contracts import (
@@ -17,7 +20,13 @@ from shared.contracts import (
     TraceMetadata,
     TraceTarget,
 )
-from shared.runtime import AgentRuntimeContext, JsonlTraceWriter, ToolLoopExecutionError
+from shared.runtime import (
+    AgentRuntimeContext,
+    ContextPolicy,
+    JsonlTraceWriter,
+    StructuredToolLoop,
+    ToolLoopExecutionError,
+)
 from shared.runtime.trace import build_agent_trace
 
 
@@ -71,7 +80,6 @@ def test_success_trace_round_trips_through_jsonl_writer(tmp_path) -> None:
                 schema_name=_Decision.__name__,
                 output_schema=_Decision.model_json_schema(),
                 value={"accepted": True},
-                sft_eligible=False,
             )
         ],
     )
@@ -86,6 +94,65 @@ def test_success_trace_round_trips_through_jsonl_writer(tmp_path) -> None:
         "observed_model_output",
         "validated_output",
     ]
+
+
+def test_context_policy_never_rewrites_tool_evidence() -> None:
+    policy = ContextPolicy(default_tool_result_chars=8)
+    assert policy.validate_tool_result("lookup", "evidence") == "evidence"
+
+    with pytest.raises(ValueError, match="exceeds its contract limit"):
+        policy.validate_tool_result("lookup", "evidence!")
+
+
+def test_tool_result_format_is_enforced_before_protocol_wrapping() -> None:
+    payload = '{"accepted":true}'
+    assert StructuredToolLoop._tool_result_to_content(payload, "json") == payload
+
+    with pytest.raises(json.JSONDecodeError):
+        StructuredToolLoop._tool_result_to_content("not-json", "json")
+    with pytest.raises(TypeError, match="text tools must return a string"):
+        StructuredToolLoop._tool_result_to_content({"accepted": True}, "text")
+    with pytest.raises(TypeError, match="domain data"):
+        StructuredToolLoop._tool_result_to_content(
+            ToolMessage(
+                content="{}",
+                tool_call_id="call-1",
+                name="lookup",
+                status="success",
+            ),
+            "json",
+        )
+
+
+def test_tool_output_must_match_the_catalog_output_schema() -> None:
+    loop = object.__new__(StructuredToolLoop)
+    loop.tools_by_name = {
+        "lookup": SimpleNamespace(func=lambda: '{"accepted":"yes"}')
+    }
+    loop.tool_contracts_by_name = {
+        "lookup": ToolContract(
+            name="lookup",
+            description="Return a typed acceptance decision.",
+            input_schema={"type": "object"},
+            output_schema={
+                "type": "object",
+                "properties": {"accepted": {"type": "boolean"}},
+                "required": ["accepted"],
+                "additionalProperties": False,
+            },
+            side_effect="read",
+            result_format="json",
+        )
+    }
+    loop.context_policy = ContextPolicy()
+
+    with pytest.raises(ValueError, match="output violates output_schema"):
+        loop._invoke_tool(
+            "lookup",
+            {},
+            context=AgentRuntimeContext(agent_name="decision_agent", scope=_scope()),
+            tool_call_id="call-1",
+        )
 
 
 def test_tool_failure_trace_keeps_unresolved_call_as_error_evidence() -> None:

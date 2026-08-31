@@ -402,8 +402,7 @@ class MainControlOrchestrator:
                 )
                 append_round_trace(state, trace=trace, feedback_added=feedback_added)
                 state.latest_result = ControlRoundResult(
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
+                    scope=scope,
                     completed=False,
                     global_intent={},
                     unified_plan={},
@@ -458,8 +457,7 @@ class MainControlOrchestrator:
                 )
                 append_round_trace(state, trace=trace, feedback_added=feedback_added)
                 state.latest_result = ControlRoundResult(
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
+                    scope=scope.model_copy(update={"supi": global_intent.supi or None}),
                     completed=False,
                     global_intent=global_intent.model_dump(mode="json"),
                     unified_plan={},
@@ -480,9 +478,7 @@ class MainControlOrchestrator:
             previous_grounding_decision = grounding_decision.model_copy(deep=True)
 
             round_execution = execute_planned_round(
-                session_id=session_id,
-                snapshot_id=snapshot_id,
-                round_index=round_index,
+                scope=scope,
                 global_intent=global_intent,
                 grounding_decision=grounding_decision,
                 policy_plan=policy_plan,
@@ -500,8 +496,7 @@ class MainControlOrchestrator:
             diagnosis_scope = scope.model_copy(update={"supi": global_intent.supi or None})
             self._remember(diagnosis_scope, "AD", diagnosis)
             state.latest_result = ControlRoundResult(
-                session_id=session_id,
-                snapshot_id=snapshot_id,
+                scope=diagnosis_scope,
                 completed=state.completed,
                 global_intent=global_intent.model_dump(mode="json"),
                 unified_plan=round_execution.unified_plan.model_dump(mode="json"),
@@ -574,14 +569,18 @@ class MainControlOrchestrator:
         if state.latest_result is None:
             raise RuntimeError("main control orchestrator produced no result")
         agent_elapsed_totals["total"] = round(sum(agent_elapsed_totals.values()), 3)
-        state.latest_result.agent_elapsed_ms = {
-            agent_name: round(elapsed_ms, 3)
-            for agent_name, elapsed_ms in agent_elapsed_totals.items()
-        }
         projection_metrics = self.main_agent.schema_projection_metrics
-        state.latest_result.main_schema_projection_count = int(projection_metrics["count"])
-        state.latest_result.main_schema_projected_field_count = int(projection_metrics["field_count"])
-        state.latest_result.main_schema_projected_fields = list(projection_metrics["fields"])
+        state.latest_result = state.latest_result.model_copy(
+            update={
+                "agent_elapsed_ms": {
+                    agent_name: round(elapsed_ms, 3)
+                    for agent_name, elapsed_ms in agent_elapsed_totals.items()
+                },
+                "main_schema_projection_count": int(projection_metrics["count"]),
+                "main_schema_projected_field_count": int(projection_metrics["field_count"]),
+                "main_schema_projected_fields": list(projection_metrics["fields"]),
+            }
+        )
         return state.latest_result
 
 

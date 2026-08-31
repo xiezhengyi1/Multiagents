@@ -24,7 +24,14 @@ from .prompts import ENVIRONMENT_DESIGN_AGENT_SYSTEM_PROMPT
 from .tools import build_environment_tools
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.logging import log_event, log_timing
-from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, RuntimePersistence, ToolLoopExecutionError, extract_tool_results
+from shared.runtime import (
+    ArtifactEnvelope,
+    ArtifactWorkerMixin,
+    ContextPolicy,
+    RuntimePersistence,
+    ToolLoopExecutionError,
+    extract_tool_results,
+)
 from application_runtime.persistence import create_runtime_persistence
 
 
@@ -158,14 +165,16 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             prompt_version="2.0.0",
             response_model=EnvironmentAdvisorOutput,
             max_iterations=14,
-            tool_result_limits={
-                "submit_environment_catalog": 5000,
-                "prepare_environment_design_context": 7000,
-                "inspect_environment_catalog": 5000,
-                "compile_environment_design": 6000,
-                "revise_environment_design": 6500,
-                "validate_environment_draft": 4000,
-            },
+            context_policy=ContextPolicy(
+                tool_result_char_limits={
+                    "submit_environment_catalog": 5000,
+                    "prepare_environment_design_context": 7000,
+                    "inspect_environment_catalog": 5000,
+                    "compile_environment_design": 6000,
+                    "revise_environment_design": 6500,
+                    "validate_environment_draft": 4000,
+                }
+            ),
             capability_aliases=ENVIRONMENT_TOOL_CAPABILITIES,
         )
 
@@ -316,7 +325,6 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                     schema_name=ScenarioCandidate.__name__,
                     output_schema=ScenarioCandidate.model_json_schema(),
                     value=candidate.model_dump(mode="json"),
-                    sft_eligible=False,
                 )
             ],
         )

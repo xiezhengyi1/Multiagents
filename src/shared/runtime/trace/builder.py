@@ -54,7 +54,6 @@ def build_agent_trace(
                 schema_name=response_model.__name__,
                 output_schema=json_friendly(response_model.model_json_schema()),
                 value=result.structured_response,
-                sft_eligible=True,
             ),
         )
 

@@ -3,14 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
 
 from shared.agents import BaseAgent
 from training.artifacts import PROJECT_ROOT, processed_dir, read_jsonl, write_json, write_jsonl
 from training.projection import load_projected_trace_records
-from training.schemas import ProjectedTraceRecord
+from training.schemas import ProjectedTraceRecord, WorkflowTrajectoryRecord
 
 
 class ToolIssue(BaseModel):
@@ -101,9 +101,7 @@ def load_traces_by_session(root: Path) -> Dict[str, Dict[str, List[ProjectedTrac
     by_session: Dict[str, Dict[str, List[ProjectedTraceRecord]]] = {}
     for agent_name, trace_path in discover_trace_files(root).items():
         for trace in load_projected_trace_records(trace_path):
-            session_id = str(trace.session_id or "").strip()
-            if not session_id:
-                continue
+            session_id = trace.scope.session_id
             by_session.setdefault(session_id, {}).setdefault(agent_name, []).append(trace)
     return by_session
 
@@ -228,7 +226,7 @@ def _trace_summary(trace: ProjectedTraceRecord) -> Dict[str, Any]:
 
 
 def evaluate_workflow_record(
-    record: Mapping[str, Any],
+    record: WorkflowTrajectoryRecord,
     session_traces: Dict[str, List[ProjectedTraceRecord]],
     llm: Any,
 ) -> Dict[str, Any]:
@@ -252,7 +250,7 @@ def evaluate_workflow_record(
                 "role": "user",
                 "content": json.dumps(
                     {
-                        "workflow_record": dict(record),
+                        "workflow_record": record.model_dump(mode="json"),
                         "agent_evaluations": agent_evaluations,
                     },
                     ensure_ascii=False,
@@ -263,13 +261,13 @@ def evaluate_workflow_record(
     )
     normalized = workflow_judgement if isinstance(workflow_judgement, WorkflowTrajectoryJudgement) else WorkflowTrajectoryJudgement.model_validate(workflow_judgement)
     return {
-        "record_index": record.get("record_index"),
-        "scenario_id": record.get("scenario_id"),
-        "scenario_tags": record.get("scenario_tags", []),
-        "session_id": record.get("session_id"),
-        "status": record.get("status"),
-        "completed": record.get("completed"),
-        "user_input": record.get("user_input"),
+        "record_index": record.record_index,
+        "scenario_id": record.scope.scenario_id,
+        "scenario_tags": record.scope.scenario_tags,
+        "session_id": record.scope.session_id,
+        "status": record.status,
+        "completed": record.completed,
+        "user_input": record.user_input,
         "agent_evaluations": agent_evaluations,
         "workflow_judgement": normalized.model_dump(mode="json"),
     }
@@ -300,34 +298,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run_records = read_jsonl(args.run_records)
+    run_records = [
+        WorkflowTrajectoryRecord.model_validate(row)
+        for row in read_jsonl(args.run_records)
+    ]
     session_traces = load_traces_by_session(PROJECT_ROOT)
     llm = BaseAgent(model_name=args.model, temperature=0.0).get_llm()
 
     evaluation_rows: List[Dict[str, Any]] = []
     for record in run_records:
-        session_id = str(record.get("session_id") or "").strip()
-        if not session_id:
-            evaluation_rows.append(
-                {
-                    "record_index": record.get("record_index"),
-                    "scenario_id": record.get("scenario_id"),
-                    "scenario_tags": record.get("scenario_tags", []),
-                    "session_id": "",
-                    "status": record.get("status"),
-                    "completed": record.get("completed"),
-                    "user_input": record.get("user_input"),
-                    "agent_evaluations": [],
-                    "workflow_judgement": {
-                        "passed": False,
-                        "summary": "workflow run has no session_id; trajectory evaluation is impossible for this record",
-                        "strengths": [],
-                        "issues": ["missing session_id"],
-                    },
-                }
-            )
-            continue
-
+        session_id = record.scope.session_id
         evaluation_rows.append(
             evaluate_workflow_record(record, session_traces.get(session_id, {}), llm)
         )

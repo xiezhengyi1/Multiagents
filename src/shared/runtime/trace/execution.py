@@ -103,7 +103,6 @@ def write_deterministic_execution_trace(
                     schema_name="FeedbackReport",
                     output_schema=_OBJECT_SCHEMA,
                     value=feedback_report,
-                    sft_eligible=False,
                 )
             ],
             status="success",

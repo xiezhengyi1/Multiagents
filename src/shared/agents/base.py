@@ -193,31 +193,21 @@ class BaseAgent:
         max_calls_per_tool: int | None = None,
         tool_call_limits: dict[str, int] | None = None,
         forbid_duplicate_tool_calls: bool = False,
-        max_tool_result_chars: int = 8000,
-        tool_result_limits: dict[str, int] | None = None,
-        max_tool_result_tokens: int | None = None,
-        tool_result_token_limits: dict[str, int] | None = None,
         context_policy: ContextPolicy | None = None,
-        token_counter: Any = None,
-        token_budget: Any = None,
         capability_aliases: Mapping[str, Iterable[Any]] | None = None,
     ) -> TracedStructuredAgent:
         tool_list = list(tools)
+        tool_catalog = build_tool_catalog(tool_list, capability_aliases=capability_aliases)
         runnable = StructuredToolLoop(
             llm=self.llm,
             tools=tool_list,
+            tool_catalog=tool_catalog,
             system_prompt=system_prompt,
             response_model=response_model,
             max_iterations=max_iterations,
             max_calls_per_tool=max_calls_per_tool,
             tool_call_limits=tool_call_limits,
             forbid_duplicate_tool_calls=forbid_duplicate_tool_calls,
-            max_tool_result_chars=max_tool_result_chars,
-            tool_result_limits=tool_result_limits,
-            max_tool_result_tokens=max_tool_result_tokens,
-            tool_result_token_limits=tool_result_token_limits,
-            token_counter=token_counter,
-            token_budget=token_budget,
             context_policy=context_policy,
         )
         agent_name = str(getattr(self, "agent_name", "") or "").strip()
@@ -229,7 +219,7 @@ class BaseAgent:
             system_prompt=system_prompt,
             prompt_name=prompt_name,
             prompt_version=prompt_version,
-            tool_catalog=build_tool_catalog(tool_list, capability_aliases=capability_aliases),
+            tool_catalog=tool_catalog,
             response_model=response_model,
             runnable=runnable,
             writer=JsonlTraceWriter(agent_name),

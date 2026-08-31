@@ -76,12 +76,16 @@ def append_round_trace(
     if len(state.rounds) > 3:
         del state.rounds[:-3]
     if state.latest_result is not None:
-        state.latest_result.round_traces = state.round_traces
-        state.latest_result.single_agent_details = [
-            deepcopy(item.trace.single_agent_detail)
-            for item in state.rounds
-            if item.trace.single_agent_detail
-        ]
+        state.latest_result = state.latest_result.model_copy(
+            update={
+                "round_traces": state.round_traces,
+                "single_agent_details": [
+                    deepcopy(item.trace.single_agent_detail)
+                    for item in state.rounds
+                    if item.trace.single_agent_detail
+                ],
+            }
+        )
 
 
 def finish_control_session(

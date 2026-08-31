@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, get_args, get_origin
+from typing import Any, Iterable, Mapping
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel
@@ -31,7 +31,7 @@ def json_friendly(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, type) and issubclass(value, BaseModel):
-        return serialize_base_model_schema(value)
+        return json_friendly(value.model_json_schema())
     if isinstance(value, BaseModel):
         return json_friendly(value.model_dump(mode="json"))
     if hasattr(value, "model_dump"):
@@ -48,12 +48,9 @@ def json_friendly(value: Any) -> Any:
 # ── Message Serialization ─────────────────────────────────────
 
 
-def serialize_message(message: BaseMessage | Mapping[str, Any]) -> Dict[str, Any]:
-    """Serialize a LangChain message or raw dict to a JSON-friendly dict."""
-    if isinstance(message, Mapping):
-        return {str(key): json_friendly(value) for key, value in message.items()}
-
-    payload: Dict[str, Any] = {
+def serialize_message(message: BaseMessage) -> dict[str, Any]:
+    """Serialize one LangChain transport message to a JSON-friendly dict."""
+    payload: dict[str, Any] = {
         "type": message.type,
         "content": json_friendly(message.content),
         "name": getattr(message, "name", None),
@@ -72,77 +69,6 @@ def serialize_message(message: BaseMessage | Mapping[str, Any]) -> Dict[str, Any
         payload["status"] = getattr(message, "status", None)
 
     return payload
-
-
-# ── Pydantic Schema Serialization ─────────────────────────────────────
-
-
-def _annotation_to_string(annotation: Any) -> str:
-    if annotation is None:
-        return "None"
-    origin = get_origin(annotation)
-    if origin is None:
-        return getattr(annotation, "__name__", str(annotation))
-    args = ", ".join(_annotation_to_string(item) for item in get_args(annotation))
-    origin_name = getattr(origin, "__name__", str(origin))
-    return f"{origin_name}[{args}]"
-
-
-def serialize_base_model_schema(model_cls: type[BaseModel]) -> Dict[str, Any]:
-    """Serialize a Pydantic model class to a JSON-friendly schema dict."""
-    properties: Dict[str, Any] = {}
-    required: List[str] = []
-    for field_name, field_info in model_cls.model_fields.items():
-        if field_name == "runtime":
-            continue
-        field_payload: Dict[str, Any] = {
-            "annotation": _annotation_to_string(field_info.annotation),
-        }
-        if field_info.description:
-            field_payload["description"] = str(field_info.description)
-        if field_info.is_required():
-            required.append(field_name)
-        elif field_info.default is not None:
-            field_payload["default"] = json_friendly(field_info.default)
-        properties[field_name] = field_payload
-    return {
-        "title": model_cls.__name__,
-        "type": "object",
-        "properties": properties,
-        "required": required,
-    }
-
-
-# ── ChatML Formatting ─────────────────────────────────────
-
-
-def format_tool_call(tool_call: Dict[str, Any]) -> str:
-    """Render a tool call as a ChatML XML tag."""
-    name = str(tool_call.get("name") or "").strip()
-    args = tool_call.get("args")
-    return f'<tool_call name="{name}">{json.dumps(args, ensure_ascii=False)}</tool_call>'
-
-
-def format_tool_result(tool_result: Dict[str, Any]) -> str:
-    """Render a tool result as a ChatML XML tag."""
-    content = tool_result.get("content")
-    rendered = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
-    return f"<tool_result>{rendered}</tool_result>"
-
-
-# ── Message Role & Content Normalization ─────────────────────────────────────
-
-
-def normalize_message_role(serialized: Dict[str, Any], *, default: str = "assistant") -> str:
-    """Normalize a message role string to standard ChatML roles."""
-    raw_role = str(serialized.get("role") or serialized.get("type") or "").strip().lower()
-    if raw_role == "human":
-        return "user"
-    if raw_role == "ai":
-        return "assistant"
-    if raw_role:
-        return raw_role
-    return default
 
 
 def stringify_message_content(value: Any) -> str:
@@ -197,7 +123,7 @@ def build_tool_catalog(
     return ToolCatalog.create(contracts)
 
 
-def message_to_contract(message: BaseMessage | Mapping[str, Any]) -> AgentMessage:
+def message_to_contract(message: BaseMessage) -> AgentMessage:
     """Convert one runtime message without changing tool-call semantics."""
 
     if isinstance(message, SystemMessage):
@@ -205,14 +131,18 @@ def message_to_contract(message: BaseMessage | Mapping[str, Any]) -> AgentMessag
     if isinstance(message, HumanMessage):
         return AgentMessage(role="user", content=stringify_message_content(message.content))
     if isinstance(message, AIMessage):
-        calls = [
-            ToolCall(
-                id=str(call.get("id") or "").strip(),
-                name=str(call.get("name") or "").strip(),
-                arguments=dict(call.get("args") or {}),
+        calls: list[ToolCall] = []
+        for call in message.tool_calls:
+            arguments = call.get("args")
+            if not isinstance(arguments, dict):
+                raise TypeError("LangChain tool_call args must be an object")
+            calls.append(
+                ToolCall(
+                    id=str(call.get("id") or "").strip(),
+                    name=str(call.get("name") or "").strip(),
+                    arguments=arguments,
+                )
             )
-            for call in message.tool_calls
-        ]
         return AgentMessage(
             role="assistant",
             content=stringify_message_content(message.content),
@@ -226,25 +156,7 @@ def message_to_contract(message: BaseMessage | Mapping[str, Any]) -> AgentMessag
             tool_call_id=str(message.tool_call_id or "").strip(),
             tool_status=str(message.status or "").strip(),
         )
-    if not isinstance(message, Mapping):
-        raise TypeError(f"unsupported message type: {type(message).__name__}")
-    role = normalize_message_role(dict(message))
-    calls = [
-        ToolCall(
-            id=str(call.get("id") or "").strip(),
-            name=str(call.get("name") or "").strip(),
-            arguments=dict(call.get("arguments") or call.get("args") or {}),
-        )
-        for call in message.get("tool_calls") or []
-    ]
-    return AgentMessage(
-        role=role,
-        content=stringify_message_content(message.get("content")),
-        name=str(message.get("name") or "").strip() or None,
-        tool_calls=calls,
-        tool_call_id=str(message.get("tool_call_id") or "").strip() or None,
-        tool_status=str(message.get("tool_status") or message.get("status") or "").strip() or None,
-    )
+    raise TypeError(f"unsupported message type: {type(message).__name__}")
 
 
 def contract_to_message(message: AgentMessage) -> BaseMessage:
@@ -275,9 +187,9 @@ def contract_to_message(message: AgentMessage) -> BaseMessage:
     )
 
 
-def extract_tool_calls(messages: Iterable[AgentMessage]) -> List[Dict[str, Any]]:
+def extract_tool_calls(messages: Iterable[AgentMessage]) -> list[dict[str, Any]]:
     """Project canonical assistant tool calls for application-level evidence logic."""
-    calls: List[Dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
     for message in messages:
         for call in message.tool_calls:
             calls.append(
@@ -291,9 +203,9 @@ def extract_tool_calls(messages: Iterable[AgentMessage]) -> List[Dict[str, Any]]
     return calls
 
 
-def extract_tool_results(messages: Iterable[AgentMessage]) -> List[Dict[str, Any]]:
+def extract_tool_results(messages: Iterable[AgentMessage]) -> list[dict[str, Any]]:
     """Project canonical tool results for application-level evidence logic."""
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for message in messages:
         if message.role != "tool":
             continue
@@ -313,12 +225,8 @@ __all__ = [
     "contract_to_message",
     "extract_tool_calls",
     "extract_tool_results",
-    "format_tool_call",
-    "format_tool_result",
     "json_friendly",
     "message_to_contract",
-    "normalize_message_role",
-    "serialize_base_model_schema",
     "serialize_message",
     "stringify_message_content",
 ]

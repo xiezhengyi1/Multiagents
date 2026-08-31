@@ -167,13 +167,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         limits = cls._tool_result_limits_for_model(model_name)
         return ContextPolicy(
             default_tool_result_chars=4000 if small_model else 8000,
-            default_tool_result_tokens=1000 if small_model else 2000,
             tool_result_char_limits=limits,
-            tool_result_token_limits={
-                name: 1000 if small_model else 2000
-                for name in limits
-            },
-            recent_tool_results_per_tool=1,
         )
 
     def plan_round(
@@ -262,10 +256,6 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 response_model=OsaAdvisorOutput,
                 max_iterations=12,
                 forbid_duplicate_tool_calls=True,
-                max_tool_result_chars=context_policy.default_tool_result_chars,
-                tool_result_limits=context_policy.tool_result_char_limits,
-                max_tool_result_tokens=context_policy.default_tool_result_tokens,
-                tool_result_token_limits=context_policy.tool_result_token_limits,
                 context_policy=context_policy,
                 capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
             )
@@ -390,7 +380,6 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     schema_name=OsaAdvisorOutput.__name__,
                     output_schema=OsaAdvisorOutput.model_json_schema(),
                     value=advisor_output.model_dump(mode="json"),
-                    sft_eligible=False,
                 ),
                 TraceTarget(
                     kind="compiled_output",
@@ -398,7 +387,6 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     schema_name=PolicyPlanDraft.__name__,
                     output_schema=PolicyPlanDraft.model_json_schema(),
                     value=policy_plan.model_dump(mode="json"),
-                    sft_eligible=False,
                 ),
             ],
         )

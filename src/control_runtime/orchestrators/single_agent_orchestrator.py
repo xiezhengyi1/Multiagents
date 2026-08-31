@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from shared.contracts import ExecutionScope
 from shared.runtime import RuntimePersistence
 from application_runtime.persistence import create_runtime_persistence
 
@@ -123,6 +124,14 @@ class SingleAgentOrchestrator:
         state = OrchestratorLoopState()
 
         for round_index in range(1, self.max_rounds + 1):
+            scope = ExecutionScope(
+                session_id=session_id,
+                thread_id=session_id,
+                snapshot_id=snapshot_id,
+                round_index=round_index,
+                scenario_id=scenario_id or None,
+                scenario_tags=list(scenario_tags or []),
+            )
             log_event(
                 self.single_agent.logger,
                 "single_control_round_start",
@@ -151,9 +160,7 @@ class SingleAgentOrchestrator:
                 )
 
                 round_execution = execute_planned_round(
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
-                    round_index=round_index,
+                    scope=scope,
                     policy_plan=policy_plan,
                     cr_tool=self.cr_tool,
                     pd_agent=self.pd_agent,
@@ -165,8 +172,7 @@ class SingleAgentOrchestrator:
                 mobility_feedback = round_execution.mobility_feedback
                 diagnosis = round_execution.diagnosis
                 state.latest_result = ControlRoundResult(
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
+                    scope=scope.model_copy(update={"supi": policy_plan.supi or None}),
                     completed=state.completed,
                     global_intent={},
                     unified_plan=round_execution.unified_plan.model_dump(mode="json"),
@@ -182,8 +188,7 @@ class SingleAgentOrchestrator:
                 diagnosis = self._build_round_exception_diagnosis(exc)
                 exception_feedback = self._build_round_exception_feedback(exc=exc)
                 state.latest_result = ControlRoundResult(
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
+                    scope=scope,
                     completed=False,
                     global_intent={},
                     unified_plan={},

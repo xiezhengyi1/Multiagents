@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 from typing import Any, Dict, List, Optional
+
+from shared.contracts import ExecutionScope
 
 from ..agents.dispatch.agent import PolicyDispatchAgent
 from ..agents.dispatch.contracts import FeedbackReport
@@ -81,7 +83,7 @@ class RoundExecutionArtifacts:
             if fallback_consumer:
                 pda_feedback["correction_suggestion"] = "; ".join(self.diagnosis.get("recommended_actions") or [])
                 pda_feedback["recommended_consumer"] = fallback_consumer
-        return replace(self.trace, pda_feedback=pda_feedback)
+        return self.trace.with_pda_feedback(pda_feedback)
 
 
 @dataclass(frozen=True)
@@ -544,14 +546,17 @@ def _objective_breakdown(policy_plan: PolicyPlanDraft, global_intent: Optional[G
 
 def _build_planning_blocked_artifacts(
     *,
-    session_id: str,
-    snapshot_id: str,
-    round_index: int,
+    scope: ExecutionScope,
     policy_plan: PolicyPlanDraft,
     grounding_decision: Optional[GroundingDecision],
     global_intent: Optional[GlobalControlIntent],
     planning_status: str,
 ) -> RoundExecutionArtifacts:
+    session_id = scope.session_id
+    snapshot_id = scope.snapshot_id
+    round_index = scope.round_index
+    if snapshot_id is None:
+        raise ValueError("planning artifacts require scope.snapshot_id")
     blocker = PlanningBlockerReport(
         round_index=round_index,
         source_agent="optimization_strategy" if global_intent is not None else "single_control",
@@ -580,9 +585,9 @@ def _build_planning_blocked_artifacts(
         ),
     }
     unified_plan = UnifiedControlPlan(
-        session_id=session_id,
-        snapshot_id=snapshot_id,
-        supi=_effective_supi(global_intent, grounding_decision, policy_plan),
+        scope=scope.model_copy(
+            update={"supi": _effective_supi(global_intent, grounding_decision, policy_plan) or None}
+        ),
         global_intent=global_intent,
         domain_verdicts=[],
         blocked_domains=[
@@ -619,9 +624,7 @@ def _build_planning_blocked_artifacts(
 
 def _assemble_round_artifacts(
     *,
-    session_id: str,
-    snapshot_id: str,
-    round_index: int,
+    scope: ExecutionScope,
     policy_plan: PolicyPlanDraft,
     global_intent: Optional[GlobalControlIntent],
     grounding_decision: Optional[GroundingDecision],
@@ -629,6 +632,7 @@ def _assemble_round_artifacts(
     dispatch: _DispatchResult,
     assurance: _AssuranceResult,
 ) -> RoundExecutionArtifacts:
+    round_index = scope.round_index
     if global_intent is None:
         agent_contributions = [
             {
@@ -678,9 +682,9 @@ def _assemble_round_artifacts(
             },
         ]
     unified_plan = UnifiedControlPlan(
-        session_id=session_id,
-        snapshot_id=snapshot_id,
-        supi=_effective_supi(global_intent, grounding_decision, policy_plan),
+        scope=scope.model_copy(
+            update={"supi": _effective_supi(global_intent, grounding_decision, policy_plan) or None}
+        ),
         global_intent=global_intent,
         qos_proposal=mediation.qos_proposal,
         mobility_proposal=mediation.mobility_proposal,
@@ -739,9 +743,7 @@ def _assemble_round_artifacts(
 
 def execute_planned_round(
     *,
-    session_id: str,
-    snapshot_id: str,
-    round_index: int,
+    scope: ExecutionScope,
     policy_plan: PolicyPlanDraft,
     cr_tool: ConflictResolutionTool,
     pd_agent: PolicyDispatchAgent,
@@ -750,6 +752,13 @@ def execute_planned_round(
     global_intent: Optional[GlobalControlIntent] = None,
     trace_metadata: Optional[Dict[str, Any]] = None,
 ) -> RoundExecutionArtifacts:
+    if scope.snapshot_id is None:
+        raise ValueError("planned round execution requires scope.snapshot_id")
+    if scope.round_index < 1:
+        raise ValueError("planned round execution requires scope.round_index >= 1")
+    session_id = scope.session_id
+    snapshot_id = scope.snapshot_id
+    round_index = scope.round_index
     snapshot_data = get_snapshot_data_by_id(snapshot_id) or {}
     if not snapshot_data:
         raise LookupError(f"bound snapshot not found: snapshot_id={snapshot_id}")
@@ -757,9 +766,7 @@ def execute_planned_round(
     dispatchable_partial_plan = planning_status == "partial_plan" and bool(policy_plan.all_policies)
     if planning_status != "executable_plan" and not dispatchable_partial_plan:
         return _build_planning_blocked_artifacts(
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            round_index=round_index,
+            scope=scope,
             policy_plan=policy_plan,
             grounding_decision=grounding_decision,
             global_intent=global_intent,
@@ -800,9 +807,7 @@ def execute_planned_round(
         ad_tool=ad_tool,
     )
     return _assemble_round_artifacts(
-        session_id=session_id,
-        snapshot_id=snapshot_id,
-        round_index=round_index,
+        scope=scope,
         policy_plan=policy_plan,
         global_intent=global_intent,
         grounding_decision=grounding_decision,

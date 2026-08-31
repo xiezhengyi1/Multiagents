@@ -61,7 +61,6 @@ class MainControlInvocation:
                     schema_name=GlobalControlIntent.__name__,
                     output_schema=GlobalControlIntent.model_json_schema(),
                     value=structured_response,
-                    sft_eligible=False,
                 )
             )
         self.trace_agent.write_trace(

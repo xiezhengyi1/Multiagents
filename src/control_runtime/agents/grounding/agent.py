@@ -88,7 +88,6 @@ class IntentAdvisorInvocation:
                     schema_name=GroundingDecision.__name__,
                     output_schema=GroundingDecision.model_json_schema(),
                     value=grounding_decision.model_dump(mode="json"),
-                    sft_eligible=False,
                 )
             )
         self.trace_agent.write_trace(
@@ -202,13 +201,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 "get_sm_ue_flow_catalog": 4,
                 "search_sm_flow_targets": 4,
             },
-            tool_result_limits={
-                "get_sm_ue_flow_catalog": 16000,
-                "search_sm_flow_targets": 8000,
-                "get_am_policy_context": 8000,
-                "search_am_policy_targets": 8000,
-                "get_ue_slice_subscription": 8000,
-            },
             context_policy=ContextPolicy(
                 default_tool_result_chars=8000,
                 tool_result_char_limits={
@@ -217,11 +209,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     "get_am_policy_context": 8000,
                     "search_am_policy_targets": 8000,
                     "get_ue_slice_subscription": 8000,
-                },
-                recent_tool_results_per_tool=1,
-                tool_history_keep_limits={
-                    "get_sm_ue_flow_catalog": 3,
-                    "search_sm_flow_targets": 2,
                 },
             ),
             capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
