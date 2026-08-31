@@ -5,6 +5,7 @@ import math
 import re
 from typing import Any, Dict, List, Optional
 
+from shared.contracts import ExecutionScope, MemoryQuery, MemoryRecord
 from shared.runtime import ContextPolicy
 
 from ..agents.main.contracts import GlobalControlIntent
@@ -268,15 +269,16 @@ def build_feedback_context_from_snapshots(
 def build_memory_context(
     user_input: str,
     *,
+    scope: ExecutionScope,
     memory_manager: Any,
     diagnosis_hint: str = "",
     routing_hint: str = "",
     context_policy: Optional[ContextPolicy] = None,
     token_counter: Any = None,
 ) -> str:
-    bundle = memory_manager.retrieve(user_input)
-    short_term = bundle.get("short_term", []) if isinstance(bundle, dict) else []
-    long_term = bundle.get("long_term", []) if isinstance(bundle, dict) else []
+    bundle = memory_manager.retrieve(MemoryQuery(scope=scope, text=user_input))
+    short_term = list(bundle.short_term)
+    long_term = list(bundle.long_term)
     short_term = rerank_by_context_hints(short_term, diagnosis_hint, routing_hint)[:5]
     long_term = rerank_by_context_hints(long_term, diagnosis_hint, routing_hint)[:5]
     blocks: List[str] = []
@@ -284,13 +286,12 @@ def build_memory_context(
         blocks.append(
             "[Memory][Short-Term]\n"
             + "\n".join(
-                f"{item.get('role', 'unknown')}: {item.get('content', '')}"
+                f"{item.role}: {item.content}"
                 for item in short_term
-                if isinstance(item, dict)
             )
         )
     if long_term:
-        blocks.append("[Memory][Long-Term]\n" + "\n".join(str(item) for item in long_term))
+        blocks.append("[Memory][Long-Term]\n" + "\n".join(item.content for item in long_term))
     rendered = "\n\n".join(block for block in blocks if block.strip())
     policy = context_policy or ContextPolicy()
     return policy.compact_text(
@@ -313,7 +314,9 @@ def rerank_by_context_hints(items: List[Any], diagnosis_hint: str = "", routing_
 
     def score_item(index_item: tuple[int, Any]) -> tuple[int, int]:
         index, item = index_item
-        if isinstance(item, dict):
+        if isinstance(item, MemoryRecord):
+            text = json.dumps(item.model_dump(mode="json"), ensure_ascii=False).lower()
+        elif isinstance(item, dict):
             text = json.dumps(item, ensure_ascii=False).lower()
         else:
             text = str(item or "").lower()

@@ -7,12 +7,13 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
+from shared.contracts import AgentRunResult, ExecutionScope
 from shared.runtime import ContextPolicy
 from shared.runtime import RuntimeCache
 from shared.runtime import RuntimePersistence
 from shared.runtime import AgentRuntimeContext
 from shared.runtime import StructuredToolLoop
-from shared.runtime import build_tool_specs, extract_tool_calls
+from shared.runtime import build_tool_catalog
 from shared.runtime import JsonlTraceWriter, TracedStructuredAgent
 from shared.logging import setup_logger
 
@@ -29,7 +30,7 @@ def resolve_agent_model_name(model_name: str = "", *, use_local_model: bool = Fa
     return str(model_name or "qwen-plus").strip()
 
 
-def extract_grounding_tool_names(result: dict[str, Any], grounding_tools: Iterable[str]) -> list[str]:
+def extract_grounding_tool_names(result: AgentRunResult, grounding_tools: Iterable[str]) -> list[str]:
     allowed = {
         str(name).strip()
         for name in grounding_tools
@@ -37,30 +38,21 @@ def extract_grounding_tool_names(result: dict[str, Any], grounding_tools: Iterab
     }
     if not allowed:
         return []
-    messages = result.get("messages") or []
-    calls = extract_tool_calls(messages)
-    names: list[str] = []
-    for call in calls:
-        name = str(call.get("name") or "").strip()
-        if name in allowed:
-            names.append(name)
-    return names
+    return [
+        call.name
+        for message in result.messages
+        for call in message.tool_calls
+        if call.name in allowed
+    ]
 
 
 def coerce_structured_response(
-    result: dict[str, Any],
+    result: AgentRunResult,
     response_model: type[BaseModel],
     *,
     error_message: str,
 ) -> BaseModel:
-    structured = result.get("structured_response")
-    if structured is None:
-        raise RuntimeError(error_message)
-    if isinstance(structured, response_model):
-        return structured
-    if isinstance(structured, str):
-        return response_model.model_validate_json(structured)
-    return response_model.model_validate(structured)
+    return response_model.model_validate(result.structured_response)
 
 
 class BaseAgent:
@@ -169,27 +161,19 @@ class BaseAgent:
     def build_runtime_context(
         *,
         agent_name: str,
-        session_id: str = "",
-        snapshot_id: str = "",
-        supi: Optional[str] = None,
-        thread_id: str = "",
+        scope: ExecutionScope,
         allow_user_interaction: bool = False,
         token_budget: Any = None,
         token_counter: Any = None,
-        trace_metadata: dict[str, Any] | None = None,
+        trace_attributes: dict[str, Any] | None = None,
     ) -> AgentRuntimeContext:
-        normalized_session = str(session_id or "").strip()
-        normalized_thread = str(thread_id or normalized_session).strip()
         return AgentRuntimeContext(
             agent_name=str(agent_name or "").strip(),
-            session_id=normalized_session,
-            snapshot_id=str(snapshot_id or "").strip(),
-            supi=str(supi or "").strip() or None,
-            thread_id=normalized_thread,
+            scope=scope,
             allow_user_interaction=bool(allow_user_interaction),
             token_budget=token_budget,
             token_counter=token_counter,
-            trace_metadata=dict(trace_metadata or {}),
+            trace_attributes=dict(trace_attributes or {}),
         )
 
     def _resolve_token_context(self, token_budget: Any = None, token_counter: Any = None) -> tuple[Any, Any]:
@@ -202,9 +186,10 @@ class BaseAgent:
         *,
         tools: Iterable[Any],
         system_prompt: str,
+        prompt_name: str,
+        prompt_version: str,
         response_model: type[BaseModel],
         max_iterations: int = 8,
-        tool_error_mode: str = "raise",
         max_calls_per_tool: int | None = None,
         tool_call_limits: dict[str, int] | None = None,
         forbid_duplicate_tool_calls: bool = False,
@@ -224,7 +209,6 @@ class BaseAgent:
             system_prompt=system_prompt,
             response_model=response_model,
             max_iterations=max_iterations,
-            tool_error_mode=tool_error_mode,
             max_calls_per_tool=max_calls_per_tool,
             tool_call_limits=tool_call_limits,
             forbid_duplicate_tool_calls=forbid_duplicate_tool_calls,
@@ -243,7 +227,10 @@ class BaseAgent:
             agent_name=agent_name,
             model_name=self.model_name,
             system_prompt=system_prompt,
-            tool_specs=build_tool_specs(tool_list, capability_aliases=capability_aliases),
+            prompt_name=prompt_name,
+            prompt_version=prompt_version,
+            tool_catalog=build_tool_catalog(tool_list, capability_aliases=capability_aliases),
+            response_model=response_model,
             runnable=runnable,
             writer=JsonlTraceWriter(agent_name),
         )

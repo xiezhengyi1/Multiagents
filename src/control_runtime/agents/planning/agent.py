@@ -5,6 +5,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from shared.contracts import (
+    AgentInvocation,
+    AgentMessage,
+    AgentRunResult,
+    ExecutionScope,
+    TraceMetadata,
+    TraceTarget,
+)
 from shared.runtime import ArtifactEnvelope, RuntimePersistence
 from shared.runtime import ContextPolicy
 from shared.agents import (
@@ -61,14 +69,14 @@ class _OsaAdvisorStageState:
 
     current_prompt: str
     retry_tool_evidence: dict[str, Any] = field(default_factory=dict)
-    disable_knowledge_tools: bool = False
     invocation_error: str = ""
     advisor_output: OsaAdvisorOutput | None = None
-    advisor_result: dict[str, Any] | None = None
+    advisor_result: AgentRunResult | None = None
     advisor_trace: dict[str, Any] | None = None
     planning_tool_evidence: dict[str, Any] = field(default_factory=dict)
     grounding_tools: list[str] = field(default_factory=list)
     contract_errors: list[str] = field(default_factory=list)
+    trace_recorded: bool = False
 
 
 class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
@@ -144,9 +152,15 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     def _cache_received_request(self, planning_request: PlanningRequest) -> ArtifactEnvelope:
         return self.cache_received_artifact(
             artifact_type="PlanningRequest",
+            payload_schema_name=PlanningRequest.__name__,
             payload=planning_request,
-            session_id=planning_request.context.session_id,
-            snapshot_id=planning_request.context.snapshot_id,
+            scope=ExecutionScope(
+                session_id=planning_request.context.session_id,
+                thread_id=planning_request.context.session_id,
+                snapshot_id=planning_request.context.snapshot_id or None,
+                round_index=planning_request.context.round_index,
+                supi=_planning_supi(planning_request),
+            ),
         )
 
     def _cache_produced_result(
@@ -157,6 +171,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> None:
         self.cache_produced_artifact(
             artifact_type="PolicyPlanDraft",
+            payload_schema_name=PolicyPlanDraft.__name__,
             request_envelope=request_envelope,
             payload=policy_plan,
         )
@@ -194,7 +209,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         log_event(self.logger, "osa_generate_start")
         advisor_trace: dict[str, Any] | None = None
         advisor_output: OsaAdvisorOutput | None = None
-        advisor_result: dict[str, Any] | None = None
+        advisor_result: AgentRunResult | None = None
         stage_state: _OsaAdvisorStageState | None = None
         self.last_failure_debug = {}
         try:
@@ -237,7 +252,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 advisor_trace=advisor_trace,
                 advisor_output=advisor_output,
                 compiler_output=final_output.model_dump(mode="json"),
-                status="success",
             )
             self._cache_produced_result(
                 request_envelope=request_envelope,
@@ -254,12 +268,11 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                     failed_advisor_trace = stage_state.advisor_trace
                 if failed_advisor_output is None:
                     failed_advisor_output = stage_state.advisor_output
-            if failed_advisor_trace is not None:
+            if failed_advisor_trace is not None and not stage_state.trace_recorded:
                 self._write_advisor_trace(
                     advisor_trace=failed_advisor_trace,
                     advisor_output=failed_advisor_output,
                     compiler_output=None,
-                    status="error",
                     error=str(exc),
                 )
             self.logger.exception(f"Failed to generate optimization strategy: {exc}")
@@ -280,12 +293,15 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         """Run OSA's existing advisor/repair/validation lifecycle once or with retries."""
 
         def invoke_advisor(_: StageAttempt) -> _OsaAdvisorStageState:
+            state.advisor_output = None
+            state.advisor_result = None
+            state.advisor_trace = None
+            state.trace_recorded = False
             advisor_output, advisor_result, advisor_trace = self._invoke_strategy_advisor(
                 planning_request=planning_request,
                 prompt=state.current_prompt,
                 trace_metadata=trace_metadata,
                 cached_tool_evidence=state.retry_tool_evidence,
-                disable_knowledge_tools=state.disable_knowledge_tools,
             )
             state.advisor_output = advisor_output
             state.advisor_result = advisor_result
@@ -332,6 +348,14 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             return contract_errors
 
         def record_advisor_failure(context: RetryContext) -> None:
+            if context.phase is RetryPhase.VALIDATION and state.advisor_trace is not None:
+                self._write_advisor_trace(
+                    advisor_trace=state.advisor_trace,
+                    advisor_output=state.advisor_output,
+                    compiler_output=None,
+                    error=str(context.error),
+                )
+                state.trace_recorded = True
             if context.phase is not RetryPhase.INVOKE or not isinstance(context.error, RuntimeError):
                 return
             state.invocation_error = str(context.error)
@@ -341,11 +365,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
                 "invocation_error": state.invocation_error,
             }
             state.retry_tool_evidence = self._cached_tool_evidence_for_retry()
-            if (
-                "get_knowledge_by_key exceeded" in state.invocation_error
-                or "search_semantic_knowledge exceeded" in state.invocation_error
-            ):
-                state.disable_knowledge_tools = True
 
         def prepare_advisor_retry(context: RetryContext) -> None:
             if context.phase is RetryPhase.INVOKE:
@@ -447,33 +466,37 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         prompt: str,
         trace_metadata: dict[str, Any] | None = None,
         cached_tool_evidence: dict[str, Any] | None = None,
-        disable_knowledge_tools: bool = False,
     ) -> tuple[OsaAdvisorOutput, dict[str, Any], dict[str, Any]]:
         token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
-            session_id=planning_request.context.session_id,
-            snapshot_id=planning_request.context.snapshot_id,
-            supi=_planning_supi(planning_request),
-            thread_id=planning_request.context.session_id,
+            scope=ExecutionScope(
+                session_id=planning_request.context.session_id,
+                thread_id=planning_request.context.session_id,
+                snapshot_id=planning_request.context.snapshot_id or None,
+                round_index=planning_request.context.round_index,
+                scenario_id=str((trace_metadata or {}).get("scenario_id") or "").strip() or None,
+                scenario_tags=list((trace_metadata or {}).get("scenario_tags") or []),
+                supi=_planning_supi(planning_request),
+            ),
             token_budget=token_budget,
             token_counter=token_counter,
-            trace_metadata=trace_metadata,
+            trace_attributes=dict(trace_metadata or {}),
         )
         planning_tools, tools_cache = build_request_tools(
             planning_request,
             cached_tool_evidence=cached_tool_evidence,
         )
         self._tools_cache = tools_cache
-        include_knowledge_tools = (
-            not disable_knowledge_tools and self._include_knowledge_tools(planning_request)
-        )
+        include_knowledge_tools = self._include_knowledge_tools(planning_request)
         advisor_agent = self.create_json_agent(
             tools=[
                 *(self._rag_tools() if include_knowledge_tools else []),
                 *planning_tools,
             ],
             system_prompt=render_planning_system_prompt(),
+            prompt_name="optimization_strategy_advisor",
+            prompt_version="2.0.0",
             response_model=OsaAdvisorOutput,
             max_iterations=12,
             max_calls_per_tool=2,
@@ -510,18 +533,29 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             token_counter=getattr(runtime_context, "token_counter", None),
         )
         log_event(self.logger, "osa_context_components", **context_components)
-        invoke_payload = {
-            "messages": messages,
-            "trace_write_mode": "manual",
-            "trace_metadata": {
-                **(trace_metadata or {}),
-                "path_label": "strategy_advisor",
-                "context_token_components": context_components,
-            },
-        }
+        invocation = AgentInvocation(
+            messages=[AgentMessage(role="user", content=prompt)],
+            metadata=TraceMetadata(
+                path_label="strategy_advisor",
+                prompt_name="optimization_strategy_advisor",
+                prompt_version="2.0.0",
+                attributes={
+                    **{
+                        key: value
+                        for key, value in (trace_metadata or {}).items()
+                        if key not in {"path_label", "scenario_id", "scenario_tags"}
+                    },
+                    "context_token_components": context_components,
+                },
+            ),
+        )
         self._pending_invoke_messages = messages
         try:
-            result = advisor_agent.invoke(invoke_payload, context=runtime_context)
+            result = advisor_agent.invoke(
+                invocation,
+                context=runtime_context,
+                defer_trace=True,
+            )
         except Exception as exc:
             if isinstance(exc, ToolLoopExecutionError):
                 failed_tool_call = exc.failed_tool_call or {}
@@ -557,7 +591,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         )
         return advisor_output, result, {
             "agent": advisor_agent,
-            "payload": invoke_payload,
+            "invocation": invocation,
             "runtime_context": runtime_context,
             "result": result,
         }
@@ -578,25 +612,26 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         advisor_trace: dict[str, Any],
         advisor_output: OsaAdvisorOutput | None,
         compiler_output: Any,
-        status: str,
         error: str | None = None,
     ) -> None:
-        payload = copy.deepcopy(advisor_trace["payload"])
-        metadata = dict(payload.get("trace_metadata") or {})
-        metadata["advisor_decision"] = (
-            advisor_output.model_dump(mode="json")
-            if advisor_output is not None
-            else None
-        )
-        metadata["compiler_output"] = compiler_output
-        payload["trace_metadata"] = metadata
+        derived_targets = []
+        if compiler_output is not None and error is None:
+            derived_targets.append(
+                TraceTarget(
+                    kind="compiled_output",
+                    producer="compiler",
+                    schema_name=PolicyPlanDraft.__name__,
+                    output_schema=PolicyPlanDraft.model_json_schema(),
+                    value=compiler_output,
+                    sft_eligible=False,
+                )
+            )
         advisor_trace["agent"].write_trace(
-            payload=payload,
+            invocation=advisor_trace["invocation"],
             context=advisor_trace["runtime_context"],
             result=advisor_trace["result"],
-            status=status,
+            derived_targets=derived_targets,
             error=error,
-            structured_response_override=compiler_output,
         )
 
 

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from shared.contracts import AgentMessage, AgentRunResult, ToolCall
 from control_runtime.agents.grounding.contracts import FlowSelector, GroundingDecision
 from control_runtime.agents.main.contracts import ControlDomain, GlobalControlIntent
 from control_runtime.agents.planning.compiler import OptimizationStrategyCompiler
@@ -76,8 +77,15 @@ def _valid_osa_wire() -> dict:
     }
 
 
+def _result(payload: dict, messages: list[AgentMessage] | None = None) -> AgentRunResult:
+    return AgentRunResult(
+        messages=messages or [AgentMessage(role="assistant", content="{}")],
+        structured_response=payload,
+    )
+
+
 def test_single_rejects_legacy_osa_aliases_without_runtime_normalization() -> None:
-    legacy_single_wire = {"structured_response": {"smPolicies": []}}
+    legacy_single_wire = _result({"smPolicies": []})
 
     assert not hasattr(single_agent, "_SingleAgentOutputNormalizingLlm")
     assert not hasattr(single_agent, "SingleAgentRoundDecision")
@@ -92,7 +100,7 @@ def test_single_rejects_legacy_osa_aliases_without_runtime_normalization() -> No
 def test_single_osa_wire_compiles_equivalently_to_direct_planning_wire() -> None:
     raw_wire = _valid_osa_wire()
     single_output = single_agent.coerce_structured_response(
-        {"structured_response": raw_wire},
+        _result(raw_wire),
         OsaAdvisorOutput,
         error_message="Single control agent returned no OsaAdvisorOutput",
     )
@@ -118,20 +126,16 @@ def test_single_hidden_planning_request_preserves_catalog_allocation_for_slice_m
     agent = object.__new__(single_agent.SingleControlAgent)
     planning_request = agent._build_single_planning_request(
         advisor_output=OsaAdvisorOutput.model_validate(_valid_osa_wire()),
-        advisor_result={
-            "messages": [
-                {
-                    "role": "tool",
-                    "name": "get_sm_ue_flow_catalog",
-                    "content": '{"flow_catalog":[{"supi":"imsi-1","app_id":"app-1","flow_id":"flow-1","flow_name":"video","allocation":{"current_slice_snssai":"01000001","allocated_bandwidth_ul":10,"allocated_bandwidth_dl":20}}]}',
-                },
-                {
-                    "role": "tool",
-                    "name": "get_ue_slice_subscription",
-                    "content": '{"authority":"subscription","authorized_snssais":["01000002"]}',
-                },
-            ]
-        },
+        advisor_result=_result(
+            _valid_osa_wire(),
+            messages=[
+                AgentMessage(role="assistant", tool_calls=[ToolCall(id="call-1", name="get_sm_ue_flow_catalog", arguments={})]),
+                AgentMessage(role="tool", name="get_sm_ue_flow_catalog", tool_call_id="call-1", tool_status="success", content='{"flow_catalog":[{"supi":"imsi-1","app_id":"app-1","flow_id":"flow-1","flow_name":"video","allocation":{"current_slice_snssai":"01000001","allocated_bandwidth_ul":10,"allocated_bandwidth_dl":20}}]}'),
+                AgentMessage(role="assistant", tool_calls=[ToolCall(id="call-2", name="get_ue_slice_subscription", arguments={})]),
+                AgentMessage(role="tool", name="get_ue_slice_subscription", tool_call_id="call-2", tool_status="success", content='{"authority":"subscription","authorized_snssais":["01000002"]}'),
+                AgentMessage(role="assistant", content="{}"),
+            ],
+        ),
         user_input="move off the current slice for imsi-1 video",
         supi="imsi-1",
         session_id="session-1",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
+from shared.contracts import AgentRunResult
 from shared.runtime import extract_tool_calls, extract_tool_results
 
 from .contracts import PlanningRequest
@@ -76,20 +77,20 @@ def _normalize_qos_operation_constraint(
 
 def extract_planning_tool_evidence(
     *,
-    advisor_result: Dict[str, Any],
+    advisor_result: AgentRunResult,
     tool_payload_cache: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Collect the structured planning-tool evidence used by validation and compilation."""
     tool_calls = {
         str(call.get("id") or "").strip(): call
-        for call in extract_tool_calls(advisor_result.get("messages") or [])
+        for call in extract_tool_calls(advisor_result.messages)
         if str(call.get("id") or "").strip()
     }
     optimizer_previews: List[Dict[str, Any]] = []
     network_statuses: List[Dict[str, Any]] = []
     mobility_contexts: List[Dict[str, Any]] = []
 
-    for result in extract_tool_results(advisor_result.get("messages") or []):
+    for result in extract_tool_results(advisor_result.messages):
         tool_name = str(result.get("name") or "").strip()
         if tool_name not in _STRUCTURED_PLANNING_TOOLS:
             continue

@@ -1,32 +1,77 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import json
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import Field, JsonValue, model_validator
 
-
-class DatasetMessage(BaseModel):
-    role: str
-    content: str
-
-
-class TrajectoryMessage(BaseModel):
-    role: str = Field(description="ChatML role. ChatML traces must start with system and end with assistant.")
-    content: str = Field(description="Rendered message content. Tool turns store only the raw tool result body inside <tool_result>.")
-    step_index: int
-    tool_call_id: Optional[str] = None
-    tool_name: Optional[str] = None
-
-
-class ChatmlSftRecord(BaseModel):
-    sample_id: str
-    task: str
-    agent: str
-    messages: List[DatasetMessage]
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+from shared.contracts import (
+    CONTRACT_VERSION,
+    AgentMessage,
+    ContractModel,
+    ContractVersion,
+    ExecutionScope,
+    ToolCatalog,
+    TraceMetadata,
+    TraceTarget,
+    validate_message_sequence,
+)
 
 
-class ProjectedTraceRecord(BaseModel):
+class SftExampleV2(ContractModel):
+    """Model-independent SFT example projected from one validated observed trace."""
+
+    schema_version: ContractVersion = CONTRACT_VERSION
+    sample_id: str = Field(min_length=1)
+    trace_id: str = Field(min_length=1)
+    agent_name: str = Field(min_length=1)
+    scope: ExecutionScope
+    messages: list[AgentMessage] = Field(min_length=2)
+    tool_catalog: ToolCatalog
+    response_schema_name: str = Field(min_length=1)
+    response_schema: dict[str, JsonValue]
+    observed_target: TraceTarget
+    quality_targets: list[TraceTarget] = Field(min_length=1)
+    metadata: TraceMetadata
+
+    @model_validator(mode="after")
+    def validate_example(self) -> "SftExampleV2":
+        validate_message_sequence(self.messages, require_final_assistant=True)
+        if self.observed_target.kind != "observed_model_output" or not self.observed_target.sft_eligible:
+            raise ValueError("SFT example requires one eligible observed_model_output target")
+        if any(target.kind not in {"validated_output", "compiled_output"} for target in self.quality_targets):
+            raise ValueError("quality_targets must be validator/compiler outputs")
+        catalog_names = {tool.name for tool in self.tool_catalog.tools}
+        called_names = {
+            call.name
+            for message in self.messages
+            for call in message.tool_calls
+        }
+        undeclared = sorted(called_names - catalog_names)
+        if undeclared:
+            raise ValueError("SFT example calls undeclared tools: " + ", ".join(undeclared))
+        for message in self.messages:
+            if "<think>" in message.content.lower() or "</think>" in message.content.lower():
+                raise ValueError("SFT example contains private reasoning tags")
+        final_value = json.loads(self.messages[-1].content)
+        if final_value != self.observed_target.value:
+            raise ValueError("final assistant JSON must equal observed target")
+        return self
+
+
+class Qwen3SftRecord(ContractModel):
+    """Qwen3/Hermes-compatible messages and OpenAI-style function schemas."""
+
+    schema_version: ContractVersion = CONTRACT_VERSION
+    sample_id: str = Field(min_length=1)
+    messages: list[dict[str, JsonValue]] = Field(min_length=2)
+    tools: list[dict[str, JsonValue]]
+    metadata: dict[str, JsonValue]
+
+
+class ProjectedTraceRecord(ContractModel):
+    """Read-only evaluation view; never used as the SFT source contract."""
+
     trace_id: str
     timestamp: str
     agent_name: str
@@ -34,52 +79,29 @@ class ProjectedTraceRecord(BaseModel):
     snapshot_id: str
     thread_id: str
     model_name: str
-    input_messages: List[Dict[str, Any]]
-    message_trajectory: List[TrajectoryMessage] = Field(default_factory=list, description="Rendered ChatML-style trajectory for SFT export.")
-    tool_calls: List[Dict[str, Any]]
-    tool_results: List[Dict[str, Any]]
-    structured_response: Any
+    messages: list[AgentMessage]
+    tool_calls: list[dict[str, JsonValue]]
+    tool_results: list[dict[str, JsonValue]]
+    structured_response: JsonValue | None
     status: str
-    error: Optional[str] = None
-    scenario_id: Optional[str] = None
-    scenario_tags: List[str] = Field(default_factory=list)
-    path_label: Optional[str] = None
-    advisor_decision: Any = None
-    compiler_output: Any = None
+    error: str | None = None
+    scenario_id: str | None = None
+    scenario_tags: list[str] = Field(default_factory=list)
+    path_label: str
+    quality_targets: list[TraceTarget] = Field(default_factory=list)
 
 
-class FineTuningTraceRecord(BaseModel):
-    """The minimal per-agent trajectory used as a fine-tuning example.
-
-    The runtime run tree is intentionally richer and remains in ``raw_traces``
-    for debugging.  This record is the stable, compact artifact emitted by an
-    experiment for model training.
-    """
-
-    trace_id: str
-    timestamp: str
-    agent_name: str
-    session_id: str
-    snapshot_id: str
-    input: List[Dict[str, Any]] = Field(default_factory=list)
-    output: Any = None
-    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
-    tool_results: List[Dict[str, Any]] = Field(default_factory=list)
-    status: str
-    error: Optional[str] = None
-
-
-class WorkflowTrajectoryRecord(BaseModel):
+class WorkflowTrajectoryRecord(ContractModel):
     workflow_id: str
-    record_index: Optional[int] = None
-    scenario_id: Optional[str] = None
-    scenario_tags: List[str] = Field(default_factory=list)
+    record_index: int | None = None
+    scenario_id: str | None = None
+    scenario_tags: list[str] = Field(default_factory=list)
     session_id: str
     snapshot_id: str
     status: str
     completed: bool
     user_input: str
-    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    messages: list[dict[str, Any]] = Field(default_factory=list)
     context: str = ""
     global_intent: Any = None
     unified_plan: Any = None
@@ -88,7 +110,15 @@ class WorkflowTrajectoryRecord(BaseModel):
     diagnosis: Any = None
     round_count: int = 0
     retry_count: int = 0
-    round_traces: List[Dict[str, Any]] = Field(default_factory=list)
-    agent_trajectories: Dict[str, List[ProjectedTraceRecord]] = Field(default_factory=dict)
-    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
-    tool_results: List[Dict[str, Any]] = Field(default_factory=list)
+    round_traces: list[dict[str, Any]] = Field(default_factory=list)
+    agent_trajectories: dict[str, list[ProjectedTraceRecord]] = Field(default_factory=dict)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    tool_results: list[dict[str, Any]] = Field(default_factory=list)
+
+
+__all__ = [
+    "ProjectedTraceRecord",
+    "Qwen3SftRecord",
+    "SftExampleV2",
+    "WorkflowTrajectoryRecord",
+]

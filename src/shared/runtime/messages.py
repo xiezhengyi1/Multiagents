@@ -1,10 +1,9 @@
-"""Canonical serialization, ChatML formatting, and message extraction utilities.
+"""Serialization adapters between LangChain and the canonical V2 contracts.
 
 This module is the single source of truth for:
 - JSON-safe recursive serialization (json_friendly, serialize_message, etc.)
-- ChatML tag rendering (format_tool_call, format_tool_result)
-- Message role normalization and content stringification
-- Tool spec building and tool call / result extraction from message sequences
+- LangChain-to-contract message conversion
+- strict tool catalog construction from explicit tool metadata
 
 Other modules should import shared message formatting from here
 rather than re-implementing these functions.
@@ -16,8 +15,10 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, get_args, get_origin
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel
+
+from shared.contracts import AgentMessage, ToolCall, ToolCatalog, ToolContract
 
 
 # ── Generic JSON Serialization ─────────────────────────────────────
@@ -41,7 +42,7 @@ def json_friendly(value: Any) -> Any:
         return {str(key): json_friendly(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [json_friendly(item) for item in value]
-    return str(value)
+    raise TypeError(f"value of type {type(value).__name__} is not JSON serializable")
 
 
 # ── Message Serialization ─────────────────────────────────────
@@ -156,93 +157,166 @@ def stringify_message_content(value: Any) -> str:
 # ── Tool Spec & Extraction ─────────────────────────────────────
 
 
-def build_tool_specs(
+def build_tool_catalog(
     tools: Iterable[Any],
     *,
     capability_aliases: Mapping[str, Iterable[Any]] | None = None,
-) -> List[Dict[str, Any]]:
-    """Build JSON-safe trace tool specs from explicit, call-scoped capabilities."""
+) -> ToolCatalog:
+    """Build a strict, content-addressed catalog from model-visible tools."""
 
     aliases = {
-        str(tool_name or "").strip(): json_friendly(capabilities)
+        str(tool_name).strip(): [str(item).strip() for item in capabilities]
         for tool_name, capabilities in (capability_aliases or {}).items()
-        if str(tool_name or "").strip()
     }
-    specs: List[Dict[str, Any]] = []
+    contracts: list[ToolContract] = []
     for tool in tools:
-        name = getattr(tool, "name", None)
-        if not name and hasattr(tool, "__name__"):
-            name = tool.__name__
-        description = getattr(tool, "description", None) or getattr(tool, "__doc__", None) or ""
-        args_schema = getattr(tool, "args_schema", None)
-        capabilities = getattr(tool, "capabilities", None)
-        if capabilities is None:
-            capabilities = aliases.get(str(name or "").strip(), [])
-        specs.append(
-            {
-                "name": str(name or ""),
-                "description": str(description).strip(),
-                "args_schema": json_friendly(args_schema),
-                "capabilities": json_friendly(capabilities),
-            }
+        name = str(getattr(tool, "name", "")).strip()
+        if not name:
+            raise ValueError("every model tool requires a name")
+        description = str(getattr(tool, "description", "")).strip()
+        if not description:
+            raise ValueError(f"tool {name} requires a description")
+        metadata = dict(getattr(tool, "metadata", None) or {})
+        contract_metadata = metadata.get("contract")
+        if not isinstance(contract_metadata, Mapping):
+            raise ValueError(f"tool {name} is missing explicit contract metadata")
+        input_model = tool.get_input_schema()
+        input_schema = input_model.model_json_schema()
+        tool_capabilities = metadata.get("capabilities", aliases.get(name, []))
+        contracts.append(
+            ToolContract(
+                name=name,
+                description=description,
+                input_schema=json_friendly(input_schema),
+                output_schema=json_friendly(contract_metadata.get("output_schema")),
+                capabilities=[str(item).strip() for item in tool_capabilities],
+                side_effect=str(contract_metadata.get("side_effect")),
+                result_format=str(contract_metadata.get("result_format")),
+            )
         )
-    return specs
+    return ToolCatalog.create(contracts)
 
 
-def extract_tool_calls(messages: Iterable[Any]) -> List[Dict[str, Any]]:
-    """Extract structured tool call records from a sequence of messages."""
+def message_to_contract(message: BaseMessage | Mapping[str, Any]) -> AgentMessage:
+    """Convert one runtime message without changing tool-call semantics."""
+
+    if isinstance(message, SystemMessage):
+        return AgentMessage(role="system", content=stringify_message_content(message.content))
+    if isinstance(message, HumanMessage):
+        return AgentMessage(role="user", content=stringify_message_content(message.content))
+    if isinstance(message, AIMessage):
+        calls = [
+            ToolCall(
+                id=str(call.get("id") or "").strip(),
+                name=str(call.get("name") or "").strip(),
+                arguments=dict(call.get("args") or {}),
+            )
+            for call in message.tool_calls
+        ]
+        return AgentMessage(
+            role="assistant",
+            content=stringify_message_content(message.content),
+            tool_calls=calls,
+        )
+    if isinstance(message, ToolMessage):
+        return AgentMessage(
+            role="tool",
+            content=stringify_message_content(message.content),
+            name=str(message.name or "").strip(),
+            tool_call_id=str(message.tool_call_id or "").strip(),
+            tool_status=str(message.status or "").strip(),
+        )
+    if not isinstance(message, Mapping):
+        raise TypeError(f"unsupported message type: {type(message).__name__}")
+    role = normalize_message_role(dict(message))
+    calls = [
+        ToolCall(
+            id=str(call.get("id") or "").strip(),
+            name=str(call.get("name") or "").strip(),
+            arguments=dict(call.get("arguments") or call.get("args") or {}),
+        )
+        for call in message.get("tool_calls") or []
+    ]
+    return AgentMessage(
+        role=role,
+        content=stringify_message_content(message.get("content")),
+        name=str(message.get("name") or "").strip() or None,
+        tool_calls=calls,
+        tool_call_id=str(message.get("tool_call_id") or "").strip() or None,
+        tool_status=str(message.get("tool_status") or message.get("status") or "").strip() or None,
+    )
+
+
+def contract_to_message(message: AgentMessage) -> BaseMessage:
+    """Convert one canonical message to the LangChain transport boundary."""
+
+    if message.role == "system":
+        return SystemMessage(content=message.content)
+    if message.role == "user":
+        return HumanMessage(content=message.content)
+    if message.role == "assistant":
+        return AIMessage(
+            content=message.content,
+            tool_calls=[
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "args": call.arguments,
+                    "type": "tool_call",
+                }
+                for call in message.tool_calls
+            ],
+        )
+    return ToolMessage(
+        content=message.content,
+        tool_call_id=str(message.tool_call_id),
+        name=message.name,
+        status=str(message.tool_status),
+    )
+
+
+def extract_tool_calls(messages: Iterable[AgentMessage]) -> List[Dict[str, Any]]:
+    """Project canonical assistant tool calls for application-level evidence logic."""
     calls: List[Dict[str, Any]] = []
-    for item in messages:
-        serialized = serialize_message(item) if isinstance(item, BaseMessage) else json_friendly(item)
-        if not isinstance(serialized, dict):
-            continue
-        raw_calls = serialized.get("tool_calls", [])
-        if not isinstance(raw_calls, list):
-            raise TypeError("tool_calls must be a list when present in traced messages")
-        for call in raw_calls:
-            if not isinstance(call, dict):
-                raise TypeError("each tool_call must be a dict")
+    for message in messages:
+        for call in message.tool_calls:
             calls.append(
                 {
-                    "id": call.get("id"),
-                    "name": call.get("name"),
-                    "args": json_friendly(call.get("args")),
-                    "content": serialized.get("content"),
-                    "message_id": serialized.get("id"),
+                    "id": call.id,
+                    "name": call.name,
+                    "args": call.arguments,
+                    "content": message.content,
                 }
             )
     return calls
 
 
-def extract_tool_results(messages: Iterable[Any]) -> List[Dict[str, Any]]:
-    """Extract structured tool result records from a sequence of messages."""
+def extract_tool_results(messages: Iterable[AgentMessage]) -> List[Dict[str, Any]]:
+    """Project canonical tool results for application-level evidence logic."""
     results: List[Dict[str, Any]] = []
-    for item in messages:
-        serialized = serialize_message(item) if isinstance(item, BaseMessage) else json_friendly(item)
-        if not isinstance(serialized, dict):
-            continue
-        message_type = str(serialized.get("type") or serialized.get("role") or "")
-        if message_type != "tool":
+    for message in messages:
+        if message.role != "tool":
             continue
         results.append(
             {
-                "tool_call_id": serialized.get("tool_call_id"),
-                "name": serialized.get("name"),
-                "content": serialized.get("content"),
-                "status": serialized.get("status"),
-                "message_id": serialized.get("id"),
+                "tool_call_id": message.tool_call_id,
+                "name": message.name,
+                "content": message.content,
+                "status": message.tool_status,
             }
         )
     return results
 
 
 __all__ = [
-    "build_tool_specs",
+    "build_tool_catalog",
+    "contract_to_message",
     "extract_tool_calls",
     "extract_tool_results",
     "format_tool_call",
     "format_tool_result",
     "json_friendly",
+    "message_to_contract",
     "normalize_message_role",
     "serialize_base_model_schema",
     "serialize_message",

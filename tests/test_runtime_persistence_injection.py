@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from shared.contracts import ExecutionScope
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -196,16 +198,27 @@ class _ConstructedDependency:
         self.kwargs = kwargs
         self.model_name = str(kwargs.get("model_name") or "fake-model")
 
+    def get_llm(self) -> "_ConstructedDependency":
+        return self
 
-def _envelope(artifacts: ModuleType, artifact_id: str = "artifact-1") -> Any:
+
+def _envelope(
+    artifacts: ModuleType,
+    artifact_id: str = "artifact-1",
+    target_agent: str = "policy_dispatch",
+) -> Any:
     return artifacts.ArtifactEnvelope(
         artifact_id=artifact_id,
         correlation_id="corr-1",
         artifact_type="PolicyPlanDraft",
+        payload_schema_name="PolicyPlanDraft",
         source_agent="main_control",
-        target_agent="policy_dispatch",
-        session_id="session-1",
-        snapshot_id="snapshot-1",
+        target_agent=target_agent,
+        scope=ExecutionScope(
+            session_id="session-1",
+            thread_id="session-1",
+            snapshot_id="snapshot-1",
+        ),
         payload={"policy": "draft"},
     )
 
@@ -262,8 +275,11 @@ def test_persistence_failures_remain_visible_after_disk_write(
     persistence = _FakePersistence()
     persistence.record_result = False
     store = artifacts.ArtifactStore(persistence=persistence, root=tmp_path / "interfaces")
-    response = _envelope(artifacts, artifact_id="artifact-response")
-    response.target_agent = "main_control"
+    response = _envelope(
+        artifacts,
+        artifact_id="artifact-response",
+        target_agent="main_control",
+    )
 
     with pytest.raises(RuntimeError, match="Failed to record response artifact metadata"):
         store.write_response(response)

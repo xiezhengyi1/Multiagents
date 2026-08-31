@@ -5,7 +5,9 @@ import json
 import sys
 import time
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
+from shared.contracts import ExecutionScope, MemoryRecord
 from shared.memory import MemoryManager
 from shared.runtime import ContextPolicy, RuntimePersistence, TokenBudget, TokenCounter
 from application_runtime.persistence import create_runtime_persistence
@@ -91,6 +93,7 @@ class MainControlOrchestrator:
         self.memory_manager = memory_manager or MemoryManager(
             short_term_limit=max(20, max_rounds * 8),
             enable_llm_summarization=True,
+            summarizer_llm=self.main_agent.get_llm(),
         )
         self.max_rounds = max_rounds
         self.rag_enabled = rag_enabled
@@ -146,21 +149,21 @@ class MainControlOrchestrator:
             agent._token_budget = self._token_budget
             agent._token_counter = self._token_counter
 
-    def _remember(self, role: str, payload: Any) -> None:
+    def _remember(self, scope: ExecutionScope, role: str, payload: Any) -> None:
         if isinstance(payload, str):
             content = payload
         else:
             content = json.dumps(project_memory_payload(role, payload), ensure_ascii=False)
-        if role == "MAIN":
-            try:
-                parsed = json.loads(content)
-            except Exception:
-                parsed = {}
-            if isinstance(parsed, dict):
-                supi = str(parsed.get("supi") or "").strip()
-                if supi:
-                    self.memory_manager.bind_supi(supi)
-        self.memory_manager.add_memory(role, content)
+        self.memory_manager.add(
+            MemoryRecord(
+                memory_id=f"memory-{uuid4()}",
+                scope=scope,
+                kind="event",
+                source_agent=role.lower(),
+                role=role,
+                content=content,
+            )
+        )
 
     def _plan_round(
         self,
@@ -183,6 +186,7 @@ class MainControlOrchestrator:
         previous_execution_reentry: Dict[str, Any],
         round_traces: List[Dict[str, Any]],
         agent_elapsed_ms: Dict[str, float],
+        scope: ExecutionScope,
     ) -> tuple[GlobalControlIntent, Optional[GroundingDecision], Optional[Any], Optional[DomainNegotiationRequest]]:
         trace_metadata = self._trace_metadata(scenario_id=scenario_id, scenario_tags=scenario_tags)
         agent_started_at = time.perf_counter()
@@ -217,7 +221,8 @@ class MainControlOrchestrator:
             raise RuntimeError("Main Agent returned no requested_domains; refusing to infer domains outside the agent.")
         if not has_supi_scope(global_intent):
             raise RuntimeError("Main Agent returned no SUPI scope; refusing to patch identifiers outside the agent.")
-        self._remember("MAIN", global_intent)
+        memory_scope = scope.model_copy(update={"supi": global_intent.supi or None})
+        self._remember(memory_scope, "MAIN", global_intent)
 
         selected_next_agent = str(global_intent.next_agent or "").strip().lower()
         reuse_grounding_decision = (
@@ -261,7 +266,7 @@ class MainControlOrchestrator:
                 )
             finally:
                 agent_elapsed_ms["iea"] = round((time.perf_counter() - agent_started_at) * 1000.0, 3)
-            self._remember("IEA", grounding_decision)
+            self._remember(memory_scope, "IEA", grounding_decision)
             if grounding_decision.open_questions:
                 return global_intent, grounding_decision, None, build_negotiation_request(
                     grounding_decision,
@@ -288,7 +293,7 @@ class MainControlOrchestrator:
             policy_plan = self.os_agent.generate_strategy(planning_request, trace_metadata=trace_metadata)
         finally:
             agent_elapsed_ms["osa"] = round((time.perf_counter() - agent_started_at) * 1000.0, 3)
-        self._remember("OSA", policy_plan)
+        self._remember(memory_scope, "OSA", policy_plan)
         return global_intent, grounding_decision, policy_plan, None
 
     def run(
@@ -302,7 +307,6 @@ class MainControlOrchestrator:
     ) -> ControlRoundResult:
         self.main_agent.reset_schema_projection_metrics()
         session_id, snapshot_id = start_control_session(step_name="main_control", user_input=user_input, snapshot_id=snapshot_id)
-        self.memory_manager.bind_thread(session_id)
         self._token_budget = TokenBudget()
         self._inject_token_context()
         state = OrchestratorLoopState()
@@ -310,6 +314,14 @@ class MainControlOrchestrator:
         agent_elapsed_totals = {"main": 0.0, "iea": 0.0, "osa": 0.0}
 
         for round_index in range(1, self.max_rounds + 1):
+            scope = ExecutionScope(
+                session_id=session_id,
+                thread_id=session_id,
+                snapshot_id=snapshot_id or None,
+                round_index=round_index,
+                scenario_id=scenario_id or None,
+                scenario_tags=list(scenario_tags or []),
+            )
             log_event(
                 self.main_agent.logger,
                 "control_round_start",
@@ -320,6 +332,7 @@ class MainControlOrchestrator:
             )
             memory_context = build_memory_context(
                 user_input,
+                scope=scope,
                 memory_manager=self.memory_manager,
                 context_policy=getattr(self, "_context_policy", None),
                 token_counter=getattr(self, "_token_counter", None),
@@ -356,6 +369,7 @@ class MainControlOrchestrator:
                     previous_execution_reentry=state.previous_execution_reentry,
                     round_traces=state.round_traces,
                     agent_elapsed_ms=round_agent_elapsed_ms,
+                    scope=scope,
                 )
             except Exception as exc:
                 for agent_name, elapsed_ms in round_agent_elapsed_ms.items():
@@ -483,7 +497,8 @@ class MainControlOrchestrator:
             mobility_feedback = round_execution.mobility_feedback
             diagnosis = round_execution.diagnosis
             round_trace = round_execution.trace.with_agent_elapsed_ms(round_agent_elapsed_ms)
-            self._remember("AD", diagnosis)
+            diagnosis_scope = scope.model_copy(update={"supi": global_intent.supi or None})
+            self._remember(diagnosis_scope, "AD", diagnosis)
             state.latest_result = ControlRoundResult(
                 session_id=session_id,
                 snapshot_id=snapshot_id,

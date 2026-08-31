@@ -8,6 +8,14 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, Field
 
+from shared.contracts import (
+    AgentInvocation,
+    AgentMessage,
+    AgentRunResult,
+    ExecutionScope,
+    TraceMetadata,
+    TraceTarget,
+)
 from experiments.scripts.common import resolve_python_executable
 
 from .compiler import EnvironmentAgentCompiler, S3_QUALITY_PROFILE
@@ -43,37 +51,33 @@ def _resolve_environment_python_executables(project_root: Path, workspace_root: 
     )
 
 
-def _extract_simulation_payloads(result: dict[str, Any]) -> list[dict[str, Any]]:
+def _extract_simulation_payloads(result: AgentRunResult) -> list[dict[str, Any]]:
     return _extract_tool_payloads(result, "simulate_candidate_environment")
 
 
-def _extract_tool_payloads(result: dict[str, Any], tool_name: str) -> list[dict[str, Any]]:
+def _extract_tool_payloads(result: AgentRunResult, tool_name: str) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
-    for tool_result in extract_tool_results(result.get("messages") or []):
+    for tool_result in extract_tool_results(result.messages):
         if str(tool_result.get("name") or "").strip() != tool_name:
             continue
-        try:
-            payload = json.loads(str(tool_result.get("content") or ""))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            payloads.append(payload)
+        payload = json.loads(str(tool_result.get("content") or ""))
+        if not isinstance(payload, dict):
+            raise TypeError(f"tool {tool_name} must return a JSON object")
+        payloads.append(payload)
     return payloads
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
+    import yaml
+
     text = Path(path).read_text(encoding="utf-8")
-    try:
-        import yaml
-        payload = yaml.safe_load(text)
-    except Exception:
-        payload = json.loads(text)
+    payload = yaml.safe_load(text)
     if not isinstance(payload, dict):
         raise TypeError(f"{path} must contain a mapping")
     return payload
 
 
-def _load_written_candidate(payload: dict[str, Any], *, fallback_name: str = "") -> ScenarioCandidate:
+def _load_written_candidate(payload: dict[str, Any]) -> ScenarioCandidate:
     scenario_path = Path(str(payload.get("scenario_path") or "")).resolve()
     if not scenario_path.is_file():
         raise FileNotFoundError(f"written scenario YAML does not exist: {scenario_path}")
@@ -82,7 +86,7 @@ def _load_written_candidate(payload: dict[str, Any], *, fallback_name: str = "")
     overlay = _load_mapping(overlay_path) if str(payload.get("split_mode_overlay_path") or "").strip() else None
     return ScenarioCandidate(
         scenario_id=str(payload.get("scenario_id") or scenario.get("scenario_id") or "").strip(),
-        name=str(scenario.get("name") or fallback_name or "").strip(),
+        name=str(scenario.get("name") or "").strip(),
         scenario=scenario,
         split_mode_overlay=overlay,
         source_path=scenario_path,
@@ -150,9 +154,10 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         self.agent = self.create_json_agent(
             tools=self.environment_tools,
             system_prompt=self.system_prompt,
+            prompt_name="environment_generation_advisor",
+            prompt_version="2.0.0",
             response_model=EnvironmentAdvisorOutput,
             max_iterations=14,
-            tool_error_mode="return",
             tool_result_limits={
                 "submit_environment_catalog": 5000,
                 "prepare_environment_design_context": 7000,
@@ -174,8 +179,8 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         request = EnvironmentGenerationRequest(**dict(envelope.payload or {}))
         candidate = self.generate_environment(
             request,
-            session_id=envelope.session_id,
-            snapshot_id=envelope.snapshot_id,
+            session_id=envelope.scope.session_id,
+            snapshot_id=envelope.scope.snapshot_id or "",
         )
         return {
             "scenario_id": candidate.scenario_id,
@@ -228,15 +233,20 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         )
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            thread_id=session_id,
+            scope=ExecutionScope(
+                session_id=session_id,
+                thread_id=session_id,
+                snapshot_id=snapshot_id or None,
+            ),
         )
-        payload = {
-            "messages": [{"role": "user", "content": prompt}],
-            "trace_write_mode": "manual",
-            "trace_metadata": {"path_label": "environment_generation"},
-        }
+        invocation = AgentInvocation(
+            messages=[AgentMessage(role="user", content=prompt)],
+            metadata=TraceMetadata(
+                path_label="environment_generation",
+                prompt_name="environment_generation_advisor",
+                prompt_version="2.0.0",
+            ),
+        )
         try:
             log_event(
                 self.logger,
@@ -246,7 +256,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                 session_id=session_id,
                 snapshot_id=snapshot_id,
             )
-            result = self.agent.invoke(payload, context=runtime_context)
+            result = self.agent.invoke(invocation, context=runtime_context, defer_trace=True)
         except Exception as exc:
             self.logger.exception(f"Failed to generate environment candidate: {exc}")
             log_timing(
@@ -260,20 +270,32 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             if isinstance(exc, ToolLoopExecutionError):
                 raise RuntimeError(f"Environment generation advisor failed: {exc}") from exc
             raise
-        simulation_payloads = _extract_simulation_payloads(result)
-        if not simulation_validation_succeeded(simulation_payloads):
-            raise RuntimeError("Environment advisor returned without successful real simulator validation evidence")
-        output = coerce_structured_response(
-            result,
-            EnvironmentAdvisorOutput,
-            error_message="Environment advisor returned no structured_response",
-        )
-        written_payloads = _extract_tool_payloads(result, "write_validated_environment_yaml")
-        if not written_payloads:
-            raise RuntimeError("Environment advisor returned without validated YAML write evidence")
-        candidate = _load_written_candidate(written_payloads[-1], fallback_name=output.name)
-        report = self.compiler.validate_candidate(candidate, quality_profile=self.quality_profile)
-        if not report.ok:
+        try:
+            simulation_payloads = _extract_simulation_payloads(result)
+            if not simulation_validation_succeeded(simulation_payloads):
+                raise RuntimeError("Environment advisor returned without successful real simulator validation evidence")
+            output = coerce_structured_response(
+                result,
+                EnvironmentAdvisorOutput,
+                error_message="Environment advisor returned no structured_response",
+            )
+            written_payloads = _extract_tool_payloads(result, "write_validated_environment_yaml")
+            if not written_payloads:
+                raise RuntimeError("Environment advisor returned without validated YAML write evidence")
+            candidate = _load_written_candidate(written_payloads[-1])
+            report = self.compiler.validate_candidate(candidate, quality_profile=self.quality_profile)
+            if not report.ok:
+                raise RuntimeError(
+                    "Environment advisor returned invalid scenario: "
+                    + json.dumps(report.errors, ensure_ascii=False)
+                )
+        except Exception as exc:
+            self.agent.write_trace(
+                invocation=invocation,
+                context=runtime_context,
+                result=result,
+                error=str(exc),
+            )
             log_timing(
                 self.logger,
                 "environment_total",
@@ -282,7 +304,22 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                 session_id=session_id,
                 snapshot_id=snapshot_id,
             )
-            raise RuntimeError("Environment advisor returned invalid scenario: " + json.dumps(report.errors, ensure_ascii=False))
+            raise
+        self.agent.write_trace(
+            invocation=invocation,
+            context=runtime_context,
+            result=result,
+            derived_targets=[
+                TraceTarget(
+                    kind="validated_output",
+                    producer="validator",
+                    schema_name=ScenarioCandidate.__name__,
+                    output_schema=ScenarioCandidate.model_json_schema(),
+                    value=candidate.model_dump(mode="json"),
+                    sft_eligible=False,
+                )
+            ],
+        )
         log_timing(
             self.logger,
             "environment_total",

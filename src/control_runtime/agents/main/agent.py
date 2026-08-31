@@ -3,6 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from shared.contracts import (
+    AgentInvocation,
+    AgentMessage,
+    AgentRunResult,
+    ExecutionScope,
+    TraceMetadata,
+    TraceTarget,
+)
 from shared.runtime import ToolLoopExecutionError
 from shared.agents import (
     BaseAgent,
@@ -33,25 +41,35 @@ from ...context.prompts.main import (
 
 @dataclass
 class MainControlInvocation:
-    raw_result: Dict[str, Any]
+    raw_result: AgentRunResult
     trace_agent: Any
-    trace_payload: Dict[str, Any]
+    invocation: AgentInvocation
     runtime_context: Any
 
     def write_final_trace(
         self,
         *,
-        status: str,
         structured_response: Dict[str, Any] | None = None,
         error: str | None = None,
     ) -> None:
+        derived_targets = []
+        if structured_response is not None and error is None:
+            derived_targets.append(
+                TraceTarget(
+                    kind="validated_output",
+                    producer="validator",
+                    schema_name=GlobalControlIntent.__name__,
+                    output_schema=GlobalControlIntent.model_json_schema(),
+                    value=structured_response,
+                    sft_eligible=False,
+                )
+            )
         self.trace_agent.write_trace(
-            payload=self.trace_payload,
+            invocation=self.invocation,
             context=self.runtime_context,
             result=self.raw_result,
-            status=status,
+            derived_targets=derived_targets,
             error=error,
-            structured_response_override=structured_response,
         )
 
 
@@ -72,6 +90,7 @@ class _MainIntentStageState:
     projected_fields: List[str] = field(default_factory=list)
     validation_errors: List[str] = field(default_factory=list)
     invocation_error: str = ""
+    trace_recorded: bool = False
 
 
 class MainControlAgent(BaseAgent):
@@ -89,6 +108,8 @@ class MainControlAgent(BaseAgent):
         self.agent = self.create_json_agent(
             tools=self.tools,
             system_prompt=render_main_system_prompt(),
+            prompt_name="main_control_decision",
+            prompt_version="2.0.0",
             response_model=MainControlDecisionWire,
             max_iterations=6,
             capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
@@ -140,12 +161,17 @@ class MainControlAgent(BaseAgent):
         token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            thread_id=session_id,
+            scope=ExecutionScope(
+                session_id=session_id,
+                thread_id=session_id,
+                snapshot_id=snapshot_id or None,
+                round_index=round_index,
+                scenario_id=str((trace_metadata or {}).get("scenario_id") or "").strip() or None,
+                scenario_tags=list((trace_metadata or {}).get("scenario_tags") or []),
+            ),
             token_budget=token_budget,
             token_counter=token_counter,
-            trace_metadata=trace_metadata,
+            trace_attributes=dict(trace_metadata or {}),
         )
         self._pending_invoke_messages = [payload]
         base_trace_metadata = {
@@ -169,15 +195,13 @@ class MainControlAgent(BaseAgent):
             if state.invocation is None:
                 raise RuntimeError("Main Agent finished without a trace invocation")
             state.invocation.write_final_trace(
-                status="success",
                 structured_response=state.intent.model_dump(mode="json"),
             )
             return state.intent
         except Exception as exc:
-            if state.invocation is not None:
+            if state.invocation is not None and not state.trace_recorded:
                 state.invocation.write_final_trace(
-                    status="error",
-                    structured_response=None if state.intent is None else state.intent.model_dump(mode="json"),
+                    structured_response=None,
                     error=str(exc),
                 )
             raise
@@ -206,6 +230,9 @@ class MainControlAgent(BaseAgent):
                 snapshot_id=state.snapshot_id,
             )
             state.projected_fields = []
+            state.invocation = None
+            state.intent = None
+            state.trace_recorded = False
 
         def invoke_global_intent(_: StageAttempt) -> _MainIntentStageState:
             state.invocation = self._invoke_global_intent_result(
@@ -267,6 +294,14 @@ class MainControlAgent(BaseAgent):
             )
 
         def record_stage_failure(retry_context: RetryContext) -> None:
+            if retry_context.phase in {RetryPhase.PARSE, RetryPhase.VALIDATION}:
+                if state.invocation is None:
+                    raise RuntimeError("Main failed after invocation without trace context")
+                state.invocation.write_final_trace(
+                    structured_response=None,
+                    error=str(retry_context.error),
+                )
+                state.trace_recorded = True
             if retry_context.phase in {RetryPhase.INVOKE, RetryPhase.PARSE}:
                 if not isinstance(retry_context.error, RuntimeError):
                     return
@@ -318,13 +353,21 @@ class MainControlAgent(BaseAgent):
 
     def _invoke_global_intent_result(self, user_prompt: str, *, runtime_context: Any, trace_metadata: Dict[str, Any]) -> MainControlInvocation:
         self._pending_invoke_messages = [{"role": "user", "content": user_prompt}]
-        payload = {
-            "messages": self._pending_invoke_messages,
-            "trace_write_mode": "manual",
-            "trace_metadata": dict(trace_metadata or {}),
-        }
+        invocation = AgentInvocation(
+            messages=[AgentMessage(role="user", content=user_prompt)],
+            metadata=TraceMetadata(
+                path_label=str(trace_metadata.get("path_label") or "global_intent_advisor"),
+                prompt_name="main_control_decision",
+                prompt_version="2.0.0",
+                attributes={
+                    key: value
+                    for key, value in trace_metadata.items()
+                    if key not in {"path_label", "scenario_id", "scenario_tags"}
+                },
+            ),
+        )
         try:
-            result = self.agent.invoke(payload, context=runtime_context)
+            result = self.agent.invoke(invocation, context=runtime_context, defer_trace=True)
         except Exception as exc:
             if isinstance(exc, ToolLoopExecutionError):
                 failed_tool_call = exc.failed_tool_call or {}
@@ -339,6 +382,6 @@ class MainControlAgent(BaseAgent):
         return MainControlInvocation(
             raw_result=result,
             trace_agent=self.agent,
-            trace_payload=payload,
+            invocation=invocation,
             runtime_context=runtime_context,
         )

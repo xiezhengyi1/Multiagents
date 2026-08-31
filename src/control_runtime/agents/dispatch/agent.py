@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from shared.contracts import ExecutionScope
 from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, JsonlTraceWriter, RuntimePersistence
 from shared.runtime.trace.execution import write_deterministic_execution_trace
 from shared.logging import setup_logger
@@ -54,9 +55,14 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         self.ensure_worker_runtime_initialized()
         request_envelope = self.cache_received_artifact(
             artifact_type="PolicyPlanDraft",
+            payload_schema_name="PolicyPlanDraft",
             payload=strategy_output,
-            session_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
-            snapshot_id=str(getattr(strategy_output, "snapshot_id", "") or "").strip(),
+            scope=ExecutionScope(
+                session_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
+                thread_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
+                snapshot_id=str(getattr(strategy_output, "snapshot_id", "") or "").strip() or None,
+                supi=str(getattr(strategy_output, "supi", "") or "").strip() or None,
+            ),
         )
         return self.execute_and_evaluate_from_request(
             strategy_output=strategy_output,
@@ -90,6 +96,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         )
         self.cache_produced_artifact(
             artifact_type="FeedbackReport",
+            payload_schema_name=FeedbackReport.__name__,
             request_envelope=request_envelope,
             payload=feedback_report,
         )

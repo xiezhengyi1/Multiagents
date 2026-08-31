@@ -302,7 +302,7 @@ def build_single_agent_tools(
     )
     from ...integrations.optimizer import run_joint_control_optimizer as run_optimizer
 
-    @tool_with_reason
+    @tool_with_reason(side_effect="read", result_format="json")
     def preview_qos_optimizer(
         supi: str,
         flow_ids: List[str],
@@ -335,7 +335,7 @@ def build_single_agent_tools(
             ensure_ascii=False,
         )
 
-    @tool_with_reason
+    @tool_with_reason(side_effect="read", result_format="json")
     def get_sm_ue_flow_catalog(
         supi: str = "",
         runtime: ToolRuntime[AgentRuntimeContext] = None,
@@ -351,7 +351,7 @@ def build_single_agent_tools(
         compact = compact_flow_catalog_for_single_agent(payload if isinstance(payload, dict) else {})
         return "SM UE Flow Catalog Retrieved:\n" + json.dumps(compact, ensure_ascii=False)
 
-    @tool_with_reason
+    @tool_with_reason(side_effect="read", result_format="json")
     def fetch_qos_network_status(
         service_type_id: Optional[int] = None,
         runtime: ToolRuntime[AgentRuntimeContext] = None,
@@ -366,7 +366,7 @@ def build_single_agent_tools(
         compact = compact_network_status_for_single_agent(payload)
         return "QoS Network Status Retrieved:\n" + json.dumps(compact, ensure_ascii=False)
 
-    @tool_with_reason
+    @tool_with_reason(side_effect="read", result_format="json")
     def inspect_mobility_ue_policies(
         supi: str,
         runtime: ToolRuntime[AgentRuntimeContext] = None,

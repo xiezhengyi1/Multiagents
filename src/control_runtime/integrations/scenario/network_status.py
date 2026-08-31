@@ -13,7 +13,7 @@ from .network_graph import (
     get_graph_snapshot_payload,
 )
 
-@tool_with_reason
+@tool_with_reason(side_effect="write", result_format="json")
 def save_network_status_snapshot(
     trigger_event: str = "Manual",
     runtime: ToolRuntime[AgentRuntimeContext] = None,

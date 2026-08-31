@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from shared.contracts import AgentMessage, AgentRunResult, ExecutionScope, MemoryBundle, MemoryRecord
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 for candidate in (ROOT, SRC):
@@ -144,7 +146,7 @@ def _bare_main_for_public_contract(monkeypatch):
     return agent, main_agent
 
 
-def _main_control_decision_result(*, include_compiled_field: bool = False) -> dict:
+def _main_control_decision_result(*, include_compiled_field: bool = False) -> AgentRunResult:
     from control_runtime.agents.main.contracts import ControlDomain, MainControlDecision
 
     decision = MainControlDecision(
@@ -160,7 +162,10 @@ def _main_control_decision_result(*, include_compiled_field: bool = False) -> di
     ).model_dump(mode="json")
     if include_compiled_field:
         decision["routing_decision"] = "compiler-owned field"
-    return {"structured_response": decision}
+    return AgentRunResult(
+        messages=[AgentMessage(role="assistant", content=json.dumps(decision))],
+        structured_response=decision,
+    )
 
 
 def test_canonical_runtime_paths_stay_bound_to_the_repository_layout() -> None:
@@ -310,21 +315,25 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
         self.assertNotIn("very old verbose detail", context)
 
     def test_memory_context_prefers_entries_matching_diagnosis_and_routing_hints(self) -> None:
+        scope = ExecutionScope(session_id="session-1", thread_id="session-1")
+
         class Memory:
-            def retrieve(self, _: str) -> dict:
-                return {
-                    "short_term": [
-                        {"role": "MAIN", "content": "generic context"},
-                        {"role": "AD", "content": "planning_blocked optimizer preview missing"},
+            def retrieve(self, query):
+                return MemoryBundle(
+                    query=query,
+                    short_term=[
+                        MemoryRecord(memory_id="m1", scope=scope, kind="event", source_agent="main", role="MAIN", content="generic context"),
+                        MemoryRecord(memory_id="m2", scope=scope, kind="event", source_agent="ad", role="AD", content="planning_blocked optimizer preview missing"),
                     ],
-                    "long_term": [
-                        "general success case",
-                        "optimization_strategy target_stable retry fixed planner gap",
+                    long_term=[
+                        MemoryRecord(memory_id="m3", scope=scope, kind="summary", source_agent="memory", role="summary", content="general success case"),
+                        MemoryRecord(memory_id="m4", scope=scope, kind="summary", source_agent="memory", role="summary", content="optimization_strategy target_stable retry fixed planner gap"),
                     ],
-                }
+                )
 
         context = build_memory_context(
             "QoS request",
+            scope=scope,
             memory_manager=Memory(),
             diagnosis_hint="planning_blocked",
             routing_hint="optimization_strategy target_stable",
@@ -695,7 +704,7 @@ def test_osa_public_generate_strategy_preserves_stage_failure_cleanup_and_trace(
         agent.generate_strategy(request, trace_metadata={"scenario_id": "offline-case"})
 
     assert raised.value is terminal_error
-    assert trace_writes[0]["status"] == "error"
+    assert trace_writes[0]["error"] == "strategy advisor unavailable"
     assert trace_writes[0]["error"] == "strategy advisor unavailable"
     assert not hasattr(agent, "_pending_invoke_messages")
 
@@ -714,6 +723,7 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
     agent.last_failure_debug = {}
     invocations = []
     validations = []
+    trace_writes = []
     request = PlanningRequest(
         grounding_decision=_grounding_decision(),
         context=PlanningContext(shared_context=SharedControlContext(main_intent=_main_intent())),
@@ -731,6 +741,11 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
         return OsaAdvisorOutput(), {}, {}
 
     monkeypatch.setattr(agent, "_invoke_strategy_advisor", invoke_advisor)
+    monkeypatch.setattr(
+        agent,
+        "_write_advisor_trace",
+        lambda **kwargs: trace_writes.append(kwargs),
+    )
     monkeypatch.setattr(planning_agent, "extract_planning_tool_evidence", lambda **_kwargs: {})
     monkeypatch.setattr(planning_agent, "extract_grounding_tool_names", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(planning_agent, "log_event", lambda *_args, **_kwargs: None)
@@ -748,6 +763,8 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
     )
     assert invocations == ["invoke", "invoke", "invoke"]
     assert validations == ["validate", "validate", "validate"]
+    assert len(trace_writes) == 3
+    assert all("contract validation failed" in item["error"] for item in trace_writes)
 
 
 def test_iea_public_entrypoint_returns_grounding_decision_and_persists_artifact_boundary(monkeypatch) -> None:
@@ -864,7 +881,7 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
 
     orchestrator = object.__new__(BareMainControlOrchestrator)
     orchestrator.main_agent = MainAgent()
-    orchestrator.memory_manager = SimpleNamespace(bind_thread=lambda _session_id: None)
+    orchestrator.memory_manager = object()
     orchestrator.max_rounds = 2
     orchestrator._token_counter = object()
     orchestrator._inject_token_context = lambda: None
@@ -970,8 +987,8 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
     assert finalization[0]["state"].completed is True
 
 
-def test_iea_public_analysis_reraises_final_invocation_error_without_final_retry_side_effects(monkeypatch) -> None:
-    """The shared runner must retain the former public IEA failure contract."""
+def test_iea_public_analysis_records_rejected_output_before_later_invocation_failure(monkeypatch) -> None:
+    """Every completed model response is traced once even when a later retry fails."""
 
     agent, grounding_agent, evidence = _bare_iea_for_public_contract(monkeypatch)
     attempts = []
@@ -1033,9 +1050,8 @@ def test_iea_public_analysis_reraises_final_invocation_error_without_final_retry
     assert agent.last_failure_debug["advisor_validation_errors"] == ["advisor decision invalid"]
     assert trace_writes == [
         {
-            "grounding_decision": decision,
-            "status": "error",
-            "error": "advisor unavailable",
+            "grounding_decision": None,
+            "error": "IEA advisor decision validation failed: advisor decision invalid",
         }
     ]
     assert not hasattr(agent, "_pending_invoke_messages")
@@ -1086,7 +1102,6 @@ def test_iea_public_analysis_keeps_terminal_parse_message_and_cause(monkeypatch)
     ]
     assert trace_writes[-1] == {
         "grounding_decision": None,
-        "status": "error",
         "error": "IEA advisor output contract validation failed: advisor response is malformed",
     }
     assert not hasattr(agent, "_pending_invoke_messages")
@@ -1143,8 +1158,8 @@ def test_iea_public_analysis_keeps_distinct_terminal_validation_messages(
     assert invocations == ["invoke", "invoke", "invoke"]
     assert agent.last_failure_debug["advisor_validation_errors"] == advisor_errors
     assert agent.last_failure_debug["grounding_validation_errors"] == grounding_errors
-    assert trace_writes[-1]["grounding_decision"] == decision
-    assert trace_writes[-1]["status"] == "error"
+    assert trace_writes[-1]["grounding_decision"] is None
+    assert trace_writes[-1]["error"] == expected_message
 
 
 def test_iea_public_analysis_does_not_retry_nonretryable_errors_and_cleans_pending_messages(monkeypatch) -> None:
@@ -1395,7 +1410,7 @@ def test_main_public_analysis_retries_runtime_invocations_then_succeeds_with_ret
         if len(invocation_prompts) == 2:
             raise second_error
         return SimpleNamespace(
-            raw_result=_main_control_decision_result(include_compiled_field=True),
+            raw_result=_main_control_decision_result(),
             write_final_trace=lambda **kwargs: trace_writes.append(kwargs),
         )
 
@@ -1433,18 +1448,14 @@ def test_main_public_analysis_retries_runtime_invocations_then_succeeds_with_ret
         (1, str(first_error), "<empty>"),
         (2, str(second_error), "<empty>"),
     ]
-    assert agent.schema_projection_metrics == {
-        "count": 1,
-        "field_count": 1,
-        "fields": ["routing_decision"],
-    }
+    assert agent.schema_projection_metrics == {"count": 0, "field_count": 0, "fields": []}
     assert trace_writes == [
-        {"status": "success", "structured_response": result.model_dump(mode="json")}
+        {"structured_response": result.model_dump(mode="json")}
     ]
     assert not hasattr(agent, "_pending_invoke_messages")
 
 
-def test_main_public_analysis_keeps_terminal_wrapped_parse_error_identity_cause_and_trace(monkeypatch) -> None:
+def test_main_public_analysis_traces_each_rejected_parse_attempt(monkeypatch) -> None:
     import control_runtime.agents.main.compiler as main_compiler
 
     agent, main_agent = _bare_main_for_public_contract(monkeypatch)
@@ -1501,12 +1512,14 @@ def test_main_public_analysis_keeps_terminal_wrapped_parse_error_identity_cause_
     assert [prompt["validation_errors"] for prompt in retry_prompts] == [[], []]
     assert [prompt["invocation_error"] for prompt in retry_prompts] == [expected_message, expected_message]
     assert trace_writes == [
-        {"status": "error", "structured_response": None, "error": expected_message}
+        {"structured_response": None, "error": expected_message},
+        {"structured_response": None, "error": expected_message},
+        {"structured_response": None, "error": expected_message},
     ]
     assert not hasattr(agent, "_pending_invoke_messages")
 
 
-def test_main_public_analysis_keeps_terminal_semantic_validation_message_trace_and_projection(monkeypatch) -> None:
+def test_main_public_analysis_traces_each_semantically_rejected_output(monkeypatch) -> None:
     agent, main_agent = _bare_main_for_public_contract(monkeypatch)
     intent = _main_intent(next_agent="intent_encoding")
     semantic_errors = ["semantic target is incomplete", "route must retain required evidence"]
@@ -1572,13 +1585,11 @@ def test_main_public_analysis_keeps_terminal_semantic_validation_message_trace_a
         "field_count": 3,
         "fields": ["routing_decision"],
     }
-    assert trace_writes == [
-        {
-            "status": "error",
-            "structured_response": intent.model_dump(mode="json"),
-            "error": expected_message,
-        }
-    ]
+    expected_trace = {
+        "structured_response": None,
+        "error": expected_message,
+    }
+    assert trace_writes == [expected_trace, expected_trace, expected_trace]
     assert not hasattr(agent, "_pending_invoke_messages")
 
 
@@ -1630,7 +1641,7 @@ def test_main_public_analysis_does_not_retry_nonretryable_parse_value_error_and_
     assert not [event for event, _kwargs in events if event == "main_control_validation_failed"]
     assert agent.schema_projection_metrics == {"count": 0, "field_count": 0, "fields": []}
     assert trace_writes == [
-        {"status": "error", "structured_response": None, "error": str(terminal_error)}
+        {"structured_response": None, "error": str(terminal_error)}
     ]
     assert not hasattr(agent, "_pending_invoke_messages")
 

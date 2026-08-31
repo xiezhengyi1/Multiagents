@@ -167,7 +167,7 @@ def _compact_trace_payload(trace: ProjectedTraceRecord) -> Dict[str, Any]:
         "trace_id": trace.trace_id,
         "agent_name": trace.agent_name,
         "status": trace.status,
-        "input_messages": trace.input_messages,
+        "messages": [message.model_dump(mode="json") for message in trace.messages],
         "tool_calls": _business_tool_calls(trace),
         "tool_results": trace.tool_results,
         "structured_response": trace.structured_response,
@@ -282,17 +282,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-records",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_runs_v1.jsonl",
+        default=processed_dir("workflow") / "trajectory_runs_v2.jsonl",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_evaluations_v1.jsonl",
+        default=processed_dir("workflow") / "trajectory_evaluations_v2.jsonl",
     )
     parser.add_argument(
         "--summary-output",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_evaluation_summary_v1.json",
+        default=processed_dir("workflow") / "trajectory_evaluation_summary_v2.json",
     )
     parser.add_argument("--model", type=str, default="qwen-plus")
     return parser.parse_args()

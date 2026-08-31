@@ -13,6 +13,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from langchain_core.documents import Document
 from langchain.tools import ToolRuntime
 
+from shared.contracts import (
+    KnowledgeCitation,
+    KnowledgeHit,
+    KnowledgeQuery,
+    KnowledgeResponse,
+)
 from shared.tools import tool_with_reason
 
 from shared.runtime import AgentRuntimeContext
@@ -1520,17 +1526,14 @@ def warmup_knowledge_tool_models() -> Dict[str, Any]:
     warmed["rerankers"].append(BGE_RERANK_MODEL)
 
     if _colbert_available():
-        try:
-            encoder = get_colbert_encoder()
-            retriever = get_colbert_retriever()
-            retriever.preload()
-            warmed["colbert"] = {
-                "model": encoder.model_name,
-                "dim": encoder.dim,
-                "records": retriever.record_count,
-            }
-        except Exception:
-            warmed["colbert"] = {"error": "colbert_warmup_failed"}
+        encoder = get_colbert_encoder()
+        retriever = get_colbert_retriever()
+        retriever.preload()
+        warmed["colbert"] = {
+            "model": encoder.model_name,
+            "dim": encoder.dim,
+            "records": retriever.record_count,
+        }
 
     return warmed
 
@@ -1973,10 +1976,7 @@ def _vector_search_candidates(query: str, domain: str) -> Tuple[List[Dict[str, A
                 continue
             score = 300.0 - rank * 10.0 + _metadata_query_bonus(metadata, query, domain)
             if raw_score is not None:
-                try:
-                    score -= float(raw_score) * 15.0
-                except (TypeError, ValueError):
-                    pass
+                score -= float(raw_score) * 15.0
             title_terms, object_terms, normalized_terms = _metadata_term_sets(metadata)
             score += 10.0 * len(query_terms.intersection(title_terms))
             score += 8.0 * len(query_terms.intersection(object_terms))
@@ -2120,52 +2120,6 @@ def _resolve_explicit_key_candidates(key: str, domain: str) -> List[Dict[str, An
     return _dedupe_candidates(matches, limit=6)
 
 
-def _result_summary(candidate: Dict[str, Any]) -> str:
-    metadata = candidate["metadata"]
-    title = str(
-        metadata.get("canonical_title")
-        or metadata.get("schema_name")
-        or metadata.get("operation_id")
-        or candidate.get("id")
-        or ""
-    ).strip()
-    snippet = _shorten(candidate["page_content"], limit=MAX_SUMMARY_CHARS)
-    return f"{title} | {snippet}"
-
-
-def _render_result(candidate: Dict[str, Any]) -> str:
-    metadata = candidate["metadata"]
-    features = candidate.get("features") or {}
-    result_key = _candidate_key(metadata, candidate.get("id") or "")
-    locator_parts = []
-    if metadata.get("schema_name"):
-        locator_parts.append(f"schema={metadata['schema_name']}")
-    if metadata.get("operation_id"):
-        locator_parts.append(f"operation={metadata['operation_id']}")
-    if metadata.get("clause_path"):
-        locator_parts.append(f"clause={metadata['clause_path']}")
-    if metadata.get("table_id"):
-        locator_parts.append(f"table={metadata['table_id']}")
-    locator = ", ".join(locator_parts) or "locator=unknown"
-
-    lines = [
-        f"ResultKey: {result_key}",
-        f"Title: {metadata.get('canonical_title', '')}",
-        f"Retrieval: {candidate['retrieval']}",
-        f"Spec: {metadata.get('spec_id', '')} Release {metadata.get('release', '')} Version {metadata.get('version', '')}",
-        f"Type: {metadata.get('doc_type', '')} Domain: {metadata.get('policy_domain', '')}",
-        f"Features: match_type={features.get('match_type', '')} domain_match={features.get('domain_match', '')} doc_type_match={features.get('doc_type_match', False)} object_overlap_count={features.get('object_overlap_count', 0)}",
-        f"Locator: {locator}",
-        f"Objects: {', '.join(metadata.get('object_tags') or []) or 'none'}",
-        f"Citation: {metadata.get('citation_anchor', '')}",
-    ]
-    if metadata.get("source_url"):
-        lines.append(f"Source: {metadata['source_url']}")
-    lines.append(f"Summary: {_result_summary(candidate)}")
-    lines.append(f"Content: {_shorten(candidate['page_content'])}")
-    return "\n".join(lines)
-
-
 @dataclass(frozen=True)
 class RetrievalStage:
     name: str
@@ -2188,12 +2142,9 @@ def _emit_retrieval_stage(
 ) -> None:
     if observer is None:
         return
-    try:
-        observer(RetrievalStage(
-            stage, round(duration_ms, 2), candidate_count, tuple(errors), skipped
-        ))
-    except Exception:
-        logger.debug("knowledge retrieval observer failed: %s", stage, exc_info=True)
+    observer(RetrievalStage(
+        stage, round(duration_ms, 2), candidate_count, tuple(errors), skipped
+    ))
 
 
 def _observe_retrieval_stage(
@@ -2305,35 +2256,60 @@ def _run_retrieval_pipeline(
     return reranked, errors
 
 
-def _format_results(
-    query: str,
-    candidates: List[Dict[str, Any]],
-    errors: List[str],
-    *,
-    include_selection_guide: bool = False,
-) -> str:
-    if not candidates:
-        if errors:
-            return (
-                f"No relevant knowledge found for '{query}'. "
-                f"Dense retrieval failed: {' | '.join(errors)}"
-            )
-        return f"No relevant knowledge found for '{query}'."
+def _knowledge_domain(domain: str) -> str:
+    normalized = str(domain).strip().lower()
+    if normalized == "mobility":
+        return "am_policy"
+    if normalized == "all":
+        return "cross_domain"
+    if normalized not in {"sm_policy", "am_policy", "ursp", "cross_domain"}:
+        raise ValueError(f"unsupported knowledge domain: {domain}")
+    return normalized
 
-    blocks = [_render_result(candidate) for candidate in candidates]
-    if include_selection_guide:
-        selection_lines = [
-            f"CandidateKeys for query '{query}':",
-            *[
-                f"{index}. {_candidate_key(candidate['metadata'], candidate.get('id') or '')} | {_result_summary(candidate)}"
-                for index, candidate in enumerate(candidates, start=1)
-            ],
-            "Use get_knowledge_by_key with an exact ResultKey from the list above for the second-stage lookup.",
-        ]
-        blocks.insert(0, "\n".join(selection_lines))
-    if errors:
-        blocks.append("Warnings: Dense retrieval failed for collections: " + " | ".join(errors))
-    return "\n\n---\n\n".join(blocks)
+
+def _knowledge_response(
+    *,
+    scope: Any,
+    query: str,
+    domain: str,
+    limit: int,
+    candidates: List[Dict[str, Any]],
+) -> KnowledgeResponse:
+    knowledge_query = KnowledgeQuery(
+        scope=scope,
+        query=query,
+        domain=_knowledge_domain(domain),
+        limit=limit,
+    )
+    hits = []
+    for candidate in candidates:
+        metadata = dict(candidate["metadata"])
+        result_key = _candidate_key(metadata, candidate.get("id") or "")
+        hits.append(
+            KnowledgeHit(
+                citation=KnowledgeCitation(
+                    result_key=result_key,
+                    spec_id=str(metadata["spec_id"]),
+                    release=str(metadata["release"]),
+                    version=str(metadata["version"]),
+                    anchor=str(metadata["citation_anchor"]),
+                    source_url=str(metadata["source_url"]) if metadata.get("source_url") else None,
+                ),
+                title=str(
+                    metadata.get("canonical_title")
+                    or metadata.get("schema_name")
+                    or metadata.get("operation_id")
+                    or result_key
+                ),
+                document_type=str(metadata["doc_type"]),
+                policy_domain=str(metadata["policy_domain"]),
+                retrieval_method=str(candidate["retrieval"]),
+                score=float(candidate["score"]),
+                content=str(candidate["page_content"]),
+                object_tags=[str(item) for item in metadata.get("object_tags") or []],
+            )
+        )
+    return KnowledgeResponse(query=knowledge_query, hits=hits)
 
 
 def run_semantic_knowledge_pipeline(
@@ -2374,74 +2350,81 @@ def run_semantic_knowledge_pipeline(
         )
 
 
-@tool_with_reason
+@tool_with_reason(
+    side_effect="read",
+    result_format="json",
+    output_schema=KnowledgeResponse.model_json_schema(),
+)
 def search_semantic_knowledge(
     query: str,
     category: Optional[str] = None,
     limit: int = DEFAULT_RETURNED_RESULTS,
     runtime: ToolRuntime[AgentRuntimeContext] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Search the canonical Release-19 PCF policy standards knowledge base with exact and dense retrieval.
     The optional `category` is treated as a domain hint (`sm_policy` or `ursp`), not the old business category field.
     """
     normalized_query = str(query or "").strip()
     if not normalized_query:
-        return "No relevant knowledge found for an empty query."
+        raise ValueError("query must not be empty")
+    if runtime is None or runtime.context is None:
+        raise RuntimeError("knowledge tools require AgentRuntimeContext")
+    normalized_limit = _sanitize_limit(limit)
+    candidates, errors = run_semantic_knowledge_pipeline(
+        normalized_query,
+        category=category,
+        limit=normalized_limit,
+    )
+    if errors:
+        raise RuntimeError("knowledge retrieval failed: " + " | ".join(errors))
+    domain = _infer_policy_domain(normalized_query, category)
+    return _knowledge_response(
+        scope=runtime.context.scope,
+        query=normalized_query,
+        domain=domain,
+        limit=normalized_limit,
+        candidates=candidates,
+    ).model_dump(mode="json")
 
-    try:
-        candidates, errors = run_semantic_knowledge_pipeline(
-            normalized_query,
-            category=category,
-            limit=_sanitize_limit(limit),
-        )
-        return _format_results(
-            normalized_query,
-            candidates,
-            errors,
-            include_selection_guide=True,
-        )
-    except FileNotFoundError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"{_log_prefix(runtime)} Knowledge search failed for '{normalized_query}': {exc}") from exc
 
-
-@tool_with_reason
+@tool_with_reason(
+    side_effect="read",
+    result_format="json",
+    output_schema=KnowledgeResponse.model_json_schema(),
+)
 def get_knowledge_by_key(
     key: str,
     category: Optional[str] = None,
     runtime: ToolRuntime[AgentRuntimeContext] = None,
-) -> str:
+) -> dict[str, Any]:
     """
     Retrieve standards knowledge by exact ResultKey, canonical term, alias, schema name, operationId, or citation anchor.
     """
     normalized_key = str(key or "").strip()
     if not normalized_key:
-        return "Knowledge item not found for key: "
+        raise ValueError("key must not be empty")
+    if runtime is None or runtime.context is None:
+        raise RuntimeError("knowledge tools require AgentRuntimeContext")
 
-    try:
-        _ensure_processed_corpus()
-        domain = _infer_policy_domain(normalized_key, category)
-        selected = _resolve_explicit_key_candidates(normalized_key, domain)
-        if selected:
-            cross_spec = _expand_cross_spec_candidates(selected, domain, normalized_key)
-            return _format_results(normalized_key, _dedupe_candidates([*selected, *cross_spec], limit=6), [])
-
-        direct = _direct_record_matches(normalized_key, domain)
-        if direct:
-            cross_spec = _expand_cross_spec_candidates(direct, domain, normalized_key)
-            return _format_results(normalized_key, _dedupe_candidates([*direct, *cross_spec], limit=6), [])
-
-        exact = _exact_search_candidates(normalized_key, domain)
-        if not exact:
-            return f"Knowledge item not found for key: {normalized_key}"
-        cross_spec = _expand_cross_spec_candidates(exact, domain, normalized_key)
-        return _format_results(normalized_key, _dedupe_candidates([*exact, *cross_spec], limit=6), [])
-    except FileNotFoundError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(f"{_log_prefix(runtime)} Key lookup failed for '{normalized_key}': {exc}") from exc
+    _ensure_processed_corpus()
+    domain = _infer_policy_domain(normalized_key, category)
+    selected = _resolve_explicit_key_candidates(normalized_key, domain)
+    if not selected:
+        selected = _direct_record_matches(normalized_key, domain)
+    if not selected:
+        selected = _exact_search_candidates(normalized_key, domain)
+    candidates = []
+    if selected:
+        cross_spec = _expand_cross_spec_candidates(selected, domain, normalized_key)
+        candidates = _dedupe_candidates([*selected, *cross_spec], limit=6)
+    return _knowledge_response(
+        scope=runtime.context.scope,
+        query=normalized_key,
+        domain=domain,
+        limit=6,
+        candidates=candidates,
+    ).model_dump(mode="json")
 
 
 __all__ = [

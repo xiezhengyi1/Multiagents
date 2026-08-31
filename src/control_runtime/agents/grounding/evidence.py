@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from shared.contracts import AgentRunResult
 from shared.runtime import extract_tool_calls, extract_tool_results
 
 from .contracts import (
@@ -99,14 +100,14 @@ def merge_candidate_dicts(*candidate_groups: List[Dict[str, Any]]) -> List[Dict[
     return merged
 
 
-def extract_grounding_tool_payloads(*, advisor_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+def extract_grounding_tool_payloads(*, advisor_result: AgentRunResult) -> List[Dict[str, Any]]:
     tool_calls = {
         str(call.get("id") or "").strip(): call
-        for call in extract_tool_calls(advisor_result.get("messages") or [])
+        for call in extract_tool_calls(advisor_result.messages)
         if str(call.get("id") or "").strip()
     }
     payloads: List[Dict[str, Any]] = []
-    for result in extract_tool_results(advisor_result.get("messages") or []):
+    for result in extract_tool_results(advisor_result.messages):
         tool_name = str(result.get("name") or "").strip()
         marker = TOOL_RESULT_MARKERS.get(tool_name)
         if not marker:

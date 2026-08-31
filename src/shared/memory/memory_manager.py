@@ -1,259 +1,167 @@
 from __future__ import annotations
 
-import json
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any
+from uuid import uuid4
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.store.memory import InMemoryStore
 
-from shared.agents import BaseAgent
-def _build_short_term_graph(checkpointer: Any):
-    def _persist_messages(_state: MessagesState) -> Dict[str, Any]:
-        return {}
-
-    builder = StateGraph(MessagesState)
-    builder.add_node("persist_messages", _persist_messages)
-    builder.add_edge(START, "persist_messages")
-    builder.add_edge("persist_messages", END)
-    return builder.compile(checkpointer=checkpointer)
+from shared.contracts import MemoryBundle, MemoryQuery, MemoryRecord
 
 
 class MemoryManager:
+    """Stateless typed memory service; scope is supplied on every operation."""
+
     def __init__(
         self,
         short_term_limit: int = 10,
-        similarity_threshold: float = 0.5,
         enable_llm_summarization: bool = False,
         *,
-        database_url: Optional[str] = None,
+        database_url: str | None = None,
         embeddings: Any = None,
-        checkpointer: Any = None,
         store: Any = None,
         summarizer_llm: Any = None,
-    ):
-        self.short_term_limit = max(1, int(short_term_limit))
-        self.similarity_threshold = similarity_threshold
-        self.enable_llm_summarization = bool(enable_llm_summarization)
-        self.database_url = str(database_url or "").strip()
-        if not self.database_url and (checkpointer is None or store is None):
-            from database.connection import RAW_DATABASE_URL
-
-            self.database_url = str(RAW_DATABASE_URL or "").strip()
-        self.embeddings = embeddings
-        if self.embeddings is None and store is None:
-            from database.langchain_pg import get_openai_embeddings
-
-            self.embeddings = get_openai_embeddings()
+    ) -> None:
+        if short_term_limit < 1:
+            raise ValueError("short_term_limit must be at least 1")
+        if enable_llm_summarization and summarizer_llm is None:
+            raise ValueError("summarizer_llm is required when LLM summarization is enabled")
+        self.short_term_limit = short_term_limit
+        self.enable_llm_summarization = enable_llm_summarization
         self._summarizer_llm = summarizer_llm
-
-        self._checkpointer_manager = None
         self._store_manager = None
-        self.checkpointer = checkpointer or self._init_checkpointer()
-        self.store = store or self._init_store()
-        self._message_graph = _build_short_term_graph(self.checkpointer)
+        self.store = store if store is not None else self._init_store(database_url, embeddings)
 
-        self._thread_id = ""
-        self._supi: Optional[str] = None
-
-    def __del__(self) -> None:
-        for manager in (self._store_manager, self._checkpointer_manager):
-            if manager is None:
-                continue
-            try:
-                manager.__exit__(None, None, None)
-            except Exception:
-                pass
-
-    def _init_checkpointer(self) -> Any:
-        from langgraph.checkpoint.postgres import PostgresSaver
-
-        manager = PostgresSaver.from_conn_string(self.database_url)
-        checkpointer = manager.__enter__()
-        if hasattr(checkpointer, "setup"):
-            checkpointer.setup()
-        self._checkpointer_manager = manager
-        return checkpointer
-
-    def _init_store(self) -> Any:
-        from database.langchain_pg import get_embedding_dimensions
+    def _init_store(self, database_url: str | None, embeddings: Any) -> Any:
+        from database.langchain_pg import get_embedding_dimensions, get_openai_embeddings
         from langgraph.store.postgres import PostgresStore
 
+        resolved_url = str(database_url or "").strip()
+        if not resolved_url:
+            from database.connection import RAW_DATABASE_URL
+
+            resolved_url = str(RAW_DATABASE_URL).strip()
+        if not resolved_url:
+            raise ValueError("database_url is required for persistent memory")
+        resolved_embeddings = embeddings if embeddings is not None else get_openai_embeddings()
         manager = PostgresStore.from_conn_string(
-            self.database_url,
+            resolved_url,
             index={
                 "dims": get_embedding_dimensions(),
-                "embed": self.embeddings,
+                "embed": resolved_embeddings,
                 "fields": ["content"],
             },
         )
         store = manager.__enter__()
-        if hasattr(store, "setup"):
-            store.setup()
+        store.setup()
         self._store_manager = manager
         return store
 
-    def bind_thread(self, session_id: str) -> None:
-        normalized = str(session_id or "").strip()
-        if not normalized:
-            raise ValueError("session_id is required to bind MemoryManager thread.")
-        self._thread_id = normalized
+    def close(self) -> None:
+        if self._store_manager is not None:
+            self._store_manager.__exit__(None, None, None)
+            self._store_manager = None
 
-    def bind_supi(self, supi: Optional[str]) -> None:
-        normalized = str(supi or "").strip()
-        self._supi = normalized or None
-
-    def _require_thread_id(self) -> str:
-        if not self._thread_id:
-            raise RuntimeError("MemoryManager thread_id is not bound. Call bind_thread(session_id) first.")
-        return self._thread_id
-
-    def _short_term_config(self) -> Dict[str, Any]:
-        return {"configurable": {"thread_id": self._require_thread_id()}}
-
-    def _namespace(self) -> tuple[str, str]:
-        identity = self._supi or self._require_thread_id()
-        return (identity, "episodic")
-
-    def _cursor_namespace(self) -> tuple[str, str]:
-        return (self._require_thread_id(), "memory_meta")
-
-    @staticmethod
-    def _message_to_dict(message: BaseMessage) -> Dict[str, Any]:
-        if isinstance(message, HumanMessage):
-            role = "user"
-        elif isinstance(message, AIMessage):
-            role = str(message.name or "assistant")
+    @classmethod
+    def _namespace(cls, record_or_query: MemoryRecord | MemoryQuery, kind: str) -> tuple[str, str, str]:
+        if kind == "event":
+            identity = record_or_query.scope.thread_id
+        elif kind == "summary":
+            identity = record_or_query.scope.supi or record_or_query.scope.session_id
         else:
-            role = message.type
-        return {
-            "role": role,
-            "content": str(message.content),
-        }
+            raise ValueError(f"unsupported memory kind: {kind}")
+        return (identity, "memory_v2", kind)
 
-    @staticmethod
-    def _build_message(role: str, content: str) -> BaseMessage:
-        normalized_role = str(role or "").strip()
-        text = str(content or "")
-        if normalized_role.lower() == "user":
-            return HumanMessage(content=text)
-        return AIMessage(content=text, name=normalized_role or "assistant")
+    @classmethod
+    def _meta_namespace(cls, record_or_query: MemoryRecord | MemoryQuery) -> tuple[str, str, str]:
+        return (record_or_query.scope.thread_id, "memory_v2", "metadata")
 
-    def _load_messages(self) -> List[BaseMessage]:
-        state = self._message_graph.get_state(self._short_term_config())
-        values = getattr(state, "values", {}) if state is not None else {}
-        messages = values.get("messages", []) if isinstance(values, dict) else []
-        return [message for message in messages if isinstance(message, BaseMessage)]
-
-    def _get_summary_cursor(self) -> int:
-        item = self.store.get(self._cursor_namespace(), "summary_cursor")
-        if item is None or not isinstance(getattr(item, "value", None), dict):
-            return 0
-        try:
-            return int(item.value.get("count", 0))
-        except (TypeError, ValueError):
-            return 0
-
-    def _set_summary_cursor(self, count: int) -> None:
-        self.store.put(self._cursor_namespace(), "summary_cursor", {"count": int(count)})
-
-    def _extract_supi_from_content(self, content: str) -> Optional[str]:
-        try:
-            payload = json.loads(content)
-        except Exception:
-            return None
-
-        if not isinstance(payload, dict):
-            return None
-
-        supi = str(payload.get("supi") or "").strip()
-        return supi or None
-
-    def add_memory(self, role: str, content: str):
-        self._message_graph.invoke(
-            {"messages": [self._build_message(role, content)]},
-            config=self._short_term_config(),
-        )
-
-        if role == "IEA":
-            self.bind_supi(self._extract_supi_from_content(content))
-
-        self.consolidate_memory()
-
-    def consolidate_memory(self):
-        if not self.enable_llm_summarization:
-            return
-        messages = self._load_messages()
-        if len(messages) <= self.short_term_limit:
-            return
-
-        keep_count = max(1, self.short_term_limit // 2)
-        summary_cursor = self._get_summary_cursor()
-        candidate_messages = messages[summary_cursor : max(summary_cursor, len(messages) - keep_count)]
-        if not candidate_messages:
-            return
-
-        text_chunk = "\n".join(
-            f"{item['role']}: {item['content']}" for item in (self._message_to_dict(message) for message in candidate_messages)
-        )
-        summary = self._summarize_text(text_chunk)
-        if not summary:
-            raise RuntimeError("Memory summarization returned empty content.")
-
-        memory_id = f"summary-{uuid.uuid4()}"
+    def add(self, record: MemoryRecord) -> None:
         self.store.put(
-            self._namespace(),
-            memory_id,
-            {
-                "content": summary,
-                "thread_id": self._require_thread_id(),
-                "source_count": len(candidate_messages),
-            },
+            self._namespace(record, record.kind),
+            record.memory_id,
+            record.model_dump(mode="json"),
         )
-        self._set_summary_cursor(summary_cursor + len(candidate_messages))
+        if self.enable_llm_summarization and record.kind == "event":
+            self._consolidate(record)
 
-    def _summarize_text(self, text: str) -> str:
-        prompt = (
+    def retrieve(self, query: MemoryQuery) -> MemoryBundle:
+        short_term = self._read_records(
+            self._namespace(query, "event"),
+            query=None,
+            limit=self.short_term_limit,
+        )
+        long_term = self._read_records(
+            self._namespace(query, "summary"),
+            query=query.text,
+            limit=query.top_k,
+        )
+        return MemoryBundle(
+            query=query,
+            short_term=short_term[-self.short_term_limit :],
+            long_term=long_term,
+        )
+
+    def _read_records(
+        self,
+        namespace: tuple[str, str, str],
+        *,
+        query: str | None,
+        limit: int,
+    ) -> list[MemoryRecord]:
+        items = self.store.search(namespace, query=query, limit=limit)
+        records = [MemoryRecord.model_validate(item.value) for item in items]
+        return sorted(records, key=lambda record: (record.created_at, record.memory_id))
+
+    def _summary_cursor(self, record: MemoryRecord) -> int:
+        item = self.store.get(self._meta_namespace(record), "summary_cursor")
+        if item is None:
+            return 0
+        value = item.value
+        if not isinstance(value, dict) or not isinstance(value.get("count"), int):
+            raise TypeError("memory summary cursor must contain an integer count")
+        return value["count"]
+
+    def _consolidate(self, trigger: MemoryRecord) -> None:
+        events = self._read_records(
+            self._namespace(trigger, "event"),
+            query=None,
+            limit=10_000,
+        )
+        cursor = self._summary_cursor(trigger)
+        keep_count = max(1, self.short_term_limit // 2)
+        end_index = len(events) - keep_count
+        if end_index <= cursor:
+            return
+        candidates = events[cursor:end_index]
+        source_text = "\n".join(f"{record.role}: {record.content}" for record in candidates)
+        response = self._summarizer_llm.invoke(
             "Summarize the following conversation into durable operational memory. "
-            "Keep only facts, preferences, task objectives, and corrective feedback.\n\n"
-            f"{text}"
+            "Keep only facts, objectives, decisions, and corrective feedback.\n\n"
+            + source_text
         )
-        response = self._get_summarizer_llm().invoke(prompt)
-        content = getattr(response, "content", "")
-        normalized = str(content or "").strip()
-        if not normalized:
-            raise RuntimeError("LLM returned empty memory summary.")
-        return normalized
-
-    def _get_summarizer_llm(self) -> Any:
-        if self._summarizer_llm is None:
-            self._summarizer_llm = BaseAgent().get_llm()
-        return self._summarizer_llm
-
-    def retrieve(self, query: str, top_k: int = 3) -> Dict[str, Any]:
-        short_term = [self._message_to_dict(message) for message in self._load_messages()[-self.short_term_limit :]]
-        if self._get_summary_cursor() <= 0:
-            return {
-                "short_term": short_term,
-                "long_term": [],
-            }
-
-        long_term_items = self.store.search(
-            self._namespace(),
-            query=str(query or "").strip(),
-            limit=max(1, int(top_k)),
+        summary = str(response.content).strip()
+        if not summary:
+            raise RuntimeError("memory summarizer returned empty content")
+        self.add(
+            MemoryRecord(
+                memory_id=f"summary-{uuid4()}",
+                scope=trigger.scope,
+                kind="summary",
+                source_agent="memory_summarizer",
+                role="summary",
+                content=summary,
+                source_trace_ids=[
+                    trace_id
+                    for candidate in candidates
+                    for trace_id in candidate.source_trace_ids
+                ],
+            )
         )
-        long_term = [
-            str(item.value.get("content"))
-            for item in long_term_items
-            if isinstance(getattr(item, "value", None), dict) and item.value.get("content")
-        ]
-        return {
-            "short_term": short_term,
-            "long_term": long_term,
-        }
+        self.store.put(
+            self._meta_namespace(trigger),
+            "summary_cursor",
+            {"count": end_index},
+        )
 
 
-__all__ = ["MemoryManager", "InMemorySaver", "InMemoryStore"]
+__all__ = ["InMemoryStore", "MemoryManager"]

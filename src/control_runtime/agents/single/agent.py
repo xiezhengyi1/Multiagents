@@ -8,9 +8,17 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage
 
+from shared.contracts import (
+    AgentInvocation,
+    AgentMessage,
+    AgentRunResult,
+    ExecutionScope,
+    TraceMetadata,
+    TraceTarget,
+)
 from shared.agents import BaseAgent, coerce_structured_response
 from shared.agents.base import resolve_agent_model_name
-from shared.runtime import ArtifactWorkerMixin, ContextPolicy, RuntimePersistence, ToolLoopExecutionError, extract_tool_calls, extract_tool_results
+from shared.runtime import ArtifactWorkerMixin, ContextPolicy, RuntimePersistence, extract_tool_calls, extract_tool_results
 from shared.logging import log_event, log_timing
 from application_runtime.persistence import create_runtime_persistence
 
@@ -204,10 +212,13 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         context_policy = self._tool_context_policy_for_model(self.model_name)
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            supi=supi or None,
-            thread_id=session_id,
+            scope=ExecutionScope(
+                session_id=session_id,
+                thread_id=session_id,
+                snapshot_id=snapshot_id or None,
+                round_index=round_index,
+                supi=supi or None,
+            ),
             allow_user_interaction=allow_user_interaction,
             token_budget=token_budget,
             token_counter=token_counter,
@@ -222,14 +233,18 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         )
         current_prompt = base_prompt
         advisor_output: Optional[OsaAdvisorOutput] = None
-        result: Dict[str, Any] = {}
+        result: AgentRunResult | None = None
         planning_tool_evidence: Dict[str, Any] = {}
         planning_request: Optional[PlanningRequest] = None
         contract_errors: List[str] = []
+        final_trace: tuple[Any, AgentInvocation, AgentRunResult] | None = None
 
         # Match OSA's bounded repair behaviour: every retry gets the original
         # contract plus focused validation feedback and prior tool evidence.
         for attempt_index in range(3):
+            result = None
+            invocation: AgentInvocation | None = None
+            trace_recorded = False
             attempt_detail: Dict[str, Any] = {
                 "attempt_index": attempt_index + 1,
                 "prompt_mode": "initial" if attempt_index == 0 else "validation_retry",
@@ -242,9 +257,10 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     allow_knowledge_tools=allow_knowledge_tools,
                 ),
                 system_prompt=render_single_system_prompt(),
+                prompt_name="single_control_advisor",
+                prompt_version="2.0.0",
                 response_model=OsaAdvisorOutput,
                 max_iterations=12,
-                tool_error_mode="raise",
                 forbid_duplicate_tool_calls=True,
                 max_tool_result_chars=context_policy.default_tool_result_chars,
                 tool_result_limits=context_policy.tool_result_char_limits,
@@ -254,7 +270,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
             )
             try:
-                result = self._invoke_round_advisor(
+                result, invocation = self._invoke_round_advisor(
                     advisor_agent=advisor_agent,
                     prompt=current_prompt,
                     runtime_context=runtime_context,
@@ -265,8 +281,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                     error_message="Single control agent returned no OsaAdvisorOutput",
                 )
                 planning_tool_evidence = extract_planning_tool_evidence(advisor_result=result)
-                attempt_detail["tool_calls"] = extract_tool_calls(result.get("messages") or [])
-                attempt_detail["tool_results"] = extract_tool_results(result.get("messages") or [])
+                attempt_detail["tool_calls"] = extract_tool_calls(result.messages)
+                attempt_detail["tool_results"] = extract_tool_results(result.messages)
                 attempt_detail["osa_advisor_output"] = advisor_output.model_dump(mode="json")
                 attempt_detail["planning_tool_evidence"] = planning_tool_evidence
                 planning_request = self._build_single_planning_request(
@@ -283,7 +299,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 )
                 grounding_tools = [
                     str(item.get("name") or "").strip()
-                    for item in extract_tool_results(result.get("messages") or [])
+                    for item in extract_tool_results(result.messages)
                     if str(item.get("name") or "").strip()
                 ]
                 contract_errors = self.plan_compiler.validate_advisor_output(
@@ -297,15 +313,31 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 attempt_detail["status"] = "validated" if not contract_errors else "contract_rejected"
                 self.last_round_detail["attempts"].append(attempt_detail)
                 if not contract_errors:
+                    final_trace = (advisor_agent, invocation, result)
                     break
+                advisor_agent.write_trace(
+                    invocation=invocation,
+                    context=runtime_context,
+                    result=result,
+                    error="Single control advisor contract validation failed: "
+                    + "; ".join(contract_errors),
+                )
+                trace_recorded = True
             except Exception as exc:
+                if result is not None and invocation is not None and not trace_recorded:
+                    advisor_agent.write_trace(
+                        invocation=invocation,
+                        context=runtime_context,
+                        result=result,
+                        error=str(exc),
+                    )
                 contract_errors = [str(exc)]
                 attempt_detail["status"] = "invocation_or_processing_error"
                 attempt_detail["error_type"] = type(exc).__name__
                 attempt_detail["error"] = str(exc)
-                if result:
-                    attempt_detail["tool_calls"] = extract_tool_calls(result.get("messages") or [])
-                    attempt_detail["tool_results"] = extract_tool_results(result.get("messages") or [])
+                if result is not None:
+                    attempt_detail["tool_calls"] = extract_tool_calls(result.messages)
+                    attempt_detail["tool_results"] = extract_tool_results(result.messages)
                 self.last_round_detail["attempts"].append(attempt_detail)
 
             if attempt_index == 2:
@@ -321,7 +353,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 cached_planning_evidence=planning_tool_evidence,
             )
 
-        if advisor_output is None or planning_request is None:
+        if advisor_output is None or planning_request is None or final_trace is None:
             raise RuntimeError("Single control agent returned no OSA-compatible planning result")
         try:
             policy_plan = self.plan_compiler.assemble_policy_plan(
@@ -330,6 +362,13 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 planning_tool_evidence=planning_tool_evidence,
             )
         except Exception as exc:
+            final_agent, final_invocation, final_result = final_trace
+            final_agent.write_trace(
+                invocation=final_invocation,
+                context=runtime_context,
+                result=final_result,
+                error=str(exc),
+            )
             self.last_round_detail.update(
                 {
                     "status": "compiler_error",
@@ -339,6 +378,30 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 }
             )
             raise
+        final_agent, final_invocation, final_result = final_trace
+        final_agent.write_trace(
+            invocation=final_invocation,
+            context=runtime_context,
+            result=final_result,
+            derived_targets=[
+                TraceTarget(
+                    kind="validated_output",
+                    producer="validator",
+                    schema_name=OsaAdvisorOutput.__name__,
+                    output_schema=OsaAdvisorOutput.model_json_schema(),
+                    value=advisor_output.model_dump(mode="json"),
+                    sft_eligible=False,
+                ),
+                TraceTarget(
+                    kind="compiled_output",
+                    producer="compiler",
+                    schema_name=PolicyPlanDraft.__name__,
+                    output_schema=PolicyPlanDraft.model_json_schema(),
+                    value=policy_plan.model_dump(mode="json"),
+                    sft_eligible=False,
+                ),
+            ],
+        )
         self.last_round_detail.update(
             {
                 "status": "success",
@@ -354,7 +417,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         self,
         *,
         advisor_output: OsaAdvisorOutput,
-        advisor_result: Dict[str, Any],
+        advisor_result: AgentRunResult,
         user_input: str,
         supi: str,
         session_id: str,
@@ -493,8 +556,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         return any(marker in lowered for marker in explicit_markers)
 
     @classmethod
-    def _single_subscription_evidence(cls, advisor_result: Dict[str, Any]) -> Dict[str, Any]:
-        for result in reversed(extract_tool_results((advisor_result or {}).get("messages") or [])):
+    def _single_subscription_evidence(cls, advisor_result: AgentRunResult) -> Dict[str, Any]:
+        for result in reversed(extract_tool_results(advisor_result.messages)):
             if str(result.get("name") or "").strip() != "get_ue_slice_subscription":
                 continue
             payload = cls._parse_json_content(result.get("content"))
@@ -514,9 +577,9 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         return "balanced"
 
     @classmethod
-    def _catalog_rows_by_flow_id(cls, advisor_result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    def _catalog_rows_by_flow_id(cls, advisor_result: AgentRunResult) -> Dict[str, Dict[str, Any]]:
         rows_by_flow_id: Dict[str, Dict[str, Any]] = {}
-        for result in extract_tool_results((advisor_result or {}).get("messages") or []):
+        for result in extract_tool_results(advisor_result.messages):
             if str(result.get("name") or "").strip() != "get_sm_ue_flow_catalog":
                 continue
             payload = cls._parse_json_content(result.get("content"))
@@ -557,43 +620,12 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
 
     @staticmethod
     def _parse_json_content(content: Any) -> Any:
-        if isinstance(content, str):
-            text = content.strip()
-        elif isinstance(content, list):
-            parts: List[str] = []
-            for block in content:
-                if isinstance(block, str):
-                    parts.append(block)
-                elif isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
-                    parts.append(str(block.get("text") or ""))
-            text = "".join(parts).strip()
-        else:
-            text = str(content or "").strip()
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+        if not isinstance(content, str):
+            raise TypeError("tool result content must be a JSON string")
+        text = content.strip()
         if not text:
-            return None
-        for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
-            fenced = match.group(1).strip()
-            if not fenced:
-                continue
-            try:
-                return json.loads(fenced)
-            except Exception:
-                continue
-        try:
-            return json.loads(text)
-        except Exception:
-            pass
-        decoder = json.JSONDecoder()
-        for index, char in enumerate(text):
-            if char not in "{[":
-                continue
-            try:
-                parsed, _ = decoder.raw_decode(text[index:])
-                return parsed
-            except Exception:
-                continue
-        return None
+            raise ValueError("tool result content must not be empty")
+        return json.loads(text)
 
     @staticmethod
     def _flow_selector_payload(*, supi: str, flow_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
@@ -641,15 +673,26 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         return any(token in lowered for token in cls.KNOWLEDGE_HINT_TOKENS)
 
     @staticmethod
-    def _invoke_round_advisor(*, advisor_agent: Any, prompt: str, runtime_context: Any) -> Dict[str, Any]:
-        try:
-            return advisor_agent.invoke({"messages": [{"role": "user", "content": prompt}]}, context=runtime_context)
-        except Exception as exc:
-            if isinstance(exc, ToolLoopExecutionError):
-                message = str(exc)
-                if "max iterations" in message.lower():
-                    raise RuntimeError(f"Single control round advisor did not converge: {message}") from exc
-            raise RuntimeError(f"Single control round advisor invocation failed: {exc}") from exc
+    def _invoke_round_advisor(
+        *,
+        advisor_agent: Any,
+        prompt: str,
+        runtime_context: Any,
+    ) -> tuple[AgentRunResult, AgentInvocation]:
+        invocation = AgentInvocation(
+            messages=[AgentMessage(role="user", content=prompt)],
+            metadata=TraceMetadata(
+                path_label="single_control_advisor",
+                prompt_name="single_control_advisor",
+                prompt_version="2.0.0",
+            ),
+        )
+        result = advisor_agent.invoke(
+            invocation,
+            context=runtime_context,
+            defer_trace=True,
+        )
+        return result, invocation
 
     @staticmethod
     def _required_evidence_from_domains(domains: List[str]) -> List[str]:

@@ -1,37 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
-from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from shared.contracts import ArtifactEnvelope
 
 from shared.runtime.core.workspace import AgentWorkspace
 from shared.runtime.io.files import ensure_directory, read_json_file, write_json_file_atomic
 from shared.runtime.io.paths import runtime_interfaces_root
 
 from .persistence import RuntimePersistence
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-class ArtifactEnvelope(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    artifact_id: str = Field(default_factory=lambda: f"artifact-{uuid4()}")
-    artifact_type: str
-    schema_version: str = Field(default="1.0")
-    source_agent: str
-    target_agent: str
-    session_id: str = Field(default="")
-    snapshot_id: str = Field(default="")
-    created_at: str = Field(default_factory=_utc_now_iso)
-    correlation_id: str = Field(default_factory=lambda: f"corr-{uuid4()}")
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    upstream_artifact_ids: list[str] = Field(default_factory=list)
 
 
 class ArtifactStore:
@@ -58,8 +36,8 @@ class ArtifactStore:
             artifact_type=envelope.artifact_type,
             source_agent=envelope.source_agent,
             target_agent=envelope.target_agent,
-            session_id=envelope.session_id,
-            snapshot_id=envelope.snapshot_id,
+            session_id=envelope.scope.session_id,
+            snapshot_id=envelope.scope.snapshot_id or "",
             correlation_id=envelope.correlation_id,
         )
         if not enqueued:
@@ -88,8 +66,8 @@ class ArtifactStore:
         recorded = self.persistence.record_artifact(
             artifact_id=envelope.artifact_id,
             correlation_id=envelope.correlation_id,
-            session_id=envelope.session_id,
-            snapshot_id=envelope.snapshot_id,
+            session_id=envelope.scope.session_id,
+            snapshot_id=envelope.scope.snapshot_id or "",
             source_agent=envelope.source_agent,
             target_agent=envelope.target_agent,
             artifact_type=envelope.artifact_type,

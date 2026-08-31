@@ -232,7 +232,7 @@ def _tool_snapshot_id(runtime: ToolRuntime[AgentRuntimeContext]) -> str:
     return snapshot_id
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def get_ue_context(
     supi: str = "",
     runtime: ToolRuntime[AgentRuntimeContext] = None,
@@ -265,7 +265,7 @@ def get_ue_context(
     return f"UE Context Not Found for SUPI: {normalized_supi}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def get_sm_ue_context(
     supi: str = "",
     runtime: ToolRuntime[AgentRuntimeContext] = None,
@@ -298,7 +298,7 @@ def get_sm_ue_context(
     return f"{prefix}SM UE Context Retrieved:\n{json.dumps(trimmed, ensure_ascii=False, indent=2)}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def get_ue_flow_catalog(
     supi: str = "",
     runtime: ToolRuntime[AgentRuntimeContext] = None,
@@ -322,7 +322,7 @@ def get_ue_flow_catalog(
     return f"{prefix}UE Flow Catalog Retrieved:\n {result}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def get_sm_ue_flow_catalog(
     supi: str = "",
     runtime: ToolRuntime[AgentRuntimeContext] = None,
@@ -348,7 +348,7 @@ def get_sm_ue_flow_catalog(
     return f"{prefix}SM UE Flow Catalog Retrieved:\n {result}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def get_ue_slice_subscription(
     supi: str = "",
     serving_plmn_id: str = "",
@@ -379,7 +379,7 @@ def get_ue_slice_subscription(
     return f"{prefix}UE Slice Subscription Retrieved:\n{json.dumps(subscription, ensure_ascii=False, indent=2)}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def search_flow_targets_by_name(
     app_name: str = "",
     flow_name: str = "",
@@ -409,7 +409,7 @@ def search_flow_targets_by_name(
     return f"{prefix}Semantic Flow Target Search Retrieved:\n {result}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def search_sm_flow_targets(
     supi: str = "",
     app_name: str = "",
@@ -451,7 +451,7 @@ def search_sm_flow_targets(
     return f"{prefix}SM Flow Target Search Retrieved:\n {result}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def get_am_policy_context(
     supi: str = "",
     association_id: str = "",
@@ -503,7 +503,7 @@ def get_am_policy_context(
     return f"{prefix}AM Policy Context Retrieved:\n{json.dumps(trimmed, ensure_ascii=False, indent=2)}"
 
 
-@tool_with_reason
+@tool_with_reason(side_effect="read", result_format="json")
 def search_am_policy_targets(
     supi: str = "",
     association_id: str = "",

@@ -101,7 +101,7 @@ def build_request_tools(
             raise RuntimeError(f"UE context for {target} contains no policy-relevant mobility fields")
         return trimmed
 
-    @tool_with_reason
+    @tool_with_reason(side_effect="read", result_format="json")
     def preview_qos_optimizer(
         objective_profile: str = "balanced",
         optimization_template: str = "joint_balanced",
@@ -150,7 +150,7 @@ def build_request_tools(
             ensure_ascii=False,
         )
 
-    @tool_with_reason
+    @tool_with_reason(side_effect="read", result_format="json")
     def fetch_qos_network_status(service_type_id: Optional[int] = None) -> str:
         """Fetch QoS-domain network slice utilization and capacity summary."""
         return get_network_status_summary(
@@ -158,7 +158,7 @@ def build_request_tools(
             snapshot_id=planning_request.context.snapshot_id,
         )
 
-    @tool_with_reason
+    @tool_with_reason(side_effect="read", result_format="json")
     def inspect_mobility_ue_policies(supi: Optional[str] = None) -> str:
         """Inspect current UE mobility-relevant policy state and access-mobility context."""
         target = _require_target_supi(supi)

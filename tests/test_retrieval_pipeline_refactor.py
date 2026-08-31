@@ -17,6 +17,23 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 
 from knowledge_build.scripts import evaluate_pcf_policy_rag
 from knowledge_runtime.retrieval.raw import knowledge_tool
+from langchain.tools import ToolRuntime
+from shared.contracts import ExecutionScope, KnowledgeResponse
+from shared.runtime import AgentRuntimeContext
+
+
+def _tool_runtime() -> ToolRuntime:
+    return ToolRuntime(
+        state={},
+        context=AgentRuntimeContext(
+            agent_name="test",
+            scope=ExecutionScope(session_id="session-1", thread_id="session-1"),
+        ),
+        config={},
+        stream_writer=lambda *_args, **_kwargs: None,
+        tool_call_id="call-1",
+        store=None,
+    )
 
 
 def _candidate(index: int) -> dict[str, Any]:
@@ -101,10 +118,13 @@ def test_pipeline_keeps_raw_evaluator_limit_but_tool_boundary_caps_it(monkeypatc
         return [], []
 
     monkeypatch.setattr(knowledge_tool, "run_semantic_knowledge_pipeline", fake_public_pipeline)
-    monkeypatch.setattr(knowledge_tool, "_format_results", lambda *_args, **_kwargs: "formatted")
-    assert knowledge_tool.search_semantic_knowledge.invoke(
-        {"reason": "test limit boundary", "query": "tool limit", "limit": 61}
-    ) == "formatted"
+    response = knowledge_tool.search_semantic_knowledge.func(
+        reason="test limit boundary",
+        query="tool limit",
+        limit=61,
+        runtime=_tool_runtime(),
+    )
+    assert KnowledgeResponse.model_validate(response).hits == []
     assert captured["tool_limit"] == 30
 
 

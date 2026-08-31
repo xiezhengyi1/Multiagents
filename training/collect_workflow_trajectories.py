@@ -20,11 +20,11 @@ from control_runtime.integrations.storage import get_latest_snapshot_metadata
 from training.artifacts import processed_dir, read_json, read_jsonl, write_json, write_jsonl
 from training.projection import (
     WORKFLOW_AGENT_NAMES,
-    build_finetuning_record,
+    build_sft_example,
     build_workflow_record,
     index_traces_by_session,
     load_traces,
-    sort_traces,
+    is_sft_candidate,
 )
 from control_runtime.orchestrators.main_control_orchestrator import MainControlOrchestrator
 
@@ -203,8 +203,8 @@ def _merge_tags(record_tags: Iterable[str], extra_tags: Iterable[str]) -> List[s
 
 def _agent_trajectory_output_path(agent_name: str, *, output_root: Path | None) -> Path:
     if output_root is None:
-        return processed_dir(agent_name) / f"{agent_name}_trajectories_v1.jsonl"
-    return output_root / agent_name / f"{agent_name}_trajectories_v1.jsonl"
+        return processed_dir(agent_name) / f"{agent_name}_sft_v2.jsonl"
+    return output_root / agent_name / f"{agent_name}_sft_v2.jsonl"
 
 
 def _initialize_projection_outputs(
@@ -239,7 +239,8 @@ def _append_projected_case(
         projection_summary["skipped_without_session"] += 1
         return
 
-    session_traces = index_traces_by_session(load_traces(WORKFLOW_AGENT_NAMES)).get(session_id)
+    raw_traces = load_traces(WORKFLOW_AGENT_NAMES)
+    session_traces = index_traces_by_session(raw_traces).get(session_id)
     if session_traces is None:
         raise RuntimeError(f"Missing raw traces for workflow session {session_id}")
     if "main_control" not in session_traces:
@@ -256,8 +257,10 @@ def _append_projected_case(
 
     for agent_name in WORKFLOW_AGENT_NAMES:
         output_path = Path(projection_summary["agent_outputs"][agent_name])
-        for trace in sort_traces(session_traces.get(agent_name, [])):
-            write_jsonl(output_path, [build_finetuning_record(trace)], mode="a")
+        for trace in raw_traces[agent_name]:
+            if trace.scope.session_id != session_id or not is_sft_candidate(trace):
+                continue
+            write_jsonl(output_path, [build_sft_example(trace)], mode="a")
             projection_summary["agent_counts"][agent_name] += 1
 
 
@@ -457,7 +460,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result-output",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_runs_v1.jsonl",
+        default=processed_dir("workflow") / "trajectory_runs_v2.jsonl",
     )
     parser.add_argument(
         "--spec-output",
@@ -467,7 +470,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workflow-output",
         type=Path,
-        default=processed_dir("workflow") / "workflow_trajectories_v1.jsonl",
+        default=processed_dir("workflow") / "workflow_trajectories_v2.jsonl",
         help="Tool-bearing workflow trajectory output generated from this batch's sessions.",
     )
     parser.add_argument(

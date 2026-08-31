@@ -5,10 +5,10 @@ import json
 import logging
 import os
 from collections import Counter
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
+from langchain_core.tools import StructuredTool
 from pydantic import ValidationError
 
 from .compiler import EnvironmentAgentCompiler, S3_MINIMUM_COUNTS, S3_QUALITY_PROFILE
@@ -25,26 +25,25 @@ from .specs import ExistingScenarioSpecExplorer
 from shared.logging import log_event
 
 
-@dataclass
-class SimpleEnvironmentTool:
-    name: str
-    description: str
-    func: Callable[..., str]
-
-    def invoke(self, payload: dict[str, Any]) -> str:
-        return self.func(**payload)
-
-
-def _make_tool(name: str, description: str, func: Callable[..., str]) -> Any:
-    try:
-        from langchain_core.tools import StructuredTool
-    except ImportError:
-        try:
-            from langchain.tools import StructuredTool
-        except ImportError:
-            return SimpleEnvironmentTool(name=name, description=description, func=func)
-
-    return StructuredTool.from_function(func=func, name=name, description=description)
+def _make_tool(
+    name: str,
+    description: str,
+    func: Callable[..., str],
+    *,
+    side_effect: Literal["read", "write", "external_action"],
+) -> StructuredTool:
+    return StructuredTool.from_function(
+        func=func,
+        name=name,
+        description=description,
+        metadata={
+            "contract": {
+                "side_effect": side_effect,
+                "result_format": "json",
+                "output_schema": {"type": "object"},
+            }
+        },
+    )
 
 
 def _json(data: Any) -> str:
@@ -1120,20 +1119,20 @@ def build_environment_tools(
         })
 
     shared_tools = [
-        _make_tool("list_existing_environment_specs", list_existing_environment_specs.__doc__ or "", list_existing_environment_specs),
-        _make_tool("validate_environment_draft", validate_environment_draft.__doc__ or "", validate_environment_draft),
-        _make_tool("write_validated_environment_yaml", write_validated_environment_yaml.__doc__ or "", write_validated_environment_yaml),
-        _make_tool("simulate_candidate_environment", simulate_candidate_environment.__doc__ or "", simulate_candidate_environment),
-        _make_tool("record_validation_feedback", record_validation_feedback.__doc__ or "", record_validation_feedback),
-        _make_tool("read_back_written_yaml", read_back_written_yaml.__doc__ or "", read_back_written_yaml),
+        _make_tool("list_existing_environment_specs", list_existing_environment_specs.__doc__ or "", list_existing_environment_specs, side_effect="read"),
+        _make_tool("validate_environment_draft", validate_environment_draft.__doc__ or "", validate_environment_draft, side_effect="read"),
+        _make_tool("write_validated_environment_yaml", write_validated_environment_yaml.__doc__ or "", write_validated_environment_yaml, side_effect="write"),
+        _make_tool("simulate_candidate_environment", simulate_candidate_environment.__doc__ or "", simulate_candidate_environment, side_effect="external_action"),
+        _make_tool("record_validation_feedback", record_validation_feedback.__doc__ or "", record_validation_feedback, side_effect="write"),
+        _make_tool("read_back_written_yaml", read_back_written_yaml.__doc__ or "", read_back_written_yaml, side_effect="read"),
     ]
     if semantic_design_mode:
         return [
-            _make_tool("prepare_environment_design_context", prepare_environment_design_context.__doc__ or "", prepare_environment_design_context),
-            _make_tool("submit_environment_catalog", submit_environment_catalog.__doc__ or "", submit_environment_catalog),
-            _make_tool("inspect_environment_catalog", inspect_environment_catalog.__doc__ or "", inspect_environment_catalog),
-            _make_tool("compile_environment_design", compile_environment_design.__doc__ or "", compile_environment_design),
-            _make_tool("revise_environment_design", revise_environment_design.__doc__ or "", revise_environment_design),
+            _make_tool("prepare_environment_design_context", prepare_environment_design_context.__doc__ or "", prepare_environment_design_context, side_effect="read"),
+            _make_tool("submit_environment_catalog", submit_environment_catalog.__doc__ or "", submit_environment_catalog, side_effect="write"),
+            _make_tool("inspect_environment_catalog", inspect_environment_catalog.__doc__ or "", inspect_environment_catalog, side_effect="read"),
+            _make_tool("compile_environment_design", compile_environment_design.__doc__ or "", compile_environment_design, side_effect="write"),
+            _make_tool("revise_environment_design", revise_environment_design.__doc__ or "", revise_environment_design, side_effect="write"),
             shared_tools[1],
             shared_tools[2],
             shared_tools[3],
@@ -1141,9 +1140,9 @@ def build_environment_tools(
         ]
     return [
         shared_tools[0],
-        _make_tool("initialize_environment_draft", initialize_environment_draft.__doc__ or "", initialize_environment_draft),
-        _make_tool("replace_draft_section", replace_draft_section.__doc__ or "", replace_draft_section),
-        _make_tool("patch_draft_entity", patch_draft_entity.__doc__ or "", patch_draft_entity),
-        _make_tool("inspect_draft_section", inspect_draft_section.__doc__ or "", inspect_draft_section),
+        _make_tool("initialize_environment_draft", initialize_environment_draft.__doc__ or "", initialize_environment_draft, side_effect="write"),
+        _make_tool("replace_draft_section", replace_draft_section.__doc__ or "", replace_draft_section, side_effect="write"),
+        _make_tool("patch_draft_entity", patch_draft_entity.__doc__ or "", patch_draft_entity, side_effect="write"),
+        _make_tool("inspect_draft_section", inspect_draft_section.__doc__ or "", inspect_draft_section, side_effect="read"),
         *shared_tools[1:],
     ]

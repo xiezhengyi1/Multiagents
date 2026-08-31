@@ -18,7 +18,8 @@ from .core import (
 )
 from .execution import StructuredToolLoop, ToolLoopExecutionError
 from .messages import (
-    build_tool_specs,
+    build_tool_catalog,
+    contract_to_message,
     extract_tool_calls,
     extract_tool_results,
     format_tool_call,
@@ -39,15 +40,8 @@ from .storage import (
 )
 from .trace import (
     JsonlTraceWriter,
-    RunTreeEvent,
-    RunTreeTraceRecord,
-    TRACE_UNSET,
     TracedStructuredAgent,
-    build_run_tree_record,
-    collect_descendant_ids,
-    dotted_order_key,
-    iter_runs_in_dotted_order,
-    utc_now,
+    build_agent_trace,
 )
 from .worker import ArtifactWorkerMixin
 
@@ -61,24 +55,19 @@ __all__ = [
     "ContextPolicy",
     "FileTaskQueue",
     "JsonlTraceWriter",
-    "RunTreeEvent",
-    "RunTreeTraceRecord",
     "RuntimeCache",
     "StructuredToolLoop",
-    "TRACE_UNSET",
     "TokenBudget",
     "TokenCounter",
     "ToolLoopExecutionError",
     "TracedStructuredAgent",
-    "build_run_tree_record",
-    "build_tool_specs",
-    "collect_descendant_ids",
-    "dotted_order_key",
+    "build_agent_trace",
+    "build_tool_catalog",
+    "contract_to_message",
     "extract_tool_calls",
     "extract_tool_results",
     "format_tool_call",
     "format_tool_result",
-    "iter_runs_in_dotted_order",
     "json_friendly",
     "normalize_message_role",
     "project_root",
@@ -88,5 +77,4 @@ __all__ = [
     "serialize_base_model_schema",
     "serialize_message",
     "stringify_message_content",
-    "utc_now",
 ]

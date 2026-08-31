@@ -7,6 +7,14 @@ from typing import Any, Dict, List
 
 from pydantic import ValidationError
 
+from shared.contracts import (
+    AgentInvocation,
+    AgentMessage,
+    AgentRunResult,
+    ExecutionScope,
+    TraceMetadata,
+    TraceTarget,
+)
 from shared.runtime import ArtifactEnvelope, RuntimePersistence
 from shared.runtime import ContextPolicy
 from shared.runtime import ToolLoopExecutionError
@@ -60,29 +68,35 @@ from .validator import IntentGroundingValidator, validate_grounding
 
 @dataclass
 class IntentAdvisorInvocation:
-    advisor_result: Dict[str, Any]
+    advisor_result: AgentRunResult
     trace_agent: Any
-    trace_payload: Dict[str, Any]
+    invocation: AgentInvocation
     runtime_context: Any
 
     def write_final_trace(
         self,
         *,
         grounding_decision: GroundingDecision | None,
-        status: str,
         error: str | None = None,
     ) -> None:
-        payload = dict(self.trace_payload)
-        metadata = dict(payload.get("trace_metadata") or {})
-        metadata["grounding_decision"] = None if grounding_decision is None else grounding_decision.model_dump(mode="json")
-        payload["trace_metadata"] = metadata
+        derived_targets = []
+        if grounding_decision is not None and error is None:
+            derived_targets.append(
+                TraceTarget(
+                    kind="validated_output",
+                    producer="validator",
+                    schema_name=GroundingDecision.__name__,
+                    output_schema=GroundingDecision.model_json_schema(),
+                    value=grounding_decision.model_dump(mode="json"),
+                    sft_eligible=False,
+                )
+            )
         self.trace_agent.write_trace(
-            payload=payload,
+            invocation=self.invocation,
             context=self.runtime_context,
             result=self.advisor_result,
-            status=status,
+            derived_targets=derived_targets,
             error=error,
-            structured_response_override=metadata["grounding_decision"],
         )
 
 
@@ -141,6 +155,7 @@ class _IeaAdvisorStageState:
     invocation_failure: _IeaInvocationFailure | None = None
     advisor_contract_failure: _IeaAdvisorContractFailure | None = None
     validation_outcome: _IeaValidationOutcome | None = None
+    trace_recorded: bool = False
 
 
 class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
@@ -177,6 +192,8 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         return self.create_json_agent(
             tools=tools,
             system_prompt=render_grounding_system_prompt(),
+            prompt_name="intent_grounding_advisor",
+            prompt_version="2.0.0",
             response_model=GroundingAdvisorOutput,
             max_iterations=14,
             max_calls_per_tool=3,
@@ -256,8 +273,8 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             context=str(payload.get("context") or ""),
             conversation_messages=payload.get("messages"),
             allow_user_interaction=bool(payload.get("allow_user_interaction", False)),
-            session_id=envelope.session_id,
-            snapshot_id=envelope.snapshot_id,
+            session_id=envelope.scope.session_id,
+            snapshot_id=envelope.scope.snapshot_id or "",
             request_envelope=envelope,
         )
 
@@ -273,14 +290,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> ArtifactEnvelope:
         return self.cache_received_artifact(
             artifact_type="GroundingDecisionRequest",
+            payload_schema_name="GroundingDecisionRequest",
             payload={
                 "user_input": str(user_input),
                 "context": str(context or ""),
                 "messages": list(conversation_messages or []),
                 "allow_user_interaction": bool(allow_user_interaction),
             },
-            session_id=session_id,
-            snapshot_id=snapshot_id,
+            scope=ExecutionScope(
+                session_id=session_id,
+                thread_id=session_id,
+                snapshot_id=snapshot_id or None,
+            ),
         )
 
     def _cache_produced_result(
@@ -291,6 +312,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> None:
         self.cache_produced_artifact(
             artifact_type="GroundingDecision",
+            payload_schema_name=GroundingDecision.__name__,
             request_envelope=request_envelope,
             payload=grounding_decision,
         )
@@ -362,14 +384,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             token_budget, token_counter = self._resolve_token_context()
             runtime_context = self.build_runtime_context(
                 agent_name=self.agent_name,
-                session_id=session_id,
-                snapshot_id=snapshot_id,
-                supi=evidence.supi or None,
-                thread_id=session_id,
+                scope=ExecutionScope(
+                    session_id=session_id,
+                    thread_id=session_id,
+                    snapshot_id=snapshot_id or None,
+                    scenario_id=str((trace_metadata or {}).get("scenario_id") or "").strip() or None,
+                    scenario_tags=list((trace_metadata or {}).get("scenario_tags") or []),
+                    supi=evidence.supi or None,
+                ),
                 allow_user_interaction=allow_user_interaction,
                 token_budget=token_budget,
                 token_counter=token_counter,
-                trace_metadata=trace_metadata,
+                trace_attributes=dict(trace_metadata or {}),
             )
             request_advisor_agent = self._create_advisor_agent(
                 self._filter_tools_for_domains(
@@ -406,16 +432,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                 raise RuntimeError("IEA GroundingDecision failed validation after retry loop")
             advisor_invocation.write_final_trace(
                 grounding_decision=validated_intent,
-                status="success",
             )
             log_timing(self.logger, "iea_total", time.perf_counter() - total_start, status="success")
             self.last_failure_debug = {}
             return validated_intent
         except Exception as exc:
-            if stage_state is not None and stage_state.advisor_invocation is not None:
+            if (
+                stage_state is not None
+                and stage_state.advisor_invocation is not None
+                and not stage_state.trace_recorded
+            ):
                 stage_state.advisor_invocation.write_final_trace(
-                    grounding_decision=stage_state.grounding_decision,
-                    status="error",
+                    grounding_decision=None,
                     error=str(exc),
                 )
             self.logger.error(f"Failed to analyze grounding decision: {exc}")
@@ -592,6 +620,10 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
         def invoke_advisor(_: StageAttempt) -> _IeaAdvisorStageState:
+            state.advisor_invocation = None
+            state.advisor_output = None
+            state.grounding_decision = None
+            state.trace_recorded = False
             state.advisor_invocation = self._invoke_intent_advisor(
                 prompt=state.current_prompt,
                 runtime_context=state.runtime_context,
@@ -701,6 +733,14 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             # Final/non-retryable failures retain the old no-extra-side-effect
             # behavior.  A non-final malformed advisor response is the one
             # path that must retain its tool evidence before prompt repair.
+            if retry_context.phase in {RetryPhase.PARSE, RetryPhase.VALIDATION}:
+                if state.advisor_invocation is None:
+                    raise RuntimeError("IEA failed after invocation without trace context")
+                state.advisor_invocation.write_final_trace(
+                    grounding_decision=None,
+                    error=str(retry_context.error),
+                )
+                state.trace_recorded = True
             if retry_context.phase is not RetryPhase.PARSE:
                 return
             if not retry_policy.should_retry(retry_context):
@@ -853,7 +893,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         advisor_agent: Any | None = None,
     ) -> IntentAdvisorInvocation:
         self._pending_invoke_messages = [{"role": "user", "content": prompt}]
-        base_trace_metadata = dict(getattr(runtime_context, "trace_metadata", {}) or {})
+        base_trace_metadata = dict(runtime_context.trace_attributes)
         active_advisor_agent = advisor_agent or self.advisor_agent
         context_components = measure_context_components(
             {
@@ -863,17 +903,28 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             token_counter=getattr(runtime_context, "token_counter", None),
         )
         log_event(self.logger, "iea_context_components", **context_components)
-        invoke_payload = {
-            "messages": self._pending_invoke_messages,
-            "trace_write_mode": "manual",
-            "trace_metadata": {
-                **base_trace_metadata,
-                "path_label": "advisor_path",
-                "context_token_components": context_components,
-            },
-        }
+        invocation = AgentInvocation(
+            messages=[AgentMessage(role="user", content=prompt)],
+            metadata=TraceMetadata(
+                path_label="advisor_path",
+                prompt_name="intent_grounding_advisor",
+                prompt_version="2.0.0",
+                attributes={
+                    **{
+                        key: value
+                        for key, value in base_trace_metadata.items()
+                        if key not in {"path_label", "scenario_id", "scenario_tags"}
+                    },
+                    "context_token_components": context_components,
+                },
+            ),
+        )
         try:
-            result = active_advisor_agent.invoke(invoke_payload, context=runtime_context)
+            result = active_advisor_agent.invoke(
+                invocation,
+                context=runtime_context,
+                defer_trace=True,
+            )
         except Exception as exc:
             if isinstance(exc, ToolLoopExecutionError):
                 failed_tool_call = exc.failed_tool_call or {}
@@ -902,7 +953,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         return IntentAdvisorInvocation(
             advisor_result=result,
             trace_agent=active_advisor_agent,
-            trace_payload=invoke_payload,
+            invocation=invocation,
             runtime_context=runtime_context,
         )
 
@@ -935,7 +986,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         self,
         *,
         evidence: IntentEvidence,
-        advisor_result: Dict[str, Any],
+        advisor_result: AgentRunResult,
         main_directives: Dict[str, Any],
         snapshot_id: str,
     ) -> IntentEvidence:

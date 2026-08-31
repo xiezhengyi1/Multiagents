@@ -3,14 +3,20 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from typing import Callable
+from typing import Any, Callable, Literal
 
 from langchain.tools import tool
 
 logger = logging.getLogger(__name__)
 
 
-def tool_with_reason(fn: Callable | None = None, *, return_direct: bool = False):
+def tool_with_reason(
+    *,
+    side_effect: Literal["read", "write", "external_action"],
+    result_format: Literal["json", "text"],
+    output_schema: dict[str, Any] | None = None,
+    return_direct: bool = False,
+):
     def decorator(fn: Callable):
         original_sig = inspect.signature(fn)
         original_doc = fn.__doc__ or ""
@@ -40,14 +46,21 @@ def tool_with_reason(fn: Callable | None = None, *, return_direct: bool = False)
             "and what you expect to learn or accomplish."
         )
 
-        return tool(wrapper, return_direct=return_direct)
+        structured_tool = tool(wrapper, return_direct=return_direct)
+        structured_tool.metadata = {
+            **dict(structured_tool.metadata or {}),
+            "contract": {
+                "side_effect": side_effect,
+                "result_format": result_format,
+                "output_schema": output_schema,
+            },
+        }
+        return structured_tool
 
-    if fn is not None:
-        return decorator(fn)
     return decorator
 
 
-@tool
+@tool_with_reason(side_effect="read", result_format="text")
 def think_tool(message: str) -> str:
     """Return a scratchpad message for internal reasoning traces."""
     return message

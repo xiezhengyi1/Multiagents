@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from shared.contracts import ExecutionScope
 from .core import AgentWorkspace
 from .storage import ArtifactCache, ArtifactEnvelope, ArtifactStore, FileTaskQueue, RuntimePersistence
 
@@ -60,10 +61,10 @@ class ArtifactWorkerMixin:
         self,
         *,
         artifact_type: str,
+        payload_schema_name: str,
         payload: Any,
         source_agent: str = "coordinator",
-        session_id: str = "",
-        snapshot_id: str = "",
+        scope: ExecutionScope,
         target_agent: Optional[str] = None,
     ) -> ArtifactEnvelope:
         if not hasattr(self, "cache"):
@@ -71,10 +72,10 @@ class ArtifactWorkerMixin:
 
         envelope = ArtifactEnvelope(
             artifact_type=str(artifact_type or "").strip(),
+            payload_schema_name=str(payload_schema_name).strip(),
             source_agent=str(source_agent or "").strip(),
             target_agent=str(target_agent or getattr(self, "agent_name", "") or "").strip(),
-            session_id=str(session_id or "").strip(),
-            snapshot_id=str(snapshot_id or "").strip(),
+            scope=scope,
             payload=self.build_response_payload(payload),
         )
         self.cache.cache_received(envelope)
@@ -84,6 +85,7 @@ class ArtifactWorkerMixin:
         self,
         *,
         artifact_type: str,
+        payload_schema_name: str,
         request_envelope: ArtifactEnvelope,
         payload: Any,
         source_agent: Optional[str] = None,
@@ -94,10 +96,10 @@ class ArtifactWorkerMixin:
 
         envelope = ArtifactEnvelope(
             artifact_type=str(artifact_type or "").strip(),
+            payload_schema_name=str(payload_schema_name).strip(),
             source_agent=str(source_agent or getattr(self, "agent_name", "") or "").strip(),
             target_agent=str(target_agent or request_envelope.source_agent or "").strip(),
-            session_id=request_envelope.session_id,
-            snapshot_id=request_envelope.snapshot_id,
+            scope=request_envelope.scope,
             correlation_id=request_envelope.correlation_id,
             upstream_artifact_ids=[request_envelope.artifact_id],
             payload=self.build_response_payload(payload),
@@ -120,10 +122,10 @@ class ArtifactWorkerMixin:
             result = self.handle_artifact(envelope)
             response_envelope = ArtifactEnvelope(
                 artifact_type=self.response_artifact_type(),
+                payload_schema_name=result.__class__.__name__,
                 source_agent=self.agent_name,
                 target_agent=envelope.source_agent,
-                session_id=envelope.session_id,
-                snapshot_id=envelope.snapshot_id,
+                scope=envelope.scope,
                 correlation_id=envelope.correlation_id,
                 upstream_artifact_ids=[envelope.artifact_id],
                 payload=self.build_response_payload(result),
