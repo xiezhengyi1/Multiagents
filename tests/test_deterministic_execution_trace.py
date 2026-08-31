@@ -29,8 +29,8 @@ def _request_envelope() -> ArtifactEnvelope:
     return ArtifactEnvelope(
         artifact_id="artifact-request-1",
         correlation_id="corr-1",
+        kind="request",
         artifact_type="PolicyPlanDraft",
-        payload_schema_name="PolicyPlanDraft",
         source_agent="optimization_strategy",
         target_agent="policy_dispatch",
         scope=ExecutionScope(

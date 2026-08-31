@@ -277,7 +277,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> ArtifactEnvelope:
         return self.cache_received_artifact(
             artifact_type="GroundingDecisionRequest",
-            payload_schema_name="GroundingDecisionRequest",
             payload={
                 "user_input": str(user_input),
                 "context": str(context or ""),
@@ -299,7 +298,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> None:
         self.cache_produced_artifact(
             artifact_type="GroundingDecision",
-            payload_schema_name=GroundingDecision.__name__,
             request_envelope=request_envelope,
             payload=grounding_decision,
         )

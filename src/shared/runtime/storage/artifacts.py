@@ -29,8 +29,10 @@ class ArtifactStore:
         return path
 
     def write_request(self, envelope: ArtifactEnvelope) -> Path:
+        if envelope.kind != "request":
+            raise ValueError(f"write_request expects request artifact, got {envelope.kind}")
         path = self.request_dir(envelope.source_agent, envelope.target_agent) / f"{envelope.artifact_id}.json"
-        stored_path = self._store_envelope(path, envelope, kind="request")
+        stored_path = self._store_envelope(path, envelope)
         enqueued = self.persistence.enqueue_task(
             artifact_id=envelope.artifact_id,
             artifact_type=envelope.artifact_type,
@@ -45,8 +47,10 @@ class ArtifactStore:
         return stored_path
 
     def write_response(self, envelope: ArtifactEnvelope) -> Path:
+        if envelope.kind != "response":
+            raise ValueError(f"write_response expects response artifact, got {envelope.kind}")
         path = self.response_dir(envelope.source_agent, envelope.target_agent) / f"{envelope.artifact_id}.json"
-        return self._store_envelope(path, envelope, kind="response")
+        return self._store_envelope(path, envelope)
 
     def read_artifact(self, path: Path) -> ArtifactEnvelope:
         payload = read_json_file(path)
@@ -61,7 +65,7 @@ class ArtifactStore:
             raise ValueError(f"Unsupported artifact kind: {kind}")
         return sorted(directory.glob("*.json"))
 
-    def _store_envelope(self, path: Path, envelope: ArtifactEnvelope, *, kind: str) -> Path:
+    def _store_envelope(self, path: Path, envelope: ArtifactEnvelope) -> Path:
         stored_path = write_json_file_atomic(path, envelope.model_dump(mode="json"))
         recorded = self.persistence.record_artifact(
             artifact_id=envelope.artifact_id,
@@ -71,12 +75,14 @@ class ArtifactStore:
             source_agent=envelope.source_agent,
             target_agent=envelope.target_agent,
             artifact_type=envelope.artifact_type,
-            kind=kind,
+            kind=envelope.kind,
             path=str(stored_path),
             payload=envelope.payload,
         )
         if not recorded:
-            raise RuntimeError(f"Failed to record {kind} artifact metadata for {envelope.artifact_id}.")
+            raise RuntimeError(
+                f"Failed to record {envelope.kind} artifact metadata for {envelope.artifact_id}."
+            )
         return stored_path
 
 
@@ -91,10 +97,14 @@ class ArtifactCache:
         ensure_directory(self.state_dir)
 
     def cache_received(self, envelope: ArtifactEnvelope) -> Path:
+        if envelope.kind != "request":
+            raise ValueError(f"cache_received expects request artifact, got {envelope.kind}")
         path = self.received_dir / f"{envelope.artifact_id}.json"
         return write_json_file_atomic(path, envelope.model_dump(mode="json"))
 
     def cache_produced(self, envelope: ArtifactEnvelope) -> Path:
+        if envelope.kind != "response":
+            raise ValueError(f"cache_produced expects response artifact, got {envelope.kind}")
         path = self.produced_dir / f"{envelope.artifact_id}.json"
         return write_json_file_atomic(path, envelope.model_dump(mode="json"))
 

@@ -11,7 +11,7 @@
 | 模型输出 | `AgentRunResult` | 保留完整原生消息顺序和经 response schema 解析的结构化输出 |
 | 消息 | `AgentMessage` / `ToolCall` | 仅允许 `system/user/assistant/tool`；所有并行 tool call 必须闭合后才能继续对话 |
 | 工具 | `ToolContract` / `ToolCatalog` | 执行与 trace 共用同一目录；必须声明输入 schema、副作用、结果格式和有界结果 |
-| 代理间交接 | `ArtifactEnvelope` | 必须声明 payload schema、源/目标 agent、scope、correlation 和上游 artifact |
+| 代理间交接 | `ArtifactEnvelope` | 必须声明 request/response 方向、唯一 payload 类型、源/目标 agent、scope、correlation 和上游 artifact |
 | 记忆 | `MemoryRecord` / `MemoryQuery` / `MemoryBundle` | 每次读写显式携带 scope；记忆记录携带来源 agent 和源 trace id |
 | RAG | `KnowledgeQuery` / `KnowledgeResponse` | 返回结构化 hit；每个 hit 必须有 spec、release、version、anchor 引用链 |
 | Trace | `AgentTrace` / `TraceTarget` | 记录 scope、prompt 版本、tool catalog 指纹、模型实际可见消息、结果来源和错误 |
@@ -19,7 +19,11 @@
 
 上述契约均拒绝未知字段，且对象创建后禁止属性重赋值。生产路径不使用“猜测字段”、多形态 JSON 提取、Markdown 代码块剔除或错误转正。
 
-记忆命名空间有明确边界：短期 `event` 按 `thread_id` 隔离，长期 `summary` 按 SUPI 共享（无 SUPI 时按 `session_id`），摘要游标按 `thread_id` 隔离。
+记忆命名空间有明确边界：短期 `event` 按带类型前缀的 `thread_id` 隔离，长期 `summary` 按带类型前缀的 SUPI 共享（无 SUPI 时按 `session_id`），摘要游标按 `thread_id` 隔离。`MemoryBundle` 会验证短期记录只能是同一 thread 的 event、长期记录只能来自同一 SUPI/session 命名空间的 summary；记忆 ID 和 trace 来源不得重复。
+
+RAG 工具在执行检索前创建 `KnowledgeQuery`。非法类型或超出 `1..30` 的 limit 直接拒绝，不进行类型转换、默认值替换或上下界裁剪。`KnowledgeResponse` 的 hit 数不得超过请求 limit，同一响应中的引用 key 必须唯一，分数必须是有限浮点数。
+
+`ArtifactEnvelope.kind` 明确区分 request 与 response；request 不得声明上游 artifact，response 必须声明至少一个上游 artifact，源和目标 agent 不得相同。payload 的唯一类型判别字段是 `artifact_type`，不再同时维护同值的 `payload_schema_name`。存储、缓存和 worker 均校验 envelope 方向，不依赖调用方法名称在契约外猜测。
 
 编排器内部的 `UnifiedControlPlan`、`ControlRoundResult` 和 round execution 入口同样只接收 `ExecutionScope`，不再平铺复制 session、snapshot、round 和 SUPI。`ControlRoundTrace`、domain proposal、agent contribution、handoff、协商和重入消息全部使用严格 Pydantic 契约；未知字段或错误 JSON 类型直接拒绝，不再通过 `dict(...)`、空对象或过滤无效列表项来“修复”输入。
 

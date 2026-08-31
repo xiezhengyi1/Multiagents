@@ -15,6 +15,7 @@ from langchain.tools import ToolRuntime
 
 from shared.contracts import (
     KnowledgeCitation,
+    KnowledgeDomainHint,
     KnowledgeHit,
     KnowledgeQuery,
     KnowledgeResponse,
@@ -55,7 +56,6 @@ PCF_URSP_SCHEMA_COLLECTION = COLLECTIONS["ursp_schema"]
 
 
 DEFAULT_RETURNED_RESULTS = 10
-MAX_RETURNED_RESULTS = 30
 MAX_CONTENT_CHARS = 1200
 MAX_SUMMARY_CHARS = 240
 BGE_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -647,8 +647,16 @@ def _prefers_clause_location(query: str, domain: str) -> bool:
 
 def _infer_policy_domain(query: str, category: Optional[str]) -> str:
     normalized_category = _normalized(category)
-    if normalized_category in {"sm_policy", "am_policy", "ursp", "mobility", "shared", "all"}:
-        return "all" if normalized_category == "shared" else normalized_category
+    if normalized_category in {
+        "sm_policy",
+        "am_policy",
+        "ursp",
+        "mobility",
+        "cross_domain",
+        "shared",
+        "all",
+    }:
+        return "all" if normalized_category in {"cross_domain", "shared"} else normalized_category
 
     haystack = " ".join(part for part in [query, category] if part).lower()
     am_hits = sum(1 for keyword in AM_POLICY_KEYWORDS if keyword in haystack)
@@ -861,16 +869,6 @@ def _candidate_key(metadata: Dict[str, Any], fallback_id: str = "") -> str:
         if value:
             return value
     return fallback_id
-
-
-def _sanitize_limit(limit: Optional[int]) -> int:
-    if limit is None:
-        return DEFAULT_RETURNED_RESULTS
-    try:
-        parsed = int(limit)
-    except (TypeError, ValueError):
-        return DEFAULT_RETURNED_RESULTS
-    return max(1, min(parsed, MAX_RETURNED_RESULTS))
 
 
 def _doc_type_priority(doc_type: str, query: str, domain: str) -> float:
@@ -2269,18 +2267,9 @@ def _knowledge_domain(domain: str) -> str:
 
 def _knowledge_response(
     *,
-    scope: Any,
-    query: str,
-    domain: str,
-    limit: int,
+    query: KnowledgeQuery,
     candidates: List[Dict[str, Any]],
 ) -> KnowledgeResponse:
-    knowledge_query = KnowledgeQuery(
-        scope=scope,
-        query=query,
-        domain=_knowledge_domain(domain),
-        limit=limit,
-    )
     hits = []
     for candidate in candidates:
         metadata = dict(candidate["metadata"])
@@ -2302,14 +2291,14 @@ def _knowledge_response(
                     or result_key
                 ),
                 document_type=str(metadata["doc_type"]),
-                policy_domain=str(metadata["policy_domain"]),
+                policy_domain=_knowledge_domain(str(metadata["policy_domain"])),
                 retrieval_method=str(candidate["retrieval"]),
                 score=float(candidate["score"]),
                 content=str(candidate["page_content"]),
                 object_tags=[str(item) for item in metadata.get("object_tags") or []],
             )
         )
-    return KnowledgeResponse(query=knowledge_query, hits=hits)
+    return KnowledgeResponse(query=query, hits=hits)
 
 
 def run_semantic_knowledge_pipeline(
@@ -2357,7 +2346,7 @@ def run_semantic_knowledge_pipeline(
 )
 def search_semantic_knowledge(
     query: str,
-    category: Optional[str] = None,
+    category: KnowledgeDomainHint | None = None,
     limit: int = DEFAULT_RETURNED_RESULTS,
     runtime: ToolRuntime[AgentRuntimeContext] = None,
 ) -> dict[str, Any]:
@@ -2370,20 +2359,22 @@ def search_semantic_knowledge(
         raise ValueError("query must not be empty")
     if runtime is None or runtime.context is None:
         raise RuntimeError("knowledge tools require AgentRuntimeContext")
-    normalized_limit = _sanitize_limit(limit)
+    inferred_domain = _infer_policy_domain(normalized_query, category)
+    knowledge_query = KnowledgeQuery(
+        scope=runtime.context.scope,
+        query=normalized_query,
+        domain=_knowledge_domain(inferred_domain),
+        limit=limit,
+    )
     candidates, errors = run_semantic_knowledge_pipeline(
         normalized_query,
         category=category,
-        limit=normalized_limit,
+        limit=knowledge_query.limit,
     )
     if errors:
         raise RuntimeError("knowledge retrieval failed: " + " | ".join(errors))
-    domain = _infer_policy_domain(normalized_query, category)
     return _knowledge_response(
-        scope=runtime.context.scope,
-        query=normalized_query,
-        domain=domain,
-        limit=normalized_limit,
+        query=knowledge_query,
         candidates=candidates,
     ).model_dump(mode="json")
 
@@ -2395,7 +2386,7 @@ def search_semantic_knowledge(
 )
 def get_knowledge_by_key(
     key: str,
-    category: Optional[str] = None,
+    category: KnowledgeDomainHint | None = None,
     runtime: ToolRuntime[AgentRuntimeContext] = None,
 ) -> dict[str, Any]:
     """
@@ -2409,6 +2400,12 @@ def get_knowledge_by_key(
 
     _ensure_processed_corpus()
     domain = _infer_policy_domain(normalized_key, category)
+    knowledge_query = KnowledgeQuery(
+        scope=runtime.context.scope,
+        query=normalized_key,
+        domain=_knowledge_domain(domain),
+        limit=6,
+    )
     selected = _resolve_explicit_key_candidates(normalized_key, domain)
     if not selected:
         selected = _direct_record_matches(normalized_key, domain)
@@ -2419,10 +2416,7 @@ def get_knowledge_by_key(
         cross_spec = _expand_cross_spec_candidates(selected, domain, normalized_key)
         candidates = _dedupe_candidates([*selected, *cross_spec], limit=6)
     return _knowledge_response(
-        scope=runtime.context.scope,
-        query=normalized_key,
-        domain=domain,
-        limit=6,
+        query=knowledge_query,
         candidates=candidates,
     ).model_dump(mode="json")
 

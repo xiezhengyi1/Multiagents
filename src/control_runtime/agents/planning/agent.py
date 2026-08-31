@@ -152,7 +152,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     def _cache_received_request(self, planning_request: PlanningRequest) -> ArtifactEnvelope:
         return self.cache_received_artifact(
             artifact_type="PlanningRequest",
-            payload_schema_name=PlanningRequest.__name__,
             payload=planning_request,
             scope=ExecutionScope(
                 session_id=planning_request.context.session_id,
@@ -171,7 +170,6 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
     ) -> None:
         self.cache_produced_artifact(
             artifact_type="PolicyPlanDraft",
-            payload_schema_name=PolicyPlanDraft.__name__,
             request_envelope=request_envelope,
             payload=policy_plan,
         )

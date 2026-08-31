@@ -1,6 +1,6 @@
-from .artifacts import ArtifactEnvelope
+from .artifacts import ArtifactEnvelope, ArtifactKind
 from .common import CONTRACT_VERSION, ContractModel, ContractVersion, ExecutionScope, JsonValue, NonEmptyStr, utc_now
-from .knowledge import KnowledgeCitation, KnowledgeDomain, KnowledgeHit, KnowledgeQuery, KnowledgeResponse
+from .knowledge import KnowledgeCitation, KnowledgeDomain, KnowledgeDomainHint, KnowledgeHit, KnowledgeQuery, KnowledgeResponse
 from .memory import MemoryBundle, MemoryKind, MemoryQuery, MemoryRecord
 from .messages import AgentMessage, MessageRole, ToolCall, ToolCallStatus, validate_message_sequence
 from .tools import ToolCatalog, ToolContract, ToolResultFormat, ToolSideEffect
@@ -13,6 +13,7 @@ __all__ = [
     "AgentRunResult",
     "AgentTrace",
     "ArtifactEnvelope",
+    "ArtifactKind",
     "CONTRACT_VERSION",
     "ContractModel",
     "ContractVersion",
@@ -20,6 +21,7 @@ __all__ = [
     "JsonValue",
     "KnowledgeCitation",
     "KnowledgeDomain",
+    "KnowledgeDomainHint",
     "KnowledgeHit",
     "KnowledgeQuery",
     "KnowledgeResponse",

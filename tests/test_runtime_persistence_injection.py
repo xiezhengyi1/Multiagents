@@ -206,13 +206,17 @@ def _envelope(
     artifacts: ModuleType,
     artifact_id: str = "artifact-1",
     target_agent: str = "policy_dispatch",
+    *,
+    kind: str = "request",
+    source_agent: str = "main_control",
+    upstream_artifact_ids: list[str] | None = None,
 ) -> Any:
     return artifacts.ArtifactEnvelope(
         artifact_id=artifact_id,
         correlation_id="corr-1",
+        kind=kind,
         artifact_type="PolicyPlanDraft",
-        payload_schema_name="PolicyPlanDraft",
-        source_agent="main_control",
+        source_agent=source_agent,
         target_agent=target_agent,
         scope=ExecutionScope(
             session_id="session-1",
@@ -220,6 +224,7 @@ def _envelope(
             snapshot_id="snapshot-1",
         ),
         payload={"policy": "draft"},
+        upstream_artifact_ids=upstream_artifact_ids or [],
     )
 
 
@@ -279,6 +284,9 @@ def test_persistence_failures_remain_visible_after_disk_write(
         artifacts,
         artifact_id="artifact-response",
         target_agent="main_control",
+        kind="response",
+        source_agent="policy_dispatch",
+        upstream_artifact_ids=["artifact-request"],
     )
 
     with pytest.raises(RuntimeError, match="Failed to record response artifact metadata"):

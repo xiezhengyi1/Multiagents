@@ -55,7 +55,6 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         self.ensure_worker_runtime_initialized()
         request_envelope = self.cache_received_artifact(
             artifact_type="PolicyPlanDraft",
-            payload_schema_name="PolicyPlanDraft",
             payload=strategy_output,
             scope=ExecutionScope(
                 session_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
@@ -96,7 +95,6 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         )
         self.cache_produced_artifact(
             artifact_type="FeedbackReport",
-            payload_schema_name=FeedbackReport.__name__,
             request_envelope=request_envelope,
             payload=feedback_report,
         )

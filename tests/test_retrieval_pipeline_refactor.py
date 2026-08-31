@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault(
@@ -18,7 +20,7 @@ for path in (PROJECT_ROOT, PROJECT_ROOT / "src"):
 from knowledge_build.scripts import evaluate_pcf_policy_rag
 from knowledge_runtime.retrieval.raw import knowledge_tool
 from langchain.tools import ToolRuntime
-from shared.contracts import ExecutionScope, KnowledgeResponse
+from shared.contracts import ExecutionScope
 from shared.runtime import AgentRuntimeContext
 
 
@@ -100,7 +102,7 @@ def test_exact_seed_path_keeps_pool_and_observer_nonintrusive(monkeypatch) -> No
     assert {"expand_cross_spec_candidates", "vector_search_candidates"} <= skipped
 
 
-def test_pipeline_keeps_raw_evaluator_limit_but_tool_boundary_caps_it(monkeypatch) -> None:
+def test_pipeline_keeps_raw_evaluator_limit_but_tool_boundary_rejects_it(monkeypatch) -> None:
     captured: dict[str, int] = {}
     monkeypatch.setattr(knowledge_tool, "_ensure_processed_corpus", lambda: ())
     monkeypatch.setattr(knowledge_tool, "_infer_policy_domain", lambda *_args: "sm_policy")
@@ -118,14 +120,14 @@ def test_pipeline_keeps_raw_evaluator_limit_but_tool_boundary_caps_it(monkeypatc
         return [], []
 
     monkeypatch.setattr(knowledge_tool, "run_semantic_knowledge_pipeline", fake_public_pipeline)
-    response = knowledge_tool.search_semantic_knowledge.func(
-        reason="test limit boundary",
-        query="tool limit",
-        limit=61,
-        runtime=_tool_runtime(),
-    )
-    assert KnowledgeResponse.model_validate(response).hits == []
-    assert captured["tool_limit"] == 30
+    with pytest.raises(ValueError, match="less than or equal to 30"):
+        knowledge_tool.search_semantic_knowledge.func(
+            reason="test limit boundary",
+            query="tool limit",
+            limit=61,
+            runtime=_tool_runtime(),
+        )
+    assert "tool_limit" not in captured
 
 
 def test_evaluator_uses_public_pipeline_and_legacy_entrypoints_are_gone(monkeypatch) -> None:

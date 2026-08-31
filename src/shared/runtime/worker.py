@@ -61,7 +61,6 @@ class ArtifactWorkerMixin:
         self,
         *,
         artifact_type: str,
-        payload_schema_name: str,
         payload: Any,
         source_agent: str = "coordinator",
         scope: ExecutionScope,
@@ -71,10 +70,10 @@ class ArtifactWorkerMixin:
             raise RuntimeError("cache_received_artifact() requires initialized worker runtime")
 
         envelope = ArtifactEnvelope(
-            artifact_type=str(artifact_type or "").strip(),
-            payload_schema_name=str(payload_schema_name).strip(),
-            source_agent=str(source_agent or "").strip(),
-            target_agent=str(target_agent or getattr(self, "agent_name", "") or "").strip(),
+            kind="request",
+            artifact_type=artifact_type,
+            source_agent=source_agent,
+            target_agent=target_agent if target_agent is not None else self.agent_name,
             scope=scope,
             payload=self.build_response_payload(payload),
         )
@@ -85,7 +84,6 @@ class ArtifactWorkerMixin:
         self,
         *,
         artifact_type: str,
-        payload_schema_name: str,
         request_envelope: ArtifactEnvelope,
         payload: Any,
         source_agent: Optional[str] = None,
@@ -95,10 +93,10 @@ class ArtifactWorkerMixin:
             raise RuntimeError("cache_produced_artifact() requires initialized worker runtime")
 
         envelope = ArtifactEnvelope(
-            artifact_type=str(artifact_type or "").strip(),
-            payload_schema_name=str(payload_schema_name).strip(),
-            source_agent=str(source_agent or getattr(self, "agent_name", "") or "").strip(),
-            target_agent=str(target_agent or request_envelope.source_agent or "").strip(),
+            kind="response",
+            artifact_type=artifact_type,
+            source_agent=source_agent if source_agent is not None else self.agent_name,
+            target_agent=target_agent if target_agent is not None else request_envelope.source_agent,
             scope=request_envelope.scope,
             correlation_id=request_envelope.correlation_id,
             upstream_artifact_ids=[request_envelope.artifact_id],
@@ -110,6 +108,8 @@ class ArtifactWorkerMixin:
     def consume_request_artifact(self, request_path: Path) -> Path:
         self.ensure_worker_runtime_initialized()
         envelope = self.artifact_store.read_artifact(request_path)
+        if envelope.kind != "request":
+            raise ValueError(f"artifact kind mismatch: expected request, got {envelope.kind}")
         if envelope.target_agent != self.agent_name:
             raise ValueError(f"artifact target_agent mismatch: expected {self.agent_name}, got {envelope.target_agent}")
         if envelope.artifact_type != self.expected_request_type():
@@ -121,8 +121,8 @@ class ArtifactWorkerMixin:
             self.cache.cache_received(envelope)
             result = self.handle_artifact(envelope)
             response_envelope = ArtifactEnvelope(
+                kind="response",
                 artifact_type=self.response_artifact_type(),
-                payload_schema_name=result.__class__.__name__,
                 source_agent=self.agent_name,
                 target_agent=envelope.source_agent,
                 scope=envelope.scope,

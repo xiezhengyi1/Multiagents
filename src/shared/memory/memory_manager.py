@@ -64,16 +64,20 @@ class MemoryManager:
     @classmethod
     def _namespace(cls, record_or_query: MemoryRecord | MemoryQuery, kind: str) -> tuple[str, str, str]:
         if kind == "event":
-            identity = record_or_query.scope.thread_id
+            identity = f"thread:{record_or_query.scope.thread_id}"
         elif kind == "summary":
-            identity = record_or_query.scope.supi or record_or_query.scope.session_id
+            identity = (
+                f"supi:{record_or_query.scope.supi}"
+                if record_or_query.scope.supi is not None
+                else f"session:{record_or_query.scope.session_id}"
+            )
         else:
             raise ValueError(f"unsupported memory kind: {kind}")
         return (identity, "memory_v2", kind)
 
     @classmethod
     def _meta_namespace(cls, record_or_query: MemoryRecord | MemoryQuery) -> tuple[str, str, str]:
-        return (record_or_query.scope.thread_id, "memory_v2", "metadata")
+        return (f"thread:{record_or_query.scope.thread_id}", "memory_v2", "metadata")
 
     def add(self, record: MemoryRecord) -> None:
         self.store.put(
@@ -150,11 +154,13 @@ class MemoryManager:
                 source_agent="memory_summarizer",
                 role="summary",
                 content=summary,
-                source_trace_ids=[
-                    trace_id
-                    for candidate in candidates
-                    for trace_id in candidate.source_trace_ids
-                ],
+                source_trace_ids=list(
+                    dict.fromkeys(
+                        trace_id
+                        for candidate in candidates
+                        for trace_id in candidate.source_trace_ids
+                    )
+                ),
             )
         )
         self.store.put(
