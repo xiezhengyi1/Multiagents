@@ -190,6 +190,10 @@ def test_environment_agent_defaults_to_the_semantic_design_protocol() -> None:
 
     assert "submit_environment_catalog" in agent.system_prompt
     assert "compile_environment_design" in agent.system_prompt
+    assert "revise_environment_design" in agent.system_prompt
+    assert "prepare_environment_design_context" in agent.system_prompt
+    assert "Only gNB entities have an alias" not in agent.system_prompt
+    assert "`alias` exists only on a gNB" in agent.system_prompt
     assert "replace_draft_section" not in agent.system_prompt
     assert "exact flow metrics" in " ".join(prompt.split())
 
@@ -220,8 +224,10 @@ def test_semantic_toolchain_excludes_legacy_yaml_mutation_tools_and_writes_desig
     tool_names = {getattr(tool, "name", "") for tool in tools}
 
     assert "compile_environment_design" in tool_names
-    assert "get_environment_runtime_reference" in tool_names
+    assert "revise_environment_design" in tool_names
+    assert "prepare_environment_design_context" in tool_names
     assert "submit_environment_catalog" in tool_names
+    assert "record_validation_feedback" not in tool_names
     assert "replace_draft_section" not in tool_names
     assert "patch_draft_entity" not in tool_names
 
@@ -241,7 +247,52 @@ def test_semantic_toolchain_excludes_legacy_yaml_mutation_tools_and_writes_desig
     assert design_report["design"]["flows"][0]["rationale"] == design["flows"][0]["rationale"]
 
 
-def test_runtime_reference_is_loaded_only_from_the_trusted_scenario_root() -> None:
+def test_semantic_revision_repairs_only_affected_entity_and_blocks_premature_yaml_validation(
+    tmp_path: Path,
+) -> None:
+    catalog, design, _ = _s3_semantic_fixture()
+    original_flow = deepcopy(design["flows"][0])
+    app_by_key = {item["key"]: item for item in design["apps"]}
+    ue_by_key = {item["key"]: item for item in design["ues"]}
+    gnb_by_key = {item["key"]: item for item in design["gnbs"]}
+    app = app_by_key[original_flow["app_key"]]
+    ue = ue_by_key[app["ue_key"]]
+    served = set(gnb_by_key[ue["attached_gnb_key"]]["served_slice_keys"])
+    incompatible_slice = next(key for key in catalog["slice_keys"] if key not in served)
+    design["flows"][0]["slice_key"] = incompatible_slice
+
+    tools = build_environment_tools(
+        compiler=EnvironmentAgentCompiler(),
+        launcher=object(),
+        scenario_root=tmp_path,
+        execute_simulator=False,
+        semantic_design_mode=True,
+    )
+    _tool_by_name(tools, "submit_environment_catalog").invoke({"catalog": catalog})
+    failed = json.loads(
+        _tool_by_name(tools, "compile_environment_design").invoke({"design": design})
+    )
+    guarded = json.loads(_tool_by_name(tools, "validate_environment_draft").invoke({}))
+
+    assert failed["status"] == "failed"
+    assert failed["required_action"] == "revise_environment_design"
+    assert "flow_app_and_slice" in failed["repair_context"]
+    assert guarded["status"] == "blocked"
+    assert guarded["phase"] == "workflow_guard"
+    assert not any("missing required top-level sections" in error for error in guarded["errors"])
+
+    repaired = json.loads(
+        _tool_by_name(tools, "revise_environment_design").invoke(
+            {"revision": {"flows": [original_flow]}}
+        )
+    )
+
+    assert repaired["status"] == "ok"
+    assert repaired["revision_applied"] == [f"flows.{original_flow['key']}"]
+    assert json.loads(_tool_by_name(tools, "validate_environment_draft").invoke({}))["status"] == "ok"
+
+
+def test_combined_design_context_loads_runtime_only_from_the_trusted_scenario_root() -> None:
     tools = build_environment_tools(
         compiler=EnvironmentAgentCompiler(),
         launcher=object(),
@@ -250,10 +301,11 @@ def test_runtime_reference_is_loaded_only_from_the_trusted_scenario_root() -> No
         semantic_design_mode=True,
     )
 
-    runtime_reference = json.loads(_tool_by_name(tools, "get_environment_runtime_reference").invoke({}))
+    runtime_reference = json.loads(_tool_by_name(tools, "prepare_environment_design_context").invoke({}))
 
     assert runtime_reference["runtime"]["free5gc"]["mode"] == "ulcl"
     assert runtime_reference["runtime"]["split_mode_ns3"]["policy_reload_ms"] == 100
+    assert runtime_reference["spec_count"] > 0
 
 
 def test_infeasible_llm_metric_is_reported_without_silent_repair(tmp_path: Path) -> None:

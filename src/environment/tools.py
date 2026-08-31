@@ -12,7 +12,13 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from .compiler import EnvironmentAgentCompiler, S3_MINIMUM_COUNTS, S3_QUALITY_PROFILE
-from .design import EnvironmentCatalog, EnvironmentDesign, EnvironmentDesignCompiler, EnvironmentDesignError
+from .design import (
+    EnvironmentCatalog,
+    EnvironmentDesign,
+    EnvironmentDesignCompiler,
+    EnvironmentDesignError,
+    EnvironmentDesignRevision,
+)
 from .draft import ScenarioDraftStore
 from .launcher import EnvironmentLauncher
 from .specs import ExistingScenarioSpecExplorer
@@ -50,6 +56,38 @@ def _format_design_validation_errors(exc: ValidationError) -> list[str]:
         f"{'.'.join(str(part) for part in error.get('loc') or ())}: {error.get('msg')}"
         for error in exc.errors(include_url=False)
     ]
+
+
+def _semantic_repair_context(design: EnvironmentDesign) -> dict[str, Any]:
+    """Return the compact relation table needed for an LLM-authored repair."""
+
+    return {
+        "invariants": [
+            "For every flow: flow.app_key -> app.ue_key -> UE.attached_gnb_key, and the flow.slice_key must appear in that gNB.served_slice_keys.",
+            "Every catalog UE must own at least one app.",
+            "Every catalog app must be referenced by at least one flow.",
+        ],
+        "gnb_served_slices": {
+            item.key: list(item.served_slice_keys)
+            for item in design.gnbs
+        },
+        "ue_attached_gnb": {
+            item.key: item.attached_gnb_key
+            for item in design.ues
+        },
+        "app_ue": {
+            item.key: item.ue_key
+            for item in design.apps
+        },
+        "flow_app_and_slice": {
+            item.key: {"app_key": item.app_key, "slice_key": item.slice_key}
+            for item in design.flows
+        },
+        "revision_rule": (
+            "Call revise_environment_design with complete replacement entities for only the affected "
+            "slices, upfs, gnbs, ues, apps, or flows. The compiler preserves all omitted entities."
+        ),
+    }
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
@@ -314,10 +352,37 @@ def build_environment_tools(
     feedback_log: list[dict[str, Any]] = []
     sections_requiring_replacement: set[str] = set()
     submitted_catalog: EnvironmentCatalog | None = None
+    latest_semantic_design: EnvironmentDesign | None = None
     compiled_design_report: dict[str, Any] | None = None
+    semantic_compile_succeeded = False
     design_report_path = ""
     owned_scenario_path = ""
     owned_overlay_path = ""
+
+    def _record_feedback_item(
+        *,
+        reason: str,
+        scenario_id: str,
+        phase: str,
+        feedback: str,
+    ) -> dict[str, Any]:
+        item = {
+            "reason": reason,
+            "scenario_id": scenario_id,
+            "phase": phase,
+            "feedback": feedback,
+        }
+        feedback_log.append(item)
+        if logger:
+            log_event(
+                logger,
+                "environment_feedback_recorded",
+                scenario_id=scenario_id,
+                phase=phase,
+                feedback_count=len(feedback_log),
+                feedback=feedback[-500:].replace("\n", "\\n"),
+            )
+        return item
 
     def list_existing_environment_specs(reason: str = "", limit: int = 50) -> str:
         """Return compact specs for existing scenario YAML files before generating a new env."""
@@ -353,6 +418,35 @@ def build_environment_tools(
             }
         )
 
+    def prepare_environment_design_context(
+        reason: str = "",
+        source: str = "s3_high_complexity.yaml",
+        limit: int = 20,
+    ) -> str:
+        """Return executable examples and the trusted runtime in one grounding call."""
+        specs = explorer.discover_specs(Path(scenario_root), limit=limit)
+        runtime_payload = json.loads(
+            get_environment_runtime_reference(reason=reason, source=source)
+        )
+        if logger:
+            log_event(
+                logger,
+                "environment_design_context_prepared",
+                source=runtime_payload["source"],
+                spec_count=len(specs),
+            )
+        return _json(
+            {
+                "status": "ok",
+                "reason": reason,
+                "spec_count": len(specs),
+                "specs": specs,
+                "runtime_source": runtime_payload["source"],
+                "runtime": runtime_payload["runtime"],
+                "next_step": "submit_environment_catalog",
+            }
+        )
+
     def initialize_environment_draft(
         reason: str = "",
         metadata: dict[str, Any] | None = None,
@@ -369,7 +463,7 @@ def build_environment_tools(
         catalog: EnvironmentCatalog | None = None,
     ) -> str:
         """Submit the complete semantic entity manifest before any detailed design."""
-        nonlocal submitted_catalog, compiled_design_report
+        nonlocal submitted_catalog, latest_semantic_design, compiled_design_report, semantic_compile_succeeded
         try:
             parsed = EnvironmentCatalog.model_validate(catalog or {})
         except ValidationError as exc:
@@ -402,7 +496,21 @@ def build_environment_tools(
                 }
             )
         submitted_catalog = parsed
+        latest_semantic_design = None
         compiled_design_report = None
+        semantic_compile_succeeded = False
+        if logger:
+            log_event(
+                logger,
+                "environment_catalog_accepted",
+                scenario_id=parsed.scenario_id,
+                slices=parsed.expected_counts.slices,
+                upfs=parsed.expected_counts.upfs,
+                gnbs=parsed.expected_counts.gnbs,
+                ues=parsed.expected_counts.ues,
+                apps=parsed.expected_counts.apps,
+                flows=parsed.expected_counts.flows,
+            )
         return _json(
             {
                 "status": "ok",
@@ -429,46 +537,53 @@ def build_environment_tools(
             }
         )
 
-    def compile_environment_design(
-        reason: str = "",
-        design: EnvironmentDesign | None = None,
-    ) -> str:
-        """Compile one complete LLM-authored semantic design into an atomic YAML draft."""
-        nonlocal compiled_design_report
+    def _compile_parsed_environment_design(
+        parsed: EnvironmentDesign,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        nonlocal latest_semantic_design, compiled_design_report, semantic_compile_succeeded
         if submitted_catalog is None:
-            return _json(
-                {
-                    "status": "failed",
-                    "reason": reason,
-                    "phase": "catalog_missing",
-                    "errors": ["submit_environment_catalog must succeed before design compilation"],
-                    "required_action": "submit_environment_catalog",
-                }
-            )
-        try:
-            parsed = EnvironmentDesign.model_validate(design or {})
-        except ValidationError as exc:
-            return _json(
-                {
-                    "status": "failed",
-                    "reason": reason,
-                    "phase": "design_schema",
-                    "errors": _format_design_validation_errors(exc),
-                    "required_action": "resubmit_complete_environment_design",
-                }
-            )
+            return {
+                "status": "failed",
+                "reason": reason,
+                "phase": "catalog_missing",
+                "errors": ["submit_environment_catalog must succeed before design compilation"],
+                "required_action": "submit_environment_catalog",
+            }
+
+        latest_semantic_design = parsed
+        compiled_design_report = None
+        semantic_compile_succeeded = False
+        draft.validation_passed = False
         try:
             compiled = design_compiler.compile(submitted_catalog, parsed)
         except EnvironmentDesignError as exc:
-            return _json(
-                {
-                    "status": "failed",
-                    "reason": reason,
-                    "phase": "design_completeness",
-                    "errors": list(exc.errors),
-                    "required_action": "resubmit_complete_environment_design",
-                }
+            errors = list(exc.errors)
+            _record_feedback_item(
+                reason=reason,
+                scenario_id=parsed.scenario_id,
+                phase="design_completeness",
+                feedback="; ".join(errors),
             )
+            if logger:
+                log_event(
+                    logger,
+                    "environment_design_compile_result",
+                    scenario_id=parsed.scenario_id,
+                    status="failed",
+                    phase="design_completeness",
+                    error_count=len(errors),
+                    next_step="revise_environment_design",
+                )
+            return {
+                "status": "failed",
+                "reason": reason,
+                "phase": "design_completeness",
+                "errors": errors,
+                "required_action": "revise_environment_design",
+                "repair_context": _semantic_repair_context(parsed),
+            }
 
         candidate = compiled.candidate
         scenario = candidate.scenario
@@ -491,6 +606,7 @@ def build_environment_tools(
         report = compiler.validate_candidate(candidate, quality_profile=quality_profile)
         draft.validation_passed = report.ok
         compiled_design_report = compiled.report
+        semantic_compile_succeeded = report.ok
         repair_sections = sorted(
             {
                 _repair_section_for_error(error)
@@ -498,33 +614,152 @@ def build_environment_tools(
             }
         )
         if not report.ok:
+            errors = list(report.errors)
+            _record_feedback_item(
+                reason=reason,
+                scenario_id=candidate.scenario_id,
+                phase="compiled_candidate_validation",
+                feedback="; ".join(errors),
+            )
+            if logger:
+                log_event(
+                    logger,
+                    "environment_design_compile_result",
+                    scenario_id=candidate.scenario_id,
+                    status="failed",
+                    phase="compiled_candidate_validation",
+                    error_count=len(errors),
+                    next_step="revise_environment_design",
+                )
+            return {
+                "status": "failed",
+                "reason": reason,
+                "phase": "compiled_candidate_validation",
+                "scenario_id": candidate.scenario_id,
+                "errors": errors,
+                "warnings": list(report.warnings),
+                "affected_design_sections": repair_sections,
+                "required_action": "revise_environment_design",
+                "repair_context": _semantic_repair_context(parsed),
+                "metric_policy": "The compiler did not change any LLM-authored topology or flow metric.",
+            }
+        if logger:
+            log_event(
+                logger,
+                "environment_design_compile_result",
+                scenario_id=candidate.scenario_id,
+                status="ok",
+                phase="compiled_candidate_validation",
+                error_count=0,
+                next_step="validate_environment_draft",
+            )
+        return {
+            "status": "ok",
+            "reason": reason,
+            "scenario_id": candidate.scenario_id,
+            "counts": {
+                section: len(scenario[section])
+                for section in ("slices", "upfs", "gnbs", "ues", "apps", "flows")
+            },
+            "quality_profile": quality_profile or "schema-only",
+            "validation_passed": True,
+            "next_step": "validate_environment_draft",
+        }
+
+    def compile_environment_design(
+        reason: str = "",
+        design: EnvironmentDesign | None = None,
+    ) -> str:
+        """Submit the first complete LLM-authored semantic design and compile it atomically."""
+        nonlocal compiled_design_report, semantic_compile_succeeded
+        if submitted_catalog is None:
             return _json(
                 {
                     "status": "failed",
                     "reason": reason,
-                    "phase": "compiled_candidate_validation",
-                    "scenario_id": candidate.scenario_id,
-                    "errors": list(report.errors),
-                    "warnings": list(report.warnings),
-                    "affected_design_sections": repair_sections,
-                    "required_action": "revise_and_resubmit_complete_environment_design",
-                    "metric_policy": "The compiler did not change any LLM-authored topology or flow metric.",
+                    "phase": "catalog_missing",
+                    "errors": ["submit_environment_catalog must succeed before design compilation"],
+                    "required_action": "submit_environment_catalog",
                 }
             )
-        return _json(
-            {
-                "status": "ok",
-                "reason": reason,
-                "scenario_id": candidate.scenario_id,
-                "counts": {
-                    section: len(scenario[section])
-                    for section in ("slices", "upfs", "gnbs", "ues", "apps", "flows")
-                },
-                "quality_profile": quality_profile or "schema-only",
-                "validation_passed": True,
-                "next_step": "validate_environment_draft",
-            }
-        )
+        try:
+            parsed = EnvironmentDesign.model_validate(design or {})
+        except ValidationError as exc:
+            errors = _format_design_validation_errors(exc)
+            compiled_design_report = None
+            semantic_compile_succeeded = False
+            draft.validation_passed = False
+            _record_feedback_item(
+                reason=reason,
+                scenario_id=submitted_catalog.scenario_id,
+                phase="design_schema",
+                feedback="; ".join(errors),
+            )
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "design_schema",
+                    "errors": errors,
+                    "required_action": "resubmit_complete_environment_design",
+                    "schema_correction": {
+                        "alias_rule": "Only gNB entities have an alias field. UPF, UE, and app entities must omit alias.",
+                        "upf_fields": ["key", "name", "role", "dnn", "rationale"],
+                        "ue_fields": ["key", "name", "attached_gnb_key", "target_gnb_key", "preferred_gnb_keys", "rationale"],
+                        "app_fields": ["key", "name", "ue_key", "apn", "pdu_session_type", "rationale"],
+                    },
+                    "workflow_guard": "Do not call YAML validation until compilation returns status=ok.",
+                }
+            )
+        return _json(_compile_parsed_environment_design(parsed, reason=reason))
+
+    def revise_environment_design(
+        reason: str = "",
+        revision: EnvironmentDesignRevision | None = None,
+    ) -> str:
+        """Replace only affected complete semantic entities, then compile the merged design."""
+        nonlocal latest_semantic_design, semantic_compile_succeeded
+        if latest_semantic_design is None:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "workflow_guard",
+                    "errors": ["no schema-valid semantic design exists to revise"],
+                    "required_action": "compile_environment_design",
+                }
+            )
+        try:
+            parsed_revision = EnvironmentDesignRevision.model_validate(revision or {})
+            revised, changed = design_compiler.apply_revision(
+                latest_semantic_design,
+                parsed_revision,
+            )
+        except ValidationError as exc:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "revision_schema",
+                    "errors": _format_design_validation_errors(exc),
+                    "required_action": "revise_environment_design",
+                }
+            )
+        except EnvironmentDesignError as exc:
+            return _json(
+                {
+                    "status": "failed",
+                    "reason": reason,
+                    "phase": "revision_merge",
+                    "errors": list(exc.errors),
+                    "required_action": "revise_environment_design",
+                }
+            )
+        latest_semantic_design = revised
+        semantic_compile_succeeded = False
+        result = _compile_parsed_environment_design(revised, reason=reason)
+        result["revision_applied"] = changed
+        return _json(result)
 
     def replace_draft_section(reason: str = "", section: str = "", payload: Any = None) -> str:
         """Replace one draft section; first writes must follow the declared stage order."""
@@ -577,6 +812,22 @@ def build_environment_tools(
 
     def validate_environment_draft(reason: str = "") -> str:
         """Validate the draft and return a section-level repair plan for any errors."""
+        if semantic_design_mode and not semantic_compile_succeeded:
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": reason,
+                    "phase": "workflow_guard",
+                    "errors": [
+                        "semantic design compilation has not succeeded; there is no YAML draft to validate"
+                    ],
+                    "required_action": (
+                        "revise_environment_design"
+                        if latest_semantic_design is not None
+                        else "compile_environment_design"
+                    ),
+                }
+            )
         candidate = draft.assemble_candidate()
         report = compiler.validate_candidate(candidate, quality_profile=quality_profile)
         draft.validation_passed = report.ok
@@ -615,6 +866,20 @@ def build_environment_tools(
 
     def write_validated_environment_yaml(reason: str = "", output_dir: str = "generated") -> str:
         """Write YAML only after the latest complete draft passes static validation."""
+        if semantic_design_mode and not semantic_compile_succeeded:
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": reason,
+                    "phase": "workflow_guard",
+                    "errors": ["semantic design compilation must succeed before YAML can be written"],
+                    "required_action": (
+                        "revise_environment_design"
+                        if latest_semantic_design is not None
+                        else "compile_environment_design"
+                    ),
+                }
+            )
         if not draft.validation_passed:
             raise ValueError("draft must pass validation before writing YAML")
         candidate = draft.assemble_candidate()
@@ -707,6 +972,20 @@ def build_environment_tools(
         graph_db_url: str = "",
     ) -> str:
         """Execute direct simulator validation for the latest written overlay or base YAML."""
+        if semantic_design_mode and not semantic_compile_succeeded:
+            return _json(
+                {
+                    "status": "blocked",
+                    "reason": reason,
+                    "phase": "workflow_guard",
+                    "errors": ["semantic design compilation must succeed before simulation"],
+                    "required_action": (
+                        "revise_environment_design"
+                        if latest_semantic_design is not None
+                        else "compile_environment_design"
+                    ),
+                }
+            )
         if not draft.scenario_path:
             raise ValueError("validated YAML must be written before simulation")
         scenario_path = draft.split_mode_overlay_path or draft.scenario_path
@@ -767,6 +1046,13 @@ def build_environment_tools(
                 "guidance": diagnostic["guidance"],
                 "matched_keywords": diagnostic.get("matched_keywords", []),
             }
+            if payload.get("status") == "failed":
+                _record_feedback_item(
+                    reason=reason,
+                    scenario_id=str(draft.summary().get("scenario_id") or ""),
+                    phase="simulation",
+                    feedback=str(payload.get("error") or log_tail or "simulation validation failed"),
+                )
         return _json(payload)
 
     def record_validation_feedback(
@@ -776,22 +1062,12 @@ def build_environment_tools(
         feedback: str = "",
     ) -> str:
         """Record validation feedback so the next generation attempt can adjust logic."""
-        item = {
-            "reason": reason,
-            "scenario_id": scenario_id,
-            "phase": phase,
-            "feedback": feedback,
-        }
-        feedback_log.append(item)
-        if logger:
-            log_event(
-                logger,
-                "environment_feedback_recorded",
-                scenario_id=scenario_id,
-                phase=phase,
-                feedback_count=len(feedback_log),
-                feedback=feedback[-500:].replace("\n", "\\n"),
-            )
+        item = _record_feedback_item(
+            reason=reason,
+            scenario_id=scenario_id,
+            phase=phase,
+            feedback=feedback,
+        )
         return _json({"status": "ok", "feedback_count": len(feedback_log), "latest_feedback": item})
 
     def read_back_written_yaml(reason: str = "") -> str:
@@ -853,12 +1129,15 @@ def build_environment_tools(
     ]
     if semantic_design_mode:
         return [
-            shared_tools[0],
-            _make_tool("get_environment_runtime_reference", get_environment_runtime_reference.__doc__ or "", get_environment_runtime_reference),
+            _make_tool("prepare_environment_design_context", prepare_environment_design_context.__doc__ or "", prepare_environment_design_context),
             _make_tool("submit_environment_catalog", submit_environment_catalog.__doc__ or "", submit_environment_catalog),
             _make_tool("inspect_environment_catalog", inspect_environment_catalog.__doc__ or "", inspect_environment_catalog),
             _make_tool("compile_environment_design", compile_environment_design.__doc__ or "", compile_environment_design),
-            *shared_tools[1:],
+            _make_tool("revise_environment_design", revise_environment_design.__doc__ or "", revise_environment_design),
+            shared_tools[1],
+            shared_tools[2],
+            shared_tools[3],
+            shared_tools[5],
         ]
     return [
         shared_tools[0],

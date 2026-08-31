@@ -65,7 +65,6 @@ def _load_mapping(path: Path) -> dict[str, Any]:
     text = Path(path).read_text(encoding="utf-8")
     try:
         import yaml
-
         payload = yaml.safe_load(text)
     except Exception:
         payload = json.loads(text)
@@ -152,24 +151,14 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             tools=self.environment_tools,
             system_prompt=self.system_prompt,
             response_model=EnvironmentAdvisorOutput,
-            max_iterations=32,
+            max_iterations=14,
             tool_error_mode="return",
-            max_calls_per_tool=8,
-            tool_call_limits={
-                "list_existing_environment_specs": 3,
-                "get_environment_runtime_reference": 3,
-                "submit_environment_catalog": 5,
-                "inspect_environment_catalog": 5,
-                "compile_environment_design": 10,
-                "validate_environment_draft": 10,
-                "write_validated_environment_yaml": 5,
-                "simulate_candidate_environment": 5,
-            },
             tool_result_limits={
                 "submit_environment_catalog": 5000,
-                "get_environment_runtime_reference": 5000,
+                "prepare_environment_design_context": 7000,
                 "inspect_environment_catalog": 5000,
                 "compile_environment_design": 6000,
+                "revise_environment_design": 6500,
                 "validate_environment_draft": 4000,
             },
             capability_aliases=ENVIRONMENT_TOOL_CAPABILITIES,
@@ -217,16 +206,17 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         prompt = (
             f"{prompt}\n\n"
             "Semantic closed-loop requirement:\n"
-            "- You must call list_existing_environment_specs before generating the candidate.\n"
-            "- Call get_environment_runtime_reference and reuse its executable runtime shape.\n"
+            "- Call prepare_environment_design_context once for examples and the trusted runtime shape.\n"
             "- Submit the complete semantic-key manifest with submit_environment_catalog.\n"
             "- Submit all topology decisions and exact flow metrics together with compile_environment_design.\n"
             "- The compiler derives identifiers and references only; it never adjusts your metrics.\n"
-            "- If compilation fails, revise and resubmit the complete semantic design.\n"
+            "- If the first submission has a schema error, correct the complete semantic design once.\n"
+            "- For completeness or quality errors, call revise_environment_design with only complete affected entities.\n"
             "- Use validate_environment_draft, write_validated_environment_yaml, and simulate_candidate_environment in that order.\n"
+            "- Never call YAML validation, writing, or simulation before semantic compilation returns status=ok.\n"
             "- When simulation fails and returns failure_analysis, follow its suggested_section and guidance. Do NOT retry the same data unchanged.\n"
             "- If simulation fails but the draft appears correct in-memory, use read_back_written_yaml to compare the draft against the file on disk. Look for missing keys, type mismatches, or serialization gaps.\n"
-            "- If validation or simulation reports a failure, call record_validation_feedback and produce a revised candidate.\n"
+            "- Compilation and simulation feedback is recorded automatically; do not spend a tool call restating it.\n"
             "- Simulation succeeds only when the real launcher starts, the live graph snapshot exists, the policy gateway is healthy, and SLA initialization passes.\n"
             f"- Enforce the {self.quality_profile or 'schema-only'} quality contract: "
             f"{self.compiler.quality_requirements(self.quality_profile)}\n"
@@ -248,6 +238,14 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             "trace_metadata": {"path_label": "environment_generation"},
         }
         try:
+            log_event(
+                self.logger,
+                "environment_advisor_invoke_start",
+                model_name=self.model_name,
+                max_iterations=14,
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+            )
             result = self.agent.invoke(payload, context=runtime_context)
         except Exception as exc:
             self.logger.exception(f"Failed to generate environment candidate: {exc}")

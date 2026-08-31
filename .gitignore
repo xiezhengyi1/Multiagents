@@ -19,6 +19,8 @@ wheels/
 .claude
 .reasonix
 .env
+.codex_tmp
+.codegraph
 # 运行存储
 experiments/results
 runtime
@@ -61,6 +63,7 @@ knowledge_build/data/
 *.csv
 *.docx
 *.pptx
+*.ndjson
 
 # Project documentation and committed experiment inputs
 !README.md

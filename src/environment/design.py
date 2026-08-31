@@ -165,6 +165,27 @@ class EnvironmentDesign(StrictDesignModel):
     runtime: RuntimeDesign
 
 
+class EnvironmentDesignRevision(StrictDesignModel):
+    """LLM-authored replacements for a previously accepted semantic design.
+
+    Every collection entry is a complete semantic entity.  The deterministic
+    merge only replaces the entity with the same key; it never invents values,
+    adds entities, or alters an omitted entity.
+    """
+
+    name: str | None = Field(default=None, min_length=1)
+    rationale: str | None = Field(default=None, min_length=1)
+    tick_ms: int | None = Field(default=None, gt=0)
+    seed: int | None = Field(default=None, ge=0)
+    slices: list[SliceDesign] = Field(default_factory=list)
+    upfs: list[UpfDesign] = Field(default_factory=list)
+    gnbs: list[GnbDesign] = Field(default_factory=list)
+    ues: list[UeDesign] = Field(default_factory=list)
+    apps: list[AppDesign] = Field(default_factory=list)
+    flows: list[FlowDesign] = Field(default_factory=list)
+    runtime: RuntimeDesign | None = None
+
+
 class EnvironmentDesignError(ValueError):
     def __init__(self, errors: list[str]) -> None:
         self.errors = tuple(errors)
@@ -188,6 +209,60 @@ class EnvironmentDesignCompiler:
         "apps": "app_keys",
         "flows": "flow_keys",
     }
+
+    def apply_revision(
+        self,
+        design: EnvironmentDesign,
+        revision: EnvironmentDesignRevision,
+    ) -> tuple[EnvironmentDesign, list[str]]:
+        """Apply only explicit LLM-authored semantic replacements."""
+
+        payload = design.model_dump(mode="json")
+        changed: list[str] = []
+        for field_name in ("name", "rationale", "tick_ms", "seed"):
+            value = getattr(revision, field_name)
+            if value is not None:
+                payload[field_name] = value
+                changed.append(field_name)
+
+        errors: list[str] = []
+        for section in self.CATALOG_FIELDS:
+            replacements = list(getattr(revision, section))
+            if not replacements:
+                continue
+            duplicate_keys = sorted(
+                key
+                for key, count in Counter(item.key for item in replacements).items()
+                if count > 1
+            )
+            if duplicate_keys:
+                errors.append(
+                    f"revision {section} contains duplicate replacement keys: "
+                    + ", ".join(duplicate_keys)
+                )
+                continue
+            indexed = {str(item["key"]): item for item in payload[section]}
+            for replacement in replacements:
+                if replacement.key not in indexed:
+                    errors.append(
+                        f"revision cannot add undeclared {section} key {replacement.key}; "
+                        "submit a new catalog and complete design to change the manifest"
+                    )
+                    continue
+                indexed[replacement.key] = replacement.model_dump(mode="json")
+                changed.append(f"{section}.{replacement.key}")
+            payload[section] = [indexed[str(item["key"])] for item in payload[section]]
+
+        if revision.runtime is not None:
+            payload["runtime"] = revision.runtime.model_dump(mode="json")
+            changed.append("runtime")
+        if errors:
+            raise EnvironmentDesignError(errors)
+        if not changed:
+            raise EnvironmentDesignError(
+                ["revision contains no explicit semantic replacements"]
+            )
+        return EnvironmentDesign.model_validate(payload), changed
 
     def validate_catalog(self, catalog: EnvironmentCatalog) -> list[str]:
         errors: list[str] = []

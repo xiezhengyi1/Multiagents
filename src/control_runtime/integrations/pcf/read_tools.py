@@ -126,7 +126,7 @@ def _normalize_ue_slice_subscription_from_db(
 
 
 def _project_sm_flow_catalog_for_agent(catalog: object) -> dict:
-    """Keep only identity, SLA, binding, and policy-selector fields for IEA."""
+    """Keep identity, policy binding, and runtime evidence required by IEA."""
     if not isinstance(catalog, dict):
         return {"supi": "", "app_catalog": [], "flow_catalog": []}
     apps = [
@@ -152,6 +152,59 @@ def _project_sm_flow_catalog_for_agent(catalog: object) -> dict:
             "service": ("service_type", "service_type_id"),
             "sla": None,
             "allocation": None,
+            "telemetry": (
+                "throughput_ul",
+                "throughput_dl",
+                "latency",
+                "jitter",
+                "loss_rate",
+                "packet_sent",
+                "packet_received",
+                "tcp_retransmits",
+                "tcp_retransmits_per_second",
+                "tcp_rtt_ms_average",
+                "tcp_rtt_ms_maximum",
+                "availability",
+                "observed_at",
+            ),
+            "ran": (
+                "serving_cell_id",
+                "gnb_id",
+                "rnti",
+                "qfi",
+                "drb_id",
+                "mcs_ul",
+                "mcs_dl",
+                "bler_ul",
+                "bler_dl",
+                "prb_ul",
+                "prb_dl",
+                "rsrp_dbm",
+                "sinr_db",
+                "handover_state",
+            ),
+            "session": (
+                "pdu_session_id",
+                "dnn",
+                "snssai",
+                "qfi",
+                "five_qi",
+                "upf_id",
+                "ue_ip",
+            ),
+            "path": (
+                "site_id",
+                "service_instance_id",
+                "upf_path",
+                "app_endpoint",
+            ),
+            "data_quality": (
+                "window_start",
+                "window_end",
+                "sample_count",
+                "stale",
+                "correlation_status",
+            ),
         }
         for nested_key, allowed_fields in nested_fields.items():
             nested = item.get(nested_key)

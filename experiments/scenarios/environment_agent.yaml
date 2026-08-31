@@ -237,6 +237,9 @@ workflow:
         - Every topology relation must use a catalog semantic key.
         - Every entity and flow must include a rationale.
         - The LLM owns all capacities, QoS, traffic, SLA, guarantee, and allocation values.
+        - Only gNB entities may contain alias; UPFs, UEs, and apps must omit alias.
+        - For every flow, its app UE's attached gNB must advertise the flow slice.
+        - Every UE must own at least one app and every app must be used by at least one flow.
     - name: compile_design
       purpose: Derive mechanical identifiers and assemble executable YAML without changing LLM metrics.
       output:
@@ -266,8 +269,8 @@ workflow:
         - live_graph_snapshot_created
         - policy_gateway_healthcheck_responds
     - name: debug_and_repair
-      purpose: Return structured conflicts so the LLM can revise the semantic design.
-      max_attempts: 3
+      purpose: Return compact relation tables so the LLM can replace only affected semantic entities.
+      max_attempts: 5
       failure_inputs:
         - static_validation_errors
         - simulator_log_tail
@@ -275,6 +278,11 @@ workflow:
         - failed_experiments_ledger_entry
       output:
         artifact: semantic_design_revision_report
+      constraints:
+        - A schema-invalid first design must be resubmitted in full.
+        - A schema-valid design must be repaired with complete entity replacements keyed by semantic key.
+        - Unmentioned entities and all of their metrics are preserved exactly.
+        - YAML validation, writing, and simulation are blocked until semantic compilation succeeds.
     - name: accept_or_reject
       purpose: Mark scenario as validated or rejected.
       accepted_outputs:

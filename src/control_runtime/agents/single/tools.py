@@ -35,7 +35,40 @@ FLOW_SLA_KEYS = (
     "priority",
 )
 FLOW_ALLOCATION_KEYS = ("current_slice_snssai", "allocated_bandwidth_ul", "allocated_bandwidth_dl", "optimize_requested")
-FLOW_TELEMETRY_KEYS = ("latency", "jitter", "loss_rate", "throughput_ul", "throughput_dl")
+FLOW_TELEMETRY_KEYS = (
+    "latency",
+    "jitter",
+    "loss_rate",
+    "throughput_ul",
+    "throughput_dl",
+    "packet_sent",
+    "packet_received",
+    "tcp_retransmits",
+    "tcp_retransmits_per_second",
+    "tcp_rtt_ms_average",
+    "tcp_rtt_ms_maximum",
+    "availability",
+    "observed_at",
+)
+FLOW_RAN_KEYS = (
+    "serving_cell_id",
+    "gnb_id",
+    "rnti",
+    "qfi",
+    "drb_id",
+    "mcs_ul",
+    "mcs_dl",
+    "bler_ul",
+    "bler_dl",
+    "prb_ul",
+    "prb_dl",
+    "rsrp_dbm",
+    "sinr_db",
+    "handover_state",
+)
+FLOW_SESSION_KEYS = ("pdu_session_id", "dnn", "snssai", "qfi", "five_qi", "upf_id", "ue_ip")
+FLOW_PATH_KEYS = ("site_id", "service_instance_id", "upf_path", "app_endpoint")
+FLOW_DATA_QUALITY_KEYS = ("window_start", "window_end", "sample_count", "stale", "correlation_status")
 NETWORK_SLICE_KEYS = (
     "name",
     "snssai",
@@ -88,6 +121,15 @@ def compact_flow_catalog_for_single_agent(payload: Dict[str, Any]) -> Dict[str, 
         telemetry = flow.get("telemetry")
         if isinstance(telemetry, dict):
             item["telemetry"] = _project_keys(telemetry, FLOW_TELEMETRY_KEYS)
+        for nested_key, keys in (
+            ("ran", FLOW_RAN_KEYS),
+            ("session", FLOW_SESSION_KEYS),
+            ("path", FLOW_PATH_KEYS),
+            ("data_quality", FLOW_DATA_QUALITY_KEYS),
+        ):
+            nested = flow.get(nested_key)
+            if isinstance(nested, dict):
+                item[nested_key] = _project_keys(nested, keys)
         compact_flows.append({key: value for key, value in item.items() if value not in ({}, [], None, "")})
     compact["flow_catalog"] = compact_flows
     return compact

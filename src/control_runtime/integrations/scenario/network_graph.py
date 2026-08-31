@@ -185,6 +185,7 @@ class NetworkGraph:
             "apps": list(apps.values()),
             "slices": slices,
             "nodes": nodes,
+            "metrics": list(self.graph.graph.get("metrics", [])),
         }
 
     def get_flow_record(self, supi: str, flow_id: str) -> Optional[Dict[str, Any]]:
@@ -274,6 +275,10 @@ class NetworkGraph:
                 allocation = flow_payload.get("allocation") if isinstance(flow_payload.get("allocation"), dict) else {}
                 sla = flow_payload.get("sla") if isinstance(flow_payload.get("sla"), dict) else {}
                 telemetry = flow_payload.get("telemetry") if isinstance(flow_payload.get("telemetry"), dict) else {}
+                ran = flow_payload.get("ran") if isinstance(flow_payload.get("ran"), dict) else {}
+                session = flow_payload.get("session") if isinstance(flow_payload.get("session"), dict) else {}
+                path = flow_payload.get("path") if isinstance(flow_payload.get("path"), dict) else {}
+                data_quality = flow_payload.get("data_quality") if isinstance(flow_payload.get("data_quality"), dict) else {}
                 current_slice = str(allocation.get("current_slice_snssai") or "").strip()
                 if current_slice:
                     slice_key = _join_key_parts("slice", current_slice)
@@ -288,8 +293,29 @@ class NetworkGraph:
                     ("sla.loss_rate", sla.get("loss_rate")),
                     ("telemetry.latency", telemetry.get("latency")),
                     ("telemetry.jitter", telemetry.get("jitter")),
+                    ("telemetry.loss_rate", telemetry.get("loss_rate")),
                     ("telemetry.throughput_ul", telemetry.get("throughput_ul")),
                     ("telemetry.throughput_dl", telemetry.get("throughput_dl")),
+                    ("telemetry.packet_sent", telemetry.get("packet_sent")),
+                    ("telemetry.packet_received", telemetry.get("packet_received")),
+                    ("telemetry.tcp_retransmits", telemetry.get("tcp_retransmits")),
+                    ("telemetry.tcp_retransmits_per_second", telemetry.get("tcp_retransmits_per_second")),
+                    ("telemetry.tcp_rtt_ms_average", telemetry.get("tcp_rtt_ms_average")),
+                    ("telemetry.tcp_rtt_ms_maximum", telemetry.get("tcp_rtt_ms_maximum")),
+                    ("telemetry.availability", telemetry.get("availability")),
+                    ("ran.mcs_ul", ran.get("mcs_ul")),
+                    ("ran.mcs_dl", ran.get("mcs_dl")),
+                    ("ran.bler_ul", ran.get("bler_ul")),
+                    ("ran.bler_dl", ran.get("bler_dl")),
+                    ("ran.prb_ul", ran.get("prb_ul")),
+                    ("ran.prb_dl", ran.get("prb_dl")),
+                    ("ran.rsrp_dbm", ran.get("rsrp_dbm")),
+                    ("ran.sinr_db", ran.get("sinr_db")),
+                    ("session.qfi", session.get("qfi")),
+                    ("session.five_qi", session.get("five_qi")),
+                    ("path.site_id", path.get("site_id")),
+                    ("path.service_instance_id", path.get("service_instance_id")),
+                    ("data_quality.sample_count", data_quality.get("sample_count")),
                 ):
                     if metric_value is not None:
                         graph.upsert_metric("node", flow_key, metric_name, metric_value)
@@ -303,6 +329,7 @@ class NetworkGraph:
             capacity = slice_payload.get("capacity") if isinstance(slice_payload.get("capacity"), dict) else {}
             load = slice_payload.get("load") if isinstance(slice_payload.get("load"), dict) else {}
             qos = slice_payload.get("qos") if isinstance(slice_payload.get("qos"), dict) else {}
+            telemetry = slice_payload.get("telemetry") if isinstance(slice_payload.get("telemetry"), dict) else {}
             for metric_name, metric_value in (
                 ("capacity.total_bandwidth_ul", capacity.get("total_bandwidth_ul")),
                 ("capacity.total_bandwidth_dl", capacity.get("total_bandwidth_dl")),
@@ -314,6 +341,11 @@ class NetworkGraph:
                 ("qos.processing_delay", qos.get("processing_delay")),
                 ("qos.loss_rate", qos.get("loss_rate")),
                 ("qos.jitter", qos.get("jitter")),
+                ("telemetry.utilization_ul", telemetry.get("utilization_ul")),
+                ("telemetry.utilization_dl", telemetry.get("utilization_dl")),
+                ("telemetry.latency", telemetry.get("latency")),
+                ("telemetry.jitter", telemetry.get("jitter")),
+                ("telemetry.loss_rate", telemetry.get("loss_rate")),
             ):
                 if metric_value is not None:
                     graph.upsert_metric("node", slice_key, metric_name, metric_value)
@@ -328,11 +360,16 @@ class NetworkGraph:
                 slice_key = _join_key_parts("slice", hosted_slice)
                 graph.add_edge(slice_key, node_key, "hosted_on", edge_key=f"{slice_key}->{node_key}", properties={"hosted": True})
             capacity = node_payload.get("capacity") if isinstance(node_payload.get("capacity"), dict) else {}
+            telemetry = node_payload.get("telemetry") if isinstance(node_payload.get("telemetry"), dict) else {}
             for metric_name, metric_value in (
                 ("capacity.cpu", capacity.get("cpu")),
                 ("capacity.memory", capacity.get("memory")),
                 ("capacity.mec", capacity.get("mec")),
                 ("capacity.prb", capacity.get("prb")),
+                ("telemetry.cpu_utilization", telemetry.get("cpu_utilization")),
+                ("telemetry.memory_utilization", telemetry.get("memory_utilization")),
+                ("telemetry.mec_utilization", telemetry.get("mec_utilization")),
+                ("telemetry.prb_utilization", telemetry.get("prb_utilization")),
             ):
                 if metric_value is not None:
                     graph.upsert_metric("node", node_key, metric_name, metric_value)

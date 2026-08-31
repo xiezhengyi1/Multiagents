@@ -46,6 +46,41 @@ Multiagents/
 
 诊断职责已收回到主控闭环，不再把 diagnosis 当成独立主智能体阶段。
 
+## 运行时指标读取
+
+Multiagents不直接查Prometheus，也不直接解析OAI/free5GC日志。测试床的Snapshot Builder先将业务流、RAN、PDU会话、UPF路径和MEC/云站点数据关联，再以不可变 `snapshot_id` 写入PostgreSQL的 `network_graph_snapshot.graph_summary`。
+
+读取链路为：
+
+```text
+OAI/free5GC/Traffic Exporter/Prometheus
+  -> Flow Correlator
+  -> Snapshot Builder
+  -> network_graph_snapshot.graph_summary
+  -> get_snapshot_data_by_id(snapshot_id)
+  -> Agent read tools / Optimizer / FlowTelemetryMonitor
+```
+
+每个控制会话必须绑定一个 `snapshot_id`，Main、IEA、OSA、Mediator、Dispatch和Assurance不允许在同一轮内各自读取“latest”。动作验证另建post-action snapshot，与pre-action snapshot比较。
+
+| 消费者 | 读取入口 | 主要指标 |
+|---|---|---|
+| Main | 监控告警和紧凑网络摘要 | 违反SLA的流、严重度、影响域 |
+| IEA | `get_sm_ue_flow_catalog` | SUPI/App/Flow绑定、SLA、实测吞吐/时延/抖动/丢包、RAN和PDU会话关联 |
+| OSA | snapshot + optimizer input | 流分配、切片容量/利用率、RAN PRB、MEC/云路径 |
+| FlowTelemetryMonitor | 图快照 `metrics` | `telemetry.*` 与 `sla.*` 的同窗口对比 |
+| Assurance/Diagnosis | pre/post snapshot + Action receipt | 策略生效、KPI改善、会话/无线/路径变化 |
+
+单流的规范字段分为：
+
+- `telemetry`：上/下行吞吐、时延、抖动、丢包率、包计数、TCP重传/RTT、可用性和观测时间。
+- `ran`：serving cell、gNB、RNTI、QFI/DRB、MCS、BLER、PRB、RSRP、SINR和handover状态。
+- `session`：PDU Session、DNN、S-NSSAI、QFI、5QI、UPF和UE IP。
+- `path`：边缘/云站点、业务实例和UPF路径。
+- `data_quality`：观测窗口、样本数、是否过期和关联完整性。
+
+Agent工具只返回上述紧凑字段；原始Prometheus时序、容器日志和高频RAN样本留在测试床观测层，通过 `snapshot_id` 和 `observed_at` 追溯。
+
 ## 运行实验
 
 在当前目录下执行：

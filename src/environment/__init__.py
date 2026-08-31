@@ -14,6 +14,7 @@ from .design import (
     EnvironmentDesign,
     EnvironmentDesignCompiler,
     EnvironmentDesignError,
+    EnvironmentDesignRevision,
 )
 from .specs import ExistingScenarioSpecExplorer
 from .tools import build_environment_tools
@@ -27,6 +28,7 @@ __all__ = [
     "EnvironmentDesign",
     "EnvironmentDesignCompiler",
     "EnvironmentDesignError",
+    "EnvironmentDesignRevision",
     "EnvironmentValidationReport",
     "LaunchPlan",
     "ScenarioCandidate",
