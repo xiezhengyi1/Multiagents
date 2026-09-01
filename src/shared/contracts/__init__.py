@@ -1,8 +1,6 @@
 from .artifacts import ArtifactEnvelope, ArtifactKind, ArtifactType
 from .common import (
-    CONTRACT_VERSION,
     ContractModel,
-    ContractVersion,
     ExecutionScope,
     JsonValue,
     NonEmptyStr,
@@ -25,9 +23,7 @@ __all__ = [
     "ArtifactEnvelope",
     "ArtifactKind",
     "ArtifactType",
-    "CONTRACT_VERSION",
     "ContractModel",
-    "ContractVersion",
     "ExecutionScope",
     "JsonValue",
     "KnowledgeCitation",

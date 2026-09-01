@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import Field, JsonValue, model_validator
 
-from shared.contracts import ContractModel, ExecutionScope, NonEmptyStr
+from shared.contracts import (
+    ContractModel,
+    ExecutionScope,
+    NonEmptyStr,
+    validate_scope_lineage,
+)
 
+from ..agents.dispatch.contracts import FeedbackReport
+from ..agents.grounding.contracts import GroundingDecision
 from ..agents.main.contracts import ControlDomain, GlobalControlIntent, OpenQuestion
+from ..agents.planning.contracts import PolicyPlanDraft
 from ..diagnostics.mediation.contracts import (
     DomainStatus,
     DomainVerdict,
@@ -110,24 +118,66 @@ class ExecutionReentryRequest(ContractModel):
     summary: str = ""
 
 
-class ControlRoundTrace(ContractModel):
-    """JSON-safe trace for one control round."""
-
+class OrchestrationFailureReport(ContractModel):
+    failure_stage: Literal["planning", "single_control"]
     round_index: int = Field(ge=1)
-    global_intent: dict[str, JsonValue] = Field(default_factory=dict)
-    grounding_decision: dict[str, JsonValue] = Field(default_factory=dict)
-    policy_plan: dict[str, JsonValue] = Field(default_factory=dict)
-    domain_verdicts: list[dict[str, JsonValue]] = Field(default_factory=list)
-    pda_feedback: dict[str, JsonValue] = Field(default_factory=dict)
+    execution_status: Literal["Failed"] = "Failed"
+    violation_details: NonEmptyStr
+    error_type: NonEmptyStr
+    error: NonEmptyStr
+    correction_suggestion: NonEmptyStr
+    recommended_consumer: Literal["main_control", "single_control"]
+    debug_context: dict[str, JsonValue]
+
+
+class ControlRoundTrace(ContractModel):
+    """Typed source of truth for one control round."""
+
+    scope: ExecutionScope
+    round_index: int = Field(ge=1)
+    global_intent: GlobalControlIntent | None = None
+    grounding_decision: GroundingDecision | None = None
+    policy_plan: PolicyPlanDraft | None = None
+    domain_verdicts: list[DomainVerdict] = Field(default_factory=list)
+    dispatch_report: FeedbackReport | None = None
+    orchestration_failure: OrchestrationFailureReport | None = None
     qos_feedback: dict[str, JsonValue] = Field(default_factory=dict)
     mobility_feedback: dict[str, JsonValue] = Field(default_factory=dict)
     diagnosis: dict[str, JsonValue] = Field(default_factory=dict)
-    mediator_decision: dict[str, JsonValue] = Field(default_factory=dict)
-    negotiation_request: dict[str, JsonValue] = Field(default_factory=dict)
-    planning_blocker: dict[str, JsonValue] = Field(default_factory=dict)
-    execution_reentry: dict[str, JsonValue] = Field(default_factory=dict)
+    mediator_decision: MediatorDecision | None = None
+    negotiation_request: DomainNegotiationRequest | None = None
+    planning_blocker: PlanningBlockerReport | None = None
+    execution_reentry: ExecutionReentryRequest | None = None
     single_agent_detail: dict[str, JsonValue] = Field(default_factory=dict)
     agent_elapsed_ms: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_round_lineage(self) -> "ControlRoundTrace":
+        if self.scope.snapshot_id is None:
+            raise ValueError("control round trace requires scope.snapshot_id")
+        if self.scope.round_index != self.round_index:
+            raise ValueError("trace scope.round_index must match trace.round_index")
+        scoped_artifacts = (
+            self.global_intent,
+            self.grounding_decision,
+            self.policy_plan,
+            self.dispatch_report,
+        )
+        for artifact in scoped_artifacts:
+            if artifact is not None:
+                validate_scope_lineage(self.scope, artifact.scope)
+        round_artifacts = (
+            self.negotiation_request,
+            self.planning_blocker,
+            self.execution_reentry,
+            self.orchestration_failure,
+        )
+        for artifact in round_artifacts:
+            if artifact is not None and artifact.round_index != self.round_index:
+                raise ValueError("trace artifact round_index must match trace.round_index")
+        if self.dispatch_report is not None and self.orchestration_failure is not None:
+            raise ValueError("trace cannot contain dispatch_report and orchestration_failure together")
+        return self
 
     @classmethod
     def from_payload(cls, payload: Dict[str, Any]) -> "ControlRoundTrace":
@@ -145,12 +195,6 @@ class ControlRoundTrace(ContractModel):
         return self.__class__.model_validate(
             {**self.model_dump(mode="json"), "single_agent_detail": single_agent_detail}
         )
-
-    def with_pda_feedback(self, pda_feedback: Dict[str, Any]) -> "ControlRoundTrace":
-        return self.__class__.model_validate(
-            {**self.model_dump(mode="json"), "pda_feedback": pda_feedback}
-        )
-
 
 class ControlRoundResult(ContractModel):
     scope: ExecutionScope
@@ -182,6 +226,7 @@ __all__ = [
     "DomainNegotiationRequest",
     "DomainProposal",
     "ExecutionReentryRequest",
+    "OrchestrationFailureReport",
     "PlanningBlockerReport",
     "UnifiedControlPlan",
 ]

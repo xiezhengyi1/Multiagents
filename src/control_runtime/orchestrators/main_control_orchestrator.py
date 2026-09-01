@@ -13,6 +13,7 @@ from shared.runtime import ContextPolicy, RuntimePersistence, TokenBudget, Token
 from application_runtime.persistence import create_runtime_persistence
 
 from ..agents.dispatch.agent import PolicyDispatchAgent
+from ..agents.dispatch.contracts import DispatchFailureFeedback
 from ..agents.grounding.agent import IntentEncodingAgent
 from ..agents.main.agent import MainControlAgent
 from ..agents.planning.agent import OptimizationStrategyAgent
@@ -36,7 +37,7 @@ from .round_execution import execute_planned_round
 from .round_transitions import (
     build_negotiation_diagnosis,
     build_negotiation_request,
-    build_planning_failure_payload,
+    build_planning_failure_report,
     has_supi_scope,
     scope_global_intent_for_intent_encoding,
     should_reuse_grounding_decision,
@@ -381,18 +382,20 @@ class MainControlOrchestrator:
                     "optimization_strategy": getattr(self.os_agent, "last_failure_debug", {}) or {},
                 }
                 debug_context = {key: value for key, value in debug_context.items() if value}
-                report_payload, diagnosis = build_planning_failure_payload(
+                failure_report, diagnosis = build_planning_failure_report(
                     exc,
+                    round_index=round_index,
                     debug_context=debug_context,
                 )
                 trace = ControlRoundTrace(
+                    scope=scope,
                     round_index=round_index,
-                    pda_feedback=report_payload,
+                    orchestration_failure=failure_report,
                     diagnosis=diagnosis,
                     agent_elapsed_ms=round_agent_elapsed_ms,
                 )
                 feedback_added = build_round_feedback_block(
-                    pda_feedback=report_payload,
+                    pda_feedback=failure_report.model_dump(mode="json"),
                     diagnosis=diagnosis,
                     domain_verdicts=[],
                     mediator_decision={},
@@ -444,15 +447,16 @@ class MainControlOrchestrator:
                 agent_elapsed_totals[agent_name] += elapsed_ms
             if negotiation_request is not None:
                 diagnosis = build_negotiation_diagnosis(negotiation_request)
-                negotiation_payload = negotiation_request.model_dump(mode="json")
                 trace = ControlRoundTrace(
+                    scope=scope,
                     round_index=round_index,
-                    global_intent=global_intent.model_dump(mode="json"),
-                    grounding_decision=grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
+                    global_intent=global_intent,
+                    grounding_decision=grounding_decision,
                     diagnosis=diagnosis,
-                    negotiation_request=negotiation_payload,
+                    negotiation_request=negotiation_request,
                     agent_elapsed_ms=round_agent_elapsed_ms,
                 )
+                negotiation_payload = negotiation_request.model_dump(mode="json")
                 feedback_added = build_round_feedback_block(
                     diagnosis=diagnosis,
                     negotiation_request=negotiation_payload,
@@ -509,8 +513,16 @@ class MainControlOrchestrator:
                 mobility_feedback=mobility_feedback,
                 diagnosis=diagnosis,
                 negotiation_request={},
-                planning_blocker=round_trace.planning_blocker,
-                execution_reentry=round_trace.execution_reentry,
+                planning_blocker=(
+                    round_trace.planning_blocker.model_dump(mode="json")
+                    if round_trace.planning_blocker is not None
+                    else {}
+                ),
+                execution_reentry=(
+                    round_trace.execution_reentry.model_dump(mode="json")
+                    if round_trace.execution_reentry is not None
+                    else {}
+                ),
                 round_count=round_index,
                 retry_count=max(0, round_index - 1),
                 round_traces=state.round_traces,
@@ -536,21 +548,35 @@ class MainControlOrchestrator:
 
             retry_forbidden = bool(
                 report is not None
-                and isinstance(report.feedback_payload, dict)
-                and report.feedback_payload.get("retry_forbidden")
+                and isinstance(report.feedback_payload, DispatchFailureFeedback)
+                and report.feedback_payload.retry_forbidden
             )
 
-            retry_trace = round_execution.retry_trace(
-                prefer_execution_reentry=True,
-            ).with_agent_elapsed_ms(round_agent_elapsed_ms)
-            report_payload = retry_trace.pda_feedback
+            retry_trace = round_trace
+            report_payload = (
+                retry_trace.dispatch_report.model_dump(mode="json")
+                if retry_trace.dispatch_report is not None
+                else {}
+            )
             feedback_added = build_round_feedback_block(
                 pda_feedback=report_payload,
                 diagnosis=diagnosis,
-                domain_verdicts=retry_trace.domain_verdicts,
-                mediator_decision=retry_trace.mediator_decision,
-                planning_blocker=retry_trace.planning_blocker,
-                execution_reentry=retry_trace.execution_reentry,
+                domain_verdicts=[item.model_dump(mode="json") for item in retry_trace.domain_verdicts],
+                mediator_decision=(
+                    retry_trace.mediator_decision.model_dump(mode="json")
+                    if retry_trace.mediator_decision is not None
+                    else {}
+                ),
+                planning_blocker=(
+                    retry_trace.planning_blocker.model_dump(mode="json")
+                    if retry_trace.planning_blocker is not None
+                    else {}
+                ),
+                execution_reentry=(
+                    retry_trace.execution_reentry.model_dump(mode="json")
+                    if retry_trace.execution_reentry is not None
+                    else {}
+                ),
                 round_index=round_index,
             )
             append_round_trace(state, trace=retry_trace, feedback_added=feedback_added)

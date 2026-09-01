@@ -11,7 +11,11 @@ from ..agents.single.agent import SingleControlAgent
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool
 from ..diagnostics.mediation import ConflictResolutionTool
 from ..agents.planning.contracts import PolicyPlanDraft
-from .contracts import ControlRoundResult, ControlRoundTrace
+from .contracts import (
+    ControlRoundResult,
+    ControlRoundTrace,
+    OrchestrationFailureReport,
+)
 from .loop_state import OrchestratorLoopState, append_round_trace, finish_control_session, start_control_session
 from .round_context import (
     build_feedback_context_from_snapshots,
@@ -70,16 +74,24 @@ class SingleAgentOrchestrator:
         }
 
     @staticmethod
-    def _build_round_exception_feedback(*, exc: Exception) -> Dict[str, Any]:
+    def _build_round_exception_report(
+        *,
+        exc: Exception,
+        round_index: int,
+    ) -> OrchestrationFailureReport:
         error_text = str(exc).strip() or exc.__class__.__name__
-        return {
-            "execution_status": "Failed",
-            "violation_details": error_text,
-            "correction_suggestion": "Retry the single-agent round while avoiding repeated or unnecessary tool calls.",
-            "recommended_consumer": "single_control",
-            "error_type": exc.__class__.__name__,
-            "error": error_text,
-        }
+        return OrchestrationFailureReport(
+            failure_stage="single_control",
+            round_index=round_index,
+            violation_details=error_text,
+            correction_suggestion=(
+                "Retry the single-agent round while avoiding repeated or unnecessary tool calls."
+            ),
+            recommended_consumer="single_control",
+            error_type=exc.__class__.__name__,
+            error=error_text,
+            debug_context={},
+        )
 
     def _plan_round(
         self,
@@ -145,7 +157,7 @@ class SingleAgentOrchestrator:
             qos_feedback: Dict[str, Any] = {}
             mobility_feedback: Dict[str, Any] = {}
             diagnosis: Dict[str, Any] = {}
-            exception_feedback: Dict[str, Any] = {}
+            orchestration_failure: OrchestrationFailureReport | None = None
             try:
                 policy_plan = self._plan_round(
                     user_input=user_input,
@@ -180,8 +192,16 @@ class SingleAgentOrchestrator:
                     mobility_feedback=mobility_feedback,
                     diagnosis=diagnosis,
                     negotiation_request={},
-                    planning_blocker=round_execution.trace.planning_blocker,
-                    execution_reentry=round_execution.trace.execution_reentry,
+                    planning_blocker=(
+                        round_execution.trace.planning_blocker.model_dump(mode="json")
+                        if round_execution.trace.planning_blocker is not None
+                        else {}
+                    ),
+                    execution_reentry=(
+                        round_execution.trace.execution_reentry.model_dump(mode="json")
+                        if round_execution.trace.execution_reentry is not None
+                        else {}
+                    ),
                     round_count=round_index,
                     retry_count=max(0, round_index - 1),
                     round_traces=state.round_traces,
@@ -191,7 +211,10 @@ class SingleAgentOrchestrator:
             except Exception as exc:
                 state.completed = False
                 diagnosis = self._build_round_exception_diagnosis(exc)
-                exception_feedback = self._build_round_exception_feedback(exc=exc)
+                orchestration_failure = self._build_round_exception_report(
+                    exc=exc,
+                    round_index=round_index,
+                )
                 state.latest_result = ControlRoundResult(
                     scope=scope,
                     completed=False,
@@ -220,9 +243,10 @@ class SingleAgentOrchestrator:
             single_agent_detail = dict(getattr(self.single_agent, "last_round_detail", {}) or {})
             if round_execution is None:
                 trace = ControlRoundTrace(
+                    scope=scope,
                     round_index=round_index,
-                    policy_plan=policy_plan.model_dump(mode="json") if policy_plan is not None else {},
-                    pda_feedback=exception_feedback,
+                    policy_plan=policy_plan,
+                    orchestration_failure=orchestration_failure,
                     diagnosis=diagnosis,
                     single_agent_detail=single_agent_detail,
                 )
@@ -244,19 +268,31 @@ class SingleAgentOrchestrator:
                 )
                 break
 
-            if round_execution is not None:
-                trace = round_execution.retry_trace(
-                    prefer_execution_reentry=False,
-                    fallback_consumer="single_control",
-                ).with_single_agent_detail(single_agent_detail)
-            report_payload = trace.pda_feedback
+            if trace.dispatch_report is not None:
+                report_payload = trace.dispatch_report.model_dump(mode="json")
+            elif trace.orchestration_failure is not None:
+                report_payload = trace.orchestration_failure.model_dump(mode="json")
+            else:
+                report_payload = {}
             feedback_added = build_round_feedback_block(
                 pda_feedback=report_payload,
                 diagnosis=trace.diagnosis,
-                domain_verdicts=trace.domain_verdicts,
-                mediator_decision=trace.mediator_decision,
-                planning_blocker=trace.planning_blocker,
-                execution_reentry=trace.execution_reentry,
+                domain_verdicts=[item.model_dump(mode="json") for item in trace.domain_verdicts],
+                mediator_decision=(
+                    trace.mediator_decision.model_dump(mode="json")
+                    if trace.mediator_decision is not None
+                    else {}
+                ),
+                planning_blocker=(
+                    trace.planning_blocker.model_dump(mode="json")
+                    if trace.planning_blocker is not None
+                    else {}
+                ),
+                execution_reentry=(
+                    trace.execution_reentry.model_dump(mode="json")
+                    if trace.execution_reentry is not None
+                    else {}
+                ),
                 round_index=round_index,
             )
             append_round_trace(
@@ -270,7 +306,11 @@ class SingleAgentOrchestrator:
                 session_id=session_id,
                 next_round=round_index + 1,
                 diagnosis_category=str(diagnosis.get("root_cause_category") or "").strip() or "<none>",
-                recommended_consumer=str(report_payload.get("recommended_consumer") or "").strip() or "<none>",
+                recommended_consumer=(
+                    trace.orchestration_failure.recommended_consumer
+                    if trace.orchestration_failure is not None
+                    else "<none>"
+                ),
             )
         finish_control_session(session_id=session_id, snapshot_id=snapshot_id, state=state)
         if state.latest_result is None:

@@ -3,20 +3,20 @@
 This directory is the active home for offline trajectory tooling.
 
 The authoritative runtime/trace/SFT contract is documented in
-[`docs/DATA_CONTRACT_V2.md`](../docs/DATA_CONTRACT_V2.md).
+[`docs/DATA_CONTRACT.md`](../docs/DATA_CONTRACT.md).
 
 ### Scope
 
 - collect workflow trajectories
 - project raw traces into training records
-- export model-independent SFT V2 datasets and Qwen3 tool-calling datasets
+- export model-independent SFT datasets and Qwen3 tool-calling datasets
 - evaluate per-agent and workflow trajectories
 
 ### Modules
 
 - `schemas.py`: persisted training record models
 - `artifacts.py`: training paths and JSON/JSONL I/O
-- `projection.py`: strict Trace V2 validation, workflow views, and Qwen3 projection
+- `projection.py`: strict trace validation, workflow views, and Qwen3 projection
 - `project.py`: unified projection CLI
 - `collect_workflow_trajectories.py`: online workflow collection
 - `evaluate_workflow_trajectories.py`: offline trajectory evaluation

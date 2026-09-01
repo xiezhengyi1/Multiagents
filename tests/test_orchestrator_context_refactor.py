@@ -118,7 +118,7 @@ from control_runtime.orchestrators.round_context import (
 )
 
 
-def _main_intent(*, next_agent: str = "optimization_strategy"):
+def _main_intent(*, next_agent: str = "optimization_strategy", round_index: int = 1):
     from control_runtime.agents.main.contracts import ControlDomain, GlobalControlIntent
 
     return GlobalControlIntent(
@@ -126,7 +126,7 @@ def _main_intent(*, next_agent: str = "optimization_strategy"):
             session_id="session-1",
             thread_id="session-1",
             snapshot_id="snapshot-1",
-            round_index=1,
+            round_index=round_index,
             supi="imsi-001",
         ),
         next_agent=next_agent,
@@ -137,7 +137,7 @@ def _main_intent(*, next_agent: str = "optimization_strategy"):
     )
 
 
-def _grounding_decision():
+def _grounding_decision(*, round_index: int = 1):
     from control_runtime.agents.grounding.contracts import (
         FlowSelector,
         GroundedMobilityEvidence,
@@ -147,7 +147,7 @@ def _grounding_decision():
     )
 
     return GroundingDecision(
-        scope=_execution_scope(),
+        scope=_execution_scope(round_index),
         flows=[
             FlowSelector(
                 supi="imsi-001",
@@ -514,27 +514,45 @@ class _RecordingDiagnosisTool:
 
 class OrchestratorContextRefactorTest(unittest.TestCase):
     def test_loop_state_keeps_snapshots_and_derives_previous_fields(self) -> None:
+        from control_runtime.orchestrators.contracts import (
+            DomainNegotiationRequest,
+            OrchestrationFailureReport,
+        )
+
         state = OrchestratorLoopState()
 
         for index in range(1, 5):
             append_round_trace(
                 state,
                 trace=ControlRoundTrace(
+                    scope=_execution_scope(index),
                     round_index=index,
-                    global_intent={"round": index},
-                    grounding_decision={"grounding": index},
-                    policy_plan={"plan": index},
-                    pda_feedback={"execution_status": "Failed", "violation_details": f"failure-{index}"},
+                    global_intent=_main_intent(round_index=index),
+                    grounding_decision=_grounding_decision(round_index=index),
+                    policy_plan=_qos_plan(round_index=index),
+                    orchestration_failure=OrchestrationFailureReport(
+                        failure_stage="planning",
+                        round_index=index,
+                        violation_details=f"failure-{index}",
+                        error_type="RuntimeError",
+                        error=f"failure-{index}",
+                        correction_suggestion="retry planning",
+                        recommended_consumer="main_control",
+                        debug_context={},
+                    ),
                     diagnosis={"root_cause_category": f"category-{index}"},
-                    negotiation_request={"summary": f"negotiation-{index}"},
+                    negotiation_request=DomainNegotiationRequest(
+                        round_index=index,
+                        summary=f"negotiation-{index}",
+                    ),
                 ),
                 feedback_added=f"[Round Feedback]\nround_index: {index}",
             )
 
-        self.assertEqual([snap.trace.round_index for snap in state.rounds], [2, 3, 4])
+        self.assertEqual([snap.trace.round_index for snap in state.rounds], [1, 2, 3, 4])
         self.assertEqual(state.previous_diagnosis, {"root_cause_category": "category-4"})
         self.assertEqual(state.previous_report_payload["violation_details"], "failure-4")
-        self.assertEqual(state.previous_negotiation_request, {"summary": "negotiation-4"})
+        self.assertEqual(state.previous_negotiation_request["summary"], "negotiation-4")
         with self.assertRaises(Exception):
             state.rounds[-1].trace.diagnosis = {}
 
@@ -542,6 +560,7 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
         snapshots = [
             ControlRoundSnapshot(
                 trace=ControlRoundTrace(
+                    scope=_execution_scope(1),
                     round_index=1,
                     diagnosis={"root_cause_category": "old_binding", "reason_summary": "wrong flow binding"},
                 ),
@@ -549,6 +568,7 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
             ),
             ControlRoundSnapshot(
                 trace=ControlRoundTrace(
+                    scope=_execution_scope(2),
                     round_index=2,
                     diagnosis={"root_cause_category": "recent_policy", "reason_summary": "policy failed"},
                 ),
@@ -556,6 +576,7 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
             ),
             ControlRoundSnapshot(
                 trace=ControlRoundTrace(
+                    scope=_execution_scope(3),
                     round_index=3,
                     diagnosis={"root_cause_category": "latest_dispatch", "reason_summary": "dispatch failed"},
                 ),
@@ -629,14 +650,18 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
         self.assertNotEqual(context[:1], "{")
 
     def test_round_trace_uses_current_grounding_contract(self) -> None:
+        intent = _main_intent()
+        grounding = _grounding_decision()
+        policy_plan = _qos_plan()
         snapshot = ControlRoundSnapshot(
             trace=ControlRoundTrace.from_payload(
                 {
-                "round_index": 1,
-                "global_intent": {"requested_domains": ["qos"]},
-                "grounding_decision": {"flows": [{"flow_id": "flow-1"}]},
-                "policy_plan": {"planning_status": "executable_plan"},
-                "diagnosis": {},
+                    "round_index": 1,
+                    "scope": _execution_scope().model_dump(mode="json"),
+                    "global_intent": intent.model_dump(mode="json"),
+                    "grounding_decision": grounding.model_dump(mode="json"),
+                    "policy_plan": policy_plan.model_dump(mode="json"),
+                    "diagnosis": {},
                 }
             )
         )
@@ -678,9 +703,9 @@ def test_execute_planned_round_returns_a_planning_blocker_without_external_execu
     assert artifacts.planning_blocker is not None
     assert artifacts.planning_blocker.upstream_requests == ["reground flow-1"]
     assert artifacts.unified_plan.blocked_domains == [ControlDomain.QOS]
-    assert artifacts.trace.mediator_decision == {}
-    assert artifacts.trace.planning_blocker == artifacts.planning_blocker.model_dump(mode="json")
-    assert artifacts.trace.planning_blocker["planning_status"] == "needs_upstream_reground"
+    assert artifacts.trace.mediator_decision is None
+    assert artifacts.trace.planning_blocker == artifacts.planning_blocker
+    assert artifacts.trace.planning_blocker.planning_status == "needs_upstream_reground"
 
 
 def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(monkeypatch) -> None:
@@ -736,8 +761,8 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
     assert artifacts.unified_plan.approved_policies == [
         {"domain": "qos", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}
     ]
-    assert artifacts.trace.pda_feedback["execution_status"] == "Success"
-    assert artifacts.trace.mediator_decision == artifacts.unified_plan.mediator_decision.model_dump(mode="json")
+    assert artifacts.trace.dispatch_report.execution_status == "Success"
+    assert artifacts.trace.mediator_decision == artifacts.unified_plan.mediator_decision
     assert conflict_tool.requests[0].scope.snapshot_id == "snapshot-1"
     assert dispatch_agent.calls[0][1] == {"scenario_id": "offline-case"}
     assert diagnosis_tool.requests[0].execution_feedback.pda["execution_status"] == "Success"
@@ -772,8 +797,8 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(2),
         policy_plan=_qos_plan(round_index=2),
-        global_intent=_main_intent(),
-        grounding_decision=_grounding_decision(),
+        global_intent=_main_intent(round_index=2),
+        grounding_decision=_grounding_decision(round_index=2),
         cr_tool=_RecordingConflictTool(_conflict_result()),
         pd_agent=_RecordingDispatchAgent(report),
         ad_tool=_RecordingDiagnosisTool(
@@ -792,7 +817,7 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
     assert artifacts.execution_reentry.failure_scope == "qos"
     assert artifacts.execution_reentry.target_bindings_at_risk == ["flow-1"]
     assert artifacts.execution_reentry.policy_objects_at_risk == ["sm-1"]
-    assert artifacts.trace.execution_reentry["reason_by_domain"] == {"qos": "gateway rejected policy"}
+    assert artifacts.trace.execution_reentry.reason_by_domain == {"qos": "gateway rejected policy"}
 
 
 def test_osa_public_generate_strategy_rejects_wrong_input_and_returns_reground_plan_without_llm(monkeypatch) -> None:
@@ -1158,10 +1183,6 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
     orchestrator.ad_tool = object()
     plan_calls = []
     finalization = []
-    intent = _main_intent()
-    grounding = _grounding_decision()
-    policy_plan = _qos_plan()
-
     first_failures = [{"phase": "dispatch", "policy_id": "sm-1"}]
     first_report = FeedbackReport(
         scope=_execution_scope(),
@@ -1209,7 +1230,7 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
                     round_index=round_index,
                     supi="imsi-001",
                 ),
-                global_intent=intent,
+                global_intent=_main_intent(round_index=round_index),
                 qos_proposal=None,
                 mobility_proposal=None,
                 domain_verdicts=[],
@@ -1225,13 +1246,14 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
                 open_questions=[],
             ),
             trace=ControlRoundTrace(
+                scope=_execution_scope(round_index),
                 round_index=round_index,
-                global_intent=intent.model_dump(mode="json"),
-                grounding_decision=grounding.model_dump(mode="json"),
-                policy_plan=policy_plan.model_dump(mode="json"),
-                pda_feedback=report.model_dump(mode="json"),
+                global_intent=_main_intent(round_index=round_index),
+                grounding_decision=_grounding_decision(round_index=round_index),
+                policy_plan=_qos_plan(round_index=round_index),
+                dispatch_report=report,
                 diagnosis=diagnosis,
-                execution_reentry=reentry.model_dump(mode="json") if reentry else {},
+                execution_reentry=reentry,
             ),
             execution_reentry=reentry,
         )
@@ -1254,7 +1276,13 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
 
     def plan_round(**kwargs):
         plan_calls.append(kwargs)
-        return intent, grounding, policy_plan, None
+        round_index = kwargs["round_index"]
+        return (
+            _main_intent(round_index=round_index),
+            _grounding_decision(round_index=round_index),
+            _qos_plan(round_index=round_index),
+            None,
+        )
 
     monkeypatch.setattr(orchestrator, "_plan_round", plan_round)
     monkeypatch.setattr(main_orchestrator, "start_control_session", lambda **_kwargs: ("session-1", "snapshot-1"))
@@ -1586,8 +1614,8 @@ def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_art
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(3),
         policy_plan=_qos_plan(round_index=3),
-        global_intent=_main_intent(),
-        grounding_decision=_grounding_decision(),
+        global_intent=_main_intent(round_index=3),
+        grounding_decision=_grounding_decision(round_index=3),
         cr_tool=conflict_tool,
         pd_agent=_RecordingDispatchAgent(report),
         ad_tool=_RecordingDiagnosisTool(_diagnosis_result()),
@@ -1597,8 +1625,8 @@ def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_art
     assert loader_calls == [("imsi-001", "snapshot-1")]
     assert conflict_tool.requests[0].upstream_context.ue_context == ue_context
     assert artifacts.trace.round_index == 3
-    assert artifacts.trace.policy_plan == _qos_plan(round_index=3).model_dump(mode="json")
-    assert artifacts.trace.mediator_decision == {"status": "approved", "reason_summary": "no conflicts", "affected_domains": [], "revision_requests": [], "unified_constraints": {"hard_constraints": [], "evidence": []}}
+    assert artifacts.trace.policy_plan == _qos_plan(round_index=3)
+    assert artifacts.trace.mediator_decision.model_dump(mode="json") == {"status": "approved", "reason_summary": "no conflicts", "affected_domains": [], "revision_requests": [], "unified_constraints": {"hard_constraints": [], "evidence": []}}
 
 
 def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch(monkeypatch) -> None:
@@ -1624,8 +1652,8 @@ def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(2),
         policy_plan=_qos_plan(round_index=2),
-        global_intent=_main_intent(),
-        grounding_decision=_grounding_decision(),
+        global_intent=_main_intent(round_index=2),
+        grounding_decision=_grounding_decision(round_index=2),
         cr_tool=_RecordingConflictTool(conflict_result),
         pd_agent=SimpleNamespace(execute_and_evaluate=lambda *_args, **_kwargs: pytest.fail("dispatch must not run")),
         ad_tool=diagnosis_tool,
@@ -1644,9 +1672,9 @@ def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch
         "error": "binding conflict requires revision",
         "revision_requests": [],
     }
-    assert artifacts.trace.mediator_decision["status"] == "revise"
-    assert artifacts.trace.domain_verdicts[-1]["status"] == "needs_revision"
-    assert artifacts.trace.pda_feedback == {}
+    assert artifacts.trace.mediator_decision.status == "revise"
+    assert artifacts.trace.domain_verdicts[-1].status.value == "needs_revision"
+    assert artifacts.trace.dispatch_report is None
     assert diagnosis_tool.requests[0].execution_feedback.qos == artifacts.qos_feedback
 
 
@@ -1678,8 +1706,8 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(4),
         policy_plan=plan,
-        global_intent=_main_intent(),
-        grounding_decision=_grounding_decision(),
+        global_intent=_main_intent(round_index=4),
+        grounding_decision=_grounding_decision(round_index=4),
         cr_tool=_RecordingConflictTool(_conflict_result()),
         pd_agent=_RecordingDispatchAgent(report),
         ad_tool=_RecordingDiagnosisTool(_diagnosis_result(reason_summary="dispatch completed")),
@@ -1696,7 +1724,7 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
         "planning_status": "partial_plan",
     }
     assert artifacts.diagnosis["root_cause_category"] == "intent_partially_satisfied"
-    assert artifacts.trace.pda_feedback["intent_status"] == "partially_satisfied"
+    assert artifacts.trace.dispatch_report.intent_status == "partially_satisfied"
     assert artifacts.unified_plan.approved_policies == [
         {"domain": "qos", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}
     ]
@@ -1976,48 +2004,99 @@ def test_stage_runner_reraises_before_attempt_error_without_running_callbacks_or
 
 def test_control_round_trace_round_trip_deeply_isolates_typed_detail_payloads() -> None:
     payload = {
+        "scope": _execution_scope(7).model_dump(mode="json"),
         "round_index": 7,
-        "mediator_decision": {"constraints": {"hard": [{"name": "latency"}]}},
+        "mediator_decision": {
+            "status": "approved",
+            "reason_summary": "latency constraints approved",
+            "affected_domains": ["qos"],
+            "revision_requests": [],
+            "unified_constraints": {
+                "hard_constraints": ["latency <= 20 ms"],
+                "evidence": ["telemetry.latency"],
+            },
+        },
         "agent_elapsed_ms": {"planning": 12.5},
-        "planning_blocker": {"upstream_requests": [{"target": "flow-1"}]},
-        "execution_reentry": {"reason_by_domain": {"qos": ["retry binding"]}},
+        "planning_blocker": {
+            "round_index": 7,
+            "upstream_requests": ["reground flow-1"],
+            "summary": "grounding required",
+        },
+        "execution_reentry": {
+            "round_index": 7,
+            "reason_by_domain": {"qos": "retry binding"},
+            "summary": "retry flow-1",
+        },
         "single_agent_detail": {"attempts": [{"stage": "single_control"}]},
     }
 
     trace = ControlRoundTrace.from_payload(payload)
-    payload["mediator_decision"]["constraints"]["hard"][0]["name"] = "mutated-input"
+    payload["mediator_decision"]["unified_constraints"]["hard_constraints"][0] = "mutated-input"
     payload["agent_elapsed_ms"]["planning"] = 999.0
-    payload["planning_blocker"]["upstream_requests"][0]["target"] = "mutated-input"
-    payload["execution_reentry"]["reason_by_domain"]["qos"][0] = "mutated-input"
+    payload["planning_blocker"]["upstream_requests"][0] = "mutated-input"
+    payload["execution_reentry"]["reason_by_domain"]["qos"] = "mutated-input"
     payload["single_agent_detail"]["attempts"][0]["stage"] = "mutated-input"
 
     round_trip = trace.to_payload()
-    assert round_trip["mediator_decision"] == {"constraints": {"hard": [{"name": "latency"}]}}
+    assert round_trip["mediator_decision"]["unified_constraints"]["hard_constraints"] == [
+        "latency <= 20 ms"
+    ]
     assert round_trip["agent_elapsed_ms"] == {"planning": 12.5}
-    assert round_trip["planning_blocker"] == {"upstream_requests": [{"target": "flow-1"}]}
-    assert round_trip["execution_reentry"] == {"reason_by_domain": {"qos": ["retry binding"]}}
+    assert round_trip["planning_blocker"]["upstream_requests"] == ["reground flow-1"]
+    assert round_trip["execution_reentry"]["reason_by_domain"] == {"qos": "retry binding"}
     assert round_trip["single_agent_detail"] == {"attempts": [{"stage": "single_control"}]}
 
-    round_trip["mediator_decision"]["constraints"]["hard"][0]["name"] = "mutated-output"
+    round_trip["mediator_decision"]["unified_constraints"]["hard_constraints"][0] = "mutated-output"
     round_trip["agent_elapsed_ms"]["planning"] = 0.0
-    round_trip["planning_blocker"]["upstream_requests"][0]["target"] = "mutated-output"
-    round_trip["execution_reentry"]["reason_by_domain"]["qos"][0] = "mutated-output"
+    round_trip["planning_blocker"]["upstream_requests"][0] = "mutated-output"
+    round_trip["execution_reentry"]["reason_by_domain"]["qos"] = "mutated-output"
     round_trip["single_agent_detail"]["attempts"][0]["stage"] = "mutated-output"
 
-    assert trace.to_payload()["mediator_decision"]["constraints"]["hard"][0]["name"] == "latency"
+    assert trace.to_payload()["mediator_decision"]["unified_constraints"]["hard_constraints"] == [
+        "latency <= 20 ms"
+    ]
     assert trace.to_payload()["agent_elapsed_ms"]["planning"] == 12.5
-    assert trace.to_payload()["planning_blocker"]["upstream_requests"][0]["target"] == "flow-1"
-    assert trace.to_payload()["execution_reentry"]["reason_by_domain"]["qos"] == ["retry binding"]
+    assert trace.to_payload()["planning_blocker"]["upstream_requests"] == ["reground flow-1"]
+    assert trace.to_payload()["execution_reentry"]["reason_by_domain"] == {"qos": "retry binding"}
     assert trace.to_payload()["single_agent_detail"]["attempts"][0]["stage"] == "single_control"
 
 
 def test_control_round_trace_rejects_malformed_payloads_instead_of_normalizing_them() -> None:
     with pytest.raises(ValueError, match="greater than or equal to 1"):
-        ControlRoundTrace.from_payload({"round_index": 0})
+        ControlRoundTrace.from_payload(
+            {"scope": _execution_scope().model_dump(mode="json"), "round_index": 0}
+        )
     with pytest.raises(ValueError, match="Extra inputs are not permitted"):
-        ControlRoundTrace.from_payload({"round_index": 1, "legacy_trace": {}})
+        ControlRoundTrace.from_payload(
+            {
+                "scope": _execution_scope().model_dump(mode="json"),
+                "round_index": 1,
+                "legacy_trace": {},
+            }
+        )
     with pytest.raises(ValueError, match="Input should be a valid dictionary"):
-        ControlRoundTrace.from_payload({"round_index": 1, "domain_verdicts": ["invalid"]})
+        ControlRoundTrace.from_payload(
+            {
+                "scope": _execution_scope().model_dump(mode="json"),
+                "round_index": 1,
+                "domain_verdicts": ["invalid"],
+            }
+        )
+
+
+def test_control_round_trace_rejects_cross_session_artifacts() -> None:
+    foreign_intent = _main_intent().model_copy(
+        update={
+            "scope": _execution_scope().model_copy(update={"session_id": "session-2"})
+        }
+    )
+
+    with pytest.raises(ValueError, match="session_id"):
+        ControlRoundTrace(
+            scope=_execution_scope(),
+            round_index=1,
+            global_intent=foreign_intent,
+        )
 
 
 def test_append_round_trace_is_typed_only_and_retains_complete_recent_trace_payloads() -> None:
@@ -2027,27 +2106,33 @@ def test_append_round_trace_is_typed_only_and_retains_complete_recent_trace_payl
         append_round_trace(state, trace_payload={"round_index": 1})
 
     for round_index in range(1, 5):
+        mediator_decision = _conflict_result(
+            reason_summary=f"decision-{round_index}"
+        ).to_mediator_decision()
         append_round_trace(
             state,
             trace=ControlRoundTrace(
+                scope=_execution_scope(round_index),
                 round_index=round_index,
                 diagnosis={
                     "root_cause_category": f"cause-{round_index}",
                     "reason_summary": f"reason-{round_index}",
                 },
-                mediator_decision={"status": f"decision-{round_index}"},
+                mediator_decision=mediator_decision,
                 agent_elapsed_ms={"planning": float(round_index)},
             ),
             feedback_added=f"[Round Feedback]\\nround_index: {round_index}",
         )
 
     expected_keys = {
+        "scope",
         "round_index",
         "global_intent",
         "grounding_decision",
         "policy_plan",
         "domain_verdicts",
-        "pda_feedback",
+        "dispatch_report",
+        "orchestration_failure",
         "qos_feedback",
         "mobility_feedback",
         "diagnosis",
@@ -2058,9 +2143,10 @@ def test_append_round_trace_is_typed_only_and_retains_complete_recent_trace_payl
         "single_agent_detail",
         "agent_elapsed_ms",
     }
-    assert [snapshot.trace.round_index for snapshot in state.rounds] == [2, 3, 4]
+    assert [snapshot.trace.round_index for snapshot in state.rounds] == [1, 2, 3, 4]
     assert all(set(trace) == expected_keys for trace in state.round_traces)
     assert [trace["agent_elapsed_ms"] for trace in state.round_traces] == [
+        {"planning": 1.0},
         {"planning": 2.0},
         {"planning": 3.0},
         {"planning": 4.0},

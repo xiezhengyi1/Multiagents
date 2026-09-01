@@ -1,6 +1,6 @@
-# 统一数据契约 V2
+# 统一数据契约
 
-本文档是新仿真环境、多代理运行时和 SFT 数据生成共用的规范。所有新数据使用 `schema_version = "2.0.0"`，不在 V2 路径中解析、修复或兼容旧 trace。
+本文档是新仿真环境、多代理运行时和 SFT 数据生成共用的唯一规范。数据中不携带 schema 版本；契约变更直接替换旧结构，不解析、修复或兼容旧 trace。
 
 ## 1. 契约边界
 
@@ -20,7 +20,7 @@
 | Trace | `AgentTrace` / `TraceTarget` | 记录 scope、prompt 版本、tool catalog 指纹、模型实际可见消息、结果来源和错误 |
 | 训练投影 | `ProjectedTraceRecord` / `WorkflowTrajectoryRecord` | 身份信息只通过 `ExecutionScope` 传递，不重复维护 session/snapshot/scenario 字段 |
 
-上述契约均拒绝未知字段，且对象创建后禁止属性重赋值。生产路径不使用“猜测字段”、多形态 JSON 提取、Markdown 代码块剔除或错误转正。
+上述契约均拒绝未知字段，且对象创建后禁止属性重赋值。数据生成路径不使用“猜测字段”、多形态 JSON 提取、Markdown 代码块剔除或错误转正。
 
 记忆命名空间有明确边界：短期 `event` 按带类型前缀的 `thread_id` 隔离，长期 `summary` 按带类型前缀的 SUPI 共享（无 SUPI 时按 `session_id`），摘要游标按 `thread_id` 隔离。`MemoryBundle` 会验证短期记录只能是同一 thread 的 event、长期记录只能来自同一 SUPI/session 命名空间的 summary；记忆 ID 和 trace 来源不得重复。`MemoryQuery.top_k` 必须由调用方显式给出。`MemoryContextView` 记录实际 query、重排后入选的短期/长期记录和模型可见文本；未执行检索时必须显式 `query=null` 且不得携带来源不明的记忆文本。
 
@@ -82,7 +82,7 @@ SFT 资格是由 `kind == observed_model_output` 唯一推导的只读属性，�
 
 ## 4. SFT 质量门
 
-Trace 只有同时满足以下条件才能投影为 `SftExampleV2`：
+Trace 只有同时满足以下条件才能投影为 `SftExample`：
 
 - `status=success` 且 `source=observed_llm`；
 - 恰好一个可训练的 `observed_model_output`；
@@ -91,11 +91,11 @@ Trace 只有同时满足以下条件才能投影为 `SftExampleV2`：
 - 最后一条 assistant 消息是合法 JSON，并与观测 target 逐值相等；
 - 消息中不包含 `<think>` 私有推理标签。
 
-Qwen3 导出仅是从 `SftExampleV2` 到 Hermes/OpenAI 风格的无损投影：保留原消息顺序、原生 `tool_calls`、tool result 和 JSON Schema 工具定义，不生成伪 ChatML 标记。
+Qwen3 导出仅是从 `SftExample` 到 Hermes/OpenAI 风格的无损投影：保留原消息顺序、原生 `tool_calls`、tool result 和 JSON Schema 工具定义，不生成伪 ChatML 标记。
 
-## 5. 存储与版本规则
+## 5. 存储规则
 
 - 原始 trace 按 agent 追加写入 `training/<agent>/raw_traces/<agent>.jsonl`。
 - 处理后的通用 SFT 和 Qwen3 记录写入对应 agent 的 `processed/` 目录。
-- 任何 prompt、response schema 或工具集变更都必须更新 prompt/contract 版本；工具集变更会自动改变 catalog fingerprint。
+- prompt 变更时更新 `prompt_version`；工具集变更会自动改变 catalog fingerprint。数据契约本身不携带版本字段。
 - 不允许将 validator/compiler/runtime 派生值伪装成模型 label。如需训练该值，必须为它建立独立 prompt、输入和响应 schema 契约。

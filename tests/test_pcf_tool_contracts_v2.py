@@ -22,7 +22,7 @@ def _runtime() -> SimpleNamespace:
     return SimpleNamespace(context=context)
 
 
-def test_pcf_read_tool_returns_one_versioned_json_contract(monkeypatch) -> None:
+def test_pcf_read_tool_returns_one_strict_json_contract(monkeypatch) -> None:
     monkeypatch.setattr(
         read_tools,
         "get_ue_context_by_supi",
@@ -40,7 +40,6 @@ def test_pcf_read_tool_returns_one_versioned_json_contract(monkeypatch) -> None:
     )
     result = PcfReadResult.model_validate(payload)
 
-    assert result.schema_version == "2.0.0"
     assert result.operation == "ue_context"
     assert result.snapshot_id == "snapshot-1"
     assert result.supi == "imsi-208930000000001"

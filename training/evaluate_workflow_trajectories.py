@@ -280,17 +280,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--run-records",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_runs_v2.jsonl",
+        default=processed_dir("workflow") / "trajectory_runs.jsonl",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_evaluations_v2.jsonl",
+        default=processed_dir("workflow") / "trajectory_evaluations.jsonl",
     )
     parser.add_argument(
         "--summary-output",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_evaluation_summary_v2.json",
+        default=processed_dir("workflow") / "trajectory_evaluation_summary.json",
     )
     parser.add_argument("--model", type=str, default="qwen-plus")
     return parser.parse_args()

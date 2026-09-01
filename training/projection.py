@@ -11,7 +11,7 @@ from training.artifacts import raw_trace_path, read_jsonl
 from training.schemas import (
     ProjectedTraceRecord,
     Qwen3SftRecord,
-    SftExampleV2,
+    SftExample,
     WorkflowTrajectoryRecord,
 )
 
@@ -72,7 +72,7 @@ def is_sft_candidate(trace: AgentTrace) -> bool:
     )
 
 
-def build_sft_example(trace: AgentTrace) -> SftExampleV2:
+def build_sft_example(trace: AgentTrace) -> SftExample:
     if not is_sft_candidate(trace):
         raise ValueError(f"trace {trace.trace_id} has not passed the SFT quality gate")
     observed_target = next(
@@ -83,7 +83,7 @@ def build_sft_example(trace: AgentTrace) -> SftExampleV2:
         for target in trace.targets
         if target.kind in {"validated_output", "compiled_output"}
     ]
-    return SftExampleV2(
+    return SftExample(
         sample_id=f"{trace.agent_name}-{trace.trace_id}",
         trace_id=trace.trace_id,
         agent_name=trace.agent_name,
@@ -118,7 +118,7 @@ def _qwen3_message(message: AgentMessage) -> dict[str, Any]:
     return payload
 
 
-def build_qwen3_record(example: SftExampleV2) -> Qwen3SftRecord:
+def build_qwen3_record(example: SftExample) -> Qwen3SftRecord:
     return Qwen3SftRecord(
         sample_id=example.sample_id,
         messages=[_qwen3_message(message) for message in example.messages],

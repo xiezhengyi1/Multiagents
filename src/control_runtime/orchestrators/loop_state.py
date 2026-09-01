@@ -26,25 +26,38 @@ class OrchestratorLoopState:
 
     @property
     def previous_report_payload(self) -> Dict[str, Any]:
-        return deepcopy(self.rounds[-1].trace.pda_feedback) if self.rounds else {}
+        if not self.rounds:
+            return {}
+        trace = self.rounds[-1].trace
+        if trace.dispatch_report is not None:
+            return trace.dispatch_report.model_dump(mode="json")
+        if trace.orchestration_failure is not None:
+            return trace.orchestration_failure.model_dump(mode="json")
+        return {}
 
     @property
     def previous_mediator_decision(self) -> Optional[Dict[str, Any]]:
         if not self.rounds or not self.rounds[-1].trace.mediator_decision:
             return None
-        return deepcopy(self.rounds[-1].trace.mediator_decision)
+        return self.rounds[-1].trace.mediator_decision.model_dump(mode="json")
 
     @property
     def previous_negotiation_request(self) -> Dict[str, Any]:
-        return deepcopy(self.rounds[-1].trace.negotiation_request) if self.rounds else {}
+        if not self.rounds or self.rounds[-1].trace.negotiation_request is None:
+            return {}
+        return self.rounds[-1].trace.negotiation_request.model_dump(mode="json")
 
     @property
     def previous_planning_blocker(self) -> Dict[str, Any]:
-        return deepcopy(self.rounds[-1].trace.planning_blocker) if self.rounds else {}
+        if not self.rounds or self.rounds[-1].trace.planning_blocker is None:
+            return {}
+        return self.rounds[-1].trace.planning_blocker.model_dump(mode="json")
 
     @property
     def previous_execution_reentry(self) -> Dict[str, Any]:
-        return deepcopy(self.rounds[-1].trace.execution_reentry) if self.rounds else {}
+        if not self.rounds or self.rounds[-1].trace.execution_reentry is None:
+            return {}
+        return self.rounds[-1].trace.execution_reentry.model_dump(mode="json")
 
     @property
     def round_traces(self) -> List[Dict[str, Any]]:
@@ -73,8 +86,6 @@ def append_round_trace(
 ) -> None:
     snapshot = ControlRoundSnapshot(trace=trace, feedback_added=str(feedback_added or ""))
     state.rounds.append(snapshot)
-    if len(state.rounds) > 3:
-        del state.rounds[:-3]
     if state.latest_result is not None:
         state.latest_result = state.latest_result.model_copy(
             update={

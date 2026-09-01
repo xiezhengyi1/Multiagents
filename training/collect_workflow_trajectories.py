@@ -168,8 +168,8 @@ def _merge_tags(record_tags: Iterable[str], extra_tags: Iterable[str]) -> List[s
 
 def _agent_trajectory_output_path(agent_name: str, *, output_root: Path | None) -> Path:
     if output_root is None:
-        return processed_dir(agent_name) / f"{agent_name}_sft_v2.jsonl"
-    return output_root / agent_name / f"{agent_name}_sft_v2.jsonl"
+        return processed_dir(agent_name) / f"{agent_name}_sft.jsonl"
+    return output_root / agent_name / f"{agent_name}_sft.jsonl"
 
 
 def _initialize_projection_outputs(
@@ -423,7 +423,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--result-output",
         type=Path,
-        default=processed_dir("workflow") / "trajectory_runs_v2.jsonl",
+        default=processed_dir("workflow") / "trajectory_runs.jsonl",
     )
     parser.add_argument(
         "--spec-output",
@@ -433,7 +433,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workflow-output",
         type=Path,
-        default=processed_dir("workflow") / "workflow_trajectories_v2.jsonl",
+        default=processed_dir("workflow") / "workflow_trajectories.jsonl",
         help="Tool-bearing workflow trajectory output generated from this batch's sessions.",
     )
     parser.add_argument(

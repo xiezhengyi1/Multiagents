@@ -202,7 +202,6 @@ def test_artifact_envelope_has_one_type_discriminator_and_explicit_direction() -
         payload=_grounding_request_payload(scope),
     )
     assert "payload_schema_name" not in request.model_dump(mode="json")
-    assert request.payload["schema_version"] == "2.0.0"
 
     with pytest.raises(ValidationError, match="request artifact cannot declare upstream"):
         ArtifactEnvelope(

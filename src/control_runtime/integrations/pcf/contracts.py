@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import Field, JsonValue
 
-from shared.contracts import CONTRACT_VERSION, ContractModel, ContractVersion, NonEmptyStr
+from shared.contracts import ContractModel, NonEmptyStr
 
 
 PcfReadOperation = Literal[
@@ -23,7 +23,6 @@ PcfReadOperation = Literal[
 class PcfReadResult(ContractModel):
     """Canonical result envelope for every read-only PCF grounding tool."""
 
-    schema_version: ContractVersion = CONTRACT_VERSION
     operation: PcfReadOperation
     snapshot_id: NonEmptyStr
     supi: NonEmptyStr | None = None

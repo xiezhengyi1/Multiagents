@@ -7,9 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 from shared.contracts import (
-    CONTRACT_VERSION,
     ContractModel,
-    ContractVersion,
     ExecutionScope,
     JsonValue,
     MemoryContextView,
@@ -67,7 +65,6 @@ class PlanningContext(ContractModel):
 
 
 class PlanningRequest(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     grounding_decision: GroundingDecision
     context: PlanningContext
@@ -146,7 +143,6 @@ class OptimizerPlanEvidence(ContractModel):
 
 
 class PolicyPlanDraft(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     planning_status: PlanningStatus
     optimizer_result: OptimizerPlanEvidence

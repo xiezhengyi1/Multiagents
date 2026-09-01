@@ -6,10 +6,8 @@ from datetime import datetime
 from pydantic import Field, JsonValue, model_validator
 
 from shared.contracts import (
-    CONTRACT_VERSION,
     AgentMessage,
     ContractModel,
-    ContractVersion,
     ExecutionScope,
     NonEmptyStr,
     ToolCatalog,
@@ -18,6 +16,7 @@ from shared.contracts import (
     TraceTarget,
     validate_message_sequence,
 )
+from control_runtime.orchestrators.contracts import ControlRoundTrace
 
 
 class TrainingTaskMetadata(ContractModel):
@@ -32,7 +31,6 @@ class TrainingTaskMetadata(ContractModel):
 class TrainingInputRecord(ContractModel):
     """Canonical experiment input. Legacy aliases and incomplete messages are rejected."""
 
-    schema_version: ContractVersion = CONTRACT_VERSION
     record_index: int = Field(ge=1)
     user_input: NonEmptyStr
     messages: list[AgentMessage] = Field(min_length=1)
@@ -54,10 +52,9 @@ class TrainingInputRecord(ContractModel):
         return self
 
 
-class SftExampleV2(ContractModel):
+class SftExample(ContractModel):
     """Model-independent SFT example projected from one validated observed trace."""
 
-    schema_version: ContractVersion = CONTRACT_VERSION
     sample_id: NonEmptyStr
     trace_id: NonEmptyStr
     agent_name: NonEmptyStr
@@ -71,7 +68,7 @@ class SftExampleV2(ContractModel):
     metadata: TraceMetadata
 
     @model_validator(mode="after")
-    def validate_example(self) -> "SftExampleV2":
+    def validate_example(self) -> "SftExample":
         validate_message_sequence(self.messages, require_final_assistant=True)
         if self.observed_target.kind != "observed_model_output" or not self.observed_target.sft_eligible:
             raise ValueError("SFT example requires one eligible observed_model_output target")
@@ -102,7 +99,6 @@ class SftExampleV2(ContractModel):
 class Qwen3SftRecord(ContractModel):
     """Qwen3/Hermes-compatible messages and OpenAI-style function schemas."""
 
-    schema_version: ContractVersion = CONTRACT_VERSION
     sample_id: NonEmptyStr
     messages: list[dict[str, JsonValue]] = Field(min_length=2)
     tools: list[dict[str, JsonValue]]
@@ -112,7 +108,6 @@ class Qwen3SftRecord(ContractModel):
 class ProjectedTraceRecord(ContractModel):
     """Read-only evaluation view; never used as the SFT source contract."""
 
-    schema_version: ContractVersion = CONTRACT_VERSION
     trace_id: NonEmptyStr
     timestamp: datetime
     agent_name: NonEmptyStr
@@ -137,7 +132,6 @@ class ProjectedTraceRecord(ContractModel):
 
 
 class WorkflowTrajectoryRecord(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     record_index: int | None = Field(default=None, ge=1)
     status: TraceStatus
@@ -152,7 +146,7 @@ class WorkflowTrajectoryRecord(ContractModel):
     diagnosis: JsonValue | None = None
     round_count: int = Field(default=0, ge=0)
     retry_count: int = Field(default=0, ge=0)
-    round_traces: list[dict[str, JsonValue]] = Field(default_factory=list)
+    round_traces: list[ControlRoundTrace] = Field(default_factory=list)
     agent_trajectories: dict[NonEmptyStr, list[ProjectedTraceRecord]] = Field(default_factory=dict)
     tool_calls: list[dict[str, JsonValue]] = Field(default_factory=list)
     tool_results: list[dict[str, JsonValue]] = Field(default_factory=list)
@@ -161,6 +155,16 @@ class WorkflowTrajectoryRecord(ContractModel):
     def validate_agent_trajectory_scopes(self) -> "WorkflowTrajectoryRecord":
         if self.scope.snapshot_id is None:
             raise ValueError("workflow trajectory requires scope.snapshot_id")
+        if self.round_count != len(self.round_traces):
+            raise ValueError("workflow round_count must equal round_traces length")
+        round_indices = [trace.round_index for trace in self.round_traces]
+        if round_indices != list(range(1, self.round_count + 1)):
+            raise ValueError("workflow round traces must be ordered and contiguous from round 1")
+        for trace in self.round_traces:
+            if trace.scope.session_id != self.scope.session_id:
+                raise ValueError("workflow round trace belongs to another session")
+            if trace.scope.snapshot_id != self.scope.snapshot_id:
+                raise ValueError("workflow round trace belongs to another snapshot")
         for agent_name, traces in self.agent_trajectories.items():
             for trace in traces:
                 if trace.scope.session_id != self.scope.session_id:
@@ -177,7 +181,7 @@ class WorkflowTrajectoryRecord(ContractModel):
 __all__ = [
     "ProjectedTraceRecord",
     "Qwen3SftRecord",
-    "SftExampleV2",
+    "SftExample",
     "TrainingInputRecord",
     "TrainingTaskMetadata",
     "WorkflowTrajectoryRecord",

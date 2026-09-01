@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Literal
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, field_validator
 
 
-CONTRACT_VERSION = "2.0.0"
-ContractVersion = Literal["2.0.0"]
 NonEmptyStr = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, strict=True),
@@ -62,9 +60,7 @@ def validate_scope_lineage(upstream: ExecutionScope, downstream: ExecutionScope)
 
 
 __all__ = [
-    "CONTRACT_VERSION",
     "ContractModel",
-    "ContractVersion",
     "ExecutionScope",
     "JsonValue",
     "NonEmptyStr",

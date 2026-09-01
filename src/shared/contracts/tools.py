@@ -8,7 +8,7 @@ from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
 from pydantic import Field, JsonValue, model_validator
 
-from .common import CONTRACT_VERSION, ContractModel, ContractVersion, NonEmptyStr
+from .common import ContractModel, NonEmptyStr
 
 
 ToolSideEffect = Literal["read", "write", "external_action"]
@@ -60,7 +60,6 @@ class ToolContract(ContractModel):
 
 
 class ToolCatalog(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     tools: list[ToolContract] = Field(default_factory=list)
     fingerprint: NonEmptyStr
 

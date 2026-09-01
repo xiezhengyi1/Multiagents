@@ -7,27 +7,29 @@ from typing import Any, Dict, Optional
 
 from ..agents.grounding.contracts import GroundingDecision
 from ..agents.main.contracts import GlobalControlIntent
-from .contracts import DomainNegotiationRequest, ExecutionReentryRequest
+from .contracts import (
+    DomainNegotiationRequest,
+    OrchestrationFailureReport,
+)
 
 
-def build_planning_failure_payload(
+def build_planning_failure_report(
     exc: Exception,
     *,
+    round_index: int,
     debug_context: Optional[Dict[str, Any]] = None,
-) -> tuple[Dict[str, Any], Dict[str, Any]]:
+) -> tuple[OrchestrationFailureReport, Dict[str, Any]]:
     message = str(exc or "").strip() or exc.__class__.__name__
-    report_payload = {
-        "execution_status": "Failed",
-        "violation_details": message,
-        "feedback_payload": {
-            "phase": "planning",
-            "error": message,
-            "target_bindings_at_risk": [],
-            "policy_objects_at_risk": [],
-            "reason_by_domain": {},
-            "debug_context": dict(debug_context or {}),
-        },
-    }
+    report = OrchestrationFailureReport(
+        failure_stage="planning",
+        round_index=round_index,
+        violation_details=message,
+        error_type=exc.__class__.__name__,
+        error=message,
+        correction_suggestion="Retry planning after correcting the reported agent failure.",
+        recommended_consumer="main_control",
+        debug_context=dict(debug_context or {}),
+    )
     diagnosis = {
         "root_cause_category": "planning_failure",
         "root_cause": message,
@@ -35,7 +37,7 @@ def build_planning_failure_payload(
         "recommended_actions": [],
         "debug_context": dict(debug_context or {}),
     }
-    return report_payload, diagnosis
+    return report, diagnosis
 
 
 def scope_global_intent_for_intent_encoding(
@@ -120,20 +122,6 @@ def build_negotiation_diagnosis(request: DomainNegotiationRequest) -> Dict[str, 
     }
 
 
-def build_reentry_report_payload(request: ExecutionReentryRequest) -> Dict[str, Any]:
-    return {
-        "execution_status": "Failed",
-        "violation_details": request.summary,
-        "feedback_payload": {
-            "failure_scope": request.failure_scope,
-            "target_bindings_at_risk": list(request.target_bindings_at_risk or []),
-            "policy_objects_at_risk": list(request.policy_objects_at_risk or []),
-            "reason_by_domain": dict(request.reason_by_domain or {}),
-            "failures": list(request.failures or []),
-        },
-    }
-
-
 def should_reuse_grounding_decision(
     *,
     global_intent: GlobalControlIntent,
@@ -183,8 +171,7 @@ def should_reuse_grounding_decision(
 __all__ = [
     "build_negotiation_diagnosis",
     "build_negotiation_request",
-    "build_planning_failure_payload",
-    "build_reentry_report_payload",
+    "build_planning_failure_report",
     "has_supi_scope",
     "scope_global_intent_for_intent_encoding",
     "should_reuse_grounding_decision",

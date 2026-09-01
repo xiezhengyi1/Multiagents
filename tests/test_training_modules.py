@@ -16,7 +16,7 @@ from shared.contracts import (
 from training.artifacts import read_jsonl, write_jsonl
 from training.project import export_qwen3, project_agents
 from training.projection import build_sft_example, build_workflow_record, project_trace
-from training.schemas import Qwen3SftRecord, SftExampleV2
+from training.schemas import Qwen3SftRecord, SftExample
 
 
 def _trace(*, trace_id: str = "trace-1", day: int = 1) -> AgentTrace:
@@ -102,7 +102,7 @@ def test_artifact_io_supports_overwrite_and_append(tmp_path: Path) -> None:
     assert read_jsonl(path) == [{"id": 1}, {"id": 2}]
 
 
-def test_agent_projection_emits_validated_sft_v2(monkeypatch, tmp_path: Path) -> None:
+def test_agent_projection_emits_validated_sft(monkeypatch, tmp_path: Path) -> None:
     import training.project as project_module
 
     monkeypatch.setattr(
@@ -111,15 +111,15 @@ def test_agent_projection_emits_validated_sft_v2(monkeypatch, tmp_path: Path) ->
         lambda _agents: {"intent_encoding": [_trace()]},
     )
     counts = project_agents(agents=["intent_encoding"], output_dir=tmp_path)
-    row = read_jsonl(tmp_path / "intent_encoding_sft_v2.jsonl")[0]
-    example = SftExampleV2.model_validate(row)
+    row = read_jsonl(tmp_path / "intent_encoding_sft.jsonl")[0]
+    example = SftExample.model_validate(row)
     assert counts == {"intent_encoding": 1}
     assert example.observed_target.value == {"flow_id": "flow-1"}
     assert example.tool_catalog.tools[0].name == "lookup"
 
 
 def test_qwen3_export_preserves_native_tool_order(tmp_path: Path) -> None:
-    input_path = tmp_path / "sft_v2.jsonl"
+    input_path = tmp_path / "sft.jsonl"
     output_path = tmp_path / "qwen3.jsonl"
     write_jsonl(input_path, [build_sft_example(_trace())])
 

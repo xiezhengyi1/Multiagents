@@ -6,16 +6,13 @@ from typing import Literal
 from pydantic import Field, JsonValue, model_validator
 
 from shared.contracts import (
-    CONTRACT_VERSION,
     ContractModel,
-    ContractVersion,
     ExecutionScope,
     NonEmptyStr,
 )
 
 
 class EnvironmentGenerationRequest(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     scenario_id: NonEmptyStr
     objective: NonEmptyStr
@@ -33,7 +30,6 @@ class EnvironmentGenerationRequest(ContractModel):
 
 
 class ScenarioCandidate(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scenario_id: NonEmptyStr
     name: NonEmptyStr
     scenario: dict[str, JsonValue]
@@ -52,13 +48,11 @@ class ScenarioCandidate(ContractModel):
 
 
 class ScenarioCandidateArtifact(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     candidate: ScenarioCandidate
 
 
 class EnvironmentValidationReport(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scenario_id: NonEmptyStr
     ok: bool
     errors: tuple[NonEmptyStr, ...] = ()
@@ -70,7 +64,6 @@ class EnvironmentValidationReport(ContractModel):
 
 
 class LaunchPlan(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     cwd: Path
     argv: list[NonEmptyStr] = Field(min_length=1)
     graph_db_url: NonEmptyStr

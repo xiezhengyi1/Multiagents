@@ -44,7 +44,6 @@ from .contracts import (
     PlanningBlockerReport,
     UnifiedControlPlan,
 )
-from .round_transitions import build_reentry_report_payload
 
 
 AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
@@ -63,47 +62,6 @@ class RoundExecutionArtifacts:
     trace: ControlRoundTrace
     planning_blocker: Optional[PlanningBlockerReport] = None
     execution_reentry: Optional[ExecutionReentryRequest] = None
-
-    def retry_trace(
-        self,
-        *,
-        prefer_execution_reentry: bool,
-        fallback_consumer: str = "",
-    ) -> ControlRoundTrace:
-        """Return the typed trace with the retry payload for this orchestrator path."""
-
-        retry_forbidden = bool(
-            self.report is not None
-            and isinstance(self.report.feedback_payload, dict)
-            and self.report.feedback_payload.get("retry_forbidden")
-        )
-        if self.report is not None and (retry_forbidden or not prefer_execution_reentry):
-            pda_feedback = self.report.model_dump(mode="json")
-        elif prefer_execution_reentry and self.execution_reentry is not None:
-            pda_feedback = build_reentry_report_payload(self.execution_reentry)
-        elif prefer_execution_reentry and self.planning_blocker is not None:
-            pda_feedback = {
-                "execution_status": "Failed",
-                "violation_details": self.planning_blocker.summary,
-                "feedback_payload": {
-                    "missing_evidence": list(self.planning_blocker.missing_evidence or []),
-                    "blocked_targets": list(self.planning_blocker.blocked_targets or []),
-                    "upstream_requests": list(self.planning_blocker.upstream_requests or []),
-                    "planner_conflicts": list(self.planning_blocker.planner_conflicts or []),
-                },
-            }
-        elif self.report is not None:
-            pda_feedback = self.report.model_dump(mode="json")
-        else:
-            pda_feedback = {
-                "execution_status": "Failed",
-                "violation_details": self.diagnosis.get("reason_summary") or "round execution failed",
-            }
-            if fallback_consumer:
-                pda_feedback["correction_suggestion"] = "; ".join(self.diagnosis.get("recommended_actions") or [])
-                pda_feedback["recommended_consumer"] = fallback_consumer
-        return self.trace.with_pda_feedback(pda_feedback)
-
 
 @dataclass(frozen=True)
 class _MediationResult:
@@ -642,17 +600,16 @@ def _build_planning_blocked_artifacts(
         mobility_feedback={},
         unified_plan=unified_plan,
         trace=ControlRoundTrace(
+            scope=scope,
             round_index=round_index,
-            global_intent=global_intent.model_dump(mode="json") if global_intent is not None else {},
-            grounding_decision=grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
-            policy_plan=policy_plan.model_dump(mode="json"),
+            global_intent=global_intent,
+            grounding_decision=grounding_decision,
+            policy_plan=policy_plan,
             domain_verdicts=[],
-            pda_feedback={},
             qos_feedback={},
             mobility_feedback={},
             diagnosis=diagnosis,
-            mediator_decision={},
-            planning_blocker=blocker.model_dump(mode="json"),
+            planning_blocker=blocker,
         ),
         planning_blocker=blocker,
     )
@@ -757,21 +714,18 @@ def _assemble_round_artifacts(
         mobility_feedback=dispatch.mobility_feedback,
         unified_plan=unified_plan,
         trace=ControlRoundTrace(
+            scope=scope,
             round_index=round_index,
-            global_intent=global_intent.model_dump(mode="json") if global_intent is not None else {},
-            grounding_decision=grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
-            policy_plan=policy_plan.model_dump(mode="json"),
-            domain_verdicts=[item.model_dump(mode="json") for item in mediation.domain_verdicts],
-            pda_feedback=dispatch.report.model_dump(mode="json") if dispatch.report is not None else {},
+            global_intent=global_intent,
+            grounding_decision=grounding_decision,
+            policy_plan=policy_plan,
+            domain_verdicts=mediation.domain_verdicts,
+            dispatch_report=dispatch.report,
             qos_feedback=dispatch.qos_feedback,
             mobility_feedback=dispatch.mobility_feedback,
             diagnosis=assurance.diagnosis,
-            mediator_decision=mediation.mediator_decision.model_dump(mode="json"),
-            execution_reentry=(
-                assurance.execution_reentry.model_dump(mode="json")
-                if assurance.execution_reentry is not None
-                else {}
-            ),
+            mediator_decision=mediation.mediator_decision,
+            execution_reentry=assurance.execution_reentry,
         ),
         execution_reentry=assurance.execution_reentry,
     )

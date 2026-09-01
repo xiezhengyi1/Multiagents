@@ -5,14 +5,13 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from .common import CONTRACT_VERSION, ContractModel, ContractVersion, NonEmptyStr
+from .common import ContractModel, NonEmptyStr
 
 
 ManifestStatus = Literal["writing", "finalized"]
 
 
 class TraceSegmentManifest(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     dataset_run_id: NonEmptyStr
     worker_id: NonEmptyStr
     agent_name: NonEmptyStr
@@ -33,7 +32,6 @@ class TraceSegmentManifest(ContractModel):
 
 
 class TraceWorkerManifest(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     dataset_run_id: NonEmptyStr
     worker_id: NonEmptyStr
     status: Literal["finalized"] = "finalized"
@@ -55,7 +53,6 @@ class TraceWorkerManifest(ContractModel):
 
 
 class TraceDatasetManifest(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     dataset_run_id: NonEmptyStr
     status: Literal["finalized"] = "finalized"
     finalized_at: datetime

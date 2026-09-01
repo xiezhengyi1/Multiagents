@@ -7,7 +7,7 @@ from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from jsonschema.validators import validator_for
 from pydantic import Field, JsonValue, model_validator
 
-from .common import CONTRACT_VERSION, ContractModel, ContractVersion, ExecutionScope, NonEmptyStr
+from .common import ContractModel, ExecutionScope, NonEmptyStr
 from .messages import AgentMessage, validate_message_sequence
 from .tools import ToolCatalog
 
@@ -84,7 +84,6 @@ class AgentRunResult(ContractModel):
 
 
 class AgentTrace(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     trace_id: NonEmptyStr
     agent_name: NonEmptyStr
     model_name: NonEmptyStr

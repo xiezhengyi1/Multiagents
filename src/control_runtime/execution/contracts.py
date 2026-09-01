@@ -5,9 +5,7 @@ from typing import Annotated, Literal
 from pydantic import Field, JsonValue, model_validator
 
 from shared.contracts import (
-    CONTRACT_VERSION,
     ContractModel,
-    ContractVersion,
     ExecutionScope,
     NonEmptyStr,
 )
@@ -76,7 +74,6 @@ ExecutionMetrics = Annotated[
 
 
 class ExecutionResultContract(ContractModel):
-    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     execution_status: ExecutionStatus
     performance_metrics: ExecutionMetrics
