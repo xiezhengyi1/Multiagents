@@ -38,6 +38,8 @@ from .trace import (
     JsonlTraceWriter,
     TracedStructuredAgent,
     build_agent_trace,
+    finalize_trace_dataset_run,
+    finalize_trace_worker,
 )
 from .worker import ArtifactWorkerMixin
 
@@ -62,6 +64,8 @@ __all__ = [
     "contract_to_message",
     "extract_tool_calls",
     "extract_tool_results",
+    "finalize_trace_dataset_run",
+    "finalize_trace_worker",
     "json_friendly",
     "project_root",
     "RuntimePersistence",

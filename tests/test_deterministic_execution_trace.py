@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from control_runtime.agents.dispatch.agent import PolicyDispatchAgent
+from control_runtime.agents.planning.contracts import PolicyPlanDraft
 from shared.contracts import AgentTrace, ArtifactEnvelope, ExecutionScope
 from shared.runtime.trace.execution import write_deterministic_execution_trace
 
@@ -39,17 +40,45 @@ def _request_envelope() -> ArtifactEnvelope:
             snapshot_id="snapshot-1",
             scenario_id="scenario-1",
             scenario_tags=["smoke"],
+            supi="imsi-001",
         ),
-        payload={"policies": []},
+        payload=_policy_plan(),
     )
 
 
 def _policy_plan() -> dict[str, Any]:
     return {
-        "supi": "imsi-001",
-        "session_id": "session-1",
-        "snapshot_id": "snapshot-1",
-        "policies": [],
+        "scope": {
+            "session_id": "session-1",
+            "thread_id": "session-1",
+            "snapshot_id": "snapshot-1",
+            "scenario_id": "scenario-1",
+            "scenario_tags": ["smoke"],
+            "supi": "imsi-001",
+        },
+        "planning_status": "needs_upstream_reground",
+        "optimizer_result": {
+            "objective_breakdown": {},
+            "cross_domain_verdicts": [],
+        },
+        "planning_rationale": {
+            "selected_strategy_profile": "await-grounding",
+            "decisive_evidence": [],
+            "active_constraints": [],
+            "explanation": "Upstream grounding is required before execution.",
+            "rejected_alternatives": [],
+            "main_constraints": [],
+            "iea_grounding_basis": [],
+            "osa_decision_basis": [],
+            "unresolved_gaps": ["missing grounding evidence"],
+        },
+        "all_policies": [],
+        "partial_policies": [],
+        "missing_evidence": ["grounding evidence"],
+        "blocked_targets": [],
+        "upstream_requests": ["reground policy targets"],
+        "planner_conflicts": [],
+        "open_questions": [],
     }
 
 
@@ -179,3 +208,35 @@ def test_policy_dispatch_preserves_request_correlation_on_cached_feedback() -> N
     assert response.upstream_artifact_ids == [request_envelope.artifact_id]
     assert response.scope == request_envelope.scope
     assert response.payload == report.model_dump(mode="json")
+
+
+def test_policy_dispatch_failure_feedback_uses_policy_plan_scope() -> None:
+    agent = object.__new__(PolicyDispatchAgent)
+    strategy_output = PolicyPlanDraft.model_validate(_policy_plan())
+    outcome = SimpleNamespace(
+        execution_status="Failed",
+        performance_metrics="{}",
+        violation_details="gateway rejected",
+        failure_scope="qos",
+        feedback_payload={
+            "failures": [
+                {
+                    "domain": "qos",
+                    "policy_id": "sm-1",
+                    "policy_type": "SmPolicyDecision",
+                    "flow_id": "flow-1",
+                    "error": "gateway rejected",
+                }
+            ]
+        },
+        dispatch_attempts=2,
+    )
+
+    payload = agent._build_feedback_payload(
+        strategy_output=strategy_output,
+        outcome=outcome,
+    )
+
+    assert payload["supi"] == "imsi-001"
+    assert payload["failure_scope"] == "qos"
+    assert payload["dispatch_attempts"] == 2

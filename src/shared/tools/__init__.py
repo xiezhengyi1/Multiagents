@@ -1,3 +1,3 @@
-from .wrapper_think import think_tool, tool_with_reason
+from .wrapper import tool_with_purpose
 
-__all__ = ["think_tool", "tool_with_reason"]
+__all__ = ["tool_with_purpose"]

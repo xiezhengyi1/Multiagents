@@ -18,6 +18,7 @@ from control_runtime.integrations.scenario.init_scenario import rebuild_ue_relat
 from control_runtime.orchestrators.single_agent_orchestrator import SingleAgentOrchestrator
 from experiments.paths import default_catalog_input_path, resolve_scenario_source_path
 from experiments.scripts.common import append_jsonl, parse_task_ids, reset_simulator_state, write_json
+from shared.runtime import finalize_trace_worker
 from training.collect_workflow_trajectories import load_user_input_records
 from training.artifacts import processed_dir
 
@@ -130,7 +131,7 @@ def main() -> None:
             if str(item).strip()
         ]
         try:
-            scenario_source = resolve_scenario_source_path(scenario_id)
+            resolve_scenario_source_path(scenario_id)
         except Exception as exc:
             raise RuntimeError(
                 "single-agent experiment requires each record to carry a scenario_id defined in "
@@ -207,6 +208,7 @@ def main() -> None:
         reset_simulator_state()
 
     summary = summarize_run_results(results, result_output=args.result_output)
+    summary["artifacts"]["trace_worker_manifest"] = str(finalize_trace_worker())
     write_json(args.summary_output, summary)
     print(f"Ran {summary['total_cases']} single-agent cases")
     print(f"Completed cases: {summary['completed_case_count']}")

@@ -137,16 +137,68 @@ class FlowDesign(StrictDesignModel):
     rationale: str = Field(min_length=1)
 
 
-class RuntimeDesign(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class Free5gcRuntimeDesign(StrictDesignModel):
+    compose_file: str = Field(min_length=1)
+    config_root: str = Field(min_length=1)
+    mode: Literal["single_upf", "ulcl"]
+    bridge_name: str = Field(min_length=1)
+    project_name: str = Field(min_length=1)
 
-    free5gc: dict[str, Any]
-    ns3: dict[str, Any]
-    writer: dict[str, Any]
-    bridge: dict[str, Any]
-    split_mode_ns3: dict[str, Any]
-    split_mode_runtime: dict[str, Any]
-    split_mode_radio: dict[str, Any]
+
+class Ns3RuntimeDesign(StrictDesignModel):
+    ns3_root: str = Field(min_length=1)
+    scratch_name: str = Field(min_length=1)
+    output_subdir: str = Field(min_length=1)
+    simulator: str = Field(min_length=1)
+    sim_time_ms: int = Field(gt=0)
+    bridge_mode: Literal["l2_inline"]
+    slice_isolation: bool
+
+
+class WriterRuntimeDesign(StrictDesignModel):
+    archive_dir: str = Field(min_length=1)
+    state_db: str = Field(min_length=1)
+    graph_db_url: str = Field(min_length=1)
+
+
+class BridgeRuntimeDesign(StrictDesignModel):
+    enable_inline_harness: bool
+    n3_network_name: str = Field(min_length=1)
+    n3_network_cidr: str = Field(min_length=1)
+
+
+class SplitModeNs3Design(StrictDesignModel):
+    output_subdir: str = Field(min_length=1)
+    scratch_name: str = Field(min_length=1)
+    policy_reload_ms: int = Field(gt=0)
+    activation_poll_ms: int = Field(gt=0)
+    nr_numerology: int = Field(ge=0)
+    nr_bandwidth_hz: int = Field(gt=0)
+
+
+class SplitModeRuntimeDesign(StrictDesignModel):
+    startup_timeout_seconds: int = Field(gt=0)
+    state_poll_ms: int = Field(gt=0)
+
+
+class SplitModeRadioDesign(StrictDesignModel):
+    scheduler_type: str = Field(min_length=1)
+    tdd_pattern: str = Field(min_length=1)
+    gnb_tx_power_dbm: float
+    ue_tx_power_dbm: float
+    enable_uplink_power_control: bool
+    gnb_noise_figure_db: float = Field(ge=0)
+    ue_noise_figure_db: float = Field(ge=0)
+
+
+class RuntimeDesign(StrictDesignModel):
+    free5gc: Free5gcRuntimeDesign
+    ns3: Ns3RuntimeDesign
+    writer: WriterRuntimeDesign
+    bridge: BridgeRuntimeDesign
+    split_mode_ns3: SplitModeNs3Design
+    split_mode_runtime: SplitModeRuntimeDesign
+    split_mode_radio: SplitModeRadioDesign
 
 
 class EnvironmentDesign(StrictDesignModel):

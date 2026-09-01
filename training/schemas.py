@@ -20,6 +20,40 @@ from shared.contracts import (
 )
 
 
+class TrainingTaskMetadata(ContractModel):
+    task_id: NonEmptyStr
+    category: NonEmptyStr
+    expected_objects: dict[str, JsonValue] = Field(default_factory=dict)
+    expected_direction: str = ""
+    success_criteria: str = ""
+    scenario_ids: list[NonEmptyStr] = Field(default_factory=list)
+
+
+class TrainingInputRecord(ContractModel):
+    """Canonical experiment input. Legacy aliases and incomplete messages are rejected."""
+
+    schema_version: ContractVersion = CONTRACT_VERSION
+    record_index: int = Field(ge=1)
+    user_input: NonEmptyStr
+    messages: list[AgentMessage] = Field(min_length=1)
+    context: str = ""
+    scenario_id: NonEmptyStr | None = None
+    scenario_tags: list[NonEmptyStr] = Field(default_factory=list)
+    task_metadata: TrainingTaskMetadata | None = None
+
+    @model_validator(mode="after")
+    def validate_input_messages(self) -> "TrainingInputRecord":
+        if len(self.scenario_tags) != len(set(self.scenario_tags)):
+            raise ValueError("training input scenario_tags must be unique")
+        if self.messages[-1].role != "user":
+            raise ValueError("training input messages must end with a user message")
+        if self.messages[-1].content != self.user_input:
+            raise ValueError("training input user_input must equal the final user message")
+        if any(message.role in {"system", "tool"} for message in self.messages):
+            raise ValueError("training input messages may contain only user and assistant roles")
+        return self
+
+
 class SftExampleV2(ContractModel):
     """Model-independent SFT example projected from one validated observed trace."""
 
@@ -78,6 +112,7 @@ class Qwen3SftRecord(ContractModel):
 class ProjectedTraceRecord(ContractModel):
     """Read-only evaluation view; never used as the SFT source contract."""
 
+    schema_version: ContractVersion = CONTRACT_VERSION
     trace_id: NonEmptyStr
     timestamp: datetime
     agent_name: NonEmptyStr
@@ -102,6 +137,7 @@ class ProjectedTraceRecord(ContractModel):
 
 
 class WorkflowTrajectoryRecord(ContractModel):
+    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     record_index: int | None = Field(default=None, ge=1)
     status: TraceStatus
@@ -142,5 +178,7 @@ __all__ = [
     "ProjectedTraceRecord",
     "Qwen3SftRecord",
     "SftExampleV2",
+    "TrainingInputRecord",
+    "TrainingTaskMetadata",
     "WorkflowTrajectoryRecord",
 ]

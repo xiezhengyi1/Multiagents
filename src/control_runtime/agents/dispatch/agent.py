@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from shared.contracts import ExecutionScope
 from shared.runtime import ArtifactEnvelope, ArtifactWorkerMixin, JsonlTraceWriter, RuntimePersistence
 from shared.runtime.trace.execution import write_deterministic_execution_trace
 from shared.logging import setup_logger
 from application_runtime.persistence import create_runtime_persistence
 
-from ...execution import AssuranceEvaluator, ExecutionController
+from ...execution import AssuranceEvaluator, ExecutionController, ExecutionOutcome
+from ..planning.contracts import PolicyPlanDraft
 from ...integrations.pcf import dispatch_policy_to_pcf_request
 from ...integrations.storage import (
     commit_applied_policy_plan,
@@ -46,22 +46,26 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         self.init_worker_runtime(persistence=runtime_persistence)
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> FeedbackReport:
+        strategy_output = PolicyPlanDraft.model_validate(envelope.payload)
+        if envelope.scope != strategy_output.scope:
+            raise ValueError("PolicyPlanDraft scope must match its ArtifactEnvelope scope")
         return self.execute_and_evaluate_from_request(
-            strategy_output=envelope.payload,
+            strategy_output=strategy_output,
             request_envelope=envelope,
         )
 
-    def execute_and_evaluate(self, strategy_output: Any, *, trace_metadata: Dict[str, Any] | None = None) -> FeedbackReport:
+    def execute_and_evaluate(
+        self,
+        strategy_output: PolicyPlanDraft,
+        *,
+        trace_metadata: Dict[str, Any] | None = None,
+    ) -> FeedbackReport:
         self.ensure_worker_runtime_initialized()
+        strategy_output = PolicyPlanDraft.model_validate(strategy_output)
         request_envelope = self.cache_received_artifact(
             artifact_type="PolicyPlanDraft",
             payload=strategy_output,
-            scope=ExecutionScope(
-                session_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
-                thread_id=str(getattr(strategy_output, "session_id", "") or "").strip(),
-                snapshot_id=str(getattr(strategy_output, "snapshot_id", "") or "").strip() or None,
-                supi=str(getattr(strategy_output, "supi", "") or "").strip() or None,
-            ),
+            scope=strategy_output.scope,
         )
         return self.execute_and_evaluate_from_request(
             strategy_output=strategy_output,
@@ -72,10 +76,13 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
     def execute_and_evaluate_from_request(
         self,
         *,
-        strategy_output: Any,
+        strategy_output: PolicyPlanDraft,
         request_envelope: ArtifactEnvelope,
         trace_metadata: Dict[str, Any] | None = None,
     ) -> FeedbackReport:
+        strategy_output = PolicyPlanDraft.model_validate(strategy_output)
+        if request_envelope.scope != strategy_output.scope:
+            raise ValueError("PolicyPlanDraft scope must match its request envelope scope")
         outcome = self._execution_controller.execute(strategy_output)
         feedback_payload = self._build_feedback_payload(strategy_output=strategy_output, outcome=outcome)
         outcome_payload = outcome.to_dict()
@@ -100,26 +107,31 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         )
         return feedback_report
 
-    def _build_feedback_payload(self, *, strategy_output: Any, outcome: Any) -> Dict[str, Any]:
-        execution_status = str(getattr(outcome, "execution_status", "") or "").strip().lower()
+    def _build_feedback_payload(
+        self,
+        *,
+        strategy_output: PolicyPlanDraft,
+        outcome: ExecutionOutcome,
+    ) -> Dict[str, Any]:
+        execution_status = outcome.execution_status.strip().lower()
         if execution_status not in {"failed", "partial success"}:
-            return getattr(outcome, "feedback_payload", {}) or {}
+            return outcome.feedback_payload
 
-        seed = getattr(outcome, "feedback_payload", {}) or {}
+        seed = outcome.feedback_payload
         failures = seed.get("failures") if isinstance(seed.get("failures"), list) else []
         first_failure = failures[0] if failures else {}
 
         payload = {
-            "supi": str(getattr(strategy_output, "supi", "") or seed.get("supi") or "").strip(),
+            "supi": strategy_output.scope.supi,
             "policy_id": str(first_failure.get("policy_id") or seed.get("policy_id") or "").strip(),
             "flow_id": str(first_failure.get("flow_id") or seed.get("flow_id") or "").strip(),
             "reason": str(
-                getattr(outcome, "violation_details", "")
+                outcome.violation_details
                 or first_failure.get("error")
                 or seed.get("error")
                 or ""
             ).strip(),
-            "dispatch_attempts": int(getattr(outcome, "dispatch_attempts", 0) or 0),
+            "dispatch_attempts": outcome.dispatch_attempts,
             "target_bindings_at_risk": [
                 str(value).strip()
                 for value in [
@@ -140,14 +152,14 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
             "reason_by_domain": {
                 str(first_failure.get("domain") or "unknown"): str(
                     first_failure.get("error")
-                    or getattr(outcome, "violation_details", "")
+                    or outcome.violation_details
                     or ""
                 ).strip()
             },
         }
         if seed:
             payload["controller_feedback"] = seed
-        failure_scope = str(getattr(outcome, "failure_scope", "") or "").strip()
+        failure_scope = outcome.failure_scope.strip()
         if failure_scope:
             payload["failure_scope"] = failure_scope
         return payload

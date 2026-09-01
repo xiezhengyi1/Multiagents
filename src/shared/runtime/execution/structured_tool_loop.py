@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from jsonschema.validators import validator_for
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
@@ -157,6 +157,14 @@ class StructuredToolLoop:
         tool = self.tools_by_name.get(tool_name)
         if tool is None:
             raise RuntimeError(f"Model requested unknown tool: {tool_name}")
+        tool_contract = self.tool_contracts_by_name[tool_name]
+        input_validator_class = validator_for(tool_contract.input_schema)
+        try:
+            input_validator_class(tool_contract.input_schema).validate(args)
+        except JsonSchemaValidationError as exc:
+            raise ValueError(
+                f"tool {tool_name} input violates input_schema: {exc.message}"
+            ) from exc
         func = getattr(tool, "func", None)
         if func is None:
             raise RuntimeError(f"Tool {tool_name} does not expose a callable func")
@@ -164,7 +172,6 @@ class StructuredToolLoop:
         if "runtime" in inspect.signature(func).parameters:
             kwargs["runtime"] = self._build_tool_runtime(context, tool_call_id)
         result = func(**kwargs)
-        tool_contract = self.tool_contracts_by_name[tool_name]
         result_format = tool_contract.result_format
         content = self._tool_result_to_content(result, result_format)
         if tool_contract.output_schema is not None:

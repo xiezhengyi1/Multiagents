@@ -357,13 +357,11 @@ def _main_control_decision_result(*, include_compiled_field: bool = False) -> Ag
 
 
 def test_canonical_runtime_paths_stay_bound_to_the_repository_layout() -> None:
-    from shared.runtime.io.paths import project_root, runtime_root, trace_root
+    from shared.runtime.io.paths import project_root, runtime_root, trace_runs_root
 
     assert project_root() == ROOT
     assert runtime_root() == ROOT / "data" / "runtime"
-    assert trace_root("optimization_strategy") == (
-        ROOT / "training" / "optimization_strategy" / "raw_traces"
-    )
+    assert trace_runs_root() == ROOT / "data" / "traces" / "runs"
     assert "src/shared" not in project_root().as_posix()
 
 
@@ -580,7 +578,7 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
 def test_execute_planned_round_returns_a_planning_blocker_without_external_execution(monkeypatch) -> None:
     import control_runtime.orchestrators.round_execution as round_execution
     from control_runtime.agents.main.contracts import ControlDomain
-    from control_runtime.agents.planning.contracts import PolicyPlanDraft, PlanningRationale
+    from control_runtime.agents.planning.contracts import PolicyPlanDraft
 
     monkeypatch.setattr(
         round_execution,
@@ -617,8 +615,6 @@ def test_execute_planned_round_returns_a_planning_blocker_without_external_execu
 def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(monkeypatch) -> None:
     import control_runtime.orchestrators.round_execution as round_execution
     from control_runtime.agents.dispatch.contracts import FeedbackReport
-    from control_runtime.diagnostics.diagnosis.contracts import AssuranceDiagnosisResult
-    from control_runtime.diagnostics.mediation.contracts import ConflictResolutionResult
     from control_runtime.agents.main.contracts import ControlDomain
 
     monkeypatch.setattr(
@@ -677,8 +673,6 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
 def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(monkeypatch) -> None:
     import control_runtime.orchestrators.round_execution as round_execution
     from control_runtime.agents.dispatch.contracts import FeedbackReport
-    from control_runtime.diagnostics.diagnosis.contracts import AssuranceDiagnosisResult
-    from control_runtime.diagnostics.mediation.contracts import ConflictResolutionResult
 
     monkeypatch.setattr(
         round_execution,
@@ -731,11 +725,7 @@ def test_osa_public_generate_strategy_rejects_wrong_input_and_returns_reground_p
     from control_runtime.agents.planning.agent import OptimizationStrategyAgent
     from control_runtime.agents.grounding.contracts import GroundingDecision
     from control_runtime.agents.planning.contracts import (
-        PlanningContext,
         PlanningRequest,
-        PlanningRationale,
-        PolicyPlanDraft,
-        SharedControlContext,
     )
 
     class BareOptimizationStrategyAgent(OptimizationStrategyAgent):
@@ -772,7 +762,7 @@ def test_osa_public_generate_strategy_rejects_wrong_input_and_returns_reground_p
 def test_osa_stage_retries_invocation_failures_and_reraises_the_original_exception(monkeypatch) -> None:
     import control_runtime.agents.planning.agent as planning_agent
     from control_runtime.agents.planning.agent import OptimizationStrategyAgent
-    from control_runtime.agents.planning.contracts import PlanningContext, PlanningRequest, SharedControlContext
+    from control_runtime.agents.planning.contracts import PlanningRequest
 
     class BareOptimizationStrategyAgent(OptimizationStrategyAgent):
         pass
@@ -810,7 +800,7 @@ def test_osa_stage_retries_invocation_failures_and_reraises_the_original_excepti
 def test_osa_stage_does_not_retry_or_record_non_retryable_invocation_errors(monkeypatch) -> None:
     import control_runtime.agents.planning.agent as planning_agent
     from control_runtime.agents.planning.agent import OptimizationStrategyAgent
-    from control_runtime.agents.planning.contracts import PlanningContext, PlanningRequest, SharedControlContext
+    from control_runtime.agents.planning.contracts import PlanningRequest
 
     class BareOptimizationStrategyAgent(OptimizationStrategyAgent):
         pass
@@ -856,7 +846,7 @@ def test_osa_stage_does_not_retry_or_record_non_retryable_invocation_errors(monk
 def test_osa_public_generate_strategy_preserves_stage_failure_cleanup_and_trace(monkeypatch) -> None:
     import control_runtime.agents.planning.agent as planning_agent
     from control_runtime.agents.planning.agent import OptimizationStrategyAgent
-    from control_runtime.agents.planning.contracts import PlanningContext, PlanningRequest, SharedControlContext
+    from control_runtime.agents.planning.contracts import PlanningRequest
 
     class BareOptimizationStrategyAgent(OptimizationStrategyAgent):
         pass
@@ -901,7 +891,7 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
     import control_runtime.agents.planning.agent as planning_agent
     from control_runtime.agents.planning.agent import OptimizationStrategyAgent
     from control_runtime.agents.planning.response_models import OsaAdvisorOutput
-    from control_runtime.agents.planning.contracts import PlanningContext, PlanningRequest, SharedControlContext
+    from control_runtime.agents.planning.contracts import PlanningRequest
 
     class BareOptimizationStrategyAgent(OptimizationStrategyAgent):
         pass
@@ -1470,8 +1460,6 @@ def test_iea_public_analysis_does_not_retry_invocation_validation_errors(monkeyp
 def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_artifact_contract(monkeypatch) -> None:
     import control_runtime.orchestrators.round_execution as round_execution
     from control_runtime.agents.dispatch.contracts import FeedbackReport
-    from control_runtime.diagnostics.diagnosis.contracts import AssuranceDiagnosisResult
-    from control_runtime.diagnostics.mediation.contracts import ConflictResolutionResult
     from control_runtime.orchestrators.round_execution import RoundExecutionArtifacts
 
     loader_calls = []
@@ -1513,8 +1501,6 @@ def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_art
 
 def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch(monkeypatch) -> None:
     import control_runtime.orchestrators.round_execution as round_execution
-    from control_runtime.diagnostics.diagnosis.contracts import AssuranceDiagnosisResult
-    from control_runtime.diagnostics.mediation.contracts import ConflictResolutionResult
 
     monkeypatch.setattr(
         round_execution,
@@ -1565,8 +1551,6 @@ def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch
 def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantics(monkeypatch) -> None:
     import control_runtime.orchestrators.round_execution as round_execution
     from control_runtime.agents.dispatch.contracts import FeedbackReport
-    from control_runtime.diagnostics.diagnosis.contracts import AssuranceDiagnosisResult
-    from control_runtime.diagnostics.mediation.contracts import ConflictResolutionResult
 
     monkeypatch.setattr(
         round_execution,

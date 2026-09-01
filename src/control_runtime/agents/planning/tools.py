@@ -6,9 +6,8 @@ import copy
 import json
 from typing import Any, Dict, List, Literal, Optional
 
-from langchain.tools import tool
 
-from shared.tools.wrapper_think import tool_with_reason
+from shared.tools import tool_with_purpose
 from ...integrations.optimizer.contracts import OptimizerInput
 from ...integrations.optimizer.request_factory import build_optimizer_request
 from ...integrations.optimizer.result_view import (
@@ -91,7 +90,7 @@ def build_request_tools(
             raise RuntimeError(f"UE context for {target} contains no policy-relevant mobility fields")
         return trimmed
 
-    @tool_with_reason(side_effect="read", result_format="json")
+    @tool_with_purpose(side_effect="read", result_format="json")
     def preview_qos_optimizer(
         optimization_template: Literal[
             "qos_first",
@@ -144,7 +143,7 @@ def build_request_tools(
             ensure_ascii=False,
         )
 
-    @tool_with_reason(side_effect="read", result_format="json")
+    @tool_with_purpose(side_effect="read", result_format="json")
     def fetch_qos_network_status(service_type_id: Optional[int]) -> str:
         """Fetch QoS-domain network slice utilization and capacity summary."""
         return get_network_status_summary(
@@ -152,7 +151,7 @@ def build_request_tools(
             snapshot_id=planning_request.context.shared_context.main_intent.scope.snapshot_id,
         )
 
-    @tool_with_reason(side_effect="read", result_format="json")
+    @tool_with_purpose(side_effect="read", result_format="json")
     def inspect_mobility_ue_policies(supi: str) -> str:
         """Inspect current UE mobility-relevant policy state and access-mobility context."""
         target = _require_target_supi(supi)

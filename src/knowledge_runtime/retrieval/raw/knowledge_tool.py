@@ -20,7 +20,7 @@ from shared.contracts import (
     KnowledgeQuery,
     KnowledgeResponse,
 )
-from shared.tools import tool_with_reason
+from shared.tools import tool_with_purpose
 
 from shared.runtime import AgentRuntimeContext
 from database.langchain_pg import (
@@ -1900,7 +1900,6 @@ def _expand_cross_spec_candidates(
     query: str,
     emit: Optional[Callable[[str], None]] = None,
 ) -> List[Dict[str, Any]]:
-    started_at = time.perf_counter()
     alias_map = _term_alias_map()
     selected_seeds = _top_cross_spec_seeds(seed_candidates)
     if emit is not None:
@@ -2339,7 +2338,7 @@ def run_semantic_knowledge_pipeline(
         )
 
 
-@tool_with_reason(
+@tool_with_purpose(
     side_effect="read",
     result_format="json",
     output_schema=KnowledgeResponse.model_json_schema(),
@@ -2379,7 +2378,7 @@ def search_semantic_knowledge(
     ).model_dump(mode="json")
 
 
-@tool_with_reason(
+@tool_with_purpose(
     side_effect="read",
     result_format="json",
     output_schema=KnowledgeResponse.model_json_schema(),

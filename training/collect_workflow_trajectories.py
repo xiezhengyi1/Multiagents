@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping
 
 from database.init_db import init_db
 from experiments.scripts.generate_user_inputs import (
@@ -17,6 +17,7 @@ from experiments.scripts.common import parse_task_ids
 from experiments.paths import default_catalog_input_path, workflow_experiment_input_path
 from control_runtime.integrations.scenario.init_scenario import rebuild_ue_related_tables_from_graph_snapshot
 from control_runtime.integrations.storage import get_latest_snapshot_metadata
+from shared.runtime import finalize_trace_worker
 from training.artifacts import processed_dir, read_json, read_jsonl, write_json, write_jsonl
 from training.projection import (
     WORKFLOW_AGENT_NAMES,
@@ -26,53 +27,19 @@ from training.projection import (
     load_traces,
     is_sft_candidate,
 )
+from training.schemas import TrainingInputRecord
 from control_runtime.orchestrators.main_control_orchestrator import MainControlOrchestrator
 
 
 def _normalize_record(record: Mapping[str, Any], index: int) -> Dict[str, Any]:
-    messages = record.get("messages")
-    if messages is not None and not isinstance(messages, list):
-        raise TypeError(f"record #{index} field 'messages' must be a list when present")
-
-    normalized_messages: List[Dict[str, str]] = []
-    if isinstance(messages, list):
-        for message_index, message in enumerate(messages, start=1):
-            if not isinstance(message, Mapping):
-                raise TypeError(f"record #{index} message #{message_index} must be an object")
-            role = str(message.get("role") or "").strip().lower() or "user"
-            content = str(message.get("content") or "")
-            if not content.strip():
-                continue
-            normalized_messages.append({"role": role, "content": content})
-
-    user_input = str(record.get("user_input") or record.get("userInput") or "").strip()
-    if not user_input:
-        if not normalized_messages:
-            raise ValueError(f"record #{index} is missing user_input and usable messages")
-        if normalized_messages[-1]["role"] != "user":
-            raise ValueError(f"record #{index} messages must end with a user role")
-        user_input = normalized_messages[-1]["content"].strip()
-
-    if not normalized_messages:
-        normalized_messages = [{"role": "user", "content": user_input}]
-
-    scenario_tags = record.get("scenario_tags") or record.get("scenarioTags") or []
-    if scenario_tags and not isinstance(scenario_tags, list):
-        raise TypeError(f"record #{index} field 'scenario_tags' must be a list when present")
-
-    task_metadata = record.get("task_metadata") or {}
-    if task_metadata and not isinstance(task_metadata, Mapping):
-        raise TypeError(f"record #{index} field 'task_metadata' must be an object when present")
-
-    return {
-        "record_index": index,
-        "user_input": user_input,
-        "messages": normalized_messages,
-        "context": str(record.get("context") or record.get("conversation_context") or ""),
-        "scenario_id": str(record.get("scenario_id") or record.get("scenarioId") or "").strip(),
-        "scenario_tags": [str(item).strip() for item in scenario_tags if str(item).strip()],
-        "task_metadata": dict(task_metadata or {}),
-    }
+    payload = dict(record)
+    existing_index = payload.get("record_index")
+    if existing_index is not None and int(existing_index) != index:
+        raise ValueError(
+            f"record #{index} declares mismatched record_index={existing_index}"
+        )
+    payload["record_index"] = index
+    return TrainingInputRecord.model_validate(payload).model_dump(mode="json")
 
 
 def load_user_input_records(
@@ -112,9 +79,7 @@ def load_user_input_records(
                     continue
                 task_metadata = record.get("task_metadata") or {}
                 task_id = str(
-                    (task_metadata.get("task_id") if isinstance(task_metadata, Mapping) else "")
-                    or record.get("task_id")
-                    or ""
+                    task_metadata.get("task_id") if isinstance(task_metadata, Mapping) else ""
                 ).strip()
                 if task_id in requested_ids:
                     found_ids.add(task_id)
@@ -349,8 +314,8 @@ def collect_workflow_trajectories(
                 "status": "success",
                 "error_type": None,
                 "error": None,
-                "session_id": run_result.session_id,
-                "snapshot_id": run_result.snapshot_id,
+                "session_id": run_result.scope.session_id,
+                "snapshot_id": run_result.scope.snapshot_id,
                 "completed": run_result.completed,
                 "global_intent": run_result.global_intent,
                 "unified_plan": run_result.unified_plan,
@@ -362,12 +327,9 @@ def collect_workflow_trajectories(
                 "round_traces": run_result.round_traces,
                 "agent_elapsed_ms": dict(agent_elapsed_ms),
                 "agent_elapsed_total_ms": float(agent_elapsed_ms["total"]),
-                "main_schema_projection_count": run_result.main_schema_projection_count,
-                "main_schema_projected_field_count": run_result.main_schema_projected_field_count,
-                "main_schema_projected_fields": run_result.main_schema_projected_fields,
             }
             print(
-                f"[{record['record_index']}/{total}] workflow done: session_id={run_result.session_id} completed={run_result.completed}",
+                f"[{record['record_index']}/{total}] workflow done: session_id={run_result.scope.session_id} completed={run_result.completed}",
                 flush=True,
             )
         except Exception as exc:
@@ -397,9 +359,6 @@ def collect_workflow_trajectories(
                 "round_traces": [],
                 "agent_elapsed_ms": {},
                 "agent_elapsed_total_ms": 0.0,
-                "main_schema_projection_count": orchestrator.main_agent.schema_projection_metrics["count"],
-                "main_schema_projected_field_count": orchestrator.main_agent.schema_projection_metrics["field_count"],
-                "main_schema_projected_fields": orchestrator.main_agent.schema_projection_metrics["fields"],
             }
             print(
                 f"[{record['record_index']}/{total}] workflow error: scenario_id={scenario_id} error={type(exc).__name__}: {exc}",
@@ -414,9 +373,13 @@ def collect_workflow_trajectories(
             workflow_output=workflow_output,
             projection_summary=projection_summary,
         )
+    trace_worker_manifest = finalize_trace_worker()
     return {
         "results": results,
-        "projection_summary": projection_summary,
+        "projection_summary": {
+            **projection_summary,
+            "trace_worker_manifest": str(trace_worker_manifest),
+        },
     }
 
 

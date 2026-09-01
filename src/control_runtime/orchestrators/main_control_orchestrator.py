@@ -263,7 +263,7 @@ class MainControlOrchestrator:
                 )
             finally:
                 agent_elapsed_ms["iea"] = round((time.perf_counter() - agent_started_at) * 1000.0, 3)
-            self._remember(memory_scope, "IEA", grounding_decision)
+            self._remember(scope, "IEA", grounding_decision)
             if grounding_decision.open_questions:
                 return global_intent, grounding_decision, None, build_negotiation_request(
                     grounding_decision,
@@ -290,7 +290,7 @@ class MainControlOrchestrator:
             policy_plan = self.os_agent.generate_strategy(planning_request, trace_metadata=trace_metadata)
         finally:
             agent_elapsed_ms["osa"] = round((time.perf_counter() - agent_started_at) * 1000.0, 3)
-        self._remember(memory_scope, "OSA", policy_plan)
+        self._remember(scope, "OSA", policy_plan)
         return global_intent, grounding_decision, policy_plan, None
 
     def run(

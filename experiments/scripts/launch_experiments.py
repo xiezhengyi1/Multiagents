@@ -28,6 +28,7 @@ from experiments.scripts.common import (
     write_json,
 )
 from experiments.paths import scoped_catalog_input_path
+from shared.runtime import finalize_trace_dataset_run
 from experiments.scripts.simulator import (
     allocate_simulator_instance as _allocate_simulator_instance,
     ensure_simulator_running as _ensure_simulator_running,
@@ -355,7 +356,12 @@ def _partition_task_ids(*, task_ids: List[str], worker_count: int) -> List[Dict[
     return partitions
 
 
-def _worker_environment(simulator_state: Dict[str, Any]) -> Dict[str, str]:
+def _worker_environment(
+    simulator_state: Dict[str, Any],
+    *,
+    dataset_run_id: str,
+    worker_id: str,
+) -> Dict[str, str]:
     env = dict(os.environ)
     gateway_port = int(simulator_state["gateway_port"])
     reset_port = int(simulator_state["reset_port"])
@@ -368,6 +374,8 @@ def _worker_environment(simulator_state: Dict[str, Any]) -> Dict[str, str]:
     database_url = str(simulator_state.get("runtime_database_url") or "").strip()
     if database_url:
         env["DATABASE_URL"] = database_url
+    env["MULTIAGENTS_TRACE_RUN_ID"] = dataset_run_id
+    env["MULTIAGENTS_TRACE_WORKER_ID"] = worker_id
     return env
 
 
@@ -618,6 +626,10 @@ def main() -> None:
 
             for method_index, method_id in enumerate(methods, start=1):
                 task_count = experiment_summaries[experiment_id]["built_scenarios"][scenario_id]["task_count"]
+                trace_run_id = (
+                    f"{experiment_id}-{scenario_id}-{method_id}-"
+                    + datetime.now().strftime("%Y%m%dT%H%M%S%f")
+                )
                 simulator_states: List[Dict[str, Any]] = []
                 worker_runs: List[Dict[str, Any]] = []
                 worker_failures: List[Dict[str, Any]] = []
@@ -735,7 +747,11 @@ def main() -> None:
                                         f"cases={case_scope}"
                                     ),
                                     stream_output=True,
-                                    env=_worker_environment(simulator_state),
+                                    env=_worker_environment(
+                                        simulator_state,
+                                        dataset_run_id=trace_run_id,
+                                        worker_id=f"worker-{worker['worker_index']}",
+                                    ),
                                 )
                             except subprocess.CalledProcessError as exc:
                                 if (
@@ -780,6 +796,7 @@ def main() -> None:
                                 )
                     if worker_failures:
                         raise RuntimeError(f"{len(worker_failures)} parallel worker(s) failed: {worker_failures}")
+                    trace_manifest_path = finalize_trace_dataset_run(trace_run_id)
                     merged = _merge_worker_results(
                         experiment_id=experiment_id,
                         scenario_id=scenario_id,
@@ -795,6 +812,7 @@ def main() -> None:
                         "worker_count": len(worker_specs),
                         "result_path": merged["result_path"],
                         "summary_path": merged["summary_path"],
+                        "trace_manifest_path": str(trace_manifest_path),
                     }
                     launched_runs.append(run_record)
                     experiment_summaries[experiment_id]["successful_runs"].append(run_record)

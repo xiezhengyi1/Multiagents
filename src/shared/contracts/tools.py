@@ -13,6 +13,15 @@ from .common import CONTRACT_VERSION, ContractModel, ContractVersion, NonEmptySt
 
 ToolSideEffect = Literal["read", "write", "external_action"]
 ToolResultFormat = Literal["json", "text"]
+ToolPurpose = Literal[
+    "retrieve_context",
+    "validate_input",
+    "compile_output",
+    "persist_output",
+    "execute_change",
+    "inspect_failure",
+    "summarize_state",
+]
 
 
 def _fingerprint(payload: JsonValue) -> str:
@@ -76,4 +85,5 @@ __all__ = [
     "ToolContract",
     "ToolResultFormat",
     "ToolSideEffect",
+    "ToolPurpose",
 ]

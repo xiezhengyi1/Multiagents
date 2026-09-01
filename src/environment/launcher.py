@@ -51,10 +51,10 @@ class EnvironmentLauncher:
         run_dir = self.ns3_integration_root / "artifacts" / "runs" / run_id
         manifest_path = run_dir / "run-manifest.split.json"
         start_script = self.ns3_integration_root / "scripts" / "start_split_mode.py"
-        argv: list[object] = [
-            self.stack_python_executable,
-            start_script,
-            Path(scenario_path),
+        argv = [
+            str(self.stack_python_executable),
+            str(start_script),
+            str(Path(scenario_path)),
             "--run-id",
             run_id,
             "--live-graph-snapshot-id",
@@ -147,7 +147,7 @@ class EnvironmentLauncher:
         with launch_log.open("a", encoding="utf-8") as handle:
             try:
                 process = self.process_factory(
-                    [str(item) for item in plan.argv],
+                    plan.argv,
                     cwd=str(plan.cwd),
                     stdout=handle,
                     stderr=subprocess.STDOUT,

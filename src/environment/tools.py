@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from langchain_core.tools import StructuredTool
+from langchain.tools import ToolRuntime
 from pydantic import ValidationError
+import yaml
 
 from .compiler import EnvironmentAgentCompiler, S3_MINIMUM_COUNTS, S3_QUALITY_PROFILE
 from .design import (
@@ -23,6 +25,33 @@ from .draft import ScenarioDraftStore
 from .launcher import EnvironmentLauncher
 from .specs import ExistingScenarioSpecExplorer
 from shared.logging import log_event
+from shared.contracts import ToolPurpose
+from shared.runtime import AgentRuntimeContext
+
+
+ENVIRONMENT_TOOL_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["ok", "failed", "blocked", "planned"],
+        },
+        "purpose": {
+            "type": "string",
+            "enum": [
+                "retrieve_context",
+                "validate_input",
+                "compile_output",
+                "persist_output",
+                "execute_change",
+                "inspect_failure",
+                "summarize_state",
+            ],
+        },
+    },
+    "required": ["status", "purpose"],
+    "additionalProperties": True,
+}
 
 
 def _make_tool(
@@ -40,7 +69,7 @@ def _make_tool(
             "contract": {
                 "side_effect": side_effect,
                 "result_format": "json",
-                "output_schema": {"type": "object"},
+                "output_schema": ENVIRONMENT_TOOL_OUTPUT_SCHEMA,
             }
         },
     )
@@ -91,12 +120,7 @@ def _semantic_repair_context(design: EnvironmentDesign) -> dict[str, Any]:
 
 def _load_mapping(path: Path) -> dict[str, Any]:
     text = Path(path).read_text(encoding="utf-8")
-    try:
-        import yaml
-
-        payload = yaml.safe_load(text)
-    except Exception:
-        payload = json.loads(text)
+    payload = yaml.safe_load(text)
     if not isinstance(payload, dict):
         raise TypeError(f"{path} must contain a mapping")
     return payload
@@ -104,12 +128,10 @@ def _load_mapping(path: Path) -> dict[str, Any]:
 
 def _dump_mapping(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import yaml
-
-        path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    except Exception:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
 
 
 def _resolve_candidate_output_dir(scenario_root: Path, output_dir: str) -> Path:
@@ -149,18 +171,12 @@ def _build_repair_plan(errors: list[str]) -> list[dict[str, Any]]:
     counts = Counter(_repair_section_for_error(error) for error in errors)
     plan: list[dict[str, Any]] = []
     for section, error_count in counts.items():
-        collection = section in {"slices", "upfs", "gnbs", "ues", "apps", "flows"}
-        action = "patch_draft_entity" if collection and error_count == 1 else "replace_draft_section"
         plan.append(
             {
                 "section": section,
                 "error_count": error_count,
-                "action": action,
-                "guidance": (
-                    f"Replace the complete {section} section in one call; do not patch entities one by one."
-                    if action == "replace_draft_section"
-                    else f"Patch the single affected {section} entity."
-                ),
+                "action": "revise_environment_design",
+                "guidance": f"Submit complete replacement entities for the affected {section} section.",
             }
         )
     return plan
@@ -220,10 +236,6 @@ def _build_topology_graph(scenario: dict[str, Any]) -> dict[str, Any]:
             links.append({"source": node_id, "target": gnb_ids[gnb], "type": "attached_to", "attributes": {}})
 
     return {"nodes": nodes, "links": links}
-
-
-def _payload_count(payload: Any) -> int:
-    return len(payload) if isinstance(payload, list) else int(payload is not None)
 
 
 def _field_diff(draft: dict[str, Any], on_disk: dict[str, Any]) -> dict[str, Any]:
@@ -340,7 +352,6 @@ def build_environment_tools(
     scenario_root: Path,
     execute_simulator: bool = True,
     quality_profile: str | None = S3_QUALITY_PROFILE,
-    semantic_design_mode: bool = False,
     design_compiler: EnvironmentDesignCompiler | None = None,
     explorer: ExistingScenarioSpecExplorer | None = None,
     logger: logging.Logger | None = None,
@@ -349,7 +360,6 @@ def build_environment_tools(
     design_compiler = design_compiler or EnvironmentDesignCompiler()
     draft = ScenarioDraftStore()
     feedback_log: list[dict[str, Any]] = []
-    sections_requiring_replacement: set[str] = set()
     submitted_catalog: EnvironmentCatalog | None = None
     latest_semantic_design: EnvironmentDesign | None = None
     compiled_design_report: dict[str, Any] | None = None
@@ -360,13 +370,13 @@ def build_environment_tools(
 
     def _record_feedback_item(
         *,
-        reason: str,
+        purpose: ToolPurpose,
         scenario_id: str,
         phase: str,
         feedback: str,
     ) -> dict[str, Any]:
         item = {
-            "reason": reason,
+            "purpose": purpose,
             "scenario_id": scenario_id,
             "phase": phase,
             "feedback": feedback,
@@ -383,13 +393,8 @@ def build_environment_tools(
             )
         return item
 
-    def list_existing_environment_specs(reason: str = "", limit: int = 50) -> str:
-        """Return compact specs for existing scenario YAML files before generating a new env."""
-        specs = explorer.discover_specs(Path(scenario_root), limit=limit)
-        return _json({"status": "ok", "reason": reason, "spec_count": len(specs), "specs": specs})
-
     def get_environment_runtime_reference(
-        reason: str = "",
+        purpose: ToolPurpose,
         source: str = "s3_high_complexity.yaml",
     ) -> str:
         """Return exact executable runtime and split-mode sections from one trusted seed."""
@@ -403,7 +408,7 @@ def build_environment_tools(
         return _json(
             {
                 "status": "ok",
-                "reason": reason,
+                "purpose": purpose,
                 "source": str(source_path),
                 "runtime": {
                     "free5gc": deepcopy(scenario.get("free5gc") or {}),
@@ -418,14 +423,14 @@ def build_environment_tools(
         )
 
     def prepare_environment_design_context(
-        reason: str = "",
+        purpose: ToolPurpose,
         source: str = "s3_high_complexity.yaml",
         limit: int = 20,
     ) -> str:
         """Return executable examples and the trusted runtime in one grounding call."""
         specs = explorer.discover_specs(Path(scenario_root), limit=limit)
         runtime_payload = json.loads(
-            get_environment_runtime_reference(reason=reason, source=source)
+            get_environment_runtime_reference(purpose=purpose, source=source)
         )
         if logger:
             log_event(
@@ -437,7 +442,7 @@ def build_environment_tools(
         return _json(
             {
                 "status": "ok",
-                "reason": reason,
+                "purpose": purpose,
                 "spec_count": len(specs),
                 "specs": specs,
                 "runtime_source": runtime_payload["source"],
@@ -446,19 +451,8 @@ def build_environment_tools(
             }
         )
 
-    def initialize_environment_draft(
-        reason: str = "",
-        metadata: dict[str, Any] | None = None,
-    ) -> str:
-        """Initialize one in-memory scenario draft with metadata only."""
-        sections_requiring_replacement.clear()
-        summary = draft.initialize(metadata or {})
-        if logger:
-            log_event(logger, "environment_draft_initialized", scenario_id=summary["scenario_id"])
-        return _json({"status": "ok", "reason": reason, "draft": draft.summary(compact=True)})
-
     def submit_environment_catalog(
-        reason: str = "",
+        purpose: ToolPurpose,
         catalog: EnvironmentCatalog | None = None,
     ) -> str:
         """Submit the complete semantic entity manifest before any detailed design."""
@@ -469,7 +463,7 @@ def build_environment_tools(
             return _json(
                 {
                     "status": "failed",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "catalog_schema",
                     "errors": _format_design_validation_errors(exc),
                     "required_action": "resubmit_complete_environment_catalog",
@@ -488,7 +482,7 @@ def build_environment_tools(
             return _json(
                 {
                     "status": "failed",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "catalog_completeness",
                     "errors": errors,
                     "required_action": "resubmit_complete_environment_catalog",
@@ -513,7 +507,7 @@ def build_environment_tools(
         return _json(
             {
                 "status": "ok",
-                "reason": reason,
+                "purpose": purpose,
                 "scenario_id": parsed.scenario_id,
                 "expected_counts": parsed.expected_counts.model_dump(mode="json"),
                 "semantic_keys": {
@@ -524,14 +518,14 @@ def build_environment_tools(
             }
         )
 
-    def inspect_environment_catalog(reason: str = "") -> str:
+    def inspect_environment_catalog(purpose: ToolPurpose) -> str:
         """Return the accepted semantic manifest and expected entity counts."""
         if submitted_catalog is None:
             raise ValueError("no environment catalog has been accepted")
         return _json(
             {
                 "status": "ok",
-                "reason": reason,
+                "purpose": purpose,
                 "catalog": submitted_catalog.model_dump(mode="json"),
             }
         )
@@ -539,13 +533,13 @@ def build_environment_tools(
     def _compile_parsed_environment_design(
         parsed: EnvironmentDesign,
         *,
-        reason: str,
+        purpose: ToolPurpose,
     ) -> dict[str, Any]:
         nonlocal latest_semantic_design, compiled_design_report, semantic_compile_succeeded
         if submitted_catalog is None:
             return {
                 "status": "failed",
-                "reason": reason,
+                "purpose": purpose,
                 "phase": "catalog_missing",
                 "errors": ["submit_environment_catalog must succeed before design compilation"],
                 "required_action": "submit_environment_catalog",
@@ -560,7 +554,7 @@ def build_environment_tools(
         except EnvironmentDesignError as exc:
             errors = list(exc.errors)
             _record_feedback_item(
-                reason=reason,
+                purpose=purpose,
                 scenario_id=parsed.scenario_id,
                 phase="design_completeness",
                 feedback="; ".join(errors),
@@ -577,7 +571,7 @@ def build_environment_tools(
                 )
             return {
                 "status": "failed",
-                "reason": reason,
+                "purpose": purpose,
                 "phase": "design_completeness",
                 "errors": errors,
                 "required_action": "revise_environment_design",
@@ -615,7 +609,7 @@ def build_environment_tools(
         if not report.ok:
             errors = list(report.errors)
             _record_feedback_item(
-                reason=reason,
+                purpose=purpose,
                 scenario_id=candidate.scenario_id,
                 phase="compiled_candidate_validation",
                 feedback="; ".join(errors),
@@ -632,7 +626,7 @@ def build_environment_tools(
                 )
             return {
                 "status": "failed",
-                "reason": reason,
+                "purpose": purpose,
                 "phase": "compiled_candidate_validation",
                 "scenario_id": candidate.scenario_id,
                 "errors": errors,
@@ -654,7 +648,7 @@ def build_environment_tools(
             )
         return {
             "status": "ok",
-            "reason": reason,
+            "purpose": purpose,
             "scenario_id": candidate.scenario_id,
             "counts": {
                 section: len(scenario[section])
@@ -666,7 +660,7 @@ def build_environment_tools(
         }
 
     def compile_environment_design(
-        reason: str = "",
+        purpose: ToolPurpose,
         design: EnvironmentDesign | None = None,
     ) -> str:
         """Submit the first complete LLM-authored semantic design and compile it atomically."""
@@ -675,7 +669,7 @@ def build_environment_tools(
             return _json(
                 {
                     "status": "failed",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "catalog_missing",
                     "errors": ["submit_environment_catalog must succeed before design compilation"],
                     "required_action": "submit_environment_catalog",
@@ -689,7 +683,7 @@ def build_environment_tools(
             semantic_compile_succeeded = False
             draft.validation_passed = False
             _record_feedback_item(
-                reason=reason,
+                purpose=purpose,
                 scenario_id=submitted_catalog.scenario_id,
                 phase="design_schema",
                 feedback="; ".join(errors),
@@ -697,7 +691,7 @@ def build_environment_tools(
             return _json(
                 {
                     "status": "failed",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "design_schema",
                     "errors": errors,
                     "required_action": "resubmit_complete_environment_design",
@@ -710,10 +704,10 @@ def build_environment_tools(
                     "workflow_guard": "Do not call YAML validation until compilation returns status=ok.",
                 }
             )
-        return _json(_compile_parsed_environment_design(parsed, reason=reason))
+        return _json(_compile_parsed_environment_design(parsed, purpose=purpose))
 
     def revise_environment_design(
-        reason: str = "",
+        purpose: ToolPurpose,
         revision: EnvironmentDesignRevision | None = None,
     ) -> str:
         """Replace only affected complete semantic entities, then compile the merged design."""
@@ -722,7 +716,7 @@ def build_environment_tools(
             return _json(
                 {
                     "status": "failed",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "workflow_guard",
                     "errors": ["no schema-valid semantic design exists to revise"],
                     "required_action": "compile_environment_design",
@@ -738,7 +732,7 @@ def build_environment_tools(
             return _json(
                 {
                     "status": "failed",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "revision_schema",
                     "errors": _format_design_validation_errors(exc),
                     "required_action": "revise_environment_design",
@@ -748,7 +742,7 @@ def build_environment_tools(
             return _json(
                 {
                     "status": "failed",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "revision_merge",
                     "errors": list(exc.errors),
                     "required_action": "revise_environment_design",
@@ -756,66 +750,17 @@ def build_environment_tools(
             )
         latest_semantic_design = revised
         semantic_compile_succeeded = False
-        result = _compile_parsed_environment_design(revised, reason=reason)
+        result = _compile_parsed_environment_design(revised, purpose=purpose)
         result["revision_applied"] = changed
         return _json(result)
 
-    def replace_draft_section(reason: str = "", section: str = "", payload: Any = None) -> str:
-        """Replace one draft section; first writes must follow the declared stage order."""
-        summary = draft.replace_section(section, payload)
-        sections_requiring_replacement.discard(section)
-        if logger:
-            log_event(
-                logger,
-                "environment_section_replaced",
-                scenario_id=summary["scenario_id"],
-                section=section,
-                item_count=_payload_count(payload),
-                next_section=summary["next_section"],
-            )
-        return _json({"status": "ok", "reason": reason, "draft": draft.summary(compact=True)})
-
-    def patch_draft_entity(
-        reason: str = "",
-        section: str = "",
-        entity_id: str = "",
-        changes: dict[str, Any] | None = None,
-    ) -> str:
-        """Patch one existing collection entity by stable ID without adding duplicates."""
-        if section in sections_requiring_replacement:
-            raise ValueError(
-                f"validation requires replace complete section {section}; "
-                "use replace_draft_section instead of patch_draft_entity"
-            )
-        summary = draft.patch_entity(section, entity_id, changes or {})
-        if logger:
-            log_event(
-                logger,
-                "environment_entity_patched",
-                scenario_id=summary["scenario_id"],
-                section=section,
-                entity_id=entity_id,
-                changed_fields=",".join(sorted((changes or {}).keys())),
-            )
-        return _json(
-            {
-                "status": "ok",
-                "reason": reason,
-                "draft": draft.summary(compact=True),
-            }
-        )
-
-    def inspect_draft_section(reason: str = "", section: str = "") -> str:
-        """Return the requested draft section in full plus a compact draft summary."""
-        return _json({"reason": reason, **draft.inspect_section(section)})
-
-    def validate_environment_draft(reason: str = "") -> str:
+    def validate_environment_draft(purpose: ToolPurpose) -> str:
         """Validate the draft and return a section-level repair plan for any errors."""
-        if semantic_design_mode and not semantic_compile_succeeded:
+        if not semantic_compile_succeeded:
             return _json(
                 {
                     "status": "blocked",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "workflow_guard",
                     "errors": [
                         "semantic design compilation has not succeeded; there is no YAML draft to validate"
@@ -831,12 +776,6 @@ def build_environment_tools(
         report = compiler.validate_candidate(candidate, quality_profile=quality_profile)
         draft.validation_passed = report.ok
         repair_plan = _build_repair_plan(list(report.errors))
-        sections_requiring_replacement.clear()
-        sections_requiring_replacement.update(
-            item["section"]
-            for item in repair_plan
-            if item["action"] == "replace_draft_section"
-        )
         if logger:
             log_event(
                 logger,
@@ -852,7 +791,7 @@ def build_environment_tools(
         return _json(
             {
                 "status": "ok" if report.ok else "failed",
-                "reason": reason,
+                "purpose": purpose,
                 "scenario_id": report.scenario_id,
                 "quality_profile": quality_profile or "schema-only",
                 "quality_contract": compiler.quality_requirements(quality_profile),
@@ -863,13 +802,13 @@ def build_environment_tools(
             }
         )
 
-    def write_validated_environment_yaml(reason: str = "", output_dir: str = "generated") -> str:
+    def write_validated_environment_yaml(purpose: ToolPurpose, output_dir: str = "generated") -> str:
         """Write YAML only after the latest complete draft passes static validation."""
-        if semantic_design_mode and not semantic_compile_succeeded:
+        if not semantic_compile_succeeded:
             return _json(
                 {
                     "status": "blocked",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "workflow_guard",
                     "errors": ["semantic design compilation must succeed before YAML can be written"],
                     "required_action": (
@@ -955,7 +894,7 @@ def build_environment_tools(
         return _json(
             {
                 "status": "ok",
-                "reason": reason,
+                "purpose": purpose,
                 "scenario_id": candidate.scenario_id,
                 "scenario_path": draft.scenario_path,
                 "split_mode_overlay_path": draft.split_mode_overlay_path,
@@ -965,17 +904,15 @@ def build_environment_tools(
         )
 
     def simulate_candidate_environment(
-        reason: str = "",
-        run_id: str = "",
-        live_graph_snapshot_id: str = "",
-        graph_db_url: str = "",
+        purpose: ToolPurpose,
+        runtime: ToolRuntime[AgentRuntimeContext] = None,
     ) -> str:
         """Execute direct simulator validation for the latest written overlay or base YAML."""
-        if semantic_design_mode and not semantic_compile_succeeded:
+        if not semantic_compile_succeeded:
             return _json(
                 {
                     "status": "blocked",
-                    "reason": reason,
+                    "purpose": purpose,
                     "phase": "workflow_guard",
                     "errors": ["semantic design compilation must succeed before simulation"],
                     "required_action": (
@@ -987,12 +924,17 @@ def build_environment_tools(
             )
         if not draft.scenario_path:
             raise ValueError("validated YAML must be written before simulation")
+        if runtime is None or runtime.context is None:
+            raise ValueError("simulate_candidate_environment requires agent runtime context")
+        scope = runtime.context.scope
+        if scope.snapshot_id is None:
+            raise ValueError("simulate_candidate_environment requires scope.snapshot_id")
         scenario_path = draft.split_mode_overlay_path or draft.scenario_path
         plan = launcher.build_direct_launch_plan(
             scenario_path=Path(scenario_path),
-            run_id=run_id or "environment-agent-validation",
-            live_graph_snapshot_id=live_graph_snapshot_id or "live-environment-agent",
-            graph_db_url=graph_db_url,
+            run_id=scope.session_id,
+            live_graph_snapshot_id=scope.snapshot_id,
+            graph_db_url=os.environ["DATABASE_URL"],
         )
         if logger:
             log_event(
@@ -1000,12 +942,12 @@ def build_environment_tools(
                 "environment_simulation_start",
                 scenario_id=draft.summary()["scenario_id"],
                 scenario_path=scenario_path,
-                run_id=run_id or "environment-agent-validation",
-                live_graph_snapshot_id=live_graph_snapshot_id or "live-environment-agent",
+                run_id=scope.session_id,
+                live_graph_snapshot_id=scope.snapshot_id,
             )
         payload: dict[str, Any] = {
             "status": "planned",
-            "reason": reason,
+            "purpose": purpose,
             "execute_simulator": bool(execute_simulator),
             "cwd": str(plan.cwd),
             "argv": [str(item) for item in plan.argv],
@@ -1020,7 +962,7 @@ def build_environment_tools(
         }
         if execute_simulator:
             payload = {
-                "reason": reason,
+                "purpose": purpose,
                 "execute_simulator": True,
                 **launcher.validate_simulator_startup(plan),
             }
@@ -1041,35 +983,24 @@ def build_environment_tools(
             payload["failure_analysis"] = {
                 "class": _simulation_failure_class(payload),
                 "suggested_section": diagnostic["section"],
-                "suggested_action": "replace_draft_section" if diagnostic["section"] != "unknown" else "inspect_draft_section",
+                "suggested_action": (
+                    "revise_environment_design"
+                    if diagnostic["section"] != "unknown"
+                    else "read_back_written_yaml"
+                ),
                 "guidance": diagnostic["guidance"],
                 "matched_keywords": diagnostic.get("matched_keywords", []),
             }
             if payload.get("status") == "failed":
                 _record_feedback_item(
-                    reason=reason,
+                    purpose=purpose,
                     scenario_id=str(draft.summary().get("scenario_id") or ""),
                     phase="simulation",
                     feedback=str(payload.get("error") or log_tail or "simulation validation failed"),
                 )
         return _json(payload)
 
-    def record_validation_feedback(
-        reason: str = "",
-        scenario_id: str = "",
-        phase: str = "",
-        feedback: str = "",
-    ) -> str:
-        """Record validation feedback so the next generation attempt can adjust logic."""
-        item = _record_feedback_item(
-            reason=reason,
-            scenario_id=scenario_id,
-            phase=phase,
-            feedback=feedback,
-        )
-        return _json({"status": "ok", "feedback_count": len(feedback_log), "latest_feedback": item})
-
-    def read_back_written_yaml(reason: str = "") -> str:
+    def read_back_written_yaml(purpose: ToolPurpose) -> str:
         """Read the last written YAML and overlay from disk, returning both raw payloads
         and a field-level diff against the current in-memory draft.
 
@@ -1107,7 +1038,7 @@ def build_environment_tools(
 
         return _json({
             "status": "ok",
-            "reason": reason,
+            "purpose": purpose,
             "scenario_path": draft.scenario_path,
             "split_mode_overlay_path": draft.split_mode_overlay_path,
             "scenario_on_disk": scenario_on_disk,
@@ -1118,31 +1049,14 @@ def build_environment_tools(
             "draft": draft.summary(compact=True),
         })
 
-    shared_tools = [
-        _make_tool("list_existing_environment_specs", list_existing_environment_specs.__doc__ or "", list_existing_environment_specs, side_effect="read"),
+    return [
+        _make_tool("prepare_environment_design_context", prepare_environment_design_context.__doc__ or "", prepare_environment_design_context, side_effect="read"),
+        _make_tool("submit_environment_catalog", submit_environment_catalog.__doc__ or "", submit_environment_catalog, side_effect="write"),
+        _make_tool("inspect_environment_catalog", inspect_environment_catalog.__doc__ or "", inspect_environment_catalog, side_effect="read"),
+        _make_tool("compile_environment_design", compile_environment_design.__doc__ or "", compile_environment_design, side_effect="write"),
+        _make_tool("revise_environment_design", revise_environment_design.__doc__ or "", revise_environment_design, side_effect="write"),
         _make_tool("validate_environment_draft", validate_environment_draft.__doc__ or "", validate_environment_draft, side_effect="read"),
         _make_tool("write_validated_environment_yaml", write_validated_environment_yaml.__doc__ or "", write_validated_environment_yaml, side_effect="write"),
         _make_tool("simulate_candidate_environment", simulate_candidate_environment.__doc__ or "", simulate_candidate_environment, side_effect="external_action"),
-        _make_tool("record_validation_feedback", record_validation_feedback.__doc__ or "", record_validation_feedback, side_effect="write"),
         _make_tool("read_back_written_yaml", read_back_written_yaml.__doc__ or "", read_back_written_yaml, side_effect="read"),
-    ]
-    if semantic_design_mode:
-        return [
-            _make_tool("prepare_environment_design_context", prepare_environment_design_context.__doc__ or "", prepare_environment_design_context, side_effect="read"),
-            _make_tool("submit_environment_catalog", submit_environment_catalog.__doc__ or "", submit_environment_catalog, side_effect="write"),
-            _make_tool("inspect_environment_catalog", inspect_environment_catalog.__doc__ or "", inspect_environment_catalog, side_effect="read"),
-            _make_tool("compile_environment_design", compile_environment_design.__doc__ or "", compile_environment_design, side_effect="write"),
-            _make_tool("revise_environment_design", revise_environment_design.__doc__ or "", revise_environment_design, side_effect="write"),
-            shared_tools[1],
-            shared_tools[2],
-            shared_tools[3],
-            shared_tools[5],
-        ]
-    return [
-        shared_tools[0],
-        _make_tool("initialize_environment_draft", initialize_environment_draft.__doc__ or "", initialize_environment_draft, side_effect="write"),
-        _make_tool("replace_draft_section", replace_draft_section.__doc__ or "", replace_draft_section, side_effect="write"),
-        _make_tool("patch_draft_entity", patch_draft_entity.__doc__ or "", patch_draft_entity, side_effect="write"),
-        _make_tool("inspect_draft_section", inspect_draft_section.__doc__ or "", inspect_draft_section, side_effect="read"),
-        *shared_tools[1:],
     ]

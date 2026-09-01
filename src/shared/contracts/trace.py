@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
+from jsonschema.validators import validator_for
 from pydantic import Field, JsonValue, model_validator
 
 from .common import CONTRACT_VERSION, ContractModel, ContractVersion, ExecutionScope, NonEmptyStr
@@ -42,6 +44,13 @@ class TraceTarget(ContractModel):
         }[self.kind]
         if self.producer != expected:
             raise ValueError(f"target {self.kind} must be produced by {expected}")
+        validator_class = validator_for(self.output_schema)
+        try:
+            validator_class(self.output_schema).validate(self.value)
+        except JsonSchemaValidationError as exc:
+            raise ValueError(
+                f"target {self.schema_name} value violates output_schema: {exc.message}"
+            ) from exc
         return self
 
 

@@ -17,6 +17,7 @@ from environment.design import (
     EnvironmentDesignError,
 )
 from environment.tools import build_environment_tools
+from shared.contracts import ExecutionScope
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -183,6 +184,11 @@ def test_environment_agent_defaults_to_the_semantic_design_protocol() -> None:
     agent = EnvironmentGenerationAgent(initialize_runtime=False)
     prompt = agent.compiler.build_semantic_generation_prompt(
         EnvironmentGenerationRequest(
+            scope=ExecutionScope(
+                session_id="environment-semantic-test",
+                thread_id="environment-semantic-test",
+                snapshot_id="live-environment-semantic-test",
+            ),
             scenario_id="semantic-s3",
             objective="Design an explainable S3 environment",
         )
@@ -219,7 +225,6 @@ def test_semantic_toolchain_excludes_legacy_yaml_mutation_tools_and_writes_desig
         launcher=object(),
         scenario_root=tmp_path,
         execute_simulator=False,
-        semantic_design_mode=True,
     )
     tool_names = {getattr(tool, "name", "") for tool in tools}
 
@@ -234,14 +239,39 @@ def test_semantic_toolchain_excludes_legacy_yaml_mutation_tools_and_writes_desig
     compile_schema = _tool_by_name(tools, "compile_environment_design").args_schema.model_json_schema()
     assert "EnvironmentDesign" in compile_schema["$defs"]
     assert "FlowSlaDesign" in compile_schema["$defs"]
-    catalog_result = json.loads(_tool_by_name(tools, "submit_environment_catalog").invoke({"catalog": catalog}))
-    compile_result = json.loads(_tool_by_name(tools, "compile_environment_design").invoke({"design": design}))
-    validation_result = json.loads(_tool_by_name(tools, "validate_environment_draft").invoke({}))
-    written = json.loads(_tool_by_name(tools, "write_validated_environment_yaml").invoke({}))
+    catalog_result = json.loads(
+        _tool_by_name(tools, "submit_environment_catalog").invoke(
+            {"purpose": "validate_input", "catalog": catalog}
+        )
+    )
+    compile_result = json.loads(
+        _tool_by_name(tools, "compile_environment_design").invoke(
+            {"purpose": "compile_output", "design": design}
+        )
+    )
+    validation_result = json.loads(
+        _tool_by_name(tools, "validate_environment_draft").invoke(
+            {"purpose": "validate_input"}
+        )
+    )
+    written = json.loads(
+        _tool_by_name(tools, "write_validated_environment_yaml").invoke(
+            {"purpose": "persist_output"}
+        )
+    )
+    written_again = json.loads(
+        _tool_by_name(tools, "write_validated_environment_yaml").invoke(
+            {"purpose": "persist_output"}
+        )
+    )
 
     assert catalog_result["status"] == "ok"
     assert compile_result["status"] == "ok"
     assert validation_result["status"] == "ok"
+    assert Path(written["scenario_path"]).parent == tmp_path / "generated"
+    assert Path(written["split_mode_overlay_path"]).parent == tmp_path / "split_mode" / "generated"
+    assert Path(written["topology_graph_path"]).parent == tmp_path / "generated" / "graphs"
+    assert written_again["scenario_path"] == written["scenario_path"]
     design_report = json.loads(Path(written["design_report_path"]).read_text(encoding="utf-8"))
     assert design_report["scenario_rationale"] == design["rationale"]
     assert design_report["design"]["flows"][0]["rationale"] == design["flows"][0]["rationale"]
@@ -266,13 +296,20 @@ def test_semantic_revision_repairs_only_affected_entity_and_blocks_premature_yam
         launcher=object(),
         scenario_root=tmp_path,
         execute_simulator=False,
-        semantic_design_mode=True,
     )
-    _tool_by_name(tools, "submit_environment_catalog").invoke({"catalog": catalog})
+    _tool_by_name(tools, "submit_environment_catalog").invoke(
+        {"purpose": "validate_input", "catalog": catalog}
+    )
     failed = json.loads(
-        _tool_by_name(tools, "compile_environment_design").invoke({"design": design})
+        _tool_by_name(tools, "compile_environment_design").invoke(
+            {"purpose": "compile_output", "design": design}
+        )
     )
-    guarded = json.loads(_tool_by_name(tools, "validate_environment_draft").invoke({}))
+    guarded = json.loads(
+        _tool_by_name(tools, "validate_environment_draft").invoke(
+            {"purpose": "validate_input"}
+        )
+    )
 
     assert failed["status"] == "failed"
     assert failed["required_action"] == "revise_environment_design"
@@ -283,13 +320,17 @@ def test_semantic_revision_repairs_only_affected_entity_and_blocks_premature_yam
 
     repaired = json.loads(
         _tool_by_name(tools, "revise_environment_design").invoke(
-            {"revision": {"flows": [original_flow]}}
+            {"purpose": "compile_output", "revision": {"flows": [original_flow]}}
         )
     )
 
     assert repaired["status"] == "ok"
     assert repaired["revision_applied"] == [f"flows.{original_flow['key']}"]
-    assert json.loads(_tool_by_name(tools, "validate_environment_draft").invoke({}))["status"] == "ok"
+    assert json.loads(
+        _tool_by_name(tools, "validate_environment_draft").invoke(
+            {"purpose": "validate_input"}
+        )
+    )["status"] == "ok"
 
 
 def test_combined_design_context_loads_runtime_only_from_the_trusted_scenario_root() -> None:
@@ -298,10 +339,13 @@ def test_combined_design_context_loads_runtime_only_from_the_trusted_scenario_ro
         launcher=object(),
         scenario_root=SCENARIO_ROOT,
         execute_simulator=False,
-        semantic_design_mode=True,
     )
 
-    runtime_reference = json.loads(_tool_by_name(tools, "prepare_environment_design_context").invoke({}))
+    runtime_reference = json.loads(
+        _tool_by_name(tools, "prepare_environment_design_context").invoke(
+            {"purpose": "retrieve_context"}
+        )
+    )
 
     assert runtime_reference["runtime"]["free5gc"]["mode"] == "ulcl"
     assert runtime_reference["runtime"]["split_mode_ns3"]["policy_reload_ms"] == 100
@@ -316,11 +360,16 @@ def test_infeasible_llm_metric_is_reported_without_silent_repair(tmp_path: Path)
         launcher=object(),
         scenario_root=tmp_path,
         execute_simulator=False,
-        semantic_design_mode=True,
     )
-    _tool_by_name(tools, "submit_environment_catalog").invoke({"catalog": catalog})
+    _tool_by_name(tools, "submit_environment_catalog").invoke(
+        {"purpose": "validate_input", "catalog": catalog}
+    )
 
-    result = json.loads(_tool_by_name(tools, "compile_environment_design").invoke({"design": design}))
+    result = json.loads(
+        _tool_by_name(tools, "compile_environment_design").invoke(
+            {"purpose": "compile_output", "design": design}
+        )
+    )
 
     assert result["status"] == "failed"
     assert result["phase"] == "compiled_candidate_validation"
@@ -338,10 +387,13 @@ def test_s3_catalog_floor_is_rejected_before_detailed_design(tmp_path: Path) -> 
         launcher=object(),
         scenario_root=tmp_path,
         execute_simulator=False,
-        semantic_design_mode=True,
     )
 
-    result = json.loads(_tool_by_name(tools, "submit_environment_catalog").invoke({"catalog": catalog}))
+    result = json.loads(
+        _tool_by_name(tools, "submit_environment_catalog").invoke(
+            {"purpose": "validate_input", "catalog": catalog}
+        )
+    )
 
     assert result["status"] == "failed"
     assert any("requires at least 15 flows" in error for error in result["errors"])

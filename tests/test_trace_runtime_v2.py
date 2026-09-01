@@ -17,8 +17,10 @@ from shared.contracts import (
     ToolCall,
     ToolCatalog,
     ToolContract,
+    TraceDatasetManifest,
     TraceMetadata,
     TraceTarget,
+    TraceWorkerManifest,
 )
 from shared.runtime import (
     AgentRuntimeContext,
@@ -26,6 +28,8 @@ from shared.runtime import (
     JsonlTraceWriter,
     StructuredToolLoop,
     ToolLoopExecutionError,
+    finalize_trace_dataset_run,
+    finalize_trace_worker,
 )
 from shared.runtime.trace import build_agent_trace
 
@@ -84,7 +88,12 @@ def test_success_trace_round_trips_through_jsonl_writer(tmp_path) -> None:
         ],
     )
 
-    path = JsonlTraceWriter("decision_agent", root=tmp_path).write(trace)
+    path = JsonlTraceWriter(
+        "decision_agent",
+        root=tmp_path,
+        dataset_run_id="dataset-run-1",
+        worker_id="worker-1",
+    ).write(trace)
     rows = path.read_text(encoding="utf-8").splitlines()
 
     assert len(rows) == 1
@@ -94,6 +103,23 @@ def test_success_trace_round_trips_through_jsonl_writer(tmp_path) -> None:
         "observed_model_output",
         "validated_output",
     ]
+    worker_manifest_path = finalize_trace_worker(
+        dataset_run_id="dataset-run-1",
+        worker_id="worker-1",
+        root=tmp_path,
+    )
+    worker_manifest = TraceWorkerManifest.model_validate_json(
+        worker_manifest_path.read_text(encoding="utf-8")
+    )
+    assert worker_manifest.record_count == 1
+    assert worker_manifest.segments[0].sha256
+
+    dataset_manifest_path = finalize_trace_dataset_run("dataset-run-1", root=tmp_path)
+    dataset_manifest = TraceDatasetManifest.model_validate_json(
+        dataset_manifest_path.read_text(encoding="utf-8")
+    )
+    assert dataset_manifest.record_count == 1
+    assert dataset_manifest.workers[0].worker_id == "worker-1"
 
 
 def test_context_policy_never_rewrites_tool_evidence() -> None:
@@ -153,6 +179,39 @@ def test_tool_output_must_match_the_catalog_output_schema() -> None:
             context=AgentRuntimeContext(agent_name="decision_agent", scope=_scope()),
             tool_call_id="call-1",
         )
+
+
+def test_tool_input_is_validated_before_the_function_is_called() -> None:
+    calls: list[dict[str, object]] = []
+    loop = object.__new__(StructuredToolLoop)
+    loop.tools_by_name = {
+        "lookup": SimpleNamespace(func=lambda **kwargs: calls.append(kwargs) or {"accepted": True})
+    }
+    loop.tool_contracts_by_name = {
+        "lookup": ToolContract(
+            name="lookup",
+            description="Return a typed acceptance decision.",
+            input_schema={
+                "type": "object",
+                "properties": {"state_id": {"type": "string", "minLength": 1}},
+                "required": ["state_id"],
+                "additionalProperties": False,
+            },
+            output_schema={"type": "object"},
+            side_effect="read",
+            result_format="json",
+        )
+    }
+    loop.context_policy = ContextPolicy()
+
+    with pytest.raises(ValueError, match="input violates input_schema"):
+        loop._invoke_tool(
+            "lookup",
+            {},
+            context=AgentRuntimeContext(agent_name="decision_agent", scope=_scope()),
+            tool_call_id="call-1",
+        )
+    assert calls == []
 
 
 def test_tool_failure_trace_keeps_unresolved_call_as_error_evidence() -> None:

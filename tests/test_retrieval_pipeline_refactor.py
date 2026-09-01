@@ -122,7 +122,7 @@ def test_pipeline_keeps_raw_evaluator_limit_but_tool_boundary_rejects_it(monkeyp
     monkeypatch.setattr(knowledge_tool, "run_semantic_knowledge_pipeline", fake_public_pipeline)
     with pytest.raises(ValueError, match="less than or equal to 30"):
         knowledge_tool.search_semantic_knowledge.func(
-            reason="test limit boundary",
+            purpose="retrieve_context",
             query="tool limit",
             limit=61,
             runtime=_tool_runtime(),

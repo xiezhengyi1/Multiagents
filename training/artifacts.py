@@ -6,6 +6,8 @@ from typing import Any, Iterable, Mapping
 
 from pydantic import BaseModel
 
+from shared.runtime.io.paths import current_trace_segment_path
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRAINING_ROOT = PROJECT_ROOT / "training"
@@ -16,7 +18,7 @@ def processed_dir(agent_name: str) -> Path:
 
 
 def raw_trace_path(agent_name: str) -> Path:
-    return TRAINING_ROOT / agent_name / "raw_traces" / f"{agent_name}.jsonl"
+    return current_trace_segment_path(agent_name)
 
 
 def read_json(path: Path) -> Any:

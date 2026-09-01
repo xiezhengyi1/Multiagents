@@ -9,6 +9,7 @@ from uuid import uuid4
 from shared.contracts import (
     AgentMessage,
     AgentTrace,
+    ExecutionScope,
     ToolCall,
     ToolCatalog,
     ToolContract,
@@ -58,9 +59,12 @@ def write_deterministic_execution_trace(
     request_envelope: Any,
     trace_metadata: dict[str, Any] | None = None,
 ) -> None:
-    scope = request_envelope.scope.model_copy(
-        update={"supi": str(policy_plan.get("supi") or "").strip() or None}
-    )
+    scope_payload = policy_plan.get("scope")
+    if not isinstance(scope_payload, dict):
+        raise TypeError("PolicyPlanDraft trace payload requires an object-valued scope")
+    scope = ExecutionScope.model_validate(scope_payload)
+    if scope != request_envelope.scope:
+        raise ValueError("PolicyPlanDraft trace scope must match its request envelope scope")
     messages = [
         AgentMessage(role="system", content=system_prompt),
         AgentMessage(
@@ -161,6 +165,10 @@ def _build_trace_messages(
     feedback_report: dict[str, Any],
 ) -> list[AgentMessage]:
     messages: list[AgentMessage] = []
+    scope_payload = policy_plan.get("scope")
+    if not isinstance(scope_payload, dict):
+        raise TypeError("PolicyPlanDraft trace payload requires an object-valued scope")
+    scope = ExecutionScope.model_validate(scope_payload)
     metrics = _decode_metrics_payload(outcome)
     failure_phase = str(outcome.feedback_payload.get("phase") or "").strip()
 
@@ -208,8 +216,8 @@ def _build_trace_messages(
                 "policy_id": receipt.get("policy_id"),
                 "policy_type": receipt.get("policy_type"),
                 "flow_id": receipt.get("flow_id"),
-                "session_id": policy_plan.get("session_id"),
-                "snapshot_id": policy_plan.get("snapshot_id"),
+                "session_id": scope.session_id,
+                "snapshot_id": scope.snapshot_id,
             },
             result=receipt,
             status=receipt_status,
@@ -226,7 +234,7 @@ def _build_trace_messages(
             arguments={
                 "policy_id": verdict.get("policy_id"),
                 "flow_id": verdict.get("flow_id"),
-                "snapshot_id": policy_plan.get("snapshot_id"),
+                "snapshot_id": scope.snapshot_id,
             },
             result=verdict,
             status="success" if verdict_status in {"satisfied", "skipped"} else "error",
@@ -245,10 +253,10 @@ def _build_trace_messages(
             messages,
             tool_name="commit_policy_updates",
             arguments={
-                "supi": policy_plan.get("supi"),
+                "supi": scope.supi,
                 "policy_ids": [policy.get("policy_id") for policy in policies],
-                "session_id": policy_plan.get("session_id"),
-                "snapshot_id": policy_plan.get("snapshot_id"),
+                "session_id": scope.session_id,
+                "snapshot_id": scope.snapshot_id,
             },
             result={"status": "committed"},
             status="success",

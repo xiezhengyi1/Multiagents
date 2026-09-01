@@ -5,7 +5,7 @@ from math import isfinite
 from typing import Any, Iterable
 
 from .contracts import EnvironmentGenerationRequest, EnvironmentValidationReport, ScenarioCandidate
-from .prompts import GENERATION_PROMPT_TEMPLATE, SEMANTIC_GENERATION_PROMPT_TEMPLATE
+from .prompts import SEMANTIC_GENERATION_PROMPT_TEMPLATE
 
 
 S3_QUALITY_PROFILE = "s3"
@@ -40,25 +40,6 @@ class EnvironmentAgentCompiler:
         "bridge",
     )
     REQUIRED_OVERLAY_FIELDS = ("name", "scenario_id", "base_scenario", "ns3", "runtime", "radio")
-
-    def build_generation_prompt(
-        self,
-        request: EnvironmentGenerationRequest,
-        *,
-        quality_profile: str | None = S3_QUALITY_PROFILE,
-    ) -> str:
-        quality_requirements = self.quality_requirements(quality_profile)
-        return GENERATION_PROMPT_TEMPLATE.format(
-            scenario_id=request.scenario_id,
-            objective=request.objective,
-            complexity=request.complexity,
-            target_flow_count=request.target_flow_count,
-            topology_mode=request.topology_mode,
-            stress_mode=request.stress_mode,
-            output_dir=request.output_dir,
-            quality_profile=quality_profile or "schema-only",
-            quality_requirements=quality_requirements,
-        )
 
     def build_semantic_generation_prompt(
         self,
@@ -110,7 +91,11 @@ class EnvironmentAgentCompiler:
 
         errors.extend(self._validate_root_fields(scenario))
         if errors:
-            return EnvironmentValidationReport(candidate.scenario_id, ok=False, errors=tuple(errors))
+            return EnvironmentValidationReport(
+                scenario_id=candidate.scenario_id,
+                ok=False,
+                errors=tuple(errors),
+            )
         self._validate_loader_contract(scenario, errors)
 
         slice_labels = self._collect_unique_strings(scenario.get("slices"), "label", errors, "slice")

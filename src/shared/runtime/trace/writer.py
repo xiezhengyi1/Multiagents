@@ -9,8 +9,13 @@ from pydantic import BaseModel
 
 from shared.contracts import AgentInvocation, AgentRunResult, AgentTrace, ToolCatalog, TraceTarget, utc_now
 from shared.runtime.core.context import AgentRuntimeContext
-from shared.runtime.io.paths import trace_root
+from shared.runtime.io.paths import (
+    current_trace_identity,
+    trace_runs_root,
+    trace_segment_path,
+)
 from shared.runtime.trace.builder import build_agent_trace
+from shared.runtime.trace.dataset import open_trace_segment, record_trace_append
 
 _FILE_LOCKS: dict[Path, threading.Lock] = {}
 _LOCK_GUARD = threading.Lock()
@@ -26,14 +31,35 @@ def _file_lock(path: Path) -> threading.Lock:
 
 
 class JsonlTraceWriter:
-    def __init__(self, agent_name: str, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        agent_name: str,
+        root: Path | None = None,
+        *,
+        dataset_run_id: str | None = None,
+        worker_id: str | None = None,
+    ) -> None:
         normalized_agent = str(agent_name).strip()
         if not normalized_agent:
             raise ValueError("agent_name is required for trace writing")
+        current_run_id, current_worker_id = current_trace_identity()
         self.agent_name = normalized_agent
-        self.root = Path(root) if root is not None else trace_root(normalized_agent)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.path = self.root / f"{self.agent_name}.jsonl"
+        self.dataset_run_id = dataset_run_id or current_run_id
+        self.worker_id = worker_id or current_worker_id
+        self.root = Path(root) if root is not None else trace_runs_root()
+        self.path = trace_segment_path(
+            self.agent_name,
+            dataset_run_id=self.dataset_run_id,
+            worker_id=self.worker_id,
+            root=self.root,
+        )
+        self._manifest = open_trace_segment(
+            segment_path=self.path,
+            dataset_run_id=self.dataset_run_id,
+            worker_id=self.worker_id,
+            agent_name=self.agent_name,
+            root=self.root,
+        )
 
     def write(self, trace: AgentTrace) -> Path:
         if trace.agent_name != self.agent_name:
@@ -46,6 +72,7 @@ class JsonlTraceWriter:
             with self.path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(payload)
                 handle.write("\n")
+            self._manifest = record_trace_append(self.path, self._manifest)
         return self.path
 
 

@@ -12,7 +12,6 @@ from shared.contracts import (
     AgentInvocation,
     AgentMessage,
     AgentRunResult,
-    ExecutionScope,
     TraceMetadata,
     TraceTarget,
 )
@@ -155,7 +154,6 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
                 scenario_root=scenario_root or (project_root / "experiments" / "scenarios"),
                 execute_simulator=True,
                 quality_profile=self.quality_profile,
-                semantic_design_mode=True,
                 logger=self.logger,
             )
         self.agent = self.create_json_agent(
@@ -185,27 +183,19 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         return "ScenarioCandidate"
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> dict[str, Any]:
-        request = EnvironmentGenerationRequest(**dict(envelope.payload or {}))
-        candidate = self.generate_environment(
-            request,
-            session_id=envelope.scope.session_id,
-            snapshot_id=envelope.scope.snapshot_id or "",
-        )
-        return {
-            "scenario_id": candidate.scenario_id,
-            "name": candidate.name,
-            "scenario": candidate.scenario,
-            "split_mode_overlay": candidate.split_mode_overlay,
-        }
+        request = EnvironmentGenerationRequest.model_validate(envelope.payload)
+        if envelope.scope != request.scope:
+            raise ValueError("EnvironmentGenerationRequest scope must match its envelope scope")
+        candidate = self.generate_environment(request)
+        return candidate.model_dump(mode="json")
 
     def generate_environment(
         self,
         request: EnvironmentGenerationRequest,
-        *,
-        session_id: str = "",
-        snapshot_id: str = "",
     ) -> ScenarioCandidate:
         self.ensure_worker_runtime_initialized()
+        session_id = request.scope.session_id
+        snapshot_id = request.scope.snapshot_id
         total_start = time.perf_counter()
         log_event(
             self.logger,
@@ -242,11 +232,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         )
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
-            scope=ExecutionScope(
-                session_id=session_id,
-                thread_id=session_id,
-                snapshot_id=snapshot_id or None,
-            ),
+            scope=request.scope,
         )
         invocation = AgentInvocation(
             messages=[AgentMessage(role="user", content=prompt)],
@@ -283,7 +269,7 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
             simulation_payloads = _extract_simulation_payloads(result)
             if not simulation_validation_succeeded(simulation_payloads):
                 raise RuntimeError("Environment advisor returned without successful real simulator validation evidence")
-            output = coerce_structured_response(
+            coerce_structured_response(
                 result,
                 EnvironmentAdvisorOutput,
                 error_message="Environment advisor returned no structured_response",

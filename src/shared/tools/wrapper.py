@@ -3,47 +3,51 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from typing import Any, Callable, Literal
+from typing import Any, Callable, get_args
 
 from langchain.tools import tool
 
+from shared.contracts import ToolPurpose
+
+
 logger = logging.getLogger(__name__)
+_TOOL_PURPOSES = frozenset(get_args(ToolPurpose))
 
 
-def tool_with_reason(
+def tool_with_purpose(
     *,
-    side_effect: Literal["read", "write", "external_action"],
-    result_format: Literal["json", "text"],
+    side_effect: str,
+    result_format: str,
     output_schema: dict[str, Any] | None = None,
     return_direct: bool = False,
 ):
+    """Expose a tool with a short, typed, trace-visible invocation purpose."""
+
     def decorator(fn: Callable):
         original_sig = inspect.signature(fn)
         original_doc = fn.__doc__ or ""
 
         @functools.wraps(fn)
-        def wrapper(reason: str = "", **kwargs):
-            if reason:
-                logger.info("[ToolReason] %s: %s", fn.__name__, reason)
+        def wrapper(purpose: ToolPurpose, **kwargs):
+            if purpose not in _TOOL_PURPOSES:
+                raise ValueError(f"unsupported tool purpose: {purpose}")
+            logger.info("[ToolPurpose] %s: %s", fn.__name__, purpose)
             return fn(**kwargs)
 
-        wrapper.__annotations__ = {"reason": str, **fn.__annotations__}
-
-        reason_param = inspect.Parameter(
-            "reason",
+        wrapper.__annotations__ = {"purpose": ToolPurpose, **fn.__annotations__}
+        purpose_param = inspect.Parameter(
+            "purpose",
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            annotation=str,
+            annotation=ToolPurpose,
         )
-        new_params = [reason_param] + list(original_sig.parameters.values())
         wrapper.__signature__ = inspect.Signature(
-            new_params,
+            [purpose_param, *original_sig.parameters.values()],
             return_annotation=original_sig.return_annotation,
         )
         wrapper.__doc__ = (
             f"{original_doc}\n\n"
             "Args:\n"
-            "    reason: (Required) Explain why you are calling this tool "
-            "and what you expect to learn or accomplish."
+            "    purpose: Required typed purpose for this invocation; it is recorded as audit metadata."
         )
 
         structured_tool = tool(wrapper, return_direct=return_direct)
@@ -60,7 +64,4 @@ def tool_with_reason(
     return decorator
 
 
-@tool_with_reason(side_effect="read", result_format="text")
-def think_tool(message: str) -> str:
-    """Return a scratchpad message for internal reasoning traces."""
-    return message
+__all__ = ["tool_with_purpose"]
