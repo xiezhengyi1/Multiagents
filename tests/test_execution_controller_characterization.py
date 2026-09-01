@@ -181,10 +181,11 @@ def test_execute_partial_dispatch_failure_preserves_scope_attempts_and_retry_for
     assert outcome.execution_status == "Partial Success"
     assert outcome.failure_scope == "mobility"
     assert outcome.dispatch_attempts == 2
-    assert outcome.feedback_payload["phase"] == "execution"
-    assert outcome.feedback_payload["successful_policy_ids"] == ["sm-1"]
-    assert outcome.feedback_payload["failed_policy_ids"] == ["am-1"]
-    assert outcome.feedback_payload["retry_forbidden"] is True
+    assert outcome.feedback_payload is not None
+    assert outcome.feedback_payload.phase == "execution"
+    assert outcome.feedback_payload.successful_policy_ids == ["sm-1"]
+    assert outcome.feedback_payload.failed_policy_ids == ["am-1"]
+    assert outcome.feedback_payload.retry_forbidden is True
     assert metrics["dispatch_attempts"] == 2
     assert metrics["dispatch_results"][1]["status"] == "failed"
     assert metrics["dispatch_results"][1]["feedback_payload"]["retry_forbidden"] is True

@@ -20,6 +20,26 @@ IntentStatus = Literal["satisfied", "partially_satisfied", "unsatisfied"]
 FailureScope = Literal["none", "qos", "mobility", "mixed", "compile"]
 
 
+class CompileControllerFeedback(ContractModel):
+    phase: Literal["compile"] = "compile"
+    error: NonEmptyStr
+
+
+class ExecutionControllerFeedback(ContractModel):
+    phase: Literal["execution"] = "execution"
+    failure_scope: Literal["qos", "mobility", "mixed"]
+    successful_policy_ids: list[NonEmptyStr]
+    failed_policy_ids: list[NonEmptyStr]
+    failures: list[dict[str, JsonValue]]
+    retry_forbidden: bool
+
+
+ControllerFeedback = Annotated[
+    CompileControllerFeedback | ExecutionControllerFeedback,
+    Field(discriminator="phase"),
+]
+
+
 class DomainExecutionReceipts(ContractModel):
     qos: list[dict[str, JsonValue]]
     mobility: list[dict[str, JsonValue]]
@@ -46,7 +66,7 @@ class CompileFailureMetrics(ContractModel):
     metrics_kind: Literal["compile_failure"] = "compile_failure"
     dispatch_attempts: Literal[0] = 0
     failure_scope: Literal["compile"] = "compile"
-    feedback_payload: dict[str, JsonValue]
+    feedback_payload: CompileControllerFeedback
 
 
 ExecutionMetrics = Annotated[
@@ -62,7 +82,6 @@ class ExecutionResultContract(ContractModel):
     performance_metrics: ExecutionMetrics
     violation_details: NonEmptyStr
     failure_scope: FailureScope
-    feedback_payload: dict[str, JsonValue]
     dispatch_attempts: int = Field(ge=0)
 
     @model_validator(mode="after")
@@ -72,8 +91,6 @@ class ExecutionResultContract(ContractModel):
         if isinstance(self.performance_metrics, CompileFailureMetrics):
             if self.execution_status != "Failed" or self.failure_scope != "compile":
                 raise ValueError("compile_failure metrics require Failed status and compile scope")
-            if not self.feedback_payload:
-                raise ValueError("compile failure requires feedback_payload")
             return self
         if self.performance_metrics.policy_plan.scope != self.scope:
             raise ValueError("execution result scope must match performance_metrics.policy_plan.scope")
@@ -90,18 +107,37 @@ class ExecutionResultContract(ContractModel):
 class ExecutionOutcome(ExecutionResultContract):
     """Typed controller result before dispatch feedback enrichment."""
 
+    feedback_payload: ControllerFeedback | None
+
     @model_validator(mode="after")
     def validate_controller_feedback(self) -> "ExecutionOutcome":
-        if self.execution_status == "Success" and self.feedback_payload:
-            raise ValueError("successful controller outcome cannot contain feedback_payload")
+        if isinstance(self.performance_metrics, CompileFailureMetrics):
+            if not isinstance(self.feedback_payload, CompileControllerFeedback):
+                raise ValueError("compile failure requires CompileControllerFeedback")
+            if self.feedback_payload != self.performance_metrics.feedback_payload:
+                raise ValueError("compile feedback must match performance_metrics feedback")
+            return self
+        if self.execution_status == "Success":
+            if self.feedback_payload is not None:
+                raise ValueError("successful controller outcome cannot contain feedback_payload")
+            return self
+        if not isinstance(self.feedback_payload, ExecutionControllerFeedback):
+            raise ValueError("failed dispatch requires ExecutionControllerFeedback")
+        if self.feedback_payload.failure_scope != self.failure_scope:
+            raise ValueError("controller feedback failure_scope must match outcome failure_scope")
+        if self.feedback_payload.failures != self.performance_metrics.failure_summaries:
+            raise ValueError("controller feedback failures must match performance metric failure summaries")
         return self
 
 
 __all__ = [
     "CompileFailureMetrics",
+    "CompileControllerFeedback",
+    "ControllerFeedback",
     "DispatchExecutionMetrics",
     "DomainExecutionReceipts",
     "ExecutionMetrics",
+    "ExecutionControllerFeedback",
     "ExecutionOutcome",
     "ExecutionResultContract",
     "ExecutionStatus",

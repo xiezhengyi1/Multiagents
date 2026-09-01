@@ -76,6 +76,35 @@ def _dispatch_metrics(
         "failure_summaries": failure_summaries or [],
     }
 
+
+def _dispatch_failure_feedback(
+    *,
+    dispatch_attempts: int,
+    failures: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "feedback_kind": "dispatch_failure",
+        "supi": "imsi-001",
+        "policy_id": "sm-1",
+        "flow_id": "flow-1",
+        "reason": "gateway rejected sm-1",
+        "dispatch_attempts": dispatch_attempts,
+        "target_bindings_at_risk": ["flow-1"],
+        "policy_objects_at_risk": ["sm-1"],
+        "reason_by_domain": {"qos": "gateway rejected policy"},
+        "controller_feedback": {
+            "phase": "execution",
+            "failure_scope": "qos",
+            "successful_policy_ids": [],
+            "failed_policy_ids": ["sm-1"],
+            "failures": failures,
+            "retry_forbidden": False,
+        },
+        "failure_scope": "qos",
+        "failures": failures,
+        "retry_forbidden": False,
+    }
+
 from control_runtime.orchestrators.loop_state import (
     ControlRoundSnapshot,
     OrchestratorLoopState,
@@ -678,7 +707,7 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
         ),
         violation_details="none",
         failure_scope="none",
-        feedback_payload={},
+        feedback_payload=None,
         dispatch_attempts=1,
     )
     conflict_tool = _RecordingConflictTool(_conflict_result())
@@ -724,6 +753,7 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
         lambda _: {"snapshot_id": "snapshot-1", "apps": [], "slices": [], "nodes": []},
     )
     monkeypatch.setattr(round_execution, "get_ue_context_by_supi", lambda *_args, **_kwargs: {})
+    failures = [{"phase": "dispatch", "policy_id": "sm-1"}]
     report = FeedbackReport(
         scope=_execution_scope(2),
         execution_status="Failed",
@@ -731,15 +761,11 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
             [{"status": "failed", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}],
             scope=_execution_scope(2),
             dispatch_attempts=1,
+            failure_summaries=failures,
         ),
         violation_details="policy gateway rejected sm-1",
         failure_scope="qos",
-        feedback_payload={
-            "target_bindings_at_risk": ["flow-1"],
-            "policy_objects_at_risk": ["sm-1"],
-            "reason_by_domain": {"qos": "gateway rejected policy"},
-            "failures": [{"phase": "dispatch", "policy_id": "sm-1"}],
-        },
+        feedback_payload=_dispatch_failure_feedback(dispatch_attempts=1, failures=failures),
         dispatch_attempts=1,
     )
 
@@ -1136,13 +1162,19 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
     grounding = _grounding_decision()
     policy_plan = _qos_plan()
 
+    first_failures = [{"phase": "dispatch", "policy_id": "sm-1"}]
     first_report = FeedbackReport(
         scope=_execution_scope(),
         execution_status="Failed",
-        performance_metrics=_dispatch_metrics([], scope=_execution_scope(), dispatch_attempts=0),
+        performance_metrics=_dispatch_metrics(
+            [],
+            scope=_execution_scope(),
+            dispatch_attempts=0,
+            failure_summaries=first_failures,
+        ),
         violation_details="gateway rejected sm-1",
         failure_scope="qos",
-        feedback_payload={"target_bindings_at_risk": ["flow-1"]},
+        feedback_payload=_dispatch_failure_feedback(dispatch_attempts=0, failures=first_failures),
         dispatch_attempts=0,
     )
     first_reentry = ExecutionReentryRequest(
@@ -1158,7 +1190,7 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
         performance_metrics=_dispatch_metrics([], scope=_execution_scope(2), dispatch_attempts=0),
         violation_details="none",
         failure_scope="none",
-        feedback_payload={},
+        feedback_payload=None,
         dispatch_attempts=0,
     )
 
@@ -1546,7 +1578,7 @@ def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_art
         ),
         violation_details="none",
         failure_scope="none",
-        feedback_payload={},
+        feedback_payload=None,
         dispatch_attempts=1,
     )
     conflict_tool = _RecordingConflictTool(_conflict_result())
@@ -1639,7 +1671,7 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
         ),
         violation_details="none",
         failure_scope="none",
-        feedback_payload={},
+        feedback_payload=None,
         dispatch_attempts=1,
     )
 
@@ -1656,7 +1688,8 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
     assert artifacts.completed is True
     assert artifacts.report is not report
     assert artifacts.report.intent_status == "partially_satisfied"
-    assert artifacts.report.feedback_payload == {
+    assert artifacts.report.feedback_payload.model_dump(mode="json") == {
+        "feedback_kind": "partial_intent",
         "intent_status": "partially_satisfied",
         "intent_blockers": ["flow-2"],
         "upstream_requests": ["reground flow-2"],

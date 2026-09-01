@@ -8,9 +8,11 @@ from shared.logging import log_event, log_timing, setup_logger
 
 from .assurance_evaluator import AssuranceEvaluator
 from .contracts import (
+    CompileControllerFeedback,
     CompileFailureMetrics,
     DispatchExecutionMetrics,
     DomainExecutionReceipts,
+    ExecutionControllerFeedback,
     ExecutionOutcome,
 )
 from .policy_batch_executor import PolicyBatchExecutor
@@ -47,15 +49,16 @@ class ExecutionController:
         detail: str,
         feedback_payload: Dict[str, Any],
     ) -> ExecutionOutcome:
+        controller_feedback = CompileControllerFeedback.model_validate(feedback_payload)
         return ExecutionOutcome(
             scope=scope,
             execution_status="Failed",
             performance_metrics=CompileFailureMetrics(
-                feedback_payload=feedback_payload,
+                feedback_payload=controller_feedback,
             ),
             violation_details=detail,
             failure_scope="compile",
-            feedback_payload=feedback_payload,
+            feedback_payload=controller_feedback,
             dispatch_attempts=0,
         )
 
@@ -159,20 +162,20 @@ class ExecutionController:
                 failed_policy_count=len(failed_policy_ids),
                 successful_policy_count=len(successful_policy_ids),
             )
+            controller_feedback = ExecutionControllerFeedback(
+                failure_scope=failure_scope,
+                successful_policy_ids=successful_policy_ids,
+                failed_policy_ids=failed_policy_ids,
+                failures=failures,
+                retry_forbidden=retry_forbidden,
+            )
             return ExecutionOutcome(
                 scope=plan.scope,
                 execution_status=execution_status,
                 performance_metrics=performance_metrics,
                 violation_details=violation_details or "execution failed",
                 failure_scope=failure_scope,
-                feedback_payload={
-                    "phase": "execution",
-                    "failure_scope": failure_scope,
-                    "successful_policy_ids": successful_policy_ids,
-                    "failed_policy_ids": failed_policy_ids,
-                    "failures": failures,
-                    "retry_forbidden": retry_forbidden,
-                },
+                feedback_payload=controller_feedback,
                 dispatch_attempts=total_dispatch_attempts,
             )
 
@@ -202,7 +205,7 @@ class ExecutionController:
             performance_metrics=performance_metrics,
             violation_details="None",
             failure_scope="none",
-            feedback_payload={},
+            feedback_payload=None,
             dispatch_attempts=total_dispatch_attempts,
         )
 

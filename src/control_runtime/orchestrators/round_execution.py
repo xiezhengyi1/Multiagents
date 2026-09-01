@@ -9,7 +9,11 @@ from typing import Any, Dict, List, Optional
 from shared.contracts import ExecutionScope
 
 from ..agents.dispatch.agent import PolicyDispatchAgent
-from ..agents.dispatch.contracts import FeedbackReport
+from ..agents.dispatch.contracts import (
+    DispatchFailureFeedback,
+    FeedbackReport,
+    PartialIntentFeedback,
+)
 from ..agents.grounding.contracts import GroundingDecision
 from ..agents.main.contracts import ControlDomain, GlobalControlIntent
 from ..agents.planning.contracts import PolicyPlanDraft
@@ -376,8 +380,11 @@ def _build_domain_feedback(
         "assurance_verdicts": mobility_verdicts,
         "failure_scope": str(report.failure_scope or "").strip(),
     }
-    if mobility_feedback["status"] != "success" and report.feedback_payload:
-        mobility_feedback["error"] = str(report.feedback_payload.get("error") or report.violation_details or "").strip()
+    if mobility_feedback["status"] != "success" and isinstance(
+        report.feedback_payload,
+        DispatchFailureFeedback,
+    ):
+        mobility_feedback["error"] = report.feedback_payload.reason
     return qos_feedback, mobility_feedback
 
 
@@ -430,14 +437,9 @@ def _dispatch_mediated_plan(
             prior_details = str(report.violation_details or "").strip()
             if prior_details and prior_details.lower() != "none":
                 partial_summary = f"{prior_details}; {partial_summary}"
-            feedback_payload = dict(report.feedback_payload or {})
-            feedback_payload.update(
-                {
-                    "intent_status": "partially_satisfied",
-                    "intent_blockers": intent_blockers,
-                    "upstream_requests": list(policy_plan.upstream_requests or []),
-                    "planning_status": "partial_plan",
-                }
+            feedback_payload = PartialIntentFeedback(
+                intent_blockers=intent_blockers,
+                upstream_requests=list(policy_plan.upstream_requests),
             )
             report = FeedbackReport.model_validate(
                 {
@@ -527,17 +529,19 @@ def _diagnose_round(
         )
     execution_reentry = None
     if report is not None and report.execution_status != "Success":
-        feedback_payload = report.feedback_payload if isinstance(report.feedback_payload, dict) else {}
-        if not bool(feedback_payload.get("retry_forbidden")):
+        feedback_payload = report.feedback_payload
+        if not isinstance(feedback_payload, DispatchFailureFeedback):
+            raise TypeError("non-successful FeedbackReport requires DispatchFailureFeedback")
+        if not feedback_payload.retry_forbidden:
             execution_reentry = ExecutionReentryRequest(
                 round_index=scope.round_index,
                 source_agent="policy_dispatch",
                 recommended_consumers=[],
-                target_bindings_at_risk=list(feedback_payload.get("target_bindings_at_risk") or []),
-                policy_objects_at_risk=list(feedback_payload.get("policy_objects_at_risk") or []),
-                reason_by_domain=dict(feedback_payload.get("reason_by_domain") or {}),
-                failure_scope=str(report.failure_scope or "none"),
-                failures=list(feedback_payload.get("failures") or []),
+                target_bindings_at_risk=feedback_payload.target_bindings_at_risk,
+                policy_objects_at_risk=feedback_payload.policy_objects_at_risk,
+                reason_by_domain=feedback_payload.reason_by_domain,
+                failure_scope=report.failure_scope,
+                failures=feedback_payload.failures,
                 summary=str(report.violation_details or diagnosis.get("reason_summary") or "").strip(),
             )
     return _AssuranceResult(diagnosis=diagnosis, execution_reentry=execution_reentry)

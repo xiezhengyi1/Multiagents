@@ -10,6 +10,7 @@ from control_runtime.execution import ExecutionOutcome
 from control_runtime.execution.contracts import (
     DispatchExecutionMetrics,
     DomainExecutionReceipts,
+    ExecutionControllerFeedback,
 )
 from shared.contracts import AgentTrace, ArtifactEnvelope, ExecutionScope
 from shared.runtime.trace.execution import write_deterministic_execution_trace
@@ -87,13 +88,26 @@ def _policy_plan() -> dict[str, Any]:
     }
 
 
-def _outcome(*, dispatch_status: str, feedback_payload: dict[str, Any]) -> ExecutionOutcome:
+def _outcome(*, dispatch_status: str) -> ExecutionOutcome:
     receipt = {
         "status": dispatch_status,
         "policy_id": "sm-1",
         "policy_type": "SmPolicyDecision",
         "flow_id": "flow-1",
     }
+    failures = (
+        []
+        if dispatch_status == "success"
+        else [
+            {
+                "domain": "qos",
+                "policy_id": "sm-1",
+                "policy_type": "SmPolicyDecision",
+                "flow_id": "flow-1",
+                "error": "gateway rejected",
+            }
+        ]
+    )
     performance_metrics = DispatchExecutionMetrics(
         policy_plan={
             "scope": _policy_plan()["scope"],
@@ -113,7 +127,18 @@ def _outcome(*, dispatch_status: str, feedback_payload: dict[str, Any]) -> Execu
         ),
         dispatch_attempts=1,
         domain_receipts=DomainExecutionReceipts(qos=[receipt], mobility=[]),
-        failure_summaries=[] if dispatch_status == "success" else [feedback_payload],
+        failure_summaries=failures,
+    )
+    feedback_payload = (
+        None
+        if dispatch_status == "success"
+        else ExecutionControllerFeedback(
+            failure_scope="qos",
+            successful_policy_ids=[],
+            failed_policy_ids=["sm-1"],
+            failures=failures,
+            retry_forbidden=False,
+        )
     )
     return ExecutionOutcome(
         scope=ExecutionScope.model_validate(_policy_plan()["scope"]),
@@ -132,7 +157,7 @@ def _tool_results(trace: AgentTrace) -> dict[str, Any]:
 
 def test_deterministic_execution_trace_projects_successful_execution() -> None:
     writer = _RecordingWriter()
-    outcome = _outcome(dispatch_status="success", feedback_payload={})
+    outcome = _outcome(dispatch_status="success")
     feedback_report = {
         "execution_status": "Success",
         "performance_metrics": outcome.performance_metrics.model_dump(mode="json"),
@@ -164,10 +189,7 @@ def test_deterministic_execution_trace_projects_successful_execution() -> None:
 
 def test_deterministic_execution_trace_retains_failed_execution_shape() -> None:
     writer = _RecordingWriter()
-    outcome = _outcome(
-        dispatch_status="failed",
-        feedback_payload={"phase": "dispatch", "failure_scope": "qos"},
-    )
+    outcome = _outcome(dispatch_status="failed")
     feedback_report = {
         "execution_status": "Failed",
         "performance_metrics": outcome.performance_metrics.model_dump(mode="json"),
@@ -186,7 +208,7 @@ def test_deterministic_execution_trace_retains_failed_execution_shape() -> None:
 
     tools = _tool_results(writer.records[0])
     assert tools["dispatch_policy_to_pcf_request"].tool_status == "error"
-    assert json.loads(tools["build_feedback_payload"].content) == outcome.feedback_payload
+    assert json.loads(tools["build_feedback_payload"].content) == outcome.feedback_payload.model_dump(mode="json")
     assert "commit_policy_updates" not in tools
 
 
@@ -196,7 +218,7 @@ def test_policy_dispatch_preserves_request_correlation_on_cached_feedback() -> N
     agent.model_name = "test-model"
     agent._trace_writer = _RecordingWriter()
     agent.cache = _RecordingCache()
-    outcome = _outcome(dispatch_status="success", feedback_payload={})
+    outcome = _outcome(dispatch_status="success")
     agent._execution_controller = SimpleNamespace(execute=lambda _plan: outcome)
     request_envelope = _request_envelope()
 
@@ -220,8 +242,11 @@ def test_policy_dispatch_failure_feedback_uses_policy_plan_scope() -> None:
         performance_metrics="{}",
         violation_details="gateway rejected",
         failure_scope="qos",
-        feedback_payload={
-            "failures": [
+        feedback_payload=ExecutionControllerFeedback(
+            failure_scope="qos",
+            successful_policy_ids=[],
+            failed_policy_ids=["sm-1"],
+            failures=[
                 {
                     "domain": "qos",
                     "policy_id": "sm-1",
@@ -229,8 +254,9 @@ def test_policy_dispatch_failure_feedback_uses_policy_plan_scope() -> None:
                     "flow_id": "flow-1",
                     "error": "gateway rejected",
                 }
-            ]
-        },
+            ],
+            retry_forbidden=False,
+        ),
         dispatch_attempts=2,
     )
 
@@ -239,6 +265,7 @@ def test_policy_dispatch_failure_feedback_uses_policy_plan_scope() -> None:
         outcome=outcome,
     )
 
-    assert payload["supi"] == "imsi-001"
-    assert payload["failure_scope"] == "qos"
-    assert payload["dispatch_attempts"] == 2
+    assert payload is not None
+    assert payload.supi == "imsi-001"
+    assert payload.failure_scope == "qos"
+    assert payload.dispatch_attempts == 2

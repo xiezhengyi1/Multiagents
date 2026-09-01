@@ -8,13 +8,14 @@ from shared.logging import setup_logger
 from application_runtime.persistence import create_runtime_persistence
 
 from ...execution import AssuranceEvaluator, ExecutionController, ExecutionOutcome
+from ...execution.contracts import ExecutionControllerFeedback
 from ..planning.contracts import PolicyPlanDraft
 from ...integrations.pcf import dispatch_policy_to_pcf_request
 from ...integrations.storage import (
     commit_applied_policy_plan,
     get_snapshot_data_by_id,
 )
-from .contracts import FeedbackReport
+from .contracts import DispatchFailureFeedback, FeedbackReport
 
 class PolicyDispatchAgent(ArtifactWorkerMixin):
     agent_name = "policy_dispatch"
@@ -86,9 +87,9 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         outcome = self._execution_controller.execute(strategy_output)
         feedback_payload = self._build_feedback_payload(strategy_output=strategy_output, outcome=outcome)
         outcome_payload = outcome.model_dump(mode="json")
-        if feedback_payload:
-            outcome_payload["feedback_payload"] = feedback_payload
-        feedback_report = FeedbackReport(**outcome_payload)
+        feedback_report = FeedbackReport.model_validate(
+            {**outcome_payload, "feedback_payload": feedback_payload}
+        )
         write_deterministic_execution_trace(
             writer=self._trace_writer,
             agent_name=self.agent_name,
@@ -112,27 +113,28 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
         *,
         strategy_output: PolicyPlanDraft,
         outcome: ExecutionOutcome,
-    ) -> Dict[str, Any]:
+    ) -> DispatchFailureFeedback | None:
         execution_status = outcome.execution_status.strip().lower()
         if execution_status not in {"failed", "partial success"}:
-            return outcome.feedback_payload
+            return None
 
         seed = outcome.feedback_payload
-        failures = seed.get("failures") if isinstance(seed.get("failures"), list) else []
+        if seed is None:
+            raise ValueError("non-successful ExecutionOutcome requires controller feedback")
+        failures = seed.failures if isinstance(seed, ExecutionControllerFeedback) else []
+        retry_forbidden = seed.retry_forbidden if isinstance(seed, ExecutionControllerFeedback) else False
         first_failure = failures[0] if failures else {}
 
-        payload = {
-            "supi": strategy_output.scope.supi,
-            "policy_id": str(first_failure.get("policy_id") or seed.get("policy_id") or "").strip(),
-            "flow_id": str(first_failure.get("flow_id") or seed.get("flow_id") or "").strip(),
-            "reason": str(
+        return DispatchFailureFeedback(
+            supi=strategy_output.scope.supi,
+            policy_id=str(first_failure.get("policy_id") or "").strip() or None,
+            flow_id=str(first_failure.get("flow_id") or "").strip() or None,
+            reason=str(
                 outcome.violation_details
                 or first_failure.get("error")
-                or seed.get("error")
-                or ""
             ).strip(),
-            "dispatch_attempts": outcome.dispatch_attempts,
-            "target_bindings_at_risk": [
+            dispatch_attempts=outcome.dispatch_attempts,
+            target_bindings_at_risk=[
                 str(value).strip()
                 for value in [
                     first_failure.get("supi"),
@@ -141,7 +143,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
                 ]
                 if str(value or "").strip()
             ],
-            "policy_objects_at_risk": [
+            policy_objects_at_risk=[
                 str(value).strip()
                 for value in [
                     first_failure.get("policy_id"),
@@ -149,17 +151,14 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
                 ]
                 if str(value or "").strip()
             ],
-            "reason_by_domain": {
-                str(first_failure.get("domain") or "unknown"): str(
+            reason_by_domain={
+                outcome.failure_scope: str(
                     first_failure.get("error")
                     or outcome.violation_details
-                    or ""
                 ).strip()
             },
-        }
-        if seed:
-            payload["controller_feedback"] = seed
-        failure_scope = outcome.failure_scope.strip()
-        if failure_scope:
-            payload["failure_scope"] = failure_scope
-        return payload
+            controller_feedback=seed,
+            failure_scope=outcome.failure_scope,
+            failures=failures,
+            retry_forbidden=retry_forbidden,
+        )

@@ -169,7 +169,13 @@ def _build_trace_messages(
         raise TypeError("PolicyPlanDraft trace payload requires an object-valued scope")
     scope = ExecutionScope.model_validate(scope_payload)
     metrics = _decode_metrics_payload(outcome)
-    failure_phase = str(outcome.feedback_payload.get("phase") or "").strip()
+    controller_feedback = outcome.feedback_payload
+    failure_phase = controller_feedback.phase if controller_feedback is not None else ""
+    controller_feedback_payload = (
+        controller_feedback.model_dump(mode="json")
+        if controller_feedback is not None
+        else None
+    )
 
     compiled_plan = metrics.get("policy_plan")
     compile_success = isinstance(compiled_plan, dict) and failure_phase != "compile"
@@ -178,7 +184,7 @@ def _build_trace_messages(
         if compile_success
         else {
             "error": str(outcome.violation_details),
-            "feedback_payload": outcome.feedback_payload,
+            "feedback_payload": controller_feedback_payload,
         }
     )
     _append_tool_exchange(
@@ -239,12 +245,12 @@ def _build_trace_messages(
             status="success" if verdict_status in {"satisfied", "skipped"} else "error",
         )
 
-    if outcome.feedback_payload:
+    if controller_feedback_payload is not None:
         _append_tool_exchange(
             messages,
             tool_name="build_feedback_payload",
-            arguments={"failure_scope": outcome.feedback_payload.get("failure_scope")},
-            result=outcome.feedback_payload,
+            arguments={"failure_scope": outcome.failure_scope},
+            result=controller_feedback_payload,
             status="success",
         )
     if str(feedback_report.get("execution_status") or "").strip().lower() == "success":
