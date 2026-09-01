@@ -9,7 +9,6 @@ from shared.contracts import (
     AgentInvocation,
     AgentMessage,
     AgentRunResult,
-    ExecutionScope,
     TraceMetadata,
     TraceTarget,
 )
@@ -153,13 +152,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         return self.cache_received_artifact(
             artifact_type="PlanningRequest",
             payload=planning_request,
-            scope=ExecutionScope(
-                session_id=planning_request.context.session_id,
-                thread_id=planning_request.context.session_id,
-                snapshot_id=planning_request.context.snapshot_id or None,
-                round_index=planning_request.context.round_index,
-                supi=_planning_supi(planning_request),
-            ),
+            scope=planning_request.context.shared_context.main_intent.scope,
         )
 
     def _cache_produced_result(
@@ -468,15 +461,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
-            scope=ExecutionScope(
-                session_id=planning_request.context.session_id,
-                thread_id=planning_request.context.session_id,
-                snapshot_id=planning_request.context.snapshot_id or None,
-                round_index=planning_request.context.round_index,
-                scenario_id=str((trace_metadata or {}).get("scenario_id") or "").strip() or None,
-                scenario_tags=list((trace_metadata or {}).get("scenario_tags") or []),
-                supi=_planning_supi(planning_request),
-            ),
+            scope=planning_request.context.shared_context.main_intent.scope,
             token_budget=token_budget,
             token_counter=token_counter,
             trace_attributes=dict(trace_metadata or {}),
@@ -494,7 +479,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             ],
             system_prompt=render_planning_system_prompt(),
             prompt_name="optimization_strategy_advisor",
-            prompt_version="2.0.0",
+            prompt_version="2.1.0",
             response_model=OsaAdvisorOutput,
             max_iterations=12,
             max_calls_per_tool=2,
@@ -528,7 +513,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             metadata=TraceMetadata(
                 path_label="strategy_advisor",
                 prompt_name="optimization_strategy_advisor",
-                prompt_version="2.0.0",
+                prompt_version="2.1.0",
                 attributes={
                     **{
                         key: value

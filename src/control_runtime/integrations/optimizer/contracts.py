@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Literal
+from typing import Dict, List, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field, model_validator
+
+from shared.contracts import ContractModel, ExecutionScope, JsonValue, NonEmptyStr
 
 from ...contracts import ControlDomain, ObjectiveProfile
 from ...diagnostics.mediation.contracts import DomainStatus, DomainVerdict
@@ -55,32 +57,27 @@ COUPLING_CONSTRAINTS = [
 ]
 
 
-class OptimizationProblemConfig(BaseModel):
-    template: OptimizationTemplate = Field(default=OptimizationTemplate.JOINT_BALANCED)
-    solver_mode: str = Field(default="incremental")
-    active_objectives: List[str] = Field(
-        default_factory=lambda: [
-            "sla_violation_cost",
-            "mobility_risk_cost",
-            "control_churn_cost",
-            "resource_pressure_cost",
-            "fairness_cost",
-        ]
-    )
-    active_constraints: List[str] = Field(
-        default_factory=lambda: [
-            *SESSION_CONSTRAINTS,
-            *MOBILITY_CONSTRAINTS,
-            *COUPLING_CONSTRAINTS,
-        ]
-    )
-    decision_variables: List[str] = Field(
-        default_factory=lambda: [*SESSION_DECISION_VARIABLES, *MOBILITY_DECISION_VARIABLES]
-    )
-    qos_relaxation_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
-    slice_kpi_source: Literal["qos", "telemetry"] = Field(default="qos")
-    qos_feasibility_mode: Literal["hard", "soft"] = Field(default="hard")
-    enable_sla_constraints: bool = Field(default=True)
+class OptimizationProblemConfig(ContractModel):
+    template: OptimizationTemplate
+    solver_mode: NonEmptyStr
+    active_objectives: list[NonEmptyStr]
+    active_constraints: list[NonEmptyStr]
+    decision_variables: list[NonEmptyStr]
+    qos_relaxation_ratio: float = Field(ge=0.0, le=1.0)
+    slice_kpi_source: Literal["qos", "telemetry"]
+    qos_feasibility_mode: Literal["hard", "soft"]
+    enable_sla_constraints: bool
+
+    @model_validator(mode="after")
+    def validate_unique_members(self) -> "OptimizationProblemConfig":
+        for name, values in (
+            ("active_objectives", self.active_objectives),
+            ("active_constraints", self.active_constraints),
+            ("decision_variables", self.decision_variables),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"{name} must not contain duplicates")
+        return self
 
     def grouped_decision_variables(self) -> Dict[str, List[str]]:
         variables = set(self.decision_variables)
@@ -100,9 +97,9 @@ class OptimizationProblemConfig(BaseModel):
 
     def normalized_for_domains(self, requested_domains: List[ControlDomain]) -> "OptimizationProblemConfig":
         domains = set(requested_domains)
-        active_objectives = list(dict.fromkeys(self.active_objectives))
-        active_constraints = list(dict.fromkeys(self.active_constraints))
-        decision_variables = list(dict.fromkeys(self.decision_variables))
+        active_objectives = list(self.active_objectives)
+        active_constraints = list(self.active_constraints)
+        decision_variables = list(self.decision_variables)
         if ControlDomain.MOBILITY not in domains:
             active_objectives = [item for item in active_objectives if item != "mobility_risk_cost"]
             active_constraints = [
@@ -125,40 +122,66 @@ class OptimizationProblemConfig(BaseModel):
         )
 
 
-class OptimizerInput(BaseModel):
+class OptimizerInput(ContractModel):
     """Agent-projected input accepted at the optimizer integration boundary."""
 
-    session_id: str
-    snapshot_id: str
-    target_supis: List[str]
-    requested_domains: List[ControlDomain]
-    grounding_decision: Dict[str, Any]
+    scope: ExecutionScope
+    target_supis: list[NonEmptyStr]
+    requested_domains: list[ControlDomain]
+    grounding_decision: dict[str, JsonValue]
     objective_profile: ObjectiveProfile
     raw_intent: str
 
+    @model_validator(mode="after")
+    def validate_optimizer_input(self) -> "OptimizerInput":
+        if self.scope.snapshot_id is None:
+            raise ValueError("optimizer input requires scope.snapshot_id")
+        if not self.target_supis:
+            raise ValueError("optimizer input requires target_supis")
+        if len(self.target_supis) != len(set(self.target_supis)):
+            raise ValueError("target_supis must not contain duplicates")
+        if not self.requested_domains:
+            raise ValueError("optimizer input requires requested_domains")
+        if len(self.requested_domains) != len(set(self.requested_domains)):
+            raise ValueError("requested_domains must not contain duplicates")
+        return self
 
-class JointOptimizationRequest(BaseModel):
-    session_id: str = ""
-    snapshot_id: str = ""
-    target_ues: List[str] = Field(default_factory=list)
-    requested_domains: List[ControlDomain] = Field(default_factory=list)
-    grounding_decision: Dict[str, Any] = Field(default_factory=dict)
-    traffic_state: Dict[str, Any] = Field(default_factory=dict)
-    resource_state: Dict[str, Any] = Field(default_factory=dict)
-    mobility_state: Dict[str, Any] = Field(default_factory=dict)
-    policy_state: Dict[str, Any] = Field(default_factory=dict)
-    objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)
-    problem_config: OptimizationProblemConfig = Field(default_factory=OptimizationProblemConfig)
+
+class JointOptimizationRequest(ContractModel):
+    scope: ExecutionScope
+    target_ues: list[NonEmptyStr]
+    requested_domains: list[ControlDomain]
+    grounding_decision: dict[str, JsonValue]
+    traffic_state: dict[str, JsonValue]
+    resource_state: dict[str, JsonValue]
+    mobility_state: dict[str, JsonValue]
+    policy_state: dict[str, JsonValue]
+    objective_profile: ObjectiveProfile
+    problem_config: OptimizationProblemConfig
+
+    @model_validator(mode="after")
+    def validate_request_scope(self) -> "JointOptimizationRequest":
+        if self.scope.snapshot_id is None:
+            raise ValueError("joint optimization requires scope.snapshot_id")
+        if not self.target_ues:
+            raise ValueError("joint optimization requires target_ues")
+        if len(self.target_ues) != len(set(self.target_ues)):
+            raise ValueError("target_ues must not contain duplicates")
+        if not self.requested_domains:
+            raise ValueError("joint optimization requires requested_domains")
+        if len(self.requested_domains) != len(set(self.requested_domains)):
+            raise ValueError("requested_domains must not contain duplicates")
+        return self
 
 
-class JointOptimizationResult(BaseModel):
+class JointOptimizationResult(ContractModel):
     status: DomainStatus
-    qos_plan: Dict[str, Any] = Field(default_factory=dict)
-    mobility_plan: Dict[str, Any] = Field(default_factory=dict)
-    am_plan: Dict[str, Any] = Field(default_factory=dict)
-    cross_domain_verdicts: List[DomainVerdict] = Field(default_factory=list)
-    objective_breakdown: Dict[str, Any] = Field(default_factory=dict)
-    infeasible_reasons: List[str] = Field(default_factory=list)
+    qos_plan: dict[str, JsonValue]
+    mobility_plan: dict[str, JsonValue]
+    am_plan: dict[str, JsonValue]
+    cross_domain_verdicts: list[DomainVerdict]
+    objective_breakdown: dict[str, JsonValue]
+    infeasible_reasons: list[NonEmptyStr]
 
 
 __all__ = [

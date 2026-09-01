@@ -274,9 +274,6 @@ class MainControlOrchestrator:
             grounding_decision=grounding_decision,
             context=build_planning_context(
                 global_intent,
-                session_id,
-                snapshot_id,
-                round_index=round_index,
                 memory_context=memory_context,
                 feedback_context=feedback_context,
                 handoff_history=round_traces,

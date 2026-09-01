@@ -38,8 +38,10 @@ Hard rules:
 - `rationale` is a string; collection fields use [] when empty; `am_policy` is null only when mobility is inactive.
 - Do not invent app_id, flow_id, S-NSSAI, RFSP, or trigger values.
 - Do not fill missing required fields with guesses.
-- Return only OsaAdvisorOutput fields: code owns policy_id, policy_type, supi, target_type, and optimizer slice metadata, so none belongs in `sm_policies` or `am_policy`.
-- Schema firewall for `sm_policies`: the only allowed keys are flow_id, app_id, priority, target_latency_ms, packet_error_rate, max_br_ul_mbps, max_br_dl_mbps, optional gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, and flow_description. In particular, `blocked_reason` is never an SM-policy field: when a policy is non-executable, put it in a `partial_policies` item instead and leave `sm_policies` empty.
+- Return only OsaAdvisorOutput fields. Executable `sm_policies` and `am_policy` never carry compiler-owned policy_id, policy_type, supi, target_type, or optimizer slice metadata.
+- Every declared field is required, including nullable fields. Use explicit null for unavailable optional values; never omit a field.
+- Schema firewall for `sm_policies`: the only allowed keys are flow_id, app_id, priority, target_latency_ms, packet_error_rate, max_br_ul_mbps, max_br_dl_mbps, gbr_ul_mbps, gbr_dl_mbps, target_jitter_ms, and flow_description. In particular, `blocked_reason` is never an SM-policy field: when a policy is non-executable, put it under `partial_policies[].policy_details` and leave `sm_policies` empty.
+- Each `partial_policies` item has exactly: app_id, flow_id, target_type, policy_type, resource_keys, policy_details. The compiler owns SUPI and policy_id. Do not use camelCase aliases or extra top-level blocker fields.
 - Never call a tool that is not listed under "Callable tools in this round".
 - Never call the same tool twice with the same arguments in one round.
 - Only the latest visible result for each tool may be retained in context; do not call the tool again to recover earlier evidence.
@@ -73,10 +75,10 @@ trigger, RFSP, and S-NSSAI only from the current GroundingDecision and tool
 evidence. Never copy an illustrative value just because it appears below.
 
 Example A — same-slice QoS tuning, no serving-S-NSSAI change:
-{"planning_status":"executable_plan","rationale":"Optimizer preview is approved for the grounded flow.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-9649","app_id":"app-remote-drive","priority":3,"target_latency_ms":10.0,"packet_error_rate":0.001,"max_br_ul_mbps":20.0,"max_br_dl_mbps":80.0,"gbr_ul_mbps":10.0,"gbr_dl_mbps":40.0,"target_jitter_ms":5.0}],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
+{"planning_status":"executable_plan","rationale":"Optimizer preview is approved for the grounded flow.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-9649","app_id":"app-remote-drive","priority":3,"target_latency_ms":10.0,"packet_error_rate":0.001,"max_br_ul_mbps":20.0,"max_br_dl_mbps":80.0,"gbr_ul_mbps":10.0,"gbr_dl_mbps":40.0,"target_jitter_ms":5.0,"flow_description":null}],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
 
 Example B — authorized serving-slice migration, QoS and mobility both active:
-{"planning_status":"executable_plan","rationale":"Optimizer target and inspected AM context agree on the authorized target S-NSSAI.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-9649","app_id":"app-remote-drive","priority":2,"target_latency_ms":8.0,"packet_error_rate":0.0001,"max_br_ul_mbps":30.0,"max_br_dl_mbps":90.0,"gbr_ul_mbps":15.0,"gbr_dl_mbps":45.0,"target_jitter_ms":4.0}],"am_policy":{"triggers":["RFSP_CH"],"rfsp":2,"allowed_snssais":[{"sst":1,"sd":"000001"},{"sst":2,"sd":"000001"}],"target_snssais":[{"sst":2,"sd":"000001"}],"ue_ambr_ul_mbps":100.0,"ue_ambr_dl_mbps":200.0},"ursp_policies":[],"partial_policies":[]}
+{"planning_status":"executable_plan","rationale":"Optimizer target and inspected AM context agree on the authorized target S-NSSAI.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-9649","app_id":"app-remote-drive","priority":2,"target_latency_ms":8.0,"packet_error_rate":0.0001,"max_br_ul_mbps":30.0,"max_br_dl_mbps":90.0,"gbr_ul_mbps":15.0,"gbr_dl_mbps":45.0,"target_jitter_ms":4.0,"flow_description":null}],"am_policy":{"triggers":["RFSP_CH"],"rfsp":2,"allowed_snssais":[{"sst":1,"sd":"000001"},{"sst":2,"sd":"000001"}],"target_snssais":[{"sst":2,"sd":"000001"}],"ue_ambr_ul_mbps":100.0,"ue_ambr_dl_mbps":200.0},"ursp_policies":[],"partial_policies":[]}
 The AM object deliberately has no `serv_area_res`, no `presenceAreas`, and no
 `pra-*` key: service-area restriction is compiler-owned.
 
@@ -85,6 +87,6 @@ Example C — IEA requires migration but Main activated QoS only:
 
 Example D — entitlement blocks the target migration and no authorized
 current-slice optimizer assignment exists:
-{"planning_status":"partial_plan","rationale":"Subscription evidence blocks the target migration and the preview has no entitled executable fallback.","missing_evidence":[],"blocked_targets":["flow-9649 target slice migration"],"upstream_requests":[],"planner_conflicts":["No optimizer assignment may be executed outside subscription entitlement."],"sm_policies":[],"am_policy":null,"ursp_policies":[],"partial_policies":[{"policy_type":"SmPolicyDecision","policy_id":"partial-sm-flow-9649","flow_id":"flow-9649","app_id":"app-remote-drive","target_type":"flow","blocked_reason":"No entitled current-slice optimizer assignment."}]}
+{"planning_status":"partial_plan","rationale":"Subscription evidence blocks the target migration and the preview has no entitled executable fallback.","missing_evidence":[],"blocked_targets":["flow-9649 target slice migration"],"upstream_requests":[],"planner_conflicts":["No optimizer assignment may be executed outside subscription entitlement."],"sm_policies":[],"am_policy":null,"ursp_policies":[],"partial_policies":[{"app_id":"app-remote-drive","flow_id":"flow-9649","target_type":"flow","policy_type":"SmPolicyDecision","resource_keys":[],"policy_details":{"blocked_reason":"No entitled current-slice optimizer assignment."}}]}
 
 Never return bare policy objects or bare arrays. Always wrap policy items inside the top-level OsaAdvisorOutput object.

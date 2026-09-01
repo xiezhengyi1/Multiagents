@@ -167,7 +167,7 @@ class GlobalControlIntent(ContractModel):
             notes=[],
         )
     )
-    objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)
+    objective_profile: ObjectiveProfile
     investigation_targets: list[MainInvestigationTarget] = Field(default_factory=list)
     uncertainty_flags: list[MainUncertaintyFlag] = Field(default_factory=list)
     retry_scope: Optional[MainRetryScope] = Field(default=None)

@@ -31,6 +31,12 @@ Main 模型直接以严格 `MainControlDecision` 作为 response schema，不再
 
 编译后的 `GlobalControlIntent` 只通过 `ExecutionScope` 保存 session、thread、snapshot、round 和顶层 SUPI，不再平铺复制这些身份字段。Main compiler 只生成明确属于运行时的 routing、round strategy 和 reuse contract；retry 输出缺少 `retry_scope` 或 intent-encoding guidance 时返回验证错误，不能由 compiler 自动补文案或默认重试范围。
 
+`ObjectiveProfile` 是 Main、Single、Planning 与 optimizer 共用的唯一目标函数契约。profile 名和五项 cost 全部必填、未知字段直接拒绝；Main 输出缺少任一权重都会失败，不能再用 balanced 默认值补齐。确定性 Single 路径只能通过显式标准 profile 工厂创建完整权重对象。
+
+`PlanningContext` 不再复制 session、snapshot 和 round，身份信息只取自 `shared_context.main_intent.scope`。`OptimizerInput` 和 `JointOptimizationRequest` 同样只接收 `ExecutionScope`，并强制 snapshot、目标 SUPI 和控制域非空且不重复。optimizer 配置的 template、solver mode、目标、约束、决策变量和 QoS 模式全部显式构造；请求工厂不再覆盖 Main 已确定的 objective profile。
+
+Planning 与 Single 共用严格 `OsaAdvisorOutput`。根字段以及 SM、AM、URSP 的所有嵌套字段全部是 JSON Schema required；可空字段也必须显式返回 null。`partial_policies` 只有 snake_case 的单一结构，不解析 camelCase 别名、不接受顶层 `blocked_reason`，SUPI 和 policy_id 由 compiler 生成。对应 prompt 版本升级为 `2.1.0`。
+
 ## 2. 模型工具协议
 
 工具定义的唯一公开形式是 JSON Schema；所有工具必须声明：

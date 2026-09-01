@@ -10,7 +10,6 @@ from jinja2 import UndefinedError
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-PROMPT_FIXTURES = ROOT / "tests" / "fixtures" / "context_prompts"
 for candidate in (ROOT, SRC):
     candidate_text = str(candidate)
     if candidate_text not in sys.path:
@@ -55,6 +54,7 @@ from control_runtime.context.projectors.base import BaseProjector
 from control_runtime.orchestrators.round_context import build_planning_context
 from control_runtime.orchestrators.round_transitions import scope_global_intent_for_intent_encoding
 from shared.contracts import ExecutionScope
+from control_runtime.contracts import standard_objective_profile
 
 
 LEGACY_CONTEXT_ENGINEERING_FILES = [
@@ -90,21 +90,18 @@ LEGACY_IMPORT_PATTERNS = [
 ]
 
 
-def _prompt_fixture(name: str) -> str:
-    return (PROMPT_FIXTURES / name).read_text(encoding="utf-8")
-
-
 def _intent_scope(
     *,
     session_id: str = "s1",
     snapshot_id: str = "snap1",
     supi: str | None = "imsi-1",
+    round_index: int = 1,
 ) -> ExecutionScope:
     return ExecutionScope(
         session_id=session_id,
         thread_id=session_id,
         snapshot_id=snapshot_id,
-        round_index=1,
+        round_index=round_index,
         supi=supi,
     )
 
@@ -143,6 +140,7 @@ def test_global_control_intent_projection_uses_declared_routing_and_flow_contrac
         raw_input="protect flow",
         next_agent="intent_encoding",
         requested_domains=[ControlDomain.QOS],
+        objective_profile=standard_objective_profile("balanced"),
         domain_evidence={"qos": ["flow catalog"]},
         required_evidence=["flow catalog"],
         routing_decision="ground qos flow",
@@ -169,6 +167,7 @@ def test_planning_evidence_matches_operation_constraint_shape() -> None:
         scope=_intent_scope(),
         next_agent="optimization_strategy",
         requested_domains=[ControlDomain.QOS],
+        objective_profile=standard_objective_profile("balanced"),
     )
     grounding_decision = GroundingDecision(
         flows=[
@@ -193,8 +192,6 @@ def test_planning_evidence_matches_operation_constraint_shape() -> None:
         ],
     )
     planning_context = PlanningContext(
-        session_id="s1",
-        snapshot_id="snap1",
         shared_context=SharedControlContext(main_intent=main_intent),
     )
 
@@ -343,6 +340,7 @@ def test_intent_context_scopes_one_stage_without_mutating_the_main_intent() -> N
         ),
         next_agent="intent_encoding",
         requested_domains=[ControlDomain.QOS],
+        objective_profile=standard_objective_profile("balanced"),
         control_semantics=MainControlSemantics(
             mode=ControlSemanticMode.STAGED_PRIORITY,
             current_stage=2,
@@ -385,9 +383,11 @@ def test_planning_context_keeps_last_two_handoffs_and_sorted_qos_retry_constrain
             session_id="session-1",
             snapshot_id="snapshot-1",
             supi="imsi-001",
+            round_index=3,
         ),
         next_agent="optimization_strategy",
         requested_domains=[ControlDomain.QOS],
+        objective_profile=standard_objective_profile("balanced"),
     )
     previous_execution_feedback = {
         "feedback_payload": {
@@ -442,9 +442,6 @@ def test_planning_context_keeps_last_two_handoffs_and_sorted_qos_retry_constrain
 
     context = build_planning_context(
         intent,
-        "session-1",
-        "snapshot-1",
-        round_index=3,
         handoff_history=[{"round": 1}, {"round": 2}, {"round": 3}, {"round": 4}],
         previous_execution_feedback=previous_execution_feedback,
     )

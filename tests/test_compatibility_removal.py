@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from shared.contracts import ExecutionScope
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -28,8 +29,14 @@ from control_runtime.agents.planning.response_models import OsaAdvisorOutput
 from control_runtime import execution as execution_package
 from control_runtime.diagnostics.mediation.contracts import ConflictResolutionResult
 from control_runtime.integrations.optimizer.contracts import (
+    COUPLING_CONSTRAINTS,
+    MOBILITY_CONSTRAINTS,
+    MOBILITY_DECISION_VARIABLES,
+    SESSION_CONSTRAINTS,
+    SESSION_DECISION_VARIABLES,
     JointOptimizationRequest,
     OptimizationProblemConfig,
+    OptimizationTemplate,
     OptimizerInput,
 )
 from control_runtime.integrations.optimizer import joint_control, request_factory
@@ -68,6 +75,48 @@ REMOVED_ARCHITECTURE_FILES = (
     "control_runtime/execution/round_dispatch.py",
     "control_runtime/execution/round_mediation.py",
 )
+
+
+def _objective_profile(**updates: float | str) -> ObjectiveProfile:
+    payload: dict[str, float | str] = {
+        "profile_name": "balanced",
+        "sla_violation_cost": 1.0,
+        "mobility_risk_cost": 0.8,
+        "control_churn_cost": 0.5,
+        "resource_pressure_cost": 0.7,
+        "fairness_cost": 0.3,
+    }
+    payload.update(updates)
+    return ObjectiveProfile.model_validate(payload)
+
+
+def _problem_config(**updates: object) -> OptimizationProblemConfig:
+    payload: dict[str, object] = {
+        "template": OptimizationTemplate.JOINT_BALANCED,
+        "solver_mode": "incremental",
+        "active_objectives": [
+            "sla_violation_cost",
+            "mobility_risk_cost",
+            "control_churn_cost",
+            "resource_pressure_cost",
+            "fairness_cost",
+        ],
+        "active_constraints": [
+            *SESSION_CONSTRAINTS,
+            *MOBILITY_CONSTRAINTS,
+            *COUPLING_CONSTRAINTS,
+        ],
+        "decision_variables": [
+            *SESSION_DECISION_VARIABLES,
+            *MOBILITY_DECISION_VARIABLES,
+        ],
+        "qos_relaxation_ratio": 0.2,
+        "slice_kpi_source": "qos",
+        "qos_feasibility_mode": "hard",
+        "enable_sla_constraints": True,
+    }
+    payload.update(updates)
+    return OptimizationProblemConfig.model_validate(payload)
 
 
 def test_misplaced_architecture_sources_and_imports_are_removed() -> None:
@@ -134,7 +183,7 @@ def test_database_bootstrap_migrates_then_drops_current_step() -> None:
 
 
 def test_optimizer_weight_mapping_lives_at_integration_boundary() -> None:
-    profile = ObjectiveProfile(
+    profile = _objective_profile(
         sla_violation_cost=1.0,
         control_churn_cost=0.5,
         resource_pressure_cost=0.7,
@@ -186,8 +235,13 @@ def test_optimizer_request_factory_accepts_explicit_integration_input(
 
     request = request_factory.build_optimizer_request(
         OptimizerInput(
-            session_id="session-1",
-            snapshot_id="snapshot-1",
+            scope=ExecutionScope(
+                session_id="session-1",
+                thread_id="session-1",
+                snapshot_id="snapshot-1",
+                round_index=1,
+                supi="imsi-1",
+            ),
             target_supis=["imsi-1"],
             requested_domains=[ControlDomain.QOS],
             grounding_decision={
@@ -195,13 +249,17 @@ def test_optimizer_request_factory_accepts_explicit_integration_input(
                     {"supi": "imsi-1", "app_id": "app-1", "flow_id": "flow-1"}
                 ]
             },
-            objective_profile=NeutralObjectiveProfile(profile_name="balanced"),
+            objective_profile=_objective_profile(),
             raw_intent="optimize QoS",
-        )
+        ),
+        template_name="joint_balanced",
+        qos_relaxation_ratio=0.2,
+        slice_kpi_source="qos",
+        qos_feasibility_mode="hard",
     )
 
-    assert request.session_id == "session-1"
-    assert request.snapshot_id == "snapshot-1"
+    assert request.scope.session_id == "session-1"
+    assert request.scope.snapshot_id == "snapshot-1"
     assert request.target_ues == ["imsi-1"]
     assert request.requested_domains == [ControlDomain.QOS]
 
@@ -209,13 +267,13 @@ def test_optimizer_request_factory_accepts_explicit_integration_input(
 @pytest.mark.parametrize(
     ("profile", "expected"),
     [
-        (ObjectiveProfile(
+        (_objective_profile(
             sla_violation_cost=0.0,
             control_churn_cost=0.0,
             resource_pressure_cost=0.0,
             fairness_cost=0.0,
         ), (1.0, 1.0, 1.0, 0.0)),
-        (ObjectiveProfile(
+        (_objective_profile(
             sla_violation_cost=0.25,
             control_churn_cost=0.1,
             resource_pressure_cost=0.2,
@@ -247,13 +305,22 @@ def test_qos_solver_receives_adapter_weights_in_positional_order(
         return {}
 
     monkeypatch.setattr(joint_control, "optimize_network_slices", fake_optimize)
-    profile = ObjectiveProfile(
+    profile = _objective_profile(
         sla_violation_cost=0.25,
         control_churn_cost=0.1,
         resource_pressure_cost=0.2,
         fairness_cost=0.4,
     )
     request = JointOptimizationRequest(
+        scope=ExecutionScope(
+            session_id="session-1",
+            thread_id="session-1",
+            snapshot_id="snapshot-1",
+            round_index=1,
+            supi="001",
+        ),
+        target_ues=["001"],
+        requested_domains=[ControlDomain.QOS],
         grounding_decision={
             "flows": [
                 {
@@ -263,14 +330,18 @@ def test_qos_solver_receives_adapter_weights_in_positional_order(
                     "supi": "001",
                 }
             ]
-        }
+        },
+        traffic_state={},
+        resource_state={},
+        mobility_state={},
+        policy_state={},
+        objective_profile=profile,
+        problem_config=_problem_config(decision_variables=["slice_assignment"]),
     )
 
     result, errors = joint_control._run_qos_subproblem(
         request,
-        problem_config=OptimizationProblemConfig(
-            decision_variables=["slice_assignment"],
-        ),
+        problem_config=request.problem_config,
         objective_profile=profile,
     )
 

@@ -1,49 +1,29 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, model_validator
+
+from shared.contracts import ContractModel, JsonValue, NonEmptyStr
 
 
-class SnssaiSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SnssaiSpec(ContractModel):
     sst: int = Field(ge=0, le=255)
-    sd: Optional[str] = Field(default=None, min_length=6, max_length=6)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _parse_canonical_snssai_key(cls, value: Any) -> Any:
-        """Accept the canonical eight-hex-digit wire form without guessing.
-
-        `01000001` is an unambiguous rendering of `{sst: 1, sd: "000001"}`.
-        This is schema decoding only; malformed strings still fail validation.
-        """
-        if not isinstance(value, str):
-            return value
-        normalized = value.strip().lower()
-        if len(normalized) == 8 and all(char in "0123456789abcdef" for char in normalized):
-            return {"sst": int(normalized[:2], 16), "sd": normalized[2:]}
-        return value
-
-    @field_validator("sd", mode="before")
-    @classmethod
-    def _normalize_sd(cls, value: Any) -> Optional[str]:
-        text = str(value or "").strip()
-        if not text:
-            return None
-        if len(text) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in text):
-            raise ValueError("sd must be a 6-character hexadecimal string")
-        return text.lower()
+    sd: Optional[str] = Field(pattern=r"^[0-9a-f]{6}$")
 
 
-class TrafficDescriptorSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+def decode_snssai_key(value: str) -> SnssaiSpec:
+    normalized = value.strip()
+    if len(normalized) != 8 or any(char not in "0123456789abcdef" for char in normalized):
+        raise ValueError("S-NSSAI key must be exactly eight lowercase hexadecimal characters")
+    return SnssaiSpec(sst=int(normalized[:2], 16), sd=normalized[2:])
 
-    flow_descs: List[str] = Field(default_factory=list)
-    dnns: List[str] = Field(default_factory=list)
-    app_ids: List[str] = Field(default_factory=list)
-    os_id: Optional[str] = Field(default=None)
+
+class TrafficDescriptorSpec(ContractModel):
+    flow_descs: list[NonEmptyStr]
+    dnns: list[NonEmptyStr]
+    app_ids: list[NonEmptyStr]
+    os_id: Optional[NonEmptyStr]
 
     @model_validator(mode="after")
     def _require_descriptor_signal(self) -> "TrafficDescriptorSpec":
@@ -52,28 +32,24 @@ class TrafficDescriptorSpec(BaseModel):
         return self
 
 
-class RouteSelectionParameterSetSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    dnn: str = Field(min_length=1)
-    precedence: Optional[int] = Field(default=None, ge=1)
-    snssai: Optional[SnssaiSpec] = None
+class RouteSelectionParameterSetSpec(ContractModel):
+    dnn: NonEmptyStr
+    precedence: Optional[int] = Field(ge=1)
+    snssai: Optional[SnssaiSpec]
 
 
-class SmPolicySpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    flow_id: str = Field(min_length=1)
-    app_id: str = Field(min_length=1)
+class SmPolicySpec(ContractModel):
+    flow_id: NonEmptyStr
+    app_id: NonEmptyStr
     priority: int = Field(ge=1, le=15)
     target_latency_ms: float = Field(ge=1.0)
     packet_error_rate: float = Field(ge=0.0, le=1.0)
     max_br_ul_mbps: float = Field(ge=0.0)
     max_br_dl_mbps: float = Field(ge=0.0)
-    gbr_ul_mbps: Optional[float] = Field(default=None, ge=0.0)
-    gbr_dl_mbps: Optional[float] = Field(default=None, ge=0.0)
-    target_jitter_ms: Optional[float] = Field(default=None, ge=0.0)
-    flow_description: Optional[str] = Field(default=None)
+    gbr_ul_mbps: Optional[float] = Field(ge=0.0)
+    gbr_dl_mbps: Optional[float] = Field(ge=0.0)
+    target_jitter_ms: Optional[float] = Field(ge=0.0)
+    flow_description: Optional[NonEmptyStr]
 
     @model_validator(mode="after")
     def _validate_gbr_not_above_maxbr(self) -> "SmPolicySpec":
@@ -93,16 +69,13 @@ class SmPolicySpec(BaseModel):
         return self
 
 
-class AmPolicySpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    triggers: List[str] = Field(min_length=1)
+class AmPolicySpec(ContractModel):
+    triggers: list[NonEmptyStr] = Field(min_length=1)
     rfsp: int = Field(ge=1)
     allowed_snssais: List[SnssaiSpec] = Field(min_length=1)
     target_snssais: List[SnssaiSpec] = Field(min_length=1)
-    ue_ambr_ul_mbps: Optional[float] = Field(default=None, ge=0.0)
-    ue_ambr_dl_mbps: Optional[float] = Field(default=None, ge=0.0)
-    serv_area_res: Optional[Dict[str, Any]] = Field(default=None)
+    ue_ambr_ul_mbps: Optional[float] = Field(ge=0.0)
+    ue_ambr_dl_mbps: Optional[float] = Field(ge=0.0)
 
     @model_validator(mode="after")
     def _validate_snssai_coverage(self) -> "AmPolicySpec":
@@ -110,21 +83,15 @@ class AmPolicySpec(BaseModel):
         target = {(item.sst, item.sd) for item in self.target_snssais}
         if not target.issubset(allowed):
             raise ValueError("target_snssais must be a subset of allowed_snssais")
-        if self.serv_area_res is not None:
-            raise ValueError(
-                "serv_area_res is runtime-owned; omit it so the compiler preserves the validated mobility context"
-            )
         return self
 
 
-class UrspPolicySpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    target_type: Literal["flow", "app"] = Field(default="flow")
-    app_id: str = Field(min_length=1)
-    flow_id: Optional[str] = Field(default=None)
+class UrspPolicySpec(ContractModel):
+    target_type: Literal["flow", "app"]
+    app_id: NonEmptyStr
+    flow_id: Optional[NonEmptyStr]
     relat_precedence: int = Field(ge=1)
-    traffic_desc: Optional[TrafficDescriptorSpec] = Field(default=None)
+    traffic_desc: Optional[TrafficDescriptorSpec]
     route_sel_param_sets: List[RouteSelectionParameterSetSpec] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -136,27 +103,48 @@ class UrspPolicySpec(BaseModel):
         return self
 
 
-class OsaAdvisorOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class PartialPolicySpec(ContractModel):
+    app_id: str
+    flow_id: Optional[NonEmptyStr]
+    target_type: Literal["flow", "app", "ue"]
+    policy_type: NonEmptyStr
+    resource_keys: list[NonEmptyStr]
+    policy_details: dict[str, JsonValue]
 
-    planning_status: Literal["executable_plan", "partial_plan", "needs_upstream_reground"] = Field(default="executable_plan")
-    rationale: str = Field(default="")
-    missing_evidence: List[str] = Field(default_factory=list)
-    blocked_targets: List[str] = Field(default_factory=list)
-    upstream_requests: List[str] = Field(default_factory=list)
-    planner_conflicts: List[str] = Field(default_factory=list)
-    sm_policies: List[SmPolicySpec] = Field(default_factory=list)
-    am_policy: Optional[AmPolicySpec] = Field(default=None)
-    ursp_policies: List[UrspPolicySpec] = Field(default_factory=list)
-    partial_policies: List[Dict[str, Any]] = Field(default_factory=list)
+
+class OsaAdvisorOutput(ContractModel):
+    planning_status: Literal["executable_plan", "partial_plan", "needs_upstream_reground"]
+    rationale: NonEmptyStr
+    missing_evidence: list[NonEmptyStr]
+    blocked_targets: list[NonEmptyStr]
+    upstream_requests: list[NonEmptyStr]
+    planner_conflicts: list[NonEmptyStr]
+    sm_policies: list[SmPolicySpec]
+    am_policy: Optional[AmPolicySpec]
+    ursp_policies: list[UrspPolicySpec]
+    partial_policies: list[PartialPolicySpec]
 
     @model_validator(mode="after")
     def _validate_policy_collections(self) -> "OsaAdvisorOutput":
+        for name, values in (
+            ("missing_evidence", self.missing_evidence),
+            ("blocked_targets", self.blocked_targets),
+            ("upstream_requests", self.upstream_requests),
+            ("planner_conflicts", self.planner_conflicts),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"{name} must not contain duplicates")
         seen_flow_ids: set[str] = set()
         for item in self.sm_policies:
             if item.flow_id in seen_flow_ids:
                 raise ValueError(f"duplicate sm_policies flow_id={item.flow_id}")
             seen_flow_ids.add(item.flow_id)
+        partial_policy_keys = [
+            (item.target_type, item.app_id, item.flow_id, item.policy_type)
+            for item in self.partial_policies
+        ]
+        if len(partial_policy_keys) != len(set(partial_policy_keys)):
+            raise ValueError("partial_policies target bindings must be unique")
         if self.planning_status == "needs_upstream_reground":
             if self.sm_policies or self.am_policy is not None or self.ursp_policies:
                 raise ValueError("needs_upstream_reground must not include executable policy payloads")
@@ -172,7 +160,9 @@ class OsaAdvisorOutput(BaseModel):
 
 __all__ = [
     "AmPolicySpec",
+    "decode_snssai_key",
     "OsaAdvisorOutput",
+    "PartialPolicySpec",
     "RouteSelectionParameterSetSpec",
     "SmPolicySpec",
     "SnssaiSpec",

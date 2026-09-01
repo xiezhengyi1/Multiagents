@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from shared.contracts import AgentMessage, AgentRunResult, ExecutionScope, ToolCall
+from control_runtime.contracts import standard_objective_profile
 from control_runtime.agents.grounding.contracts import FlowSelector, GroundingDecision
 from control_runtime.agents.main.contracts import ControlDomain, GlobalControlIntent
 from control_runtime.agents.planning.compiler import OptimizationStrategyCompiler
@@ -28,6 +29,7 @@ def _planning_request() -> PlanningRequest:
         ),
         next_agent="optimization_strategy",
         requested_domains=[ControlDomain.QOS],
+        objective_profile=standard_objective_profile("balanced"),
     )
     return PlanningRequest(
         grounding_decision=GroundingDecision(
@@ -42,8 +44,6 @@ def _planning_request() -> PlanningRequest:
             ]
         ),
         context=PlanningContext(
-            session_id="session-1",
-            snapshot_id="snapshot-1",
             shared_context=SharedControlContext(main_intent=intent),
         ),
     )
@@ -69,6 +69,10 @@ def _valid_osa_wire() -> dict:
     return {
         "planning_status": "executable_plan",
         "rationale": "optimizer allocation is feasible",
+        "missing_evidence": [],
+        "blocked_targets": [],
+        "upstream_requests": [],
+        "planner_conflicts": [],
         "sm_policies": [
             {
                 "flow_id": "flow-1",
@@ -78,8 +82,15 @@ def _valid_osa_wire() -> dict:
                 "packet_error_rate": 0.001,
                 "max_br_ul_mbps": 10,
                 "max_br_dl_mbps": 20,
+                "gbr_ul_mbps": None,
+                "gbr_dl_mbps": None,
+                "target_jitter_ms": None,
+                "flow_description": None,
             }
         ],
+        "am_policy": None,
+        "ursp_policies": [],
+        "partial_policies": [],
     }
 
 

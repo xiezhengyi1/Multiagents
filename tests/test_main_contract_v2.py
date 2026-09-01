@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from shared.contracts import ExecutionScope
+from control_runtime.contracts import standard_objective_profile
 from control_runtime.agents.main import contracts as main_contracts
 from control_runtime.agents.main.compiler import compile_global_intent, validate_global_intent
 from control_runtime.agents.main.contracts import (
@@ -58,7 +59,7 @@ def _decision(
             ],
             "notes": [],
         },
-        objective_profile={},
+        objective_profile=standard_objective_profile("balanced"),
         investigation_targets=[],
         uncertainty_flags=[],
         retry_scope=retry_scope,
@@ -76,6 +77,8 @@ def test_main_model_uses_one_strict_response_contract() -> None:
     assert not hasattr(main_contracts, "MainControlDecisionWire")
     required = set(MainControlDecision.model_json_schema()["required"])
     assert required == set(MainControlDecision.model_fields)
+    objective_schema = MainControlDecision.model_json_schema()["$defs"]["ObjectiveProfile"]
+    assert set(objective_schema["required"]) == set(main_contracts.ObjectiveProfile.model_fields)
 
     payload = _decision().model_dump(mode="json")
     payload["compiler_owned_field"] = "must be rejected"

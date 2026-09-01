@@ -130,8 +130,8 @@ def _run_qos_subproblem(
         am_policy_state=am_policy_state,
         mobility_risk_weight=objective_profile.mobility_risk_cost,
         debug_context={
-            "session_id": request.session_id,
-            "snapshot_id": request.snapshot_id,
+            "session_id": request.scope.session_id,
+            "snapshot_id": request.scope.snapshot_id,
             "requested_domains": [domain.value for domain in request.requested_domains],
             "target_ues": list(request.target_ues or []),
             "policy_state": request.policy_state,

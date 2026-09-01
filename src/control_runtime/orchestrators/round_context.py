@@ -591,10 +591,7 @@ def _build_assurance_failure_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_planning_context(
     global_intent: GlobalControlIntent,
-    session_id: str,
-    snapshot_id: str,
     *,
-    round_index: int,
     memory_context: str = "",
     feedback_context: str = "",
     handoff_history: Optional[List[Dict[str, Any]]] = None,
@@ -603,9 +600,6 @@ def build_planning_context(
     previous_execution_feedback: Optional[Dict[str, Any]] = None,
 ) -> PlanningContext:
     return PlanningContext(
-        round_index=round_index,
-        session_id=session_id,
-        snapshot_id=snapshot_id,
         memory_context=memory_context,
         shared_context=SharedControlContext(main_intent=global_intent.model_copy(deep=True)),
         feedback_context=feedback_context,

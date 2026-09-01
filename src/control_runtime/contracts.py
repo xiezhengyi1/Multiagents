@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from shared.contracts import ContractModel, NonEmptyStr
 
 
 class ControlDomain(str, Enum):
@@ -10,13 +13,34 @@ class ControlDomain(str, Enum):
     MOBILITY = "mobility"
 
 
-class ObjectiveProfile(BaseModel):
-    profile_name: str = Field(default="balanced")
-    sla_violation_cost: float = Field(default=1.0, ge=0.0)
-    mobility_risk_cost: float = Field(default=0.8, ge=0.0)
-    control_churn_cost: float = Field(default=0.5, ge=0.0)
-    resource_pressure_cost: float = Field(default=0.7, ge=0.0)
-    fairness_cost: float = Field(default=0.3, ge=0.0)
+class ObjectiveProfile(ContractModel):
+    profile_name: NonEmptyStr
+    sla_violation_cost: float = Field(ge=0.0)
+    mobility_risk_cost: float = Field(ge=0.0)
+    control_churn_cost: float = Field(ge=0.0)
+    resource_pressure_cost: float = Field(ge=0.0)
+    fairness_cost: float = Field(ge=0.0)
 
 
-__all__ = ["ControlDomain", "ObjectiveProfile"]
+StandardObjectiveProfileName = Literal["balanced", "latency", "throughput", "stability"]
+
+
+def standard_objective_profile(profile_name: StandardObjectiveProfileName) -> ObjectiveProfile:
+    """Build the explicit baseline used by deterministic single-agent routing."""
+
+    return ObjectiveProfile(
+        profile_name=profile_name,
+        sla_violation_cost=1.0,
+        mobility_risk_cost=0.8,
+        control_churn_cost=0.5,
+        resource_pressure_cost=0.7,
+        fairness_cost=0.3,
+    )
+
+
+__all__ = [
+    "ControlDomain",
+    "ObjectiveProfile",
+    "StandardObjectiveProfileName",
+    "standard_objective_profile",
+]

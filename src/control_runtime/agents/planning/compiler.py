@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from pydantic import ValidationError
-
 from ..grounding.contracts import FlowSelector
 from .contracts import PlanningRationale, PlanningRequest, PolicyDraft, PolicyPlanDraft
 from .evidence import build_planning_evidence
@@ -15,14 +13,22 @@ from .planning_validation import (
     normalize_app_id as _normalize_app_id,
     normalize_policy_plan_draft,
 )
-from .response_models import AmPolicySpec, OsaAdvisorOutput, SmPolicySpec, SnssaiSpec, UrspPolicySpec
+from .response_models import (
+    AmPolicySpec,
+    OsaAdvisorOutput,
+    PartialPolicySpec,
+    SmPolicySpec,
+    SnssaiSpec,
+    UrspPolicySpec,
+    decode_snssai_key,
+)
 
 
 
 def _build_slice_snssai(slice_code: str) -> Dict[str, Any] | None:
     try:
-        return SnssaiSpec.model_validate(slice_code).model_dump(mode="json")
-    except ValidationError:
+        return decode_snssai_key(slice_code).model_dump(mode="json")
+    except ValueError:
         return None
 
 
@@ -103,8 +109,8 @@ class OptimizationStrategyCompiler:
 
         plan = PolicyPlanDraft(
             supi=_planning_supi(planning_request),
-            session_id=str(planning_request.context.session_id or "").strip(),
-            snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
+            session_id=planning_request.context.shared_context.main_intent.scope.session_id,
+            snapshot_id=planning_request.context.shared_context.main_intent.scope.snapshot_id,
             planning_status=planning_status,
             optimizer_result=optimizer_result,
             planning_rationale=PlanningRationale(
@@ -552,34 +558,22 @@ class OptimizationStrategyCompiler:
     @staticmethod
     def _build_partial_policy_drafts(
         *,
-        partial_policies: List[Dict[str, Any]],
+        partial_policies: list[PartialPolicySpec],
         planning_request: PlanningRequest,
     ) -> List[PolicyDraft]:
         drafts: List[PolicyDraft] = []
-        for index, item in enumerate(partial_policies or [], start=1):
-            if not isinstance(item, dict):
-                raise TypeError("partial_policies items must be objects")
-            policy_type = str(item.get("policy_type") or item.get("policyType") or "").strip()
-            if not policy_type:
-                raise ValueError("partial_policies items must include policy_type")
-            policy_id = str(item.get("policy_id") or item.get("policyId") or "").strip()
-            if not policy_id:
-                raise ValueError(f"partial_policies[{index}] must include policy_id")
+        for index, item in enumerate(partial_policies, start=1):
             drafts.append(
                 PolicyDraft(
                     recommended_actions=[],
-                    supi=str(item.get("supi") or _planning_supi(planning_request)).strip(),
-                    app_id=_normalize_app_id(item.get("app_id") or item.get("appId") or ""),
-                    flow_id=str(item.get("flow_id") or item.get("flowId") or "").strip() or None,
-                    target_type=str(item.get("target_type") or item.get("targetType") or "flow").strip() or "flow",
-                    policy_id=policy_id,
-                    policy_type=policy_type,
-                    resource_keys=[
-                        str(value or "").strip()
-                        for value in (item.get("resource_keys") or item.get("resourceKeys") or [])
-                        if str(value or "").strip()
-                    ],
-                    policy_details=dict(item.get("policy_details") or item.get("policyDetails") or {}),
+                    supi=_planning_supi(planning_request),
+                    app_id=item.app_id,
+                    flow_id=item.flow_id,
+                    target_type=item.target_type,
+                    policy_id=f"partial-{index}",
+                    policy_type=item.policy_type,
+                    resource_keys=item.resource_keys,
+                    policy_details=item.policy_details,
                 )
             )
         return drafts
@@ -600,8 +594,8 @@ class OptimizationStrategyCompiler:
             upstream_requests = [reason] if str(reason or "").strip() else []
         return PolicyPlanDraft(
             supi=_planning_supi(planning_request),
-            session_id=str(planning_request.context.session_id or "").strip(),
-            snapshot_id=str(planning_request.context.snapshot_id or "").strip(),
+            session_id=planning_request.context.shared_context.main_intent.scope.session_id,
+            snapshot_id=planning_request.context.shared_context.main_intent.scope.snapshot_id,
             planning_status="needs_upstream_reground",
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(

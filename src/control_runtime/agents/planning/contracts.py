@@ -4,7 +4,9 @@ from datetime import date, datetime
 from enum import Enum
 from typing import Any, Dict, List
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, model_validator
+
+from shared.contracts import ContractModel, JsonValue
 
 from ..grounding.contracts import GroundingDecision
 from ..main.contracts import GlobalControlIntent, OpenQuestion
@@ -26,15 +28,11 @@ def json_friendly(value: Any) -> Any:
     return str(value)
 
 
-class SharedControlContext(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class SharedControlContext(ContractModel):
     main_intent: GlobalControlIntent = Field(description="Canonical Main decision")
 
 
-class QosRetryConstraint(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
+class QosRetryConstraint(ContractModel):
     flow_id: str = Field(min_length=1)
     observed_latency_ms: float = Field(gt=0.0)
     allowed_latency_ms: float = Field(gt=0.0)
@@ -43,22 +41,23 @@ class QosRetryConstraint(BaseModel):
     policy_id: str = Field(default="")
 
 
-class PlanningContext(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    round_index: int = Field(default=1)
-    session_id: str = Field(default="")
-    snapshot_id: str = Field(default="")
+class PlanningContext(ContractModel):
     memory_context: str = Field(default="")
     shared_context: SharedControlContext
     feedback_context: str = Field(default="")
-    handoff_history: List[Dict[str, Any]] = Field(default_factory=list)
-    revision_requests: List[Dict[str, Any]] = Field(default_factory=list)
-    unified_constraints: Dict[str, Any] = Field(default_factory=dict)
-    qos_retry_constraints: List[QosRetryConstraint] = Field(default_factory=list)
+    handoff_history: list[dict[str, JsonValue]] = Field(default_factory=list)
+    revision_requests: list[dict[str, JsonValue]] = Field(default_factory=list)
+    unified_constraints: dict[str, JsonValue] = Field(default_factory=dict)
+    qos_retry_constraints: list[QosRetryConstraint] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "PlanningContext":
+        if self.shared_context.main_intent.scope.snapshot_id is None:
+            raise ValueError("planning context requires main_intent.scope.snapshot_id")
+        return self
 
 
-class PlanningRequest(BaseModel):
+class PlanningRequest(ContractModel):
     grounding_decision: GroundingDecision
     context: PlanningContext
 

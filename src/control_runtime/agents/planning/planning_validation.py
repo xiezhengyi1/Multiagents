@@ -6,12 +6,12 @@ import json
 import re
 from typing import Any, Dict, List
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from ...diagnostics.mediation.contracts import DomainStatus
 from ..main.contracts import ControlDomain
 from .contracts import PlanningRequest, PolicyDraft, PolicyPlanDraft
-from .response_models import OsaAdvisorOutput, SnssaiSpec
+from .response_models import OsaAdvisorOutput, decode_snssai_key
 from model.PcfAmPolicyControl import PcfAmPolicyControlPolicyAssociation
 from model.SmPolicyDecision import SmPolicyDecision
 from model.UrspRuleRequest import UrspRuleRequest
@@ -35,8 +35,8 @@ def json_friendly(value: Any) -> Any:
 
 def _build_slice_snssai(slice_code: str) -> Dict[str, Any] | None:
     try:
-        return SnssaiSpec.model_validate(slice_code).model_dump(mode="json")
-    except ValidationError:
+        return decode_snssai_key(slice_code).model_dump(mode="json")
+    except ValueError:
         return None
 
 

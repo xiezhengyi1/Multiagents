@@ -1,63 +1,78 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal
 
 from ..storage import get_snapshot_data_by_id, get_ue_context_by_supi
-from .contracts import JointOptimizationRequest, OptimizationProblemConfig, OptimizationTemplate, OptimizerInput
+from .contracts import (
+    COUPLING_CONSTRAINTS,
+    MOBILITY_CONSTRAINTS,
+    MOBILITY_DECISION_VARIABLES,
+    SESSION_CONSTRAINTS,
+    SESSION_DECISION_VARIABLES,
+    JointOptimizationRequest,
+    OptimizationProblemConfig,
+    OptimizationTemplate,
+    OptimizerInput,
+)
 
 
 def build_optimizer_request(
     optimizer_input: OptimizerInput,
     *,
-    profile_name: str | None = None,
-    template_name: str | None = None,
-    qos_relaxation_ratio: float | None = None,
-    slice_kpi_source: str | None = None,
-    qos_feasibility_mode: str | None = None,
+    template_name: Literal[
+        "qos_first",
+        "mobility_first",
+        "joint_balanced",
+        "stability_first",
+        "congestion_relief",
+    ],
+    qos_relaxation_ratio: float,
+    slice_kpi_source: Literal["qos", "telemetry"],
+    qos_feasibility_mode: Literal["auto", "hard", "soft"],
 ) -> JointOptimizationRequest:
-    snapshot_id = str(optimizer_input.snapshot_id or "").strip()
-    if not snapshot_id:
-        raise ValueError("optimizer request requires a bound snapshot_id")
-    snapshot = get_snapshot_data_by_id(snapshot_id) or {}
+    snapshot_id = optimizer_input.scope.snapshot_id
+    if snapshot_id is None:
+        raise ValueError("optimizer request requires scope.snapshot_id")
+    snapshot = get_snapshot_data_by_id(snapshot_id)
     if not snapshot:
         raise LookupError(f"optimizer request snapshot not found: snapshot_id={snapshot_id}")
     target_supis = list(optimizer_input.target_supis)
 
     requested_domains = list(optimizer_input.requested_domains)
-    if not requested_domains:
-        raise ValueError("optimizer request requires non-empty Main requested_domains")
-
     ue_contexts = {
-        supi: (get_ue_context_by_supi(supi, snapshot_id=snapshot_id) or {})
+        supi: get_ue_context_by_supi(supi, snapshot_id=snapshot_id)
         for supi in target_supis
     }
 
-    objective_profile = optimizer_input.objective_profile.model_copy(deep=True)
-    if profile_name is not None:
-        normalized_profile = str(profile_name or "").strip().lower()
-        if not normalized_profile:
-            raise ValueError("profile_name must not be empty when provided")
-        objective_profile.profile_name = normalized_profile
-
-    problem_config = OptimizationProblemConfig()
-    if template_name is not None:
-        normalized_template = str(template_name or "").strip().lower()
-        if not normalized_template:
-            raise ValueError("template_name must not be empty when provided")
-        problem_config = OptimizationProblemConfig(template=OptimizationTemplate(normalized_template))
-    if qos_relaxation_ratio is not None:
-        problem_config.qos_relaxation_ratio = float(qos_relaxation_ratio)
-    if slice_kpi_source is not None:
-        normalized_source = str(slice_kpi_source or "").strip().lower()
-        if normalized_source not in {"qos", "telemetry"}:
-            raise ValueError("slice_kpi_source must be either 'qos' or 'telemetry'")
-        problem_config.slice_kpi_source = normalized_source
+    template = OptimizationTemplate(template_name)
     normalized_feasibility_mode = _resolve_qos_feasibility_mode(
         optimizer_input.raw_intent,
         requested_mode=qos_feasibility_mode,
     )
-    problem_config.qos_feasibility_mode = normalized_feasibility_mode
-    problem_config.enable_sla_constraints = normalized_feasibility_mode == "hard"
+    problem_config = OptimizationProblemConfig(
+        template=template,
+        solver_mode="incremental",
+        active_objectives=[
+            "sla_violation_cost",
+            "mobility_risk_cost",
+            "control_churn_cost",
+            "resource_pressure_cost",
+            "fairness_cost",
+        ],
+        active_constraints=[
+            *SESSION_CONSTRAINTS,
+            *MOBILITY_CONSTRAINTS,
+            *COUPLING_CONSTRAINTS,
+        ],
+        decision_variables=[
+            *SESSION_DECISION_VARIABLES,
+            *MOBILITY_DECISION_VARIABLES,
+        ],
+        qos_relaxation_ratio=float(qos_relaxation_ratio),
+        slice_kpi_source=slice_kpi_source,
+        qos_feasibility_mode=normalized_feasibility_mode,
+        enable_sla_constraints=normalized_feasibility_mode == "hard",
+    )
 
     optimizer_grounding_view = _build_optimizer_grounding_view(
         optimizer_input.grounding_decision,
@@ -66,11 +81,10 @@ def build_optimizer_request(
     _apply_qos_operation_constraints(optimizer_grounding_view)
     if _slice_migration_is_blocked_by_iea(optimizer_grounding_view):
         _apply_entitlement_limited_qos_delivery(optimizer_grounding_view)
-        problem_config.solver_mode = "hybrid"
+        problem_config = problem_config.model_copy(update={"solver_mode": "hybrid"})
 
     return JointOptimizationRequest(
-        session_id=optimizer_input.session_id,
-        snapshot_id=snapshot_id,
+        scope=optimizer_input.scope,
         target_ues=target_supis,
         requested_domains=requested_domains,
         grounding_decision=optimizer_grounding_view,
@@ -89,7 +103,7 @@ def build_optimizer_request(
             if ctx
         },
         policy_state={supi: ctx for supi, ctx in ue_contexts.items() if ctx},
-        objective_profile=objective_profile,
+        objective_profile=optimizer_input.objective_profile,
         problem_config=problem_config,
     )
 
@@ -233,17 +247,16 @@ def _apply_entitlement_limited_qos_delivery(optimizer_grounding_view: Dict[str, 
 def _resolve_qos_feasibility_mode(
     raw_intent: str,
     *,
-    requested_mode: str | None,
-) -> str:
-    normalized = str(requested_mode or "auto").strip().lower()
-    if normalized in {"hard", "strict"}:
+    requested_mode: Literal["auto", "hard", "soft"],
+) -> Literal["hard", "soft"]:
+    if requested_mode == "hard":
         return "hard"
-    if normalized in {"soft", "best_effort", "best-effort"}:
+    if requested_mode == "soft":
         return "soft"
-    if normalized not in {"", "auto"}:
+    if requested_mode != "auto":
         raise ValueError("qos_feasibility_mode must be 'auto', 'hard', or 'soft'")
 
-    raw_text = str(raw_intent or "").strip().lower()
+    raw_text = raw_intent.strip().lower()
     if not raw_text:
         return "soft"
 

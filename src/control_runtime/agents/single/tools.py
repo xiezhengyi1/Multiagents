@@ -18,7 +18,7 @@ from ...integrations.optimizer.result_view import (
     summarize_optimizer_result,
 )
 from ..grounding.contracts import FlowSelector, GroundingDecision
-from ...contracts import ControlDomain, ObjectiveProfile
+from ...contracts import ControlDomain, standard_objective_profile
 from ..main.contracts import GlobalControlIntent, MainRoundStrategy
 from ..planning.contracts import PlanningContext, PlanningRequest, SharedControlContext
 
@@ -253,15 +253,12 @@ def _build_runtime_planning_request(
         next_agent="optimization_strategy",
         round_strategy=MainRoundStrategy.INITIAL_GROUNDING,
         requested_domains=[ControlDomain(item) for item in normalized_domains],
-        objective_profile=ObjectiveProfile(profile_name=normalized_profile),
+        objective_profile=standard_objective_profile(normalized_profile),
         required_evidence=["qos_runtime_evidence"],
     )
     return PlanningRequest(
         grounding_decision=GroundingDecision(flows=flows),
         context=PlanningContext(
-            round_index=1,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
             shared_context=SharedControlContext(main_intent=main_intent),
         ),
     )
@@ -284,8 +281,7 @@ def _optimizer_input_from_planning_request(planning_request: PlanningRequest) ->
         )
     )
     return OptimizerInput(
-        session_id=planning_request.context.session_id,
-        snapshot_id=planning_request.context.snapshot_id,
+        scope=main_intent.scope,
         target_supis=target_supis,
         requested_domains=main_intent.requested_domains,
         grounding_decision=planning_request.grounding_decision.model_dump(mode="json"),
@@ -330,10 +326,10 @@ def build_single_agent_tools(
         result = run_optimizer(
             build_optimizer_request(
                 _optimizer_input_from_planning_request(planning_request),
-                profile_name=str(objective_profile or "").strip().lower(),
                 template_name="joint_balanced",
                 qos_relaxation_ratio=0.2,
                 slice_kpi_source="qos",
+                qos_feasibility_mode="auto",
             )
         )
         full_payload = serialize_optimizer_result(result)

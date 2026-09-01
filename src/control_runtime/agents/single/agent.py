@@ -30,7 +30,8 @@ from ..grounding.contracts import (
     QosOperationConstraint,
     SliceMigrationAuthorization,
 )
-from ..main.contracts import ControlDomain, GlobalControlIntent, MainRoundStrategy, ObjectiveProfile
+from ...contracts import standard_objective_profile
+from ..main.contracts import ControlDomain, GlobalControlIntent, MainRoundStrategy
 from ..planning.contracts import (
     PlanningContext,
     PlanningRequest,
@@ -252,7 +253,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 ),
                 system_prompt=render_single_system_prompt(),
                 prompt_name="single_control_advisor",
-                prompt_version="2.0.0",
+                prompt_version="2.1.0",
                 response_model=OsaAdvisorOutput,
                 max_iterations=12,
                 forbid_duplicate_tool_calls=True,
@@ -457,14 +458,11 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             next_agent="optimization_strategy",
             round_strategy=(MainRoundStrategy.POLICY_REVISION if round_index > 1 else MainRoundStrategy.INITIAL_GROUNDING),
             requested_domains=[ControlDomain(item) for item in active_domains],
-            objective_profile=ObjectiveProfile(profile_name=profile_name),
+            objective_profile=standard_objective_profile(profile_name),
             retry_scope=retry_scope,
             required_evidence=self._required_evidence_from_domains(active_domains),
         )
         planning_context = PlanningContext(
-            round_index=round_index,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
             shared_context=SharedControlContext(main_intent=main_intent),
             feedback_context=feedback_context,
             handoff_history=round_traces[-2:],
@@ -515,7 +513,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
     def _single_output_domains(advisor_output: OsaAdvisorOutput, user_input: str) -> List[str]:
         domains: List[str] = []
         if advisor_output.sm_policies or any(
-            isinstance(item, dict) and str(item.get("policy_type") or "").lower() == "smpolicydecision"
+            item.policy_type.lower() == "smpolicydecision"
             for item in advisor_output.partial_policies
         ):
             domains.append("qos")
@@ -678,7 +676,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             metadata=TraceMetadata(
                 path_label="single_control_advisor",
                 prompt_name="single_control_advisor",
-                prompt_version="2.0.0",
+                prompt_version="2.1.0",
             ),
         )
         result = advisor_agent.invoke(

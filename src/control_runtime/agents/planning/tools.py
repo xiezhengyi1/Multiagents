@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain.tools import tool
 
@@ -38,8 +38,7 @@ def _optimizer_input_from_planning_request(planning_request: PlanningRequest) ->
         )
     )
     return OptimizerInput(
-        session_id=planning_request.context.session_id,
-        snapshot_id=planning_request.context.snapshot_id,
+        scope=main_intent.scope,
         target_supis=target_supis,
         requested_domains=main_intent.requested_domains,
         grounding_decision=planning_request.grounding_decision.model_dump(mode="json"),
@@ -65,27 +64,16 @@ def build_request_tools(
         if str(item.value if hasattr(item, "value") else item or "").strip()
     }
 
-    def _require_target_supi(candidate: Optional[str]) -> str:
-        target = str(candidate or "").strip() or (
-            planning_request.context.shared_context.main_intent.scope.supi or ""
-        )
+    def _require_target_supi(candidate: str) -> str:
+        target = str(candidate).strip()
         if not target:
-            target = next(
-                (
-                    str(flow.supi or "").strip()
-                    for flow in (planning_request.grounding_decision.flows or [])
-                    if str(flow.supi or "").strip()
-                ),
-                "",
-            )
-        if not target:
-            raise ValueError("inspect_mobility_ue_policies requires a SUPI in the tool args or planning request")
+            raise ValueError("inspect_mobility_ue_policies requires a non-empty supi")
         return target
 
     def _require_ue_context(target: str) -> Dict[str, Any]:
-        snapshot_id = str(planning_request.context.snapshot_id or "").strip()
-        if not snapshot_id:
-            raise ValueError("inspect_mobility_ue_policies requires a bound snapshot_id")
+        snapshot_id = planning_request.context.shared_context.main_intent.scope.snapshot_id
+        if snapshot_id is None:
+            raise ValueError("inspect_mobility_ue_policies requires main_intent.scope.snapshot_id")
         ue_ctx = get_ue_context_by_supi(target, snapshot_id=snapshot_id)
         if not ue_ctx:
             raise LookupError(f"No UE context found for {target}")
@@ -105,11 +93,16 @@ def build_request_tools(
 
     @tool_with_reason(side_effect="read", result_format="json")
     def preview_qos_optimizer(
-        objective_profile: str = "balanced",
-        optimization_template: str = "joint_balanced",
-        qos_relaxation_ratio: float = 0.2,
-        slice_kpi_source: str = "qos",
-        qos_feasibility_mode: str = "auto",
+        optimization_template: Literal[
+            "qos_first",
+            "mobility_first",
+            "joint_balanced",
+            "stability_first",
+            "congestion_relief",
+        ],
+        qos_relaxation_ratio: float,
+        slice_kpi_source: Literal["qos", "telemetry"],
+        qos_feasibility_mode: Literal["auto", "hard", "soft"],
     ) -> str:
         """Run the joint optimizer for executable planning evidence and return result plus summary."""
         cached_preview = _results_cache.get("latest_optimizer_preview")
@@ -122,8 +115,7 @@ def build_request_tools(
             )
         request = build_optimizer_request(
             _optimizer_input_from_planning_request(planning_request),
-            profile_name=str(objective_profile or "balanced").strip().lower(),
-            template_name=str(optimization_template or "joint_balanced").strip().lower(),
+            template_name=optimization_template,
             qos_relaxation_ratio=qos_relaxation_ratio,
             slice_kpi_source=slice_kpi_source,
             qos_feasibility_mode=qos_feasibility_mode,
@@ -153,15 +145,15 @@ def build_request_tools(
         )
 
     @tool_with_reason(side_effect="read", result_format="json")
-    def fetch_qos_network_status(service_type_id: Optional[int] = None) -> str:
+    def fetch_qos_network_status(service_type_id: Optional[int]) -> str:
         """Fetch QoS-domain network slice utilization and capacity summary."""
         return get_network_status_summary(
             flow_type_id=service_type_id,
-            snapshot_id=planning_request.context.snapshot_id,
+            snapshot_id=planning_request.context.shared_context.main_intent.scope.snapshot_id,
         )
 
     @tool_with_reason(side_effect="read", result_format="json")
-    def inspect_mobility_ue_policies(supi: Optional[str] = None) -> str:
+    def inspect_mobility_ue_policies(supi: str) -> str:
         """Inspect current UE mobility-relevant policy state and access-mobility context."""
         target = _require_target_supi(supi)
         trimmed = _require_ue_context(target)
@@ -172,8 +164,6 @@ def build_request_tools(
         request_tools.extend([preview_qos_optimizer, fetch_qos_network_status])
     if "mobility" in active_domains:
         request_tools.append(inspect_mobility_ue_policies)
-    if not request_tools:
-        request_tools = [preview_qos_optimizer, fetch_qos_network_status, inspect_mobility_ue_policies]
     return request_tools, _results_cache
 
 

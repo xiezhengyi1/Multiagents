@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from shared.contracts import AgentMessage, AgentRunResult, ExecutionScope, MemoryBundle, MemoryRecord
+from control_runtime.contracts import standard_objective_profile
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -60,6 +61,7 @@ def _main_intent(*, next_agent: str = "optimization_strategy"):
         ),
         next_agent=next_agent,
         requested_domains=[ControlDomain.QOS],
+        objective_profile=standard_objective_profile("balanced"),
         routing_decision="protect qos flow",
         routing_rationale="offline characterization",
     )
@@ -172,7 +174,7 @@ def _main_control_decision_result(*, include_compiled_field: bool = False) -> Ag
             "stages": [],
             "notes": [],
         },
-        objective_profile={},
+        objective_profile=standard_objective_profile("balanced"),
         investigation_targets=[],
         uncertainty_flags=[],
         retry_scope=None,
@@ -755,7 +757,18 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
 
     def invoke_advisor(**_kwargs):
         invocations.append("invoke")
-        return OsaAdvisorOutput(), {}, {}
+        return OsaAdvisorOutput(
+            planning_status="needs_upstream_reground",
+            rationale="optimizer preview is missing",
+            missing_evidence=["optimizer preview"],
+            blocked_targets=[],
+            upstream_requests=[],
+            planner_conflicts=[],
+            sm_policies=[],
+            am_policy=None,
+            ursp_policies=[],
+            partial_policies=[],
+        ), {}, {}
 
     monkeypatch.setattr(agent, "_invoke_strategy_advisor", invoke_advisor)
     monkeypatch.setattr(

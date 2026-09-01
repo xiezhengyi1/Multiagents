@@ -14,7 +14,6 @@ _FEEDBACK_CONTEXT_CHAR_LIMIT = 1800
 class PlanningContextProjector(BaseProjector):
     model = PlanningContext
     visible = (
-        field("round_index"),
         field("shared_context"),
     )
     nested = {"shared_context": SharedControlContextProjector}
@@ -40,7 +39,7 @@ class PlanningContextProjector(BaseProjector):
 
 
 def _has_retry_delta(raw: dict[str, Any]) -> bool:
-    return int(raw.get("round_index") or 1) > 1
+    return int(raw["shared_context"]["main_intent"]["scope"]["round_index"]) > 1
 
 
 def _compact_head(value: Any, limit: int) -> str:
