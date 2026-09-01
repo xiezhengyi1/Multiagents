@@ -4,7 +4,9 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from shared.contracts import ContractModel, JsonValue, NonEmptyStr
 
 from ..main.contracts import OpenQuestion
 
@@ -117,60 +119,96 @@ class IntentEvidence(BaseModel):
     subscription_payload: Dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
-class FlowSelector(BaseModel):
-    supi: str = Field(default="")
-    app_id: str = Field(default="")
-    app_name: Optional[str] = Field(default=None)
-    flow_id: Optional[str] = Field(default=None)
-    target_type: str = Field(default="flow")
-    name: str = Field(default="")
-    service_type: Optional[str] = Field(default=None)
-    service_type_id: Optional[int] = Field(default=None)
-    bw_ul: Optional[float] = Field(default=None)
-    bw_dl: Optional[float] = Field(default=None)
-    gbr_ul: Optional[float] = Field(default=None)
-    gbr_dl: Optional[float] = Field(default=None)
-    lat: Optional[float] = Field(default=None)
-    loss_req: Optional[float] = Field(default=None)
-    jitter_req: Optional[float] = Field(default=None)
-    priority: Optional[int] = Field(default=None)
-    description: Optional[str] = Field(default=None)
-    five_tuple: Optional[List[Any]] = Field(default=None)
-    current_slice_snssai: Optional[str] = Field(default=None)
-    current_bw_ul: Optional[float] = Field(default=None)
-    current_bw_dl: Optional[float] = Field(default=None)
-    resolution_status: str = Field(default="resolved")
-
-
-class GroundingEvidenceBundle(BaseModel):
-    grounded_supi: str = Field(default="")
-    grounded_apps: List[Dict[str, Any]] = Field(default_factory=list)
-    grounded_flows: List[Dict[str, Any]] = Field(default_factory=list)
-    grounded_mobility_targets: Dict[str, Any] = Field(default_factory=dict)
-    evidence_sources: Dict[str, List[str]] = Field(default_factory=dict)
-
-
-class QosOperationConstraint(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    flow_id: str = Field(default="")
-    app_id: str = Field(default="")
-    operation_type: str = Field(default="")
-    require_slice_change: bool = Field(default=False)
-    source_slice_snssai: Optional[str] = Field(default=None)
-    excluded_slice_snssais: List[str] = Field(default_factory=list)
-    target_slice_preference: str = Field(default="")
-    no_op_allowed: bool = Field(default=True)
-    rationale: List[str] = Field(default_factory=list)
+class FlowSelector(ContractModel):
+    supi: NonEmptyStr | None
+    app_id: NonEmptyStr | None
+    app_name: NonEmptyStr | None
+    flow_id: NonEmptyStr | None
+    target_type: Literal["flow"]
+    name: NonEmptyStr
+    service_type: NonEmptyStr | None
+    service_type_id: int | None
+    bw_ul: float | None
+    bw_dl: float | None
+    gbr_ul: float | None
+    gbr_dl: float | None
+    lat: float | None
+    loss_req: float | None
+    jitter_req: float | None
+    priority: int | None
+    description: NonEmptyStr | None
+    five_tuple: list[JsonValue] | None
+    current_slice_snssai: NonEmptyStr | None
+    current_bw_ul: float | None
+    current_bw_dl: float | None
+    resolution_status: Literal["resolved", "unresolved"]
 
     @model_validator(mode="after")
-    def _derive_excluded_source(self) -> "QosOperationConstraint":
-        source = str(self.source_slice_snssai or "").strip()
-        excluded = [str(item or "").strip() for item in self.excluded_slice_snssais if str(item or "").strip()]
-        if self.require_slice_change and source and source not in excluded:
-            excluded.append(source)
-        self.excluded_slice_snssais = excluded
+    def validate_resolution(self) -> "FlowSelector":
+        if self.resolution_status == "resolved" and (
+            self.supi is None or self.app_id is None or self.flow_id is None
+        ):
+            raise ValueError("resolved flow requires supi, app_id, and flow_id")
+        if self.resolution_status == "unresolved" and self.flow_id is not None:
+            raise ValueError("unresolved flow cannot claim a flow_id")
         return self
+
+
+class GroundedAppEvidence(ContractModel):
+    app_id: NonEmptyStr
+    app_name: NonEmptyStr
+
+
+class MobilityIntent(ContractModel):
+    association_id: NonEmptyStr
+    rfsp: int = Field(ge=0)
+    allowed_snssais: list[NonEmptyStr]
+    target_snssais: list[NonEmptyStr]
+    access_type: Literal["3GPP_ACCESS", "NON_3GPP_ACCESS"] | None
+    service_area_restriction: dict[str, JsonValue] | None
+
+
+class MobilityContextEvidence(ContractModel):
+    association_ids: list[NonEmptyStr]
+    allowed_snssais: list[dict[str, JsonValue]]
+    target_snssais: list[dict[str, JsonValue]]
+    mapping_snssais: list[dict[str, JsonValue]]
+    current_association_id: NonEmptyStr | None
+    access_type: NonEmptyStr | None
+    rfsp: int | None
+    service_area_restriction: dict[str, JsonValue] | None
+
+
+class GroundedMobilityEvidence(ContractModel):
+    summary: MobilityContextEvidence | None
+    subscription_entitlement: dict[str, JsonValue] | None
+
+
+class GroundingEvidenceBundle(ContractModel):
+    grounded_supi: NonEmptyStr | None
+    grounded_apps: list[GroundedAppEvidence]
+    grounded_flows: list[FlowCandidateEvidence]
+    mobility: GroundedMobilityEvidence
+    evidence_sources: dict[NonEmptyStr, list[NonEmptyStr]]
+
+
+class QosOperationConstraint(ContractModel):
+    flow_id: NonEmptyStr
+    app_id: NonEmptyStr
+    operation_type: Literal["qos_reallocation", "slice_migration"]
+    require_slice_change: bool
+    source_slice_snssai: NonEmptyStr | None
+    excluded_slice_snssais: list[NonEmptyStr]
+    target_slice_preference: str
+    no_op_allowed: bool
+    rationale: list[NonEmptyStr]
+
+    @field_validator("excluded_slice_snssais")
+    @classmethod
+    def validate_unique_exclusions(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("excluded_slice_snssais must be unique")
+        return values
 
 
 SliceMigrationDecisionKind = Literal[
@@ -182,79 +220,73 @@ SliceMigrationDecisionKind = Literal[
 ]
 
 
-class SliceMigrationAuthorization(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: SliceMigrationDecisionKind = Field(default="not_applicable")
-    authority: str = Field(default="")
-    authorized_snssais: List[str] = Field(default_factory=list)
-    target_snssais: List[str] = Field(default_factory=list)
-    subscription_change_required: bool = Field(default=False)
-    rationale: List[str] = Field(default_factory=list)
+class SliceMigrationAuthorization(ContractModel):
+    decision: SliceMigrationDecisionKind
+    authority: NonEmptyStr | None
+    authorized_snssais: list[NonEmptyStr]
+    target_snssais: list[NonEmptyStr]
+    subscription_change_required: bool
+    rationale: list[NonEmptyStr]
 
 
-class GroundedFlowBinding(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class GroundedFlowBinding(ContractModel):
+    app_id: NonEmptyStr | None
+    flow_id: NonEmptyStr | None
+    name: NonEmptyStr
+    resolution_status: Literal["resolved", "unresolved"]
 
-    app_id: str = Field(default="")
-    flow_id: str = Field(default="")
-    name: str = Field(default="")
-    resolution_status: Literal["resolved", "unresolved"] = Field(default="resolved")
-
-
-class QosOperationDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    flow_id: str = Field(default="")
-    app_id: str = Field(default="")
-    operation_type: Literal["qos_reallocation", "slice_migration"] = Field(default="qos_reallocation")
-    require_slice_change: bool = Field(default=False)
-    target_slice_preference: str = Field(default="")
-    no_op_allowed: bool = Field(default=True)
-    rationale: List[str] = Field(default_factory=list)
+    @model_validator(mode="after")
+    def validate_resolution(self) -> "GroundedFlowBinding":
+        if self.resolution_status == "resolved" and (self.app_id is None or self.flow_id is None):
+            raise ValueError("resolved binding requires app_id and flow_id")
+        if self.resolution_status == "unresolved" and (self.app_id is not None or self.flow_id is not None):
+            raise ValueError("unresolved binding cannot claim app_id or flow_id")
+        return self
 
 
-class SliceMigrationDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: SliceMigrationDecisionKind = Field(default="not_applicable")
-    target_snssais: List[str] = Field(default_factory=list)
-    subscription_change_required: bool = Field(default=False)
-    rationale: List[str] = Field(default_factory=list)
-
-
-class GroundingAdvisorOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    flows: List[GroundedFlowBinding]
-    mobility_intent: Dict[str, Any] = Field(default_factory=dict)
-    qos_operation_constraints: List[QosOperationDecision] = Field(default_factory=list)
-    slice_migration_authorization: SliceMigrationDecision = Field(default_factory=SliceMigrationDecision)
-    open_questions: List[OpenQuestion] = Field(default_factory=list)
+class QosOperationDecision(ContractModel):
+    flow_id: NonEmptyStr
+    app_id: NonEmptyStr
+    operation_type: Literal["qos_reallocation", "slice_migration"]
+    require_slice_change: bool
+    target_slice_preference: str
+    no_op_allowed: bool
+    rationale: list[NonEmptyStr]
 
 
-class GroundingDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class SliceMigrationDecision(ContractModel):
+    decision: SliceMigrationDecisionKind
+    target_snssais: list[NonEmptyStr]
+    subscription_change_required: bool
+    rationale: list[NonEmptyStr]
 
-    flows: List[FlowSelector] = Field(default_factory=list)
-    mobility_intent: Dict[str, Any] = Field(default_factory=dict)
-    grounding_evidence: GroundingEvidenceBundle = Field(default_factory=GroundingEvidenceBundle)
-    qos_operation_constraints: List[QosOperationConstraint] = Field(default_factory=list)
-    slice_migration_authorization: SliceMigrationAuthorization = Field(default_factory=SliceMigrationAuthorization)
-    open_questions: List[OpenQuestion] = Field(default_factory=list)
+
+class GroundingAdvisorOutput(ContractModel):
+    flows: list[GroundedFlowBinding]
+    mobility_intent: MobilityIntent | None
+    qos_operation_constraints: list[QosOperationDecision]
+    slice_migration_authorization: SliceMigrationDecision
+    open_questions: list[OpenQuestion]
+
+
+class GroundingDecision(ContractModel):
+    flows: list[FlowSelector]
+    mobility_intent: MobilityIntent | None
+    grounding_evidence: GroundingEvidenceBundle
+    qos_operation_constraints: list[QosOperationConstraint]
+    slice_migration_authorization: SliceMigrationAuthorization
+    open_questions: list[OpenQuestion]
 
     @model_validator(mode="after")
     def _validate_grounded_qos_flows(self) -> "GroundingDecision":
         for index, flow in enumerate(self.flows):
-            if str(flow.resolution_status or "").strip().lower() != "resolved":
+            if flow.resolution_status != "resolved":
                 continue
-            if str(flow.flow_id or "").strip() and str(flow.app_id or "").strip():
-                continue
-            raise ValueError(
-                "resolved qos flow must include both flow_id and app_id "
-                f"(flows[{index}] has flow_id={str(flow.flow_id or '').strip() or '<empty>'}, "
-                f"app_id={str(flow.app_id or '').strip() or '<empty>'})"
-            )
+            if flow.flow_id is None or flow.app_id is None:
+                raise ValueError(f"resolved qos flow at flows[{index}] is missing binding identity")
+        resolved_ids = [flow.flow_id for flow in self.flows if flow.flow_id is not None]
+        if len(resolved_ids) != len(set(resolved_ids)):
+            raise ValueError("grounding decision flow_id values must be unique")
         return self
 
 
@@ -263,12 +295,16 @@ __all__ = [
     "ExplicitFlowTarget",
     "FlowCandidateEvidence",
     "FlowSelector",
+    "GroundedAppEvidence",
     "GroundedFlowBinding",
+    "GroundedMobilityEvidence",
     "GroundingAdvisorOutput",
     "GroundingDecision",
     "GroundingEvidenceBundle",
     "IntentEncodingDirectives",
     "IntentEvidence",
+    "MobilityContextEvidence",
+    "MobilityIntent",
     "QosOperationConstraint",
     "QosOperationDecision",
     "SliceMigrationAuthorization",

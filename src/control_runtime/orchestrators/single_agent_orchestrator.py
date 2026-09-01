@@ -172,16 +172,21 @@ class SingleAgentOrchestrator:
                 mobility_feedback = round_execution.mobility_feedback
                 diagnosis = round_execution.diagnosis
                 state.latest_result = ControlRoundResult(
-                    scope=scope.model_copy(update={"supi": policy_plan.supi or None}),
+                    scope=policy_plan.scope,
                     completed=state.completed,
                     global_intent={},
                     unified_plan=round_execution.unified_plan.model_dump(mode="json"),
                     qos_feedback=qos_feedback,
                     mobility_feedback=mobility_feedback,
                     diagnosis=diagnosis,
+                    negotiation_request={},
+                    planning_blocker=round_execution.trace.planning_blocker,
+                    execution_reentry=round_execution.trace.execution_reentry,
                     round_count=round_index,
                     retry_count=max(0, round_index - 1),
                     round_traces=state.round_traces,
+                    agent_elapsed_ms={},
+                    single_agent_details=[],
                 )
             except Exception as exc:
                 state.completed = False
@@ -195,9 +200,14 @@ class SingleAgentOrchestrator:
                     qos_feedback={},
                     mobility_feedback={},
                     diagnosis=diagnosis,
+                    negotiation_request={},
+                    planning_blocker={},
+                    execution_reentry={},
                     round_count=round_index,
                     retry_count=max(0, round_index - 1),
                     round_traces=state.round_traces,
+                    agent_elapsed_ms={},
+                    single_agent_details=[],
                 )
                 log_event(
                     self.single_agent.logger,

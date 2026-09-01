@@ -156,7 +156,20 @@ def test_memory_manager_does_not_accept_ignored_long_term_file() -> None:
 
 
 def test_conflict_result_exposes_only_canonical_mediator_status() -> None:
-    result = ConflictResolutionResult()
+    with pytest.raises(ValidationError, match="mediator_status"):
+        ConflictResolutionResult()
+
+    result = ConflictResolutionResult(
+        mediator_status="approved",
+        conflicts=[],
+        affected_policy_ids=[],
+        affected_objects=[],
+        affected_domains=[],
+        resolution_recommendations=[],
+        reason_summary="no conflicts",
+        revision_requests=[],
+        unified_constraints={"hard_constraints": [], "evidence": []},
+    )
 
     assert result.mediator_status == "approved"
     assert not hasattr(result, "status")

@@ -22,8 +22,11 @@ os.environ.setdefault(
 
 from control_runtime.agents.grounding.contracts import (
     FlowSelector,
+    GroundedMobilityEvidence,
     GroundingDecision,
+    GroundingEvidenceBundle,
     QosOperationConstraint,
+    SliceMigrationAuthorization,
 )
 from control_runtime.orchestrators.round_context import build_intent_encoding_context
 from control_runtime.agents.main.contracts import (
@@ -43,6 +46,7 @@ from control_runtime.agents.planning.contracts import (
 from control_runtime.agents.planning.evidence import build_planning_evidence
 from control_runtime.context.prompts.engine import PromptEngine
 from control_runtime.context.prompts.grounding import render_grounding_system_prompt
+from control_runtime.diagnostics.mediation.contracts import UnifiedConstraintSet
 from control_runtime.context.prompts.main import render_main_system_prompt
 from control_runtime.context.prompts.planning import (
     build_planning_user_prompt,
@@ -53,7 +57,7 @@ from control_runtime.context.projectors import field, project_global_intent_for_
 from control_runtime.context.projectors.base import BaseProjector
 from control_runtime.orchestrators.round_context import build_planning_context
 from control_runtime.orchestrators.round_transitions import scope_global_intent_for_intent_encoding
-from shared.contracts import ExecutionScope
+from shared.contracts import ExecutionScope, MemoryContextView
 from control_runtime.contracts import standard_objective_profile
 
 
@@ -174,11 +178,36 @@ def test_planning_evidence_matches_operation_constraint_shape() -> None:
             FlowSelector(
                 supi="imsi-1",
                 app_id="app-1",
+                app_name=None,
                 flow_id="flow-1",
+                target_type="flow",
                 name="video",
+                service_type=None,
+                service_type_id=None,
+                bw_ul=None,
+                bw_dl=None,
+                gbr_ul=None,
+                gbr_dl=None,
+                lat=None,
+                loss_req=None,
+                jitter_req=None,
+                priority=None,
+                description=None,
+                five_tuple=None,
                 current_slice_snssai="01020304",
+                current_bw_ul=None,
+                current_bw_dl=None,
+                resolution_status="resolved",
             )
         ],
+        mobility_intent=None,
+        grounding_evidence=GroundingEvidenceBundle(
+            grounded_supi="imsi-1",
+            grounded_apps=[],
+            grounded_flows=[],
+            mobility=GroundedMobilityEvidence(summary=None, subscription_entitlement=None),
+            evidence_sources={},
+        ),
         qos_operation_constraints=[
             QosOperationConstraint(
                 flow_id="flow-1",
@@ -186,13 +215,35 @@ def test_planning_evidence_matches_operation_constraint_shape() -> None:
                 operation_type="slice_migration",
                 require_slice_change=True,
                 source_slice_snssai="01020304",
+                excluded_slice_snssais=["01020304"],
                 target_slice_preference="lower_latency",
                 no_op_allowed=False,
+                rationale=[],
             )
         ],
+        slice_migration_authorization=SliceMigrationAuthorization(
+            decision="not_applicable",
+            authority=None,
+            authorized_snssais=[],
+            target_snssais=[],
+            subscription_change_required=False,
+            rationale=[],
+        ),
+        open_questions=[],
     )
     planning_context = PlanningContext(
+        memory_context=MemoryContextView(
+            query=None,
+            selected_short_term=[],
+            selected_long_term=[],
+            prompt_text="",
+        ),
         shared_context=SharedControlContext(main_intent=main_intent),
+        feedback_context="",
+        handoff_history=[],
+        revision_requests=[],
+        unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
+        qos_retry_constraints=[],
     )
 
     evidence = build_planning_evidence(
@@ -442,7 +493,16 @@ def test_planning_context_keeps_last_two_handoffs_and_sorted_qos_retry_constrain
 
     context = build_planning_context(
         intent,
+        memory_context=MemoryContextView(
+            query=None,
+            selected_short_term=[],
+            selected_long_term=[],
+            prompt_text="",
+        ),
+        feedback_context="",
         handoff_history=[{"round": 1}, {"round": 2}, {"round": 3}, {"round": 4}],
+        revision_requests=[],
+        unified_constraints={"hard_constraints": [], "evidence": []},
         previous_execution_feedback=previous_execution_feedback,
     )
 

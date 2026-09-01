@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from shared.contracts import ExecutionScope, MemoryRecord
+from shared.contracts import ExecutionScope, MemoryContextView, MemoryRecord
 from shared.memory import MemoryManager
 from shared.runtime import ContextPolicy, RuntimePersistence, TokenBudget, TokenCounter
 from application_runtime.persistence import create_runtime_persistence
@@ -175,7 +175,7 @@ class MainControlOrchestrator:
         scenario_id: str,
         scenario_tags: Optional[List[str]],
         routing_hint: Optional[Dict[str, Any]],
-        memory_context: str,
+        memory_context: MemoryContextView,
         feedback_context: str,
         previous_diagnosis: Dict[str, Any],
         previous_report_payload: Dict[str, Any],
@@ -197,7 +197,7 @@ class MainControlOrchestrator:
                 context=build_main_context(
                     snapshot_id,
                     round_index=round_index,
-                    memory_context=memory_context,
+                    memory_context=memory_context.prompt_text,
                     feedback_context=feedback_context,
                     previous_diagnosis=previous_diagnosis,
                     previous_execution_feedback=previous_report_payload,
@@ -277,8 +277,11 @@ class MainControlOrchestrator:
                 memory_context=memory_context,
                 feedback_context=feedback_context,
                 handoff_history=round_traces,
-                revision_requests=(previous_mediator_decision or {}).get("revision_requests") if isinstance(previous_mediator_decision, dict) else None,
-                unified_constraints=(previous_mediator_decision or {}).get("unified_constraints") if isinstance(previous_mediator_decision, dict) else None,
+                revision_requests=list((previous_mediator_decision or {}).get("revision_requests") or []),
+                unified_constraints=dict(
+                    (previous_mediator_decision or {}).get("unified_constraints")
+                    or {"hard_constraints": [], "evidence": []}
+                ),
                 previous_execution_feedback=previous_report_payload,
             ),
         )
@@ -408,6 +411,8 @@ class MainControlOrchestrator:
                     round_count=round_index,
                     retry_count=max(0, round_index - 1),
                     round_traces=state.round_traces,
+                    agent_elapsed_ms={},
+                    single_agent_details=[],
                 )
                 log_event(
                     self.main_agent.logger,
@@ -463,6 +468,8 @@ class MainControlOrchestrator:
                     round_count=round_index,
                     retry_count=max(0, round_index - 1),
                     round_traces=state.round_traces,
+                    agent_elapsed_ms={},
+                    single_agent_details=[],
                 )
                 continue
 
@@ -502,6 +509,8 @@ class MainControlOrchestrator:
                 round_count=round_index,
                 retry_count=max(0, round_index - 1),
                 round_traces=state.round_traces,
+                agent_elapsed_ms={},
+                single_agent_details=[],
             )
             log_event(
                 self.main_agent.logger,

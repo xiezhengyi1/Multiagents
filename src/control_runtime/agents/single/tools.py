@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 from langchain.tools import ToolRuntime
 
 from shared.runtime import AgentRuntimeContext
-from shared.contracts import ExecutionScope
+from shared.contracts import ExecutionScope, MemoryContextView
 from shared.tools.wrapper_think import tool_with_reason
 
 from ...integrations.scenario.network_status import get_network_status_summary
@@ -17,10 +17,18 @@ from ...integrations.optimizer.result_view import (
     serialize_optimizer_result,
     summarize_optimizer_result,
 )
-from ..grounding.contracts import FlowSelector, GroundingDecision
+from ..grounding.contracts import (
+    FlowCandidateEvidence,
+    FlowSelector,
+    GroundedMobilityEvidence,
+    GroundingDecision,
+    GroundingEvidenceBundle,
+    SliceMigrationAuthorization,
+)
 from ...contracts import ControlDomain, standard_objective_profile
 from ..main.contracts import GlobalControlIntent, MainRoundStrategy
 from ..planning.contracts import PlanningContext, PlanningRequest, SharedControlContext
+from ...diagnostics.mediation.contracts import UnifiedConstraintSet
 
 
 FLOW_CATALOG_KEYS = ("supi", "app_id", "app_name", "flow_id", "flow_name")
@@ -201,6 +209,7 @@ def _flow_selector_from_catalog(flow: Dict[str, Any], supi: str) -> FlowSelector
     service = flow.get("service") if isinstance(flow.get("service"), dict) else {}
     sla = flow.get("sla") if isinstance(flow.get("sla"), dict) else {}
     traffic = flow.get("traffic") if isinstance(flow.get("traffic"), dict) else {}
+    allocation = flow.get("allocation") if isinstance(flow.get("allocation"), dict) else {}
     return FlowSelector(
         supi=supi,
         app_id=str(flow.get("app_id") or "").strip(),
@@ -220,6 +229,9 @@ def _flow_selector_from_catalog(flow: Dict[str, Any], supi: str) -> FlowSelector
         priority=sla.get("priority"),
         description=str(flow.get("flow_name") or "").strip() or None,
         five_tuple=list(traffic.get("five_tuple")) if isinstance(traffic.get("five_tuple"), (list, tuple)) else None,
+        current_slice_snssai=str(allocation.get("current_slice_snssai") or "").strip() or None,
+        current_bw_ul=allocation.get("allocated_bandwidth_ul"),
+        current_bw_dl=allocation.get("allocated_bandwidth_dl"),
         resolution_status="resolved",
     )
 
@@ -257,9 +269,52 @@ def _build_runtime_planning_request(
         required_evidence=["qos_runtime_evidence"],
     )
     return PlanningRequest(
-        grounding_decision=GroundingDecision(flows=flows),
+        grounding_decision=GroundingDecision(
+            flows=flows,
+            mobility_intent=None,
+            grounding_evidence=GroundingEvidenceBundle(
+                grounded_supi=normalized_supi,
+                grounded_apps=[],
+                grounded_flows=[
+                    FlowCandidateEvidence(
+                        supi=flow.supi or normalized_supi,
+                        app_id=flow.app_id or "",
+                        app_name=flow.app_name,
+                        flow_id=flow.flow_id or "",
+                        flow_name=flow.name,
+                        service_type=flow.service_type,
+                        service_type_id=flow.service_type_id,
+                        score=1.0,
+                    )
+                    for flow in flows
+                ],
+                mobility=GroundedMobilityEvidence(summary=None, subscription_entitlement=None),
+                evidence_sources={"single_agent": ["get_sm_ue_flow_catalog"]} if flows else {},
+            ),
+            qos_operation_constraints=[],
+            slice_migration_authorization=SliceMigrationAuthorization(
+                decision="not_applicable",
+                authority=None,
+                authorized_snssais=[],
+                target_snssais=[],
+                subscription_change_required=False,
+                rationale=[],
+            ),
+            open_questions=[],
+        ),
         context=PlanningContext(
+            memory_context=MemoryContextView(
+                query=None,
+                selected_short_term=[],
+                selected_long_term=[],
+                prompt_text="",
+            ),
             shared_context=SharedControlContext(main_intent=main_intent),
+            feedback_context="",
+            handoff_history=[],
+            revision_requests=[],
+            unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
+            qos_retry_constraints=[],
         ),
     )
 

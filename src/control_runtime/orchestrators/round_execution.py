@@ -14,9 +14,23 @@ from ..agents.grounding.contracts import GroundingDecision
 from ..agents.main.contracts import ControlDomain, GlobalControlIntent
 from ..agents.planning.contracts import PolicyPlanDraft
 from ..diagnostics.diagnosis import AssuranceDiagnosisTool
-from ..diagnostics.diagnosis.contracts import AssuranceDiagnosisRequest
+from ..diagnostics.diagnosis.contracts import (
+    AssuranceDiagnosisRequest,
+    DiagnosisExecutionFeedback,
+    DiagnosisUpstreamContext,
+)
 from ..diagnostics.mediation import ConflictResolutionTool
-from ..diagnostics.mediation.contracts import ConflictResolutionRequest, DomainStatus, DomainVerdict
+from ..diagnostics.mediation.contracts import (
+    ConflictResolutionRequest,
+    ConflictResolutionResult,
+    ConflictResourceView,
+    ConflictScope,
+    ConflictUpstreamContext,
+    DomainStatus,
+    DomainVerdict,
+    MediatorDecision,
+    UnifiedConstraintSet,
+)
 from ..integrations.storage import get_snapshot_data_by_id, get_ue_context_by_supi
 from .contracts import (
     ControlRoundTrace,
@@ -91,8 +105,8 @@ class _MediationResult:
     qos_proposal: Optional[DomainProposal]
     mobility_proposal: Optional[DomainProposal]
     domain_verdicts: List[DomainVerdict]
-    mediator_decision: Any
-    conflict_result: Any
+    mediator_decision: MediatorDecision
+    conflict_result: ConflictResolutionResult
 
 
 @dataclass(frozen=True)
@@ -142,8 +156,8 @@ def _split_domain_proposals(policy_plan: PolicyPlanDraft) -> tuple[Optional[Doma
     return qos_proposal, mobility_proposal
 
 
-def _build_resource_view(snapshot_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    snapshot = snapshot_data if isinstance(snapshot_data, dict) else {}
+def _build_resource_view(snapshot_data: Dict[str, Any]) -> ConflictResourceView:
+    snapshot = snapshot_data
     slices = snapshot.get("slices") if isinstance(snapshot.get("slices"), list) else []
     apps = snapshot.get("apps") if isinstance(snapshot.get("apps"), list) else []
     valid_slice_keys: List[str] = []
@@ -194,13 +208,13 @@ def _build_resource_view(snapshot_data: Optional[Dict[str, Any]]) -> Dict[str, A
                 "allocated_bandwidth_ul": float(allocation.get("allocated_bandwidth_ul", 0.0) or 0.0),
                 "allocated_bandwidth_dl": float(allocation.get("allocated_bandwidth_dl", 0.0) or 0.0),
             }
-    return {
-        "valid_slice_keys": sorted(set(valid_slice_keys)),
-        "valid_snssai_keys": sorted(set(valid_snssai_keys)),
-        "slice_capacity_by_snssai": slice_capacity_by_snssai,
-        "flow_allocations": flow_allocations,
-        "exclusive_resource_keys": [],
-    }
+    return ConflictResourceView(
+        valid_slice_keys=sorted(set(valid_slice_keys)),
+        valid_snssai_keys=sorted(set(valid_snssai_keys)),
+        slice_capacity_by_snssai=slice_capacity_by_snssai,
+        flow_allocations=flow_allocations,
+        exclusive_resource_keys=[],
+    )
 
 
 def _effective_supi(
@@ -214,7 +228,7 @@ def _effective_supi(
         for flow in grounding_decision.flows or []:
             if str(flow.supi or "").strip():
                 return str(flow.supi).strip()
-    return str(policy_plan.supi or "").strip()
+    return policy_plan.scope.supi or ""
 
 
 def _execution_order(policy_plan: Optional[PolicyPlanDraft]) -> List[ControlDomain]:
@@ -228,27 +242,34 @@ def _execution_order(policy_plan: Optional[PolicyPlanDraft]) -> List[ControlDoma
     return order
 
 
-def _build_conflict_request_payload(
+def _build_conflict_resolution_request(
     *,
     policy_plan: PolicyPlanDraft,
-    ue_context: Optional[Dict[str, Any]],
-    snapshot_data: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    ue_context: Dict[str, Any],
+    snapshot_data: Dict[str, Any],
+) -> ConflictResolutionRequest:
     candidate_policies = [item.model_dump(mode="json") for item in policy_plan.all_policies]
-    domains = {"mobility" if item.policy_type == AM_POLICY_TYPE else "qos" for item in policy_plan.all_policies}
-    return {
-        "candidate_policies": candidate_policies,
-        "resource_view": _build_resource_view(snapshot_data),
-        "conflict_scope": {"domains": sorted(domains)},
-        "upstream_context": {
-            "ue_context": ue_context or {},
-            "planner_cross_domain_verdicts": list((policy_plan.optimizer_result or {}).get("cross_domain_verdicts") or []),
-        },
+    domains = {
+        ControlDomain.MOBILITY if item.policy_type == AM_POLICY_TYPE else ControlDomain.QOS
+        for item in policy_plan.all_policies
     }
+    return ConflictResolutionRequest(
+        scope=policy_plan.scope,
+        candidate_policies=candidate_policies,
+        resource_view=_build_resource_view(snapshot_data),
+        conflict_scope=ConflictScope(domains=sorted(domains, key=lambda item: item.value)),
+        upstream_context=ConflictUpstreamContext(
+            ue_context=ue_context,
+            planner_cross_domain_verdicts=policy_plan.optimizer_result.cross_domain_verdicts,
+        ),
+    )
 
 
-def _verdicts_from_conflict_result(conflict_result: Any, domains: List[ControlDomain]) -> List[DomainVerdict]:
-    mediator_status = str(getattr(conflict_result, "mediator_status", "") or "").strip().lower()
+def _verdicts_from_conflict_result(
+    conflict_result: ConflictResolutionResult,
+    domains: List[ControlDomain],
+) -> List[DomainVerdict]:
+    mediator_status = conflict_result.mediator_status
     if mediator_status == "approved":
         return []
     status = (
@@ -262,9 +283,11 @@ def _verdicts_from_conflict_result(conflict_result: Any, domains: List[ControlDo
         DomainVerdict(
             domain=domain,
             status=status,
-            summary=str(getattr(conflict_result, "reason_summary", "") or "").strip(),
-            hard_conflicts=[json.dumps(item, ensure_ascii=False) for item in getattr(conflict_result, "conflicts", [])],
-            metrics={"affected_policy_ids": getattr(conflict_result, "affected_policy_ids", [])},
+            summary=conflict_result.reason_summary,
+            hard_conflicts=[item.model_dump_json() for item in conflict_result.conflicts],
+            soft_conflicts=[],
+            infeasible_reasons=[],
+            metrics={"affected_policy_ids": conflict_result.affected_policy_ids},
         )
         for domain in domains
     ]
@@ -272,8 +295,7 @@ def _verdicts_from_conflict_result(conflict_result: Any, domains: List[ControlDo
 
 def _mediate_policy_plan(
     *,
-    session_id: str,
-    snapshot_id: str,
+    scope: ExecutionScope,
     snapshot_data: Dict[str, Any],
     policy_plan: PolicyPlanDraft,
     cr_tool: ConflictResolutionTool,
@@ -288,6 +310,10 @@ def _mediate_policy_plan(
                 domain=ControlDomain.QOS,
                 status=DomainStatus.PROPOSED,
                 summary="QoS proposal ready for mediation.",
+                hard_conflicts=[],
+                soft_conflicts=[],
+                infeasible_reasons=[],
+                metrics={},
             )
         )
     if mobility_proposal:
@@ -296,20 +322,23 @@ def _mediate_policy_plan(
                 domain=ControlDomain.MOBILITY,
                 status=DomainStatus.PROPOSED,
                 summary="AM policy proposal ready for mediation.",
+                hard_conflicts=[],
+                soft_conflicts=[],
+                infeasible_reasons=[],
+                metrics={},
             )
         )
+    if scope.snapshot_id is None:
+        raise ValueError("mediation requires scope.snapshot_id")
     conflict_result = cr_tool.run(
-        ConflictResolutionRequest(
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            **_build_conflict_request_payload(
-                policy_plan=policy_plan,
-                ue_context=get_ue_context_by_supi(
-                    _effective_supi(global_intent, grounding_decision, policy_plan),
-                    snapshot_id=snapshot_id,
-                ),
-                snapshot_data=snapshot_data,
-            ),
+        _build_conflict_resolution_request(
+            policy_plan=policy_plan,
+            ue_context=get_ue_context_by_supi(
+                _effective_supi(global_intent, grounding_decision, policy_plan),
+                snapshot_id=scope.snapshot_id,
+            )
+            or {},
+            snapshot_data=snapshot_data,
         )
     )
     domain_verdicts = initial_verdicts + _verdicts_from_conflict_result(conflict_result, _execution_order(policy_plan))
@@ -377,7 +406,7 @@ def _dispatch_mediated_plan(
     policy_plan: PolicyPlanDraft,
     planning_status: str,
     pd_agent: PolicyDispatchAgent,
-    conflict_result: Any,
+    conflict_result: ConflictResolutionResult,
     qos_proposal: Optional[DomainProposal],
     mobility_proposal: Optional[DomainProposal],
     trace_metadata: Optional[Dict[str, Any]],
@@ -457,14 +486,12 @@ def _dispatch_mediated_plan(
 
 def _diagnose_round(
     *,
-    session_id: str,
-    snapshot_id: str,
-    round_index: int,
+    scope: ExecutionScope,
     snapshot_data: Dict[str, Any],
     policy_plan: PolicyPlanDraft,
     global_intent: Optional[GlobalControlIntent],
     grounding_decision: Optional[GroundingDecision],
-    conflict_result: Any,
+    conflict_result: ConflictResolutionResult,
     report: Optional[FeedbackReport],
     qos_feedback: Dict[str, Any],
     mobility_feedback: Dict[str, Any],
@@ -473,21 +500,20 @@ def _diagnose_round(
     ad_tool: AssuranceDiagnosisTool,
 ) -> _AssuranceResult:
     diagnosis_request = AssuranceDiagnosisRequest(
-        execution_feedback={
-            "pda": report.model_dump(mode="json") if report is not None else {},
-            "qos": qos_feedback,
-            "mobility": mobility_feedback,
-        },
+        scope=scope,
+        execution_feedback=DiagnosisExecutionFeedback(
+            pda=report.model_dump(mode="json") if report is not None else {},
+            qos=qos_feedback,
+            mobility=mobility_feedback,
+        ),
         dispatch_receipts=dispatch_receipts,
         assurance_verdicts=assurance_verdicts,
         telemetry_snapshot=snapshot_data,
-        session_id=session_id,
-        snapshot_id=snapshot_id,
-        upstream_context={
-            "global_intent": global_intent.model_dump(mode="json") if global_intent is not None else {},
-            "grounding_decision": grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
-            "conflict_result": conflict_result.model_dump(mode="json"),
-        },
+        upstream_context=DiagnosisUpstreamContext(
+            global_intent=global_intent.model_dump(mode="json") if global_intent is not None else {},
+            grounding_decision=grounding_decision.model_dump(mode="json") if grounding_decision is not None else {},
+            conflict_result=conflict_result.model_dump(mode="json"),
+        ),
     )
     diagnosis = ad_tool.run(diagnosis_request).model_dump(mode="json")
     if report is not None and report.intent_status == "partially_satisfied":
@@ -498,7 +524,6 @@ def _diagnose_round(
                 "root_cause": "; ".join(policy_plan.blocked_targets or policy_plan.planner_conflicts),
                 "reason_summary": partial_summary,
                 "recommended_actions": list(policy_plan.upstream_requests or []),
-                "intent_status": "partially_satisfied",
             }
         )
     execution_reentry = None
@@ -506,7 +531,7 @@ def _diagnose_round(
         feedback_payload = report.feedback_payload if isinstance(report.feedback_payload, dict) else {}
         if not bool(feedback_payload.get("retry_forbidden")):
             execution_reentry = ExecutionReentryRequest(
-                round_index=round_index,
+                round_index=scope.round_index,
                 source_agent="policy_dispatch",
                 recommended_consumers=[],
                 target_bindings_at_risk=list(feedback_payload.get("target_bindings_at_risk") or []),
@@ -537,8 +562,8 @@ def _open_questions(grounding_decision: Optional[GroundingDecision], policy_plan
 
 
 def _objective_breakdown(policy_plan: PolicyPlanDraft, global_intent: Optional[GlobalControlIntent]) -> Dict[str, Any]:
-    if policy_plan.optimizer_result:
-        return dict(policy_plan.optimizer_result)
+    if policy_plan.optimizer_result.objective_breakdown:
+        return dict(policy_plan.optimizer_result.objective_breakdown)
     if global_intent is not None:
         return global_intent.objective_profile.model_dump(mode="json")
     return {}
@@ -552,7 +577,6 @@ def _build_planning_blocked_artifacts(
     global_intent: Optional[GlobalControlIntent],
     planning_status: str,
 ) -> RoundExecutionArtifacts:
-    session_id = scope.session_id
     snapshot_id = scope.snapshot_id
     round_index = scope.round_index
     if snapshot_id is None:
@@ -589,13 +613,22 @@ def _build_planning_blocked_artifacts(
             update={"supi": _effective_supi(global_intent, grounding_decision, policy_plan) or None}
         ),
         global_intent=global_intent,
+        qos_proposal=None,
+        mobility_proposal=None,
         domain_verdicts=[],
+        mediator_decision=None,
+        unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
+        execution_order=[],
+        approved_policies=[],
         blocked_domains=[
             ControlDomain(item)
             for item in _requested_domains(global_intent, policy_plan)
             if item in {ControlDomain.QOS.value, ControlDomain.MOBILITY.value}
         ],
         objective_breakdown=_objective_breakdown(policy_plan, global_intent),
+        control_churn_count=0,
+        agent_contributions=[],
+        handoff_records=[],
         open_questions=_open_questions(grounding_decision, policy_plan),
     )
     return RoundExecutionArtifacts(
@@ -756,13 +789,13 @@ def execute_planned_round(
         raise ValueError("planned round execution requires scope.snapshot_id")
     if scope.round_index < 1:
         raise ValueError("planned round execution requires scope.round_index >= 1")
-    session_id = scope.session_id
+    if policy_plan.scope != scope:
+        raise ValueError("policy plan scope must match round execution scope")
     snapshot_id = scope.snapshot_id
-    round_index = scope.round_index
     snapshot_data = get_snapshot_data_by_id(snapshot_id) or {}
     if not snapshot_data:
         raise LookupError(f"bound snapshot not found: snapshot_id={snapshot_id}")
-    planning_status = str(policy_plan.planning_status or "").strip().lower()
+    planning_status = policy_plan.planning_status
     dispatchable_partial_plan = planning_status == "partial_plan" and bool(policy_plan.all_policies)
     if planning_status != "executable_plan" and not dispatchable_partial_plan:
         return _build_planning_blocked_artifacts(
@@ -773,8 +806,7 @@ def execute_planned_round(
             planning_status=planning_status,
         )
     mediation = _mediate_policy_plan(
-        session_id=session_id,
-        snapshot_id=snapshot_id,
+        scope=scope,
         snapshot_data=snapshot_data,
         policy_plan=policy_plan,
         cr_tool=cr_tool,
@@ -791,9 +823,7 @@ def execute_planned_round(
         trace_metadata=trace_metadata,
     )
     assurance = _diagnose_round(
-        session_id=session_id,
-        snapshot_id=snapshot_id,
-        round_index=round_index,
+        scope=scope,
         snapshot_data=snapshot_data,
         policy_plan=policy_plan,
         global_intent=global_intent,

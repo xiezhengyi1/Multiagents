@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional
 
 from pydantic import Field, JsonValue, model_validator
 
@@ -43,20 +43,20 @@ class HandoffRecord(ContractModel):
 
 class UnifiedControlPlan(ContractModel):
     scope: ExecutionScope
-    global_intent: Optional[GlobalControlIntent] = None
-    qos_proposal: Optional[DomainProposal] = None
-    mobility_proposal: Optional[DomainProposal] = None
-    domain_verdicts: List[DomainVerdict] = Field(default_factory=list)
-    mediator_decision: Optional[MediatorDecision] = None
-    unified_constraints: UnifiedConstraintSet = Field(default_factory=UnifiedConstraintSet)
-    execution_order: List[ControlDomain] = Field(default_factory=list)
-    approved_policies: list[dict[str, JsonValue]] = Field(default_factory=list)
-    blocked_domains: List[ControlDomain] = Field(default_factory=list)
-    objective_breakdown: dict[str, JsonValue] = Field(default_factory=dict)
-    control_churn_count: int = Field(default=0, ge=0)
-    agent_contributions: List[AgentContribution] = Field(default_factory=list)
-    handoff_records: List[HandoffRecord] = Field(default_factory=list)
-    open_questions: List[OpenQuestion] = Field(default_factory=list)
+    global_intent: Optional[GlobalControlIntent]
+    qos_proposal: Optional[DomainProposal]
+    mobility_proposal: Optional[DomainProposal]
+    domain_verdicts: List[DomainVerdict]
+    mediator_decision: Optional[MediatorDecision]
+    unified_constraints: UnifiedConstraintSet
+    execution_order: List[ControlDomain]
+    approved_policies: list[dict[str, JsonValue]]
+    blocked_domains: List[ControlDomain]
+    objective_breakdown: dict[str, JsonValue]
+    control_churn_count: int = Field(ge=0)
+    agent_contributions: List[AgentContribution]
+    handoff_records: List[HandoffRecord]
+    open_questions: List[OpenQuestion]
 
     @model_validator(mode="after")
     def validate_domain_sets(self) -> "UnifiedControlPlan":
@@ -157,32 +157,23 @@ class ControlRoundResult(ContractModel):
     completed: bool
     global_intent: dict[str, JsonValue]
     unified_plan: dict[str, JsonValue]
-    qos_feedback: dict[str, JsonValue] = Field(default_factory=dict)
-    mobility_feedback: dict[str, JsonValue] = Field(default_factory=dict)
-    diagnosis: dict[str, JsonValue] = Field(default_factory=dict)
-    negotiation_request: dict[str, JsonValue] = Field(default_factory=dict)
-    planning_blocker: dict[str, JsonValue] = Field(default_factory=dict)
-    execution_reentry: dict[str, JsonValue] = Field(default_factory=dict)
-    round_count: int = Field(default=1, ge=1)
-    retry_count: int = Field(default=0, ge=0)
-    round_traces: list[dict[str, JsonValue]] = Field(default_factory=list)
-    agent_elapsed_ms: dict[str, float] = Field(default_factory=dict)
-    single_agent_details: list[dict[str, JsonValue]] = Field(default_factory=list)
+    qos_feedback: dict[str, JsonValue]
+    mobility_feedback: dict[str, JsonValue]
+    diagnosis: dict[str, JsonValue]
+    negotiation_request: dict[str, JsonValue]
+    planning_blocker: dict[str, JsonValue]
+    execution_reentry: dict[str, JsonValue]
+    round_count: int = Field(ge=1)
+    retry_count: int = Field(ge=0)
+    round_traces: list[dict[str, JsonValue]]
+    agent_elapsed_ms: dict[str, float]
+    single_agent_details: list[dict[str, JsonValue]]
 
     @model_validator(mode="after")
     def validate_result_scope(self) -> "ControlRoundResult":
         if self.scope.snapshot_id is None:
             raise ValueError("control round result requires scope.snapshot_id")
         return self
-
-    @property
-    def session_id(self) -> str:
-        return self.scope.session_id
-
-    @property
-    def snapshot_id(self) -> str:
-        return cast(str, self.scope.snapshot_id)
-
 
 __all__ = [
     "ControlRoundResult",

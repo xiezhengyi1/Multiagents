@@ -69,7 +69,7 @@ def _hit(result_key: str) -> KnowledgeHit:
 
 
 def test_memory_bundle_enforces_record_kind_and_namespace() -> None:
-    query = MemoryQuery(scope=_scope(), text="policy")
+    query = MemoryQuery(scope=_scope(), text="policy", top_k=3)
 
     with pytest.raises(ValidationError, match="short_term memory must contain only event"):
         MemoryBundle(

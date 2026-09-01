@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 for candidate in (ROOT, SRC):
@@ -12,6 +11,7 @@ for candidate in (ROOT, SRC):
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
 
+from shared.contracts import ExecutionScope
 from control_runtime.monitoring.contracts import IntentStatus, MonitorAlert
 from control_runtime.monitoring.lifecycle import IntentLifecycleManager
 
@@ -36,8 +36,12 @@ def _alert(*, app_id: str = "app-1") -> MonitorAlert:
 
 def _result(*, completed: bool) -> SimpleNamespace:
     return SimpleNamespace(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
+        scope=ExecutionScope(
+            session_id="session-1",
+            thread_id="session-1",
+            snapshot_id="snapshot-1",
+            round_index=1,
+        ),
         completed=completed,
         global_intent={},
         unified_plan={},

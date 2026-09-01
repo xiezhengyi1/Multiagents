@@ -12,6 +12,7 @@ for candidate in (ROOT, SRC):
     if str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
+from shared.contracts import ExecutionScope
 from control_runtime.monitoring.contracts import IntentStatus, MonitorAlert, MonitorResult
 from control_runtime.monitoring.flow_monitor import FlowTelemetryMonitor
 from control_runtime.monitoring.watch_loop import (
@@ -70,8 +71,12 @@ class RecordingOrchestrator:
         self.calls.append({"user_input": user_input, **kwargs})
         binding = kwargs.get("routing_hint", {}).get("monitor_binding", {}) if kwargs.get("routing_hint") else {}
         return SimpleNamespace(
-            session_id=f"session-{len(self.calls)}",
-            snapshot_id=kwargs["snapshot_id"],
+            scope=ExecutionScope(
+                session_id=f"session-{len(self.calls)}",
+                thread_id=f"session-{len(self.calls)}",
+                snapshot_id=kwargs["snapshot_id"],
+                round_index=1,
+            ),
             completed=True,
             round_traces=[
                 {

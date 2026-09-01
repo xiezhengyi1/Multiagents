@@ -265,7 +265,10 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
                     domain=ControlDomain.QOS,
                     status=DomainStatus.REJECTED,
                     summary="QoS optimizer returned infeasible result",
+                    hard_conflicts=[],
+                    soft_conflicts=[],
                     infeasible_reasons=qos_errors,
+                    metrics={},
                 )
             )
         else:
@@ -274,6 +277,9 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
                     domain=ControlDomain.QOS,
                     status=DomainStatus.APPROVED,
                     summary="QoS optimizer produced a feasible plan",
+                    hard_conflicts=[],
+                    soft_conflicts=[],
+                    infeasible_reasons=[],
                     metrics=qos_plan.get("meta", {}),
                 )
             )
@@ -290,7 +296,10 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
                     domain=ControlDomain.MOBILITY,
                     status=DomainStatus.INCOMPLETE_CONTEXT,
                     summary="Missing target SUPI for mobility planning",
+                    hard_conflicts=[],
+                    soft_conflicts=[],
                     infeasible_reasons=["missing target SUPI"],
+                    metrics={},
                 )
             )
         else:
@@ -302,7 +311,10 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
                         domain=ControlDomain.MOBILITY,
                         status=DomainStatus.INCOMPLETE_CONTEXT,
                         summary="Mobility context is incomplete",
+                        hard_conflicts=[],
+                        soft_conflicts=[],
                         infeasible_reasons=[f"missing mobility context field: {item}" for item in snapshot.missing_fields],
+                        metrics={},
                     )
                 )
             else:

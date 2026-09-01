@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -10,6 +9,8 @@ from pydantic import BaseModel
 from model.PcfAmPolicyControl import PcfAmPolicyControlPolicyAssociation
 from model.SmPolicyDecision import SmPolicyDecision
 from model.UrspRuleRequest import UrspRuleRequest
+from shared.contracts import ContractModel, ExecutionScope, JsonValue
+from ..agents.planning.contracts import PolicyPlanDraft
 
 
 def _json_friendly(value: Any) -> Any:
@@ -28,12 +29,9 @@ def _json_friendly(value: Any) -> Any:
     return str(value)
 
 
-@dataclass(frozen=True)
-class CompiledStrategyPlan:
-    supi: str
-    session_id: str
-    snapshot_id: str
-    policies: List[Dict[str, Any]]
+class CompiledStrategyPlan(ContractModel):
+    scope: ExecutionScope
+    policies: list[dict[str, JsonValue]]
 
 
 class PolicyCompiler:
@@ -94,18 +92,10 @@ class PolicyCompiler:
         return None
 
     @classmethod
-    def coerce_strategy_output(cls, strategy_output: Any) -> CompiledStrategyPlan:
-        payload = _json_friendly(strategy_output)
-        if not isinstance(payload, dict):
-            raise ValueError("strategy_output must be a JSON object")
-        policies = payload.get("all_policies")
-        if not isinstance(policies, list):
-            raise ValueError("strategy_output.all_policies must be a list")
+    def coerce_strategy_output(cls, strategy_output: PolicyPlanDraft) -> CompiledStrategyPlan:
         return CompiledStrategyPlan(
-            supi=str(payload.get("supi") or "").strip(),
-            session_id=str(payload.get("session_id") or "").strip(),
-            snapshot_id=str(payload.get("snapshot_id") or "").strip(),
-            policies=[_json_friendly(item) for item in policies if isinstance(item, dict)],
+            scope=strategy_output.scope,
+            policies=[item.model_dump(mode="json") for item in strategy_output.all_policies],
         )
 
     @classmethod
@@ -215,15 +205,13 @@ class PolicyCompiler:
         UrspRuleRequest.model_validate(policy_details)
 
     @classmethod
-    def compile_plan(cls, strategy_output: Any) -> CompiledStrategyPlan:
+    def compile_plan(cls, strategy_output: PolicyPlanDraft) -> CompiledStrategyPlan:
         plan = cls.coerce_strategy_output(strategy_output)
         compiled_policies = [cls.compile_policy(policy) for policy in plan.policies]
         if not compiled_policies:
             raise ValueError("strategy_output contains no policies")
         return CompiledStrategyPlan(
-            supi=plan.supi,
-            session_id=plan.session_id,
-            snapshot_id=plan.snapshot_id,
+            scope=plan.scope,
             policies=compiled_policies,
         )
 

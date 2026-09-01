@@ -9,9 +9,7 @@ from .base import BaseProjector, field, json_mapping, without_empty_values
 class PolicyPlanDraftProjector(BaseProjector):
     model = PolicyPlanDraft
     visible = (
-        field("supi"),
-        field("session_id"),
-        field("snapshot_id"),
+        field("scope"),
         field("planning_status"),
         field("missing_evidence"),
         field("blocked_targets"),

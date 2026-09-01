@@ -4,7 +4,13 @@ import json
 from typing import Any, Dict, List
 
 from ..grounding.contracts import FlowSelector
-from .contracts import PlanningRationale, PlanningRequest, PolicyDraft, PolicyPlanDraft
+from .contracts import (
+    OptimizerPlanEvidence,
+    PlanningRationale,
+    PlanningRequest,
+    PolicyDraft,
+    PolicyPlanDraft,
+)
 from .evidence import build_planning_evidence
 from .planning_validation import (
     PlanningArtifactValidator,
@@ -99,21 +105,14 @@ class OptimizationStrategyCompiler:
         if planning_status == "executable_plan" and advisor_output.am_policy is not None and not mobility_context:
             raise ValueError("am_policy compilation requires grounded mobility context")
 
-        optimizer_result = {
-            "objective_breakdown": dict(optimizer_preview.get("objective_breakdown") or {}) if isinstance(optimizer_preview, dict) else {},
-            "cross_domain_verdicts": [
-                _json_friendly(item)
-                for item in ((optimizer_preview.get("cross_domain_verdicts") if isinstance(optimizer_preview, dict) else []) or [])
-            ],
-        }
-
-        plan = PolicyPlanDraft(
-            supi=_planning_supi(planning_request),
-            session_id=planning_request.context.shared_context.main_intent.scope.session_id,
-            snapshot_id=planning_request.context.shared_context.main_intent.scope.snapshot_id,
-            planning_status=planning_status,
-            optimizer_result=optimizer_result,
-            planning_rationale=PlanningRationale(
+        optimizer_result = OptimizerPlanEvidence(
+            objective_breakdown=dict(optimizer_preview.get("objective_breakdown") or {}) if isinstance(optimizer_preview, dict) else {},
+            cross_domain_verdicts=list(
+                (optimizer_preview.get("cross_domain_verdicts") if isinstance(optimizer_preview, dict) else [])
+                or []
+            ),
+        )
+        planning_rationale = PlanningRationale(
                 selected_strategy_profile=str(
                     planning_request.context.shared_context.main_intent.objective_profile.profile_name
                     or ""
@@ -124,7 +123,9 @@ class OptimizationStrategyCompiler:
                         "target_binding_reused" if _main_retry_scope(planning_request) == "target_stable" else "",
                         "tool:preview_qos_optimizer" if advisor_output.sm_policies else "",
                         "tool:inspect_mobility_ue_policies" if advisor_output.am_policy is not None else "",
-                        "mediator_constraints" if planning_request.context.unified_constraints else "",
+                        "mediator_constraints"
+                        if planning_request.context.unified_constraints.hard_constraints
+                        else "",
                         "revision_requests" if planning_request.context.revision_requests else "",
                     ]
                     if item
@@ -154,9 +155,9 @@ class OptimizationStrategyCompiler:
                     for item in (
                         list((planning_request.grounding_decision.grounding_evidence.evidence_sources or {}).keys())
                         + [
-                            str(item.get("flow_id") or "").strip()
+                            str(item.flow_id or "").strip()
                             for item in (planning_request.grounding_decision.grounding_evidence.grounded_flows or [])
-                            if str(item.get("flow_id") or "").strip()
+                            if str(item.flow_id or "").strip()
                         ]
                     )
                     if str(item).strip()
@@ -172,19 +173,16 @@ class OptimizationStrategyCompiler:
                     if str(item).strip()
                 ],
                 unresolved_gaps=[str(item) for item in (advisor_output.missing_evidence or []) if str(item).strip()],
-            ),
-            all_policies=[],
-            partial_policies=[],
-            missing_evidence=[str(item) for item in (advisor_output.missing_evidence or []) if str(item).strip()],
-            blocked_targets=[str(item) for item in (advisor_output.blocked_targets or []) if str(item).strip()],
-            upstream_requests=[str(item) for item in (advisor_output.upstream_requests or []) if str(item).strip()],
-            planner_conflicts=[str(item) for item in (advisor_output.planner_conflicts or []) if str(item).strip()],
         )
-        if planning_status == "partial_plan":
-            plan.partial_policies = self._build_partial_policy_drafts(
+        partial_policies = (
+            self._build_partial_policy_drafts(
                 partial_policies=advisor_output.partial_policies,
                 planning_request=planning_request,
             )
+            if planning_status == "partial_plan"
+            else []
+        )
+        all_policies: list[PolicyDraft] = []
 
         # The optimizer, rather than the advisor, is authoritative for the
         # S-NSSAI actually selected for each QoS flow.  Gather it once here
@@ -211,17 +209,17 @@ class OptimizationStrategyCompiler:
             )
 
         if advisor_output.am_policy is not None:
-            plan.all_policies.append(
+            all_policies.append(
                 PolicyDraft(
-                    recommended_actions=[],
                     supi=_planning_supi(planning_request),
-                    app_id="",
+                    app_id=None,
                     flow_id=None,
                     target_type="ue",
                     policy_id=self._resolve_am_association_id(
                         planning_request=planning_request,
                         mobility_context=mobility_context,
                     ),
+                    resource_keys=[],
                     policy_type="PcfAmPolicyControlPolicyAssociation",
                     policy_details=self._build_am_policy_details(
                         advisor_output.am_policy,
@@ -236,9 +234,8 @@ class OptimizationStrategyCompiler:
             flow_ctx = self._resolve_flow(planning_request, spec.flow_id)
             if _normalize_app_id(spec.app_id) != _normalize_app_id(flow_ctx.app_id or ""):
                 raise ValueError(f"sm policy app_id does not match resolved flow context for flow_id={spec.flow_id}")
-            plan.all_policies.append(
+            all_policies.append(
                 PolicyDraft(
-                    recommended_actions=[],
                     supi=str(flow_ctx.supi or _planning_supi(planning_request)).strip(),
                     app_id=_normalize_app_id(spec.app_id),
                     flow_id=spec.flow_id,
@@ -260,33 +257,41 @@ class OptimizationStrategyCompiler:
                 raise ValueError(f"flow-scoped URSP policy references unknown flow_id={spec.flow_id}")
             if spec.target_type == "flow" and _normalize_app_id(spec.app_id) != _normalize_app_id(flow_ctx.app_id or ""):
                 raise ValueError(f"ursp policy app_id does not match resolved flow context for flow_id={spec.flow_id}")
-            plan.all_policies.append(
+            all_policies.append(
                 PolicyDraft(
-                    recommended_actions=[],
                     supi=str((flow_ctx.supi if flow_ctx is not None else "") or _planning_supi(planning_request)).strip(),
                     app_id=_normalize_app_id(spec.app_id),
                     flow_id=spec.flow_id,
                     target_type=spec.target_type,
                     policy_id=f"ursp-{_normalize_app_id(spec.app_id)}-{spec.flow_id or index}",
                     policy_type="UrspRuleRequest",
+                    resource_keys=[],
                     policy_details=self._build_ursp_policy_details(spec),
                 )
             )
 
+        plan = PolicyPlanDraft(
+            scope=planning_request.context.shared_context.main_intent.scope.model_copy(
+                update={"supi": _planning_supi(planning_request)}
+            ),
+            planning_status=planning_status,
+            optimizer_result=optimizer_result,
+            planning_rationale=planning_rationale,
+            all_policies=all_policies,
+            partial_policies=partial_policies,
+            missing_evidence=[str(item) for item in advisor_output.missing_evidence if str(item).strip()],
+            blocked_targets=[str(item) for item in advisor_output.blocked_targets if str(item).strip()],
+            upstream_requests=[str(item) for item in advisor_output.upstream_requests if str(item).strip()],
+            planner_conflicts=[str(item) for item in advisor_output.planner_conflicts if str(item).strip()],
+            open_questions=list(advisor_output.open_questions),
+        )
         normalized = normalize_policy_plan_draft(plan)
         self.validator.validate_compiled_plan(normalized, planning_request)
         return normalized
 
     @staticmethod
     def _normalized_hard_constraints(unified_constraints: Any) -> List[Any]:
-        if not isinstance(unified_constraints, dict):
-            return []
-        raw_constraints = unified_constraints.get("hard_constraints")
-        if raw_constraints is None:
-            return []
-        if not isinstance(raw_constraints, list):
-            raise TypeError("planning_request.context.unified_constraints.hard_constraints must be a list when present")
-        return raw_constraints
+        return list(unified_constraints.hard_constraints)
 
     @staticmethod
     def _resolve_flow(planning_request: PlanningRequest, flow_id: str) -> FlowSelector:
@@ -317,25 +322,35 @@ class OptimizationStrategyCompiler:
 
     @staticmethod
     def _with_optimizer_bandwidths(spec: SmPolicySpec, optimizer_preview: Any) -> SmPolicySpec:
-        """Make the optimizer allocation authoritative without changing absent legacy evidence."""
-        assignments = optimizer_preview.get("qos_flow_assignments") if isinstance(optimizer_preview, dict) else []
+        """Make the validated optimizer allocation authoritative for executable SM policy values."""
+        if not isinstance(optimizer_preview, dict):
+            raise ValueError("optimizer preview must be an object")
+        assignments = optimizer_preview.get("qos_flow_assignments")
+        if not isinstance(assignments, list):
+            raise ValueError("optimizer preview must contain qos_flow_assignments")
         assignment = next(
             (
                 item
-                for item in (assignments or [])
+                for item in assignments
                 if isinstance(item, dict) and str(item.get("flow_id") or "").strip() == spec.flow_id
             ),
             None,
         )
         if not assignment:
-            return spec
+            raise ValueError(
+                f"optimizer preview does not contain bandwidths for flow_id={spec.flow_id}"
+            )
         try:
             bandwidth_ul = float(assignment["bw_ul"])
             bandwidth_dl = float(assignment["bw_dl"])
-        except (KeyError, TypeError, ValueError):
-            return spec
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"optimizer preview contains invalid bandwidths for flow_id={spec.flow_id}"
+            ) from exc
         if bandwidth_ul <= 0 or bandwidth_dl <= 0:
-            return spec
+            raise ValueError(
+                f"optimizer preview bandwidths must be positive for flow_id={spec.flow_id}"
+            )
         updates: Dict[str, Any] = {
             "max_br_ul_mbps": bandwidth_ul,
             "max_br_dl_mbps": bandwidth_dl,
@@ -565,9 +580,8 @@ class OptimizationStrategyCompiler:
         for index, item in enumerate(partial_policies, start=1):
             drafts.append(
                 PolicyDraft(
-                    recommended_actions=[],
                     supi=_planning_supi(planning_request),
-                    app_id=item.app_id,
+                    app_id=item.app_id or None,
                     flow_id=item.flow_id,
                     target_type=item.target_type,
                     policy_id=f"partial-{index}",
@@ -593,27 +607,39 @@ class OptimizationStrategyCompiler:
         if not upstream_requests:
             upstream_requests = [reason] if str(reason or "").strip() else []
         return PolicyPlanDraft(
-            supi=_planning_supi(planning_request),
-            session_id=planning_request.context.shared_context.main_intent.scope.session_id,
-            snapshot_id=planning_request.context.shared_context.main_intent.scope.snapshot_id,
+            scope=planning_request.context.shared_context.main_intent.scope.model_copy(
+                update={"supi": _planning_supi(planning_request)}
+            ),
             planning_status="needs_upstream_reground",
+            optimizer_result=OptimizerPlanEvidence(
+                objective_breakdown={},
+                cross_domain_verdicts=[],
+            ),
             planning_rationale=PlanningRationale(
                 selected_strategy_profile=str(
                     planning_request.context.shared_context.main_intent.objective_profile.profile_name
                     or ""
                 ).strip(),
+                decisive_evidence=[],
+                active_constraints=[],
                 explanation=rationale,
+                rejected_alternatives=[],
                 unresolved_gaps=[*missing_evidence, *blocked_targets, *upstream_requests],
                 main_constraints=[
                     str(item)
                     for item in planning_request.context.shared_context.main_intent.required_evidence
                     if str(item).strip()
                 ],
+                iea_grounding_basis=[],
+                osa_decision_basis=[],
             ),
+            all_policies=[],
+            partial_policies=[],
             missing_evidence=[str(item) for item in missing_evidence if str(item).strip()],
             blocked_targets=[str(item) for item in blocked_targets if str(item).strip()],
             upstream_requests=[str(item) for item in upstream_requests if str(item).strip()],
             planner_conflicts=[str(item) for item in planner_conflicts if str(item).strip()],
+            open_questions=list(advisor_output.open_questions) if advisor_output is not None else [],
         )
 
 

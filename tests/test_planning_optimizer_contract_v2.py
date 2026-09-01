@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.contracts import ExecutionScope
+from shared.contracts import ExecutionScope, MemoryContextView
 from control_runtime.agents.main.contracts import GlobalControlIntent
 from control_runtime.agents.planning.contracts import PlanningContext, SharedControlContext
 from control_runtime.agents.planning.response_models import (
@@ -23,6 +23,7 @@ from control_runtime.integrations.optimizer.contracts import (
     OptimizationProblemConfig,
     OptimizerInput,
 )
+from control_runtime.diagnostics.mediation.contracts import UnifiedConstraintSet
 
 
 def _scope() -> ExecutionScope:
@@ -89,7 +90,18 @@ def test_osa_output_requires_explicit_nullable_and_empty_collection_fields() -> 
 
 def test_planning_context_rejects_flat_identity_fields() -> None:
     payload = PlanningContext(
-        shared_context=SharedControlContext(main_intent=_main_intent())
+        memory_context=MemoryContextView(
+            query=None,
+            selected_short_term=[],
+            selected_long_term=[],
+            prompt_text="",
+        ),
+        shared_context=SharedControlContext(main_intent=_main_intent()),
+        feedback_context="",
+        handoff_history=[],
+        revision_requests=[],
+        unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
+        qos_retry_constraints=[],
     ).model_dump(mode="json")
     payload["session_id"] = "session-1"
 

@@ -10,6 +10,7 @@ from shared.logging import log_event, log_timing, setup_logger
 from .assurance_evaluator import AssuranceEvaluator
 from .policy_batch_executor import PolicyBatchExecutor
 from .policy_compiler import PolicyCompiler
+from ..agents.planning.contracts import PolicyPlanDraft
 
 
 @dataclass(frozen=True)
@@ -96,24 +97,22 @@ class ExecutionController:
         policy_types = [entry.get("policy_type") for entry in entries if isinstance(entry, dict)]
         return self._failure_scope_from_policies([{"policy_type": item} for item in policy_types if item])
 
-    def execute(self, strategy_output: Any) -> ExecutionOutcome:
+    def execute(self, strategy_output: PolicyPlanDraft) -> ExecutionOutcome:
         total_start = datetime.now().timestamp()
         policies = list(getattr(strategy_output, "all_policies", []) or [])
         log_event(
             self.logger,
             "pda_execute_start",
-            session_id=str(getattr(strategy_output, "session_id", "") or "").strip() or "<empty>",
-            snapshot_id=str(getattr(strategy_output, "snapshot_id", "") or "").strip() or "<empty>",
-            supi=str(getattr(strategy_output, "supi", "") or "").strip() or "<empty>",
+            session_id=strategy_output.scope.session_id,
+            snapshot_id=strategy_output.scope.snapshot_id,
+            supi=strategy_output.scope.supi,
             policy_count=len(policies),
         )
 
         try:
             plan = self.compiler.compile_plan(strategy_output)
             policy_plan_payload = {
-                "session_id": plan.session_id,
-                "snapshot_id": plan.snapshot_id,
-                "supi": plan.supi,
+                "scope": plan.scope.model_dump(mode="json"),
                 "policies": plan.policies,
             }
             policies = plan.policies
@@ -131,8 +130,8 @@ class ExecutionController:
 
         batch = self.policy_batch_executor.run(
             policies=policies,
-            session_id=plan.session_id,
-            snapshot_id=plan.snapshot_id,
+            session_id=plan.scope.session_id,
+            snapshot_id=plan.scope.snapshot_id,
         )
         execution_receipts = batch.execution_receipts
         assurance_results = batch.assurance_results
@@ -201,12 +200,13 @@ class ExecutionController:
                 dispatch_attempts=total_dispatch_attempts,
             )
 
-        commit_supi = plan.supi or policies[0]["supi"]
+        if plan.scope.supi is None:
+            raise ValueError("compiled policy plan requires scope.supi")
         self.commit_policies(
-            supi=commit_supi,
+            supi=plan.scope.supi,
             policies=policies,
-            session_id=plan.session_id,
-            snapshot_id=plan.snapshot_id,
+            session_id=plan.scope.session_id,
+            snapshot_id=plan.scope.snapshot_id,
         )
         performance_metrics = json.dumps(
             {

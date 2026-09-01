@@ -23,9 +23,13 @@ class PlanningContextProjector(BaseProjector):
         raw = json_mapping(instance)
         projected = super().project(raw)
         if _has_retry_delta(raw):
+            memory_context = json_mapping(raw["memory_context"])
             retry_delta = without_empty_values(
                 {
-                    "memory_summary": _compact_head(raw.get("memory_context"), _MEMORY_CONTEXT_CHAR_LIMIT),
+                    "memory_summary": _compact_head(
+                        memory_context["prompt_text"],
+                        _MEMORY_CONTEXT_CHAR_LIMIT,
+                    ),
                     "feedback_summary": _compact_tail(raw.get("feedback_context"), _FEEDBACK_CONTEXT_CHAR_LIMIT),
                     "latest_handoff": _latest_handoff(raw.get("handoff_history")),
                     "revision_requests": raw.get("revision_requests"),

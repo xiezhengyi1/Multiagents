@@ -457,6 +457,7 @@ def run_cross_domain_checks(
             summary="Cross-domain consistency check between QoS plan and AM policy draft",
             hard_conflicts=hard_conflicts,
             soft_conflicts=soft_conflicts,
+            infeasible_reasons=[],
             metrics={
                 "target_snssai_count": len(target_snssais),
                 "allowed_snssai_count": len(allowed_snssais),

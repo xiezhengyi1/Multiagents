@@ -99,7 +99,7 @@ def _normalize_am_policy_details(details: Dict[str, Any], *, supi: str) -> Dict[
 
 
 def normalize_policy_plan_draft(draft: PolicyPlanDraft) -> PolicyPlanDraft:
-    base_supi = _require_supi(draft.supi)
+    base_supi = _require_supi(draft.scope.supi)
     normalized_policies: List[PolicyDraft] = []
     for index, policy in enumerate(draft.all_policies, start=1):
         policy_type = str(policy.policy_type or "").strip()
@@ -133,9 +133,8 @@ def normalize_policy_plan_draft(draft: PolicyPlanDraft) -> PolicyPlanDraft:
 
         normalized_policies.append(
             PolicyDraft(
-                recommended_actions=[],
                 supi=supi,
-                app_id=app_id,
+                app_id=app_id or None,
                 flow_id=flow_id,
                 target_type=target_type,
                 policy_id=_require_policy_id(policy.policy_id, policy_type=policy_type),
@@ -152,9 +151,8 @@ def normalize_policy_plan_draft(draft: PolicyPlanDraft) -> PolicyPlanDraft:
             raise ValueError(f"partial_policies[{index}] is missing policy_type")
         normalized_partial_policies.append(
             PolicyDraft(
-                recommended_actions=[],
                 supi=_require_supi(policy.supi or base_supi),
-                app_id=normalize_app_id(policy.app_id),
+                app_id=normalize_app_id(policy.app_id) or None,
                 flow_id=str(policy.flow_id or "").strip() or None,
                 target_type=str(policy.target_type or "").strip().lower() or "flow",
                 policy_id=_require_policy_id(policy.policy_id, policy_type=policy_type),
@@ -165,11 +163,9 @@ def normalize_policy_plan_draft(draft: PolicyPlanDraft) -> PolicyPlanDraft:
         )
 
     return PolicyPlanDraft(
-        supi=base_supi,
-        session_id=str(draft.session_id or "").strip(),
-        snapshot_id=str(draft.snapshot_id or "").strip(),
-        planning_status=str(draft.planning_status or "executable_plan").strip(),
-        optimizer_result=json_friendly(draft.optimizer_result),
+        scope=draft.scope.model_copy(update={"supi": base_supi}),
+        planning_status=draft.planning_status,
+        optimizer_result=draft.optimizer_result.model_copy(deep=True),
         all_policies=normalized_policies,
         partial_policies=normalized_partial_policies,
         missing_evidence=[str(item) for item in (draft.missing_evidence or []) if str(item or "").strip()],
@@ -726,12 +722,8 @@ class PlanningAdvisorValidator:
 
     @staticmethod
     def _preserved_association_id(planning_request: PlanningRequest) -> str:
-        mobility_targets = planning_request.grounding_decision.grounding_evidence.grounded_mobility_targets
-        if isinstance(mobility_targets, dict):
-            summary = mobility_targets.get("summary")
-            if isinstance(summary, dict):
-                return str(summary.get("current_association_id") or "").strip()
-        return ""
+        summary = planning_request.grounding_decision.grounding_evidence.mobility.summary
+        return summary.current_association_id if summary is not None and summary.current_association_id else ""
 
 
 class PlanningArtifactValidator:

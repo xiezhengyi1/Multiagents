@@ -493,38 +493,39 @@ class IntentEvidenceBuilder:
                 if isinstance(item, dict) and str(item.get("polAssoId") or "").strip()
             ]
 
-        summary: Dict[str, Any] = {}
-        if association_ids:
-            summary["association_ids"] = association_ids
-        if am_policy_context.get("allowedSnssais"):
-            summary["allowed_snssais"] = am_policy_context.get("allowedSnssais") or []
-        if am_policy_context.get("targetSnssais"):
-            summary["target_snssais"] = am_policy_context.get("targetSnssais") or []
-        if am_policy_context.get("mappingSnssais"):
-            summary["mapping_snssais"] = am_policy_context.get("mappingSnssais") or []
-
         current_association_id = str(mobility_summary.get("currentAssociationId") or "").strip()
-        if current_association_id:
-            summary["current_association_id"] = current_association_id
-
         access_type = str(access_mobility_context.get("accessType") or "").strip()
-        if access_type:
-            summary["access_type"] = access_type
-
         rfsp = am_policy_context.get("rfsp")
         if rfsp is None:
             rfsp = mobility_summary.get("currentRfsp")
-        if rfsp is not None:
-            summary["rfsp"] = rfsp
-
         service_area_restriction = (
             am_policy_context.get("servAreaRes")
             or am_policy_context.get("wlServAreaRes")
             or mobility_summary.get("currentServAreaRes")
         )
-        if service_area_restriction:
-            summary["service_area_restriction"] = service_area_restriction
-        return summary
+        if not any(
+            (
+                association_ids,
+                am_policy_context.get("allowedSnssais"),
+                am_policy_context.get("targetSnssais"),
+                am_policy_context.get("mappingSnssais"),
+                current_association_id,
+                access_type,
+                rfsp is not None,
+                service_area_restriction,
+            )
+        ):
+            return {}
+        return {
+            "association_ids": association_ids,
+            "allowed_snssais": list(am_policy_context.get("allowedSnssais") or []),
+            "target_snssais": list(am_policy_context.get("targetSnssais") or []),
+            "mapping_snssais": list(am_policy_context.get("mappingSnssais") or []),
+            "current_association_id": current_association_id or None,
+            "access_type": access_type or None,
+            "rfsp": rfsp,
+            "service_area_restriction": service_area_restriction or None,
+        }
 
     @staticmethod
     def _summarize_subscription(subscription_payload: Any) -> Dict[str, Any]:

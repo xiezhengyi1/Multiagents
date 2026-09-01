@@ -83,19 +83,14 @@ class IntentGroundingValidator:
 
     @staticmethod
     def _grounding_decision_has_grounded_am_policy(grounding_decision: GroundingDecision | None) -> bool:
-        if grounding_decision is None:
+        if grounding_decision is None or grounding_decision.mobility_intent is None:
             return False
-        mobility_intent: Any = grounding_decision.mobility_intent or {}
-        if not isinstance(mobility_intent, dict):
-            return False
-        association_id = str(
-            mobility_intent.get("association_id")
-            or mobility_intent.get("current_association_id")
-            or ""
-        ).strip()
-        rfsp = mobility_intent.get("current_rfsp", mobility_intent.get("rfsp"))
-        allowed_snssais = mobility_intent.get("current_allowed_snssais", mobility_intent.get("allowed_snssais"))
-        return bool(association_id and rfsp is not None and allowed_snssais)
+        mobility_intent = grounding_decision.mobility_intent
+        return bool(
+            mobility_intent.association_id
+            and mobility_intent.rfsp is not None
+            and mobility_intent.allowed_snssais
+        )
 
     def validate_grounding_decision(
         self,

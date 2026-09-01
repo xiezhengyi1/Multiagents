@@ -5,11 +5,12 @@ import math
 import re
 from typing import Any, Dict, List, Optional
 
-from shared.contracts import ExecutionScope, MemoryQuery, MemoryRecord
+from shared.contracts import ExecutionScope, MemoryContextView, MemoryQuery, MemoryRecord
 from shared.runtime import ContextPolicy
 
 from ..agents.main.contracts import GlobalControlIntent
 from ..agents.planning.contracts import PlanningContext, QosRetryConstraint, SharedControlContext
+from ..diagnostics.mediation.contracts import RevisionRequest, UnifiedConstraintSet
 from ..context.projectors import project_global_intent_for_prompt
 
 
@@ -275,8 +276,9 @@ def build_memory_context(
     routing_hint: str = "",
     context_policy: Optional[ContextPolicy] = None,
     token_counter: Any = None,
-) -> str:
-    bundle = memory_manager.retrieve(MemoryQuery(scope=scope, text=user_input))
+) -> MemoryContextView:
+    query = MemoryQuery(scope=scope, text=user_input, top_k=3)
+    bundle = memory_manager.retrieve(query)
     short_term = list(bundle.short_term)
     long_term = list(bundle.long_term)
     short_term = rerank_by_context_hints(short_term, diagnosis_hint, routing_hint)[:5]
@@ -294,11 +296,17 @@ def build_memory_context(
         blocks.append("[Memory][Long-Term]\n" + "\n".join(item.content for item in long_term))
     rendered = "\n\n".join(block for block in blocks if block.strip())
     policy = context_policy or ContextPolicy()
-    return policy.compact_text(
+    prompt_text = policy.compact_text(
         rendered,
         max_chars=6000,
         max_tokens=1500,
         token_counter=token_counter,
+    )
+    return MemoryContextView(
+        query=query,
+        selected_short_term=short_term,
+        selected_long_term=long_term,
+        prompt_text=prompt_text,
     )
 
 
@@ -592,20 +600,20 @@ def _build_assurance_failure_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
 def build_planning_context(
     global_intent: GlobalControlIntent,
     *,
-    memory_context: str = "",
-    feedback_context: str = "",
-    handoff_history: Optional[List[Dict[str, Any]]] = None,
-    revision_requests: Optional[List[Dict[str, Any]]] = None,
-    unified_constraints: Optional[Dict[str, Any]] = None,
-    previous_execution_feedback: Optional[Dict[str, Any]] = None,
+    memory_context: MemoryContextView,
+    feedback_context: str,
+    handoff_history: List[Dict[str, Any]],
+    revision_requests: List[Dict[str, Any]],
+    unified_constraints: Dict[str, Any],
+    previous_execution_feedback: Dict[str, Any],
 ) -> PlanningContext:
     return PlanningContext(
         memory_context=memory_context,
         shared_context=SharedControlContext(main_intent=global_intent.model_copy(deep=True)),
         feedback_context=feedback_context,
-        handoff_history=list(handoff_history or [])[-2:],
-        revision_requests=list(revision_requests or []),
-        unified_constraints=dict(unified_constraints or {}),
+        handoff_history=list(handoff_history)[-2:],
+        revision_requests=[RevisionRequest.model_validate(item) for item in revision_requests],
+        unified_constraints=UnifiedConstraintSet.model_validate(unified_constraints),
         qos_retry_constraints=_qos_retry_constraints_from_feedback(previous_execution_feedback),
     )
 
@@ -715,7 +723,7 @@ def _qos_retry_constraints_from_feedback(
             allowed_latency_ms=allowed,
             minimum_target_latency_ms=max(1, math.ceil(observed / (1.0 + tolerance))),
             tolerance_ratio=tolerance,
-            policy_id=str(failure.get("policy_id") or (verdict or {}).get("policy_id") or "").strip(),
+            policy_id=str(failure.get("policy_id") or (verdict or {}).get("policy_id") or "").strip() or None,
         )
         previous = strongest_by_flow.get(flow_id)
         if previous is None or constraint.minimum_target_latency_ms > previous.minimum_target_latency_ms:

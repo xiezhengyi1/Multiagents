@@ -24,6 +24,7 @@ os.environ.setdefault(
 
 import control_runtime.execution.execution_controller as execution_controller
 import control_runtime.execution.policy_batch_executor as policy_batch_executor
+from shared.contracts import ExecutionScope
 from control_runtime.execution.assurance_evaluator import AssuranceVerdict
 from control_runtime.execution.execution_controller import ExecutionController
 from control_runtime.execution.policy_batch_executor import PolicyBatchExecutor
@@ -51,9 +52,13 @@ def _strategy(
     snapshot_id: str = "snapshot-1",
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        session_id="session-1",
-        snapshot_id=snapshot_id,
-        supi="imsi-001",
+        scope=ExecutionScope(
+            session_id="session-1",
+            thread_id="session-1",
+            snapshot_id=snapshot_id,
+            round_index=1,
+            supi="imsi-001",
+        ),
         all_policies=policies,
     )
 
@@ -100,9 +105,7 @@ def test_execute_success_compiles_dispatches_assures_and_commits_without_snapsho
         def compile_plan(self, strategy_output):
             calls.append("compile")
             return SimpleNamespace(
-                session_id=strategy_output.session_id,
-                snapshot_id=strategy_output.snapshot_id,
-                supi=strategy_output.supi,
+                scope=strategy_output.scope,
                 policies=list(strategy_output.all_policies),
             )
 
@@ -153,9 +156,7 @@ def test_execute_partial_dispatch_failure_preserves_scope_attempts_and_retry_for
     class Compiler:
         def compile_plan(self, strategy_output):
             return SimpleNamespace(
-                session_id=strategy_output.session_id,
-                snapshot_id=strategy_output.snapshot_id,
-                supi=strategy_output.supi,
+                scope=strategy_output.scope,
                 policies=list(strategy_output.all_policies),
             )
 
@@ -199,9 +200,7 @@ def test_execute_assurance_failure_does_not_commit(monkeypatch) -> None:
     class Compiler:
         def compile_plan(self, strategy_output):
             return SimpleNamespace(
-                session_id=strategy_output.session_id,
-                snapshot_id=strategy_output.snapshot_id,
-                supi=strategy_output.supi,
+                scope=strategy_output.scope,
                 policies=list(strategy_output.all_policies),
             )
 

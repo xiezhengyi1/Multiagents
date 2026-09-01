@@ -435,20 +435,33 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
         }:
             return advisor_output
 
-        bounded = advisor_output.model_copy(deep=True)
-        bounded.am_policy = None
-        bounded.ursp_policies = []
-        if bounded.sm_policies or bounded.partial_policies:
-            bounded.planning_status = "partial_plan"
-        if not bounded.blocked_targets:
-            bounded.blocked_targets = ["requested target slice migration"]
-        if not bounded.missing_evidence:
-            bounded.missing_evidence = ["authorized target S-NSSAI after subscription provisioning"]
-        if not bounded.planner_conflicts:
-            bounded.planner_conflicts = [
-                "Subscription entitlement blocks the target slice change; only current-slice QoS delivery is executable."
-            ]
-        return bounded
+        return advisor_output.model_copy(
+            update={
+                "am_policy": None,
+                "ursp_policies": [],
+                "planning_status": (
+                    "partial_plan"
+                    if advisor_output.sm_policies or advisor_output.partial_policies
+                    else advisor_output.planning_status
+                ),
+                "blocked_targets": (
+                    advisor_output.blocked_targets
+                    or ["requested target slice migration"]
+                ),
+                "missing_evidence": (
+                    advisor_output.missing_evidence
+                    or ["authorized target S-NSSAI after subscription provisioning"]
+                ),
+                "planner_conflicts": (
+                    advisor_output.planner_conflicts
+                    or [
+                        "Subscription entitlement blocks the target slice change; "
+                        "only current-slice QoS delivery is executable."
+                    ]
+                ),
+            },
+            deep=True,
+        )
 
     def _invoke_strategy_advisor(
         self,
@@ -479,7 +492,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             ],
             system_prompt=render_planning_system_prompt(),
             prompt_name="optimization_strategy_advisor",
-            prompt_version="2.1.0",
+            prompt_version="2.2.0",
             response_model=OsaAdvisorOutput,
             max_iterations=12,
             max_calls_per_tool=2,
@@ -513,7 +526,7 @@ class OptimizationStrategyAgent(BaseAgent, ArtifactWorkerMixin):
             metadata=TraceMetadata(
                 path_label="strategy_advisor",
                 prompt_name="optimization_strategy_advisor",
-                prompt_version="2.1.0",
+                prompt_version="2.2.0",
                 attributes={
                     **{
                         key: value

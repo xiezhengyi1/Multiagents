@@ -42,11 +42,13 @@ from ...context.projectors import project_intent_evidence_for_prompt
 from ...context.observability import measure_context_components
 from .contracts import (
     FlowSelector,
+    GroundedMobilityEvidence,
     GroundingAdvisorOutput,
     GroundingDecision,
     GroundingEvidenceBundle,
     IntentEncodingDirectives,
     IntentEvidence,
+    MobilityContextEvidence,
     QosOperationConstraint,
     SliceMigrationAuthorization,
 )
@@ -192,7 +194,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             tools=tools,
             system_prompt=render_grounding_system_prompt(),
             prompt_name="intent_grounding_advisor",
-            prompt_version="2.0.0",
+            prompt_version="2.1.0",
             response_model=GroundingAdvisorOutput,
             max_iterations=14,
             max_calls_per_tool=3,
@@ -474,7 +476,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             domain_specific_rules.extend(
                 [
                     "- Binding and feasibility are separate: every named QoS target gets exactly one flows entry even when migration is blocked or no target slice is known.",
-                    "- An exact catalog/search match is resolved; an absent match is {app_id:'',flow_id:'',name,resolution_status:'unresolved'}. Runtime attaches the Main-owned SUPI. Never use flows:[] for a QoS target.",
+                    "- An exact catalog/search match is resolved; an absent match is {app_id:null,flow_id:null,name,resolution_status:'unresolved'}. Runtime attaches the Main-owned SUPI. Never use flows:[] for a QoS target.",
                     "- Runtime fills SLA, current-slice, traffic, and provenance facts after parsing. Output only the compact flow binding fields shown by the schema.",
                 ]
             )
@@ -893,7 +895,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             metadata=TraceMetadata(
                 path_label="advisor_path",
                 prompt_name="intent_grounding_advisor",
-                prompt_version="2.0.0",
+                prompt_version="2.1.0",
                 attributes={
                     **{
                         key: value
@@ -1043,27 +1045,47 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             evidence_sources["get_am_policy_context"] = ["runtime"]
         if evidence.am_policy_candidates:
             evidence_sources["search_am_policy_targets"] = ["runtime"]
-        mobility_targets: Dict[str, Any] = {}
-        if evidence.am_context_summary:
-            mobility_targets["summary"] = dict(evidence.am_context_summary)
-
         return GroundingDecision(
             flows=[
                 FlowSelector(
-                    supi=IntentEncodingAgent._binding_supi_from_evidence(flow=flow, evidence=evidence),
-                    app_id=str(flow.app_id or "").strip(),
-                    flow_id=str(flow.flow_id or "").strip() or None,
-                    name=str(flow.name or "").strip(),
-                    resolution_status=str(flow.resolution_status or "resolved").strip(),
+                    supi=IntentEncodingAgent._binding_supi_from_evidence(flow=flow, evidence=evidence) or None,
+                    app_id=flow.app_id,
+                    app_name=None,
+                    flow_id=flow.flow_id,
+                    target_type="flow",
+                    name=flow.name,
+                    service_type=None,
+                    service_type_id=None,
+                    bw_ul=None,
+                    bw_dl=None,
+                    gbr_ul=None,
+                    gbr_dl=None,
+                    lat=None,
+                    loss_req=None,
+                    jitter_req=None,
+                    priority=None,
+                    description=None,
+                    five_tuple=None,
+                    current_slice_snssai=None,
+                    current_bw_ul=None,
+                    current_bw_dl=None,
+                    resolution_status=flow.resolution_status,
                 )
                 for flow in (advisor_output.flows or [])
             ],
-            mobility_intent=dict(advisor_output.mobility_intent or {}),
+            mobility_intent=advisor_output.mobility_intent,
             grounding_evidence=GroundingEvidenceBundle(
-                grounded_supi=str(evidence.supi or "").strip(),
-                grounded_apps=[dict(item) for item in (evidence.candidate_apps or []) if isinstance(item, dict)],
-                grounded_flows=[item.model_dump(mode="json") for item in (evidence.candidate_flows or [])],
-                grounded_mobility_targets=mobility_targets,
+                grounded_supi=str(evidence.supi or "").strip() or None,
+                grounded_apps=list(evidence.candidate_apps or []),
+                grounded_flows=list(evidence.candidate_flows or []),
+                mobility=GroundedMobilityEvidence(
+                    summary=(
+                        MobilityContextEvidence.model_validate(evidence.am_context_summary)
+                        if evidence.am_context_summary
+                        else None
+                    ),
+                    subscription_entitlement=None,
+                ),
                 evidence_sources=evidence_sources,
             ),
             qos_operation_constraints=[
@@ -1072,6 +1094,8 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     app_id=str(constraint.app_id or "").strip(),
                     operation_type=str(constraint.operation_type or "").strip(),
                     require_slice_change=bool(constraint.require_slice_change),
+                    source_slice_snssai=None,
+                    excluded_slice_snssais=[],
                     target_slice_preference=str(constraint.target_slice_preference or "").strip(),
                     no_op_allowed=bool(constraint.no_op_allowed),
                     rationale=list(constraint.rationale or []),
@@ -1080,7 +1104,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             ],
             slice_migration_authorization=SliceMigrationAuthorization(
                 decision=advisor_output.slice_migration_authorization.decision,
-                authority=str(subscription.get("authority") or "").strip(),
+                authority=str(subscription.get("authority") or "").strip() or None,
                 authorized_snssais=authorized_snssais,
                 target_snssais=list(advisor_output.slice_migration_authorization.target_snssais or []),
                 subscription_change_required=bool(
@@ -1133,8 +1157,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             constraints.append(
                 QosOperationConstraint(**constraint_payload)
             )
-        enriched.qos_operation_constraints = constraints
-        return enriched
+        return enriched.model_copy(update={"qos_operation_constraints": constraints})
 
     @staticmethod
     def _materialize_catalog_facts(
@@ -1163,8 +1186,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             # only the catalog identity; it does not transcribe SLA facts.
             resolved_flows.append(IntentEvidenceBuilder._build_flow_selector_from_catalog(catalog_entry))
 
-        enriched.flows = resolved_flows
-        return enriched
+        return enriched.model_copy(update={"flows": resolved_flows})
 
     @staticmethod
     def _attach_subscription_evidence(
@@ -1191,16 +1213,18 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
                     ],
                 }
             )
-            enriched.slice_migration_authorization = authorization
-        mobility_targets = dict(enriched.grounding_evidence.grounded_mobility_targets or {})
-        mobility_targets["subscription_entitlement"] = subscription
-        enriched.grounding_evidence.grounded_mobility_targets = mobility_targets
+            enriched = enriched.model_copy(update={"slice_migration_authorization": authorization})
+        mobility_evidence = enriched.grounding_evidence.mobility.model_copy(
+            update={"subscription_entitlement": subscription}
+        )
         sources = dict(enriched.grounding_evidence.evidence_sources or {})
         source_list = list(sources.get("ue_slice_subscription") or [])
-        authority = str(subscription.get("authority") or "postgresql_ue_context").strip()
+        authority = str(subscription.get("authority") or "").strip()
         if authority and authority not in source_list:
             source_list.append(authority)
         sources["ue_slice_subscription"] = source_list
-        enriched.grounding_evidence.evidence_sources = sources
-        return enriched
+        grounding_evidence = enriched.grounding_evidence.model_copy(
+            update={"mobility": mobility_evidence, "evidence_sources": sources}
+        )
+        return enriched.model_copy(update={"grounding_evidence": grounding_evidence})
 

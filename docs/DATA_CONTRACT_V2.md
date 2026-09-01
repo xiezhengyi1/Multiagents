@@ -12,14 +12,17 @@
 | 消息 | `AgentMessage` / `ToolCall` | 仅允许 `system/user/assistant/tool`；所有并行 tool call 必须闭合后才能继续对话 |
 | 工具 | `ToolContract` / `ToolCatalog` | 执行与 trace 共用同一目录；必须声明输入 schema、副作用、结果格式和有界结果 |
 | 代理间交接 | `ArtifactEnvelope` | 必须声明 request/response 方向、唯一 payload 类型、源/目标 agent、scope、correlation 和上游 artifact |
-| 记忆 | `MemoryRecord` / `MemoryQuery` / `MemoryBundle` | 每次读写显式携带 scope；记忆记录携带来源 agent 和源 trace id |
+| 记忆 | `MemoryRecord` / `MemoryQuery` / `MemoryBundle` / `MemoryContextView` | 每次读写显式携带 scope；跨 Agent 上下文同时保留 query、入选记录和最终 prompt 文本 |
 | RAG | `KnowledgeQuery` / `KnowledgeResponse` | 返回结构化 hit；每个 hit 必须有 spec、release、version、anchor 引用链 |
+| 意图落地 | `GroundingDecision` / `GroundingEvidenceBundle` | flow、mobility、授权和证据分别建模；未知别名和未解析身份直接拒绝 |
+| 策略规划 | `PolicyPlanDraft` / `OptimizerPlanEvidence` | scope 唯一承载身份；优化器证据、策略状态、缺口和问题全部显式 |
+| 冲突与诊断 | `ConflictResolutionRequest/Result` / `AssuranceDiagnosisRequest/Result` | 资源视图、上游上下文、执行反馈和裁决使用唯一嵌套结构 |
 | Trace | `AgentTrace` / `TraceTarget` | 记录 scope、prompt 版本、tool catalog 指纹、模型实际可见消息、结果来源和错误 |
 | 训练投影 | `ProjectedTraceRecord` / `WorkflowTrajectoryRecord` | 身份信息只通过 `ExecutionScope` 传递，不重复维护 session/snapshot/scenario 字段 |
 
 上述契约均拒绝未知字段，且对象创建后禁止属性重赋值。生产路径不使用“猜测字段”、多形态 JSON 提取、Markdown 代码块剔除或错误转正。
 
-记忆命名空间有明确边界：短期 `event` 按带类型前缀的 `thread_id` 隔离，长期 `summary` 按带类型前缀的 SUPI 共享（无 SUPI 时按 `session_id`），摘要游标按 `thread_id` 隔离。`MemoryBundle` 会验证短期记录只能是同一 thread 的 event、长期记录只能来自同一 SUPI/session 命名空间的 summary；记忆 ID 和 trace 来源不得重复。
+记忆命名空间有明确边界：短期 `event` 按带类型前缀的 `thread_id` 隔离，长期 `summary` 按带类型前缀的 SUPI 共享（无 SUPI 时按 `session_id`），摘要游标按 `thread_id` 隔离。`MemoryBundle` 会验证短期记录只能是同一 thread 的 event、长期记录只能来自同一 SUPI/session 命名空间的 summary；记忆 ID 和 trace 来源不得重复。`MemoryQuery.top_k` 必须由调用方显式给出。`MemoryContextView` 记录实际 query、重排后入选的短期/长期记录和模型可见文本；未执行检索时必须显式 `query=null` 且不得携带来源不明的记忆文本。
 
 RAG 工具在执行检索前创建 `KnowledgeQuery`。非法类型或超出 `1..30` 的 limit 直接拒绝，不进行类型转换、默认值替换或上下界裁剪。`KnowledgeResponse` 的 hit 数不得超过请求 limit，同一响应中的引用 key 必须唯一，分数必须是有限浮点数。
 
@@ -33,9 +36,13 @@ Main 模型直接以严格 `MainControlDecision` 作为 response schema，不再
 
 `ObjectiveProfile` 是 Main、Single、Planning 与 optimizer 共用的唯一目标函数契约。profile 名和五项 cost 全部必填、未知字段直接拒绝；Main 输出缺少任一权重都会失败，不能再用 balanced 默认值补齐。确定性 Single 路径只能通过显式标准 profile 工厂创建完整权重对象。
 
-`PlanningContext` 不再复制 session、snapshot 和 round，身份信息只取自 `shared_context.main_intent.scope`。`OptimizerInput` 和 `JointOptimizationRequest` 同样只接收 `ExecutionScope`，并强制 snapshot、目标 SUPI 和控制域非空且不重复。optimizer 配置的 template、solver mode、目标、约束、决策变量和 QoS 模式全部显式构造；请求工厂不再覆盖 Main 已确定的 objective profile。
+`PlanningContext` 不再复制 session、snapshot 和 round，身份信息只取自 `shared_context.main_intent.scope`；memory 字段使用 `MemoryContextView`，不再传递裸字符串。`OptimizerInput` 和 `JointOptimizationRequest` 同样只接收 `ExecutionScope`，并强制 snapshot、目标 SUPI 和控制域非空且不重复。optimizer 配置的 template、solver mode、目标、约束、决策变量和 QoS 模式全部显式构造；请求工厂不再覆盖 Main 已确定的 objective profile。可执行 SM 策略的带宽必须来自同一 flow 的合法优化器分配，缺失、非数值或非正值直接失败，不沿用模型建议值。
 
-Planning 与 Single 共用严格 `OsaAdvisorOutput`。根字段以及 SM、AM、URSP 的所有嵌套字段全部是 JSON Schema required；可空字段也必须显式返回 null。`partial_policies` 只有 snake_case 的单一结构，不解析 camelCase 别名、不接受顶层 `blocked_reason`，SUPI 和 policy_id 由 compiler 生成。对应 prompt 版本升级为 `2.1.0`。
+Planning 与 Single 共用严格 `OsaAdvisorOutput`。根字段（包括 `open_questions`）以及 SM、AM、URSP 的所有嵌套字段全部是 JSON Schema required；可空字段也必须显式返回 null。`partial_policies` 只有 snake_case 的单一结构，不解析 camelCase 别名、不接受顶层 `blocked_reason`，SUPI 和 policy_id 由 compiler 生成。Planning/Single prompt 版本为 `2.2.0`；Grounding prompt 与 trace metadata 统一为 `2.1.0`。
+
+`GroundingDecision` 使用唯一的 `FlowSelector`、`MobilityIntent`、`GroundingEvidenceBundle`、`QosOperationConstraint` 和 `SliceMigrationAuthorization` 结构。resolved flow 必须同时具有 SUPI、app_id 和 flow_id；unresolved flow 不能声明 flow_id。mobility 只接受 association、RFSP、allowed/target S-NSSAI、access type 和 service-area restriction 的规范字段，不读取旧别名。
+
+`PolicyPlanDraft`、`ConflictResolutionRequest`、`AssuranceDiagnosisRequest` 和 `UnifiedControlPlan` 的身份均只来自 `ExecutionScope`。Mediator 的资源视图、冲突范围与 upstream context，Diagnosis 的 execution feedback 与 upstream context，以及所有结果集合都必须显式提供；不再通过空构造器或扁平 session/snapshot 字段补齐。
 
 ## 2. 模型工具协议
 

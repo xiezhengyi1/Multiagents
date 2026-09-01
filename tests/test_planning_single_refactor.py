@@ -3,9 +3,15 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from shared.contracts import AgentMessage, AgentRunResult, ExecutionScope, ToolCall
+from shared.contracts import AgentMessage, AgentRunResult, ExecutionScope, MemoryContextView, ToolCall
 from control_runtime.contracts import standard_objective_profile
-from control_runtime.agents.grounding.contracts import FlowSelector, GroundingDecision
+from control_runtime.agents.grounding.contracts import (
+    FlowSelector,
+    GroundedMobilityEvidence,
+    GroundingDecision,
+    GroundingEvidenceBundle,
+    SliceMigrationAuthorization,
+)
 from control_runtime.agents.main.contracts import ControlDomain, GlobalControlIntent
 from control_runtime.agents.planning.compiler import OptimizationStrategyCompiler
 from control_runtime.agents.planning.contracts import (
@@ -16,6 +22,7 @@ from control_runtime.agents.planning.contracts import (
 from control_runtime.agents.planning.planning_validation import PlanningAdvisorValidator
 from control_runtime.agents.planning.response_models import OsaAdvisorOutput
 from control_runtime.agents.single import agent as single_agent
+from control_runtime.diagnostics.mediation.contracts import UnifiedConstraintSet
 
 
 def _planning_request() -> PlanningRequest:
@@ -37,14 +44,60 @@ def _planning_request() -> PlanningRequest:
                 FlowSelector(
                     supi="imsi-1",
                     app_id="app-1",
+                    app_name=None,
                     flow_id="flow-1",
+                    target_type="flow",
                     name="video",
+                    service_type=None,
                     service_type_id=1,
+                    bw_ul=None,
+                    bw_dl=None,
+                    gbr_ul=None,
+                    gbr_dl=None,
+                    lat=None,
+                    loss_req=None,
+                    jitter_req=None,
+                    priority=None,
+                    description=None,
+                    five_tuple=None,
+                    current_slice_snssai=None,
+                    current_bw_ul=None,
+                    current_bw_dl=None,
+                    resolution_status="resolved",
                 )
-            ]
+            ],
+            mobility_intent=None,
+            grounding_evidence=GroundingEvidenceBundle(
+                grounded_supi="imsi-1",
+                grounded_apps=[],
+                grounded_flows=[],
+                mobility=GroundedMobilityEvidence(summary=None, subscription_entitlement=None),
+                evidence_sources={},
+            ),
+            qos_operation_constraints=[],
+            slice_migration_authorization=SliceMigrationAuthorization(
+                decision="not_applicable",
+                authority=None,
+                authorized_snssais=[],
+                target_snssais=[],
+                subscription_change_required=False,
+                rationale=[],
+            ),
+            open_questions=[],
         ),
         context=PlanningContext(
+            memory_context=MemoryContextView(
+                query=None,
+                selected_short_term=[],
+                selected_long_term=[],
+                prompt_text="",
+            ),
             shared_context=SharedControlContext(main_intent=intent),
+            feedback_context="",
+            handoff_history=[],
+            revision_requests=[],
+            unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
+            qos_retry_constraints=[],
         ),
     )
 
@@ -73,6 +126,7 @@ def _valid_osa_wire() -> dict:
         "blocked_targets": [],
         "upstream_requests": [],
         "planner_conflicts": [],
+        "open_questions": [],
         "sm_policies": [
             {
                 "flow_id": "flow-1",
@@ -168,7 +222,8 @@ def test_single_hidden_planning_request_preserves_catalog_allocation_for_slice_m
     assert flow.current_bw_ul == 10
     assert flow.current_bw_dl == 20
     constraint = planning_request.grounding_decision.qos_operation_constraints[0]
-    assert constraint.source_slice_snssai is None
+    assert constraint.source_slice_snssai == "01000001"
+    assert constraint.excluded_slice_snssais == ["01000001"]
     assert PlanningAdvisorValidator._required_slice_change_constraints(planning_request) == [
         {"flow_id": "flow-1", "source_slice_snssai": "01000001"}
     ]

@@ -9,7 +9,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from shared.contracts import AgentMessage, AgentRunResult, ExecutionScope, MemoryBundle, MemoryRecord
+from shared.contracts import (
+    AgentMessage,
+    AgentRunResult,
+    ExecutionScope,
+    MemoryBundle,
+    MemoryContextView,
+    MemoryRecord,
+)
 from control_runtime.contracts import standard_objective_profile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +40,7 @@ def _execution_scope(round_index: int = 1) -> ExecutionScope:
         thread_id="session-1",
         snapshot_id="snapshot-1",
         round_index=round_index,
+        supi="imsi-001",
     )
 
 from control_runtime.orchestrators.loop_state import (
@@ -68,29 +76,88 @@ def _main_intent(*, next_agent: str = "optimization_strategy"):
 
 
 def _grounding_decision():
-    from control_runtime.agents.grounding.contracts import FlowSelector, GroundingDecision
+    from control_runtime.agents.grounding.contracts import (
+        FlowSelector,
+        GroundedMobilityEvidence,
+        GroundingDecision,
+        GroundingEvidenceBundle,
+        SliceMigrationAuthorization,
+    )
 
     return GroundingDecision(
         flows=[
             FlowSelector(
                 supi="imsi-001",
                 app_id="app-1",
+                app_name="video-app",
                 flow_id="flow-1",
+                target_type="flow",
                 name="video",
+                service_type=None,
+                service_type_id=None,
+                bw_ul=None,
+                bw_dl=None,
+                gbr_ul=None,
+                gbr_dl=None,
+                lat=None,
+                loss_req=None,
+                jitter_req=None,
+                priority=None,
+                description=None,
+                five_tuple=None,
+                current_slice_snssai="01000001",
+                current_bw_ul=None,
+                current_bw_dl=None,
+                resolution_status="resolved",
             )
-        ]
+        ],
+        mobility_intent=None,
+        grounding_evidence=GroundingEvidenceBundle(
+            grounded_supi="imsi-001",
+            grounded_apps=[],
+            grounded_flows=[],
+            mobility=GroundedMobilityEvidence(summary=None, subscription_entitlement=None),
+            evidence_sources={},
+        ),
+        qos_operation_constraints=[],
+        slice_migration_authorization=SliceMigrationAuthorization(
+            decision="not_applicable",
+            authority=None,
+            authorized_snssais=[],
+            target_snssais=[],
+            subscription_change_required=False,
+            rationale=[],
+        ),
+        open_questions=[],
     )
 
 
-def _qos_plan(*, planning_status: str = "executable_plan"):
-    from control_runtime.agents.planning.contracts import PolicyDraft, PolicyPlanDraft, PlanningRationale
+def _qos_plan(*, planning_status: str = "executable_plan", round_index: int = 1):
+    from control_runtime.agents.planning.contracts import (
+        OptimizerPlanEvidence,
+        PolicyDraft,
+        PolicyPlanDraft,
+        PlanningRationale,
+    )
 
     return PolicyPlanDraft(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        supi="imsi-001",
+        scope=_execution_scope(round_index),
         planning_status=planning_status,
-        planning_rationale=PlanningRationale(explanation="offline plan rationale"),
+        optimizer_result=OptimizerPlanEvidence(
+            objective_breakdown={},
+            cross_domain_verdicts=[],
+        ),
+        planning_rationale=PlanningRationale(
+            selected_strategy_profile="offline",
+            decisive_evidence=[],
+            active_constraints=[],
+            explanation="offline plan rationale",
+            rejected_alternatives=[],
+            main_constraints=[],
+            iea_grounding_basis=[],
+            osa_decision_basis=[],
+            unresolved_gaps=["flow-2"] if planning_status == "partial_plan" else [],
+        ),
         all_policies=[
             PolicyDraft(
                 policy_id="sm-1",
@@ -99,9 +166,108 @@ def _qos_plan(*, planning_status: str = "executable_plan"):
                 app_id="app-1",
                 flow_id="flow-1",
                 target_type="flow",
+                resource_keys=["flow:flow-1"],
                 policy_details={"flow_id": "flow-1"},
             )
         ],
+        partial_policies=[],
+        missing_evidence=[],
+        blocked_targets=["flow-2"] if planning_status == "partial_plan" else [],
+        upstream_requests=["reground flow-2"] if planning_status == "partial_plan" else [],
+        planner_conflicts=[],
+        open_questions=[],
+    )
+
+
+def _planning_context():
+    from control_runtime.agents.planning.contracts import PlanningContext, SharedControlContext
+    from control_runtime.diagnostics.mediation.contracts import UnifiedConstraintSet
+
+    return PlanningContext(
+        memory_context=MemoryContextView(
+            query=None,
+            selected_short_term=[],
+            selected_long_term=[],
+            prompt_text="",
+        ),
+        shared_context=SharedControlContext(main_intent=_main_intent()),
+        feedback_context="",
+        handoff_history=[],
+        revision_requests=[],
+        unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
+        qos_retry_constraints=[],
+    )
+
+
+def _reground_plan():
+    from control_runtime.agents.planning.contracts import (
+        OptimizerPlanEvidence,
+        PolicyPlanDraft,
+        PlanningRationale,
+    )
+
+    return PolicyPlanDraft(
+        scope=_execution_scope(),
+        planning_status="needs_upstream_reground",
+        optimizer_result=OptimizerPlanEvidence(
+            objective_breakdown={},
+            cross_domain_verdicts=[],
+        ),
+        planning_rationale=PlanningRationale(
+            selected_strategy_profile="reground",
+            decisive_evidence=[],
+            active_constraints=[],
+            explanation="upstream evidence required",
+            rejected_alternatives=[],
+            main_constraints=[],
+            iea_grounding_basis=[],
+            osa_decision_basis=[],
+            unresolved_gaps=["QoS grounding evidence"],
+        ),
+        all_policies=[],
+        partial_policies=[],
+        missing_evidence=["QoS grounding evidence"],
+        blocked_targets=[],
+        upstream_requests=["reground QoS flow"],
+        planner_conflicts=[],
+        open_questions=[],
+    )
+
+
+def _conflict_result(*, mediator_status: str = "approved", reason_summary: str = "no conflicts"):
+    from control_runtime.diagnostics.mediation.contracts import (
+        ConflictResolutionResult,
+        UnifiedConstraintSet,
+    )
+
+    return ConflictResolutionResult(
+        mediator_status=mediator_status,
+        conflicts=[],
+        affected_policy_ids=[],
+        affected_objects=[],
+        affected_domains=[],
+        resolution_recommendations=[],
+        reason_summary=reason_summary,
+        revision_requests=[],
+        unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
+    )
+
+
+def _diagnosis_result(
+    *,
+    root_cause_category: str = "none",
+    reason_summary: str = "no assurance violation",
+):
+    from control_runtime.diagnostics.diagnosis.contracts import AssuranceDiagnosisResult
+
+    return AssuranceDiagnosisResult(
+        status="diagnosed",
+        root_cause_category=root_cause_category,
+        root_cause=reason_summary,
+        affected_policy_ids=[],
+        affected_flow_ids=[],
+        recommended_actions=[],
+        reason_summary=reason_summary,
     )
 
 
@@ -361,8 +527,16 @@ class OrchestratorContextRefactorTest(unittest.TestCase):
             routing_hint="optimization_strategy target_stable",
         )
 
-        self.assertLess(context.index("planning_blocked"), context.index("generic context"))
-        self.assertIn("optimization_strategy target_stable", context)
+        self.assertLess(
+            context.prompt_text.index("planning_blocked"),
+            context.prompt_text.index("generic context"),
+        )
+        self.assertIn("optimization_strategy target_stable", context.prompt_text)
+        self.assertEqual(
+            [record.memory_id for record in context.selected_short_term],
+            ["m2", "m1"],
+        )
+        self.assertEqual(context.query.text, "QoS request")
 
     def test_main_context_is_markdown_sections_not_json_blob(self) -> None:
         from unittest.mock import patch
@@ -413,15 +587,11 @@ def test_execute_planned_round_returns_a_planning_blocker_without_external_execu
         "get_snapshot_data_by_id",
         lambda _: {"snapshot_id": "snapshot-1"},
     )
-    blocked_plan = PolicyPlanDraft(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        supi="imsi-001",
-        planning_status="needs_upstream_reground",
-        planning_rationale=PlanningRationale(explanation="catalog evidence is missing"),
-        missing_evidence=["SM flow catalog"],
-        upstream_requests=["reground flow-1"],
-    )
+    blocked_payload = _reground_plan().model_dump(mode="json")
+    blocked_payload["planning_rationale"]["explanation"] = "catalog evidence is missing"
+    blocked_payload["missing_evidence"] = ["SM flow catalog"]
+    blocked_payload["upstream_requests"] = ["reground flow-1"]
+    blocked_plan = PolicyPlanDraft.model_validate(blocked_payload)
 
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(),
@@ -471,11 +641,9 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
         ),
         violation_details="none",
     )
-    conflict_tool = _RecordingConflictTool(ConflictResolutionResult())
+    conflict_tool = _RecordingConflictTool(_conflict_result())
     dispatch_agent = _RecordingDispatchAgent(report)
-    diagnosis_tool = _RecordingDiagnosisTool(
-        AssuranceDiagnosisResult(status="healthy", reason_summary="SLA satisfied")
-    )
+    diagnosis_tool = _RecordingDiagnosisTool(_diagnosis_result(reason_summary="SLA satisfied"))
 
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(),
@@ -501,9 +669,9 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
     ]
     assert artifacts.trace.pda_feedback["execution_status"] == "Success"
     assert artifacts.trace.mediator_decision == artifacts.unified_plan.mediator_decision.model_dump(mode="json")
-    assert conflict_tool.requests[0].snapshot_id == "snapshot-1"
+    assert conflict_tool.requests[0].scope.snapshot_id == "snapshot-1"
     assert dispatch_agent.calls[0][1] == {"scenario_id": "offline-case"}
-    assert diagnosis_tool.requests[0].execution_feedback["pda"]["execution_status"] == "Success"
+    assert diagnosis_tool.requests[0].execution_feedback.pda["execution_status"] == "Success"
 
 
 def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(monkeypatch) -> None:
@@ -535,13 +703,16 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
 
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(2),
-        policy_plan=_qos_plan(),
+        policy_plan=_qos_plan(round_index=2),
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
-        cr_tool=_RecordingConflictTool(ConflictResolutionResult()),
+        cr_tool=_RecordingConflictTool(_conflict_result()),
         pd_agent=_RecordingDispatchAgent(report),
         ad_tool=_RecordingDiagnosisTool(
-            AssuranceDiagnosisResult(root_cause_category="dispatch_failure", reason_summary="gateway rejected")
+            _diagnosis_result(
+                root_cause_category="dispatch_failure",
+                reason_summary="gateway rejected",
+            )
         ),
     )
 
@@ -576,11 +747,7 @@ def test_osa_public_generate_strategy_rejects_wrong_input_and_returns_reground_p
     with pytest.raises(TypeError, match="PlanningRequest"):
         agent.generate_strategy({"not": "a PlanningRequest"})
 
-    expected = PolicyPlanDraft(
-        planning_status="needs_upstream_reground",
-        planning_rationale=PlanningRationale(explanation="upstream evidence required"),
-        upstream_requests=["reground QoS flow"],
-    )
+    expected = _reground_plan()
     compiler_calls = []
 
     class Compiler:
@@ -590,9 +757,11 @@ def test_osa_public_generate_strategy_rejects_wrong_input_and_returns_reground_p
 
     agent.compiler = Compiler()
     monkeypatch.setattr(agent, "_cache_received_request", lambda _request: object())
+    empty_grounding_payload = _grounding_decision().model_dump(mode="json")
+    empty_grounding_payload["flows"] = []
     request = PlanningRequest(
-        grounding_decision=GroundingDecision(),
-        context=PlanningContext(shared_context=SharedControlContext(main_intent=_main_intent())),
+        grounding_decision=GroundingDecision.model_validate(empty_grounding_payload),
+        context=_planning_context(),
     )
 
     assert agent.generate_strategy(request) == expected
@@ -615,7 +784,7 @@ def test_osa_stage_retries_invocation_failures_and_reraises_the_original_excepti
     terminal_error = RuntimeError("advisor transport unavailable")
     request = PlanningRequest(
         grounding_decision=_grounding_decision(),
-        context=PlanningContext(shared_context=SharedControlContext(main_intent=_main_intent())),
+        context=_planning_context(),
     )
     monkeypatch.setattr(agent, "_cached_tool_evidence_for_retry", lambda: {})
 
@@ -655,7 +824,7 @@ def test_osa_stage_does_not_retry_or_record_non_retryable_invocation_errors(monk
     terminal_error = ValueError("advisor request is malformed")
     request = PlanningRequest(
         grounding_decision=_grounding_decision(),
-        context=PlanningContext(shared_context=SharedControlContext(main_intent=_main_intent())),
+        context=_planning_context(),
     )
 
     def fail_invocation(**_kwargs):
@@ -699,7 +868,7 @@ def test_osa_public_generate_strategy_preserves_stage_failure_cleanup_and_trace(
     trace_writes = []
     request = PlanningRequest(
         grounding_decision=_grounding_decision(),
-        context=PlanningContext(shared_context=SharedControlContext(main_intent=_main_intent())),
+        context=_planning_context(),
     )
 
     def fail_stage(*, state, **_kwargs):
@@ -745,7 +914,7 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
     trace_writes = []
     request = PlanningRequest(
         grounding_decision=_grounding_decision(),
-        context=PlanningContext(shared_context=SharedControlContext(main_intent=_main_intent())),
+        context=_planning_context(),
     )
     agent.compiler = SimpleNamespace(
         validate_advisor_output=lambda **_kwargs: validations.append("validate") or [
@@ -764,6 +933,7 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
             blocked_targets=[],
             upstream_requests=[],
             planner_conflicts=[],
+            open_questions=[],
             sm_policies=[],
             am_policy=None,
             ursp_policies=[],
@@ -956,6 +1126,19 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
                     supi="imsi-001",
                 ),
                 global_intent=intent,
+                qos_proposal=None,
+                mobility_proposal=None,
+                domain_verdicts=[],
+                mediator_decision=None,
+                unified_constraints={"hard_constraints": [], "evidence": []},
+                execution_order=[],
+                approved_policies=[],
+                blocked_domains=[],
+                objective_breakdown={},
+                control_churn_count=0,
+                agent_contributions=[],
+                handoff_records=[],
+                open_questions=[],
             ),
             trace=ControlRoundTrace(
                 round_index=round_index,
@@ -991,7 +1174,16 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
 
     monkeypatch.setattr(orchestrator, "_plan_round", plan_round)
     monkeypatch.setattr(main_orchestrator, "start_control_session", lambda **_kwargs: ("session-1", "snapshot-1"))
-    monkeypatch.setattr(main_orchestrator, "build_memory_context", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(
+        main_orchestrator,
+        "build_memory_context",
+        lambda *_args, **_kwargs: MemoryContextView(
+            query=None,
+            selected_short_term=[],
+            selected_long_term=[],
+            prompt_text="",
+        ),
+    )
     monkeypatch.setattr(main_orchestrator, "build_feedback_context_from_snapshots", lambda *_args, **_kwargs: "")
     monkeypatch.setattr(main_orchestrator, "log_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -1299,24 +1491,24 @@ def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_art
         performance_metrics='{"dispatch_results":[{"status":"success","policy_id":"sm-1","policy_type":"SmPolicyDecision"}]}',
         violation_details="none",
     )
-    conflict_tool = _RecordingConflictTool(ConflictResolutionResult())
+    conflict_tool = _RecordingConflictTool(_conflict_result())
 
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(3),
-        policy_plan=_qos_plan(),
+        policy_plan=_qos_plan(round_index=3),
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
         cr_tool=conflict_tool,
         pd_agent=_RecordingDispatchAgent(report),
-        ad_tool=_RecordingDiagnosisTool(AssuranceDiagnosisResult(status="healthy")),
+        ad_tool=_RecordingDiagnosisTool(_diagnosis_result()),
     )
 
     assert isinstance(artifacts, RoundExecutionArtifacts)
     assert loader_calls == [("imsi-001", "snapshot-1")]
-    assert conflict_tool.requests[0].upstream_context["ue_context"] == ue_context
+    assert conflict_tool.requests[0].upstream_context.ue_context == ue_context
     assert artifacts.trace.round_index == 3
-    assert artifacts.trace.policy_plan == _qos_plan().model_dump(mode="json")
-    assert artifacts.trace.mediator_decision == {"status": "approved", "reason_summary": "", "affected_domains": [], "revision_requests": [], "unified_constraints": {"hard_constraints": [], "evidence": []}}
+    assert artifacts.trace.policy_plan == _qos_plan(round_index=3).model_dump(mode="json")
+    assert artifacts.trace.mediator_decision == {"status": "approved", "reason_summary": "no conflicts", "affected_domains": [], "revision_requests": [], "unified_constraints": {"hard_constraints": [], "evidence": []}}
 
 
 def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch(monkeypatch) -> None:
@@ -1330,17 +1522,20 @@ def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch
         lambda _: {"snapshot_id": "snapshot-1", "apps": [], "slices": [], "nodes": []},
     )
     monkeypatch.setattr(round_execution, "get_ue_context_by_supi", lambda *_args, **_kwargs: {})
-    conflict_result = ConflictResolutionResult(
+    conflict_result = _conflict_result(
         mediator_status="revise",
         reason_summary="binding conflict requires revision",
     )
     diagnosis_tool = _RecordingDiagnosisTool(
-        AssuranceDiagnosisResult(root_cause_category="mediation_blocked", reason_summary="revise plan")
+        _diagnosis_result(
+            root_cause_category="mediation_blocked",
+            reason_summary="revise plan",
+        )
     )
 
     artifacts = round_execution.execute_planned_round(
         scope=_execution_scope(2),
-        policy_plan=_qos_plan(),
+        policy_plan=_qos_plan(round_index=2),
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
         cr_tool=_RecordingConflictTool(conflict_result),
@@ -1364,7 +1559,7 @@ def test_execute_planned_round_keeps_mediator_blocked_artifacts_without_dispatch
     assert artifacts.trace.mediator_decision["status"] == "revise"
     assert artifacts.trace.domain_verdicts[-1]["status"] == "needs_revision"
     assert artifacts.trace.pda_feedback == {}
-    assert diagnosis_tool.requests[0].execution_feedback["qos"] == artifacts.qos_feedback
+    assert diagnosis_tool.requests[0].execution_feedback.qos == artifacts.qos_feedback
 
 
 def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantics(monkeypatch) -> None:
@@ -1379,9 +1574,7 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
         lambda _: {"snapshot_id": "snapshot-1", "apps": [], "slices": [], "nodes": []},
     )
     monkeypatch.setattr(round_execution, "get_ue_context_by_supi", lambda *_args, **_kwargs: {})
-    plan = _qos_plan(planning_status="partial_plan")
-    plan.blocked_targets = ["flow-2"]
-    plan.upstream_requests = ["reground flow-2"]
+    plan = _qos_plan(planning_status="partial_plan", round_index=4)
     report = FeedbackReport(
         execution_status="Success",
         performance_metrics='{"dispatch_results":[{"status":"success","policy_id":"sm-1","policy_type":"SmPolicyDecision"}]}',
@@ -1393,9 +1586,9 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
         policy_plan=plan,
         global_intent=_main_intent(),
         grounding_decision=_grounding_decision(),
-        cr_tool=_RecordingConflictTool(ConflictResolutionResult()),
+        cr_tool=_RecordingConflictTool(_conflict_result()),
         pd_agent=_RecordingDispatchAgent(report),
-        ad_tool=_RecordingDiagnosisTool(AssuranceDiagnosisResult(status="healthy", reason_summary="dispatch completed")),
+        ad_tool=_RecordingDiagnosisTool(_diagnosis_result(reason_summary="dispatch completed")),
     )
 
     assert artifacts.completed is True
@@ -1408,7 +1601,6 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
         "planning_status": "partial_plan",
     }
     assert artifacts.diagnosis["root_cause_category"] == "intent_partially_satisfied"
-    assert artifacts.diagnosis["intent_status"] == "partially_satisfied"
     assert artifacts.trace.pda_feedback["intent_status"] == "partially_satisfied"
     assert artifacts.unified_plan.approved_policies == [
         {"domain": "qos", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}

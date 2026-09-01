@@ -46,7 +46,7 @@ def build_grounding_validation_retry_prompt(
         )
     if "mobility_intent" in joined and "valid dictionary" in joined:
         repair_rules.append(
-            "Set mobility_intent to {} when no mobility fact is needed; never use null, a string, or prose."
+            "Set mobility_intent to null when mobility grounding is inactive; otherwise emit the exact typed mobility object."
         )
     if "qos_operation_constraints" in joined and (
         "valid list" in joined

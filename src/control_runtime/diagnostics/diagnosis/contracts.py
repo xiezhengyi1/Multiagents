@@ -1,25 +1,63 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import field_validator, model_validator
 
-
-class AssuranceDiagnosisRequest(BaseModel):
-    execution_feedback: Dict[str, Any] = Field(default_factory=dict)
-    dispatch_receipts: List[Dict[str, Any]] = Field(default_factory=list)
-    assurance_verdicts: List[Dict[str, Any]] = Field(default_factory=list)
-    telemetry_snapshot: Dict[str, Any] = Field(default_factory=dict)
-    session_id: str = Field(default="")
-    snapshot_id: str = Field(default="")
-    upstream_context: Dict[str, Any] = Field(default_factory=dict)
+from shared.contracts import ContractModel, ExecutionScope, JsonValue, NonEmptyStr
 
 
-class AssuranceDiagnosisResult(BaseModel):
-    status: str = Field(default="insufficient_evidence")
-    root_cause_category: str = Field(default="")
-    root_cause: str = Field(default="")
-    affected_policy_ids: List[str] = Field(default_factory=list)
-    affected_flow_ids: List[str] = Field(default_factory=list)
-    recommended_actions: List[str] = Field(default_factory=list)
-    reason_summary: str = Field(default="")
+class DiagnosisExecutionFeedback(ContractModel):
+    pda: dict[str, JsonValue]
+    qos: dict[str, JsonValue]
+    mobility: dict[str, JsonValue]
+
+
+class DiagnosisUpstreamContext(ContractModel):
+    global_intent: dict[str, JsonValue]
+    grounding_decision: dict[str, JsonValue]
+    conflict_result: dict[str, JsonValue]
+
+
+class AssuranceDiagnosisRequest(ContractModel):
+    scope: ExecutionScope
+    execution_feedback: DiagnosisExecutionFeedback
+    dispatch_receipts: list[dict[str, JsonValue]]
+    assurance_verdicts: list[dict[str, JsonValue]]
+    telemetry_snapshot: dict[str, JsonValue]
+    upstream_context: DiagnosisUpstreamContext
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "AssuranceDiagnosisRequest":
+        if self.scope.snapshot_id is None:
+            raise ValueError("assurance diagnosis requires scope.snapshot_id")
+        return self
+
+
+DiagnosisStatus = Literal["diagnosed", "insufficient_evidence"]
+
+
+class AssuranceDiagnosisResult(ContractModel):
+    status: DiagnosisStatus
+    root_cause_category: NonEmptyStr
+    root_cause: NonEmptyStr
+    affected_policy_ids: list[NonEmptyStr]
+    affected_flow_ids: list[NonEmptyStr]
+    recommended_actions: list[NonEmptyStr]
+    reason_summary: NonEmptyStr
+
+    @field_validator("affected_policy_ids", "affected_flow_ids", "recommended_actions")
+    @classmethod
+    def validate_unique_lists(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("diagnosis list values must be unique")
+        return values
+
+
+__all__ = [
+    "AssuranceDiagnosisRequest",
+    "AssuranceDiagnosisResult",
+    "DiagnosisExecutionFeedback",
+    "DiagnosisStatus",
+    "DiagnosisUpstreamContext",
+]

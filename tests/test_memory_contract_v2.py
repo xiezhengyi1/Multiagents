@@ -43,8 +43,8 @@ def test_short_term_memory_is_thread_scoped_and_summaries_are_supi_scoped() -> N
         )
     )
 
-    first = manager.retrieve(MemoryQuery(scope=first_scope, text="flow-1"))
-    second = manager.retrieve(MemoryQuery(scope=second_scope, text="flow-1"))
+    first = manager.retrieve(MemoryQuery(scope=first_scope, text="flow-1", top_k=3))
+    second = manager.retrieve(MemoryQuery(scope=second_scope, text="flow-1", top_k=3))
 
     assert [record.memory_id for record in first.short_term] == ["event-1"]
     assert [record.memory_id for record in second.short_term] == []

@@ -13,6 +13,7 @@ from shared.contracts import (
     AgentMessage,
     AgentRunResult,
     ExecutionScope,
+    MemoryContextView,
     TraceMetadata,
     TraceTarget,
 )
@@ -25,8 +26,11 @@ from application_runtime.persistence import create_runtime_persistence
 from ...tool_capabilities import CONTROL_RUNTIME_CAPABILITY_ALIASES
 from ...context.prompts.single import render_single_system_prompt
 from ..grounding.contracts import (
+    FlowCandidateEvidence,
     FlowSelector,
+    GroundedMobilityEvidence,
     GroundingDecision,
+    GroundingEvidenceBundle,
     QosOperationConstraint,
     SliceMigrationAuthorization,
 )
@@ -41,6 +45,7 @@ from ..planning.contracts import (
 from ..planning.compiler import OptimizationStrategyCompiler
 from ..planning.evidence import extract_planning_tool_evidence
 from ..planning.response_models import OsaAdvisorOutput
+from ...diagnostics.mediation.contracts import RevisionRequest, UnifiedConstraintSet
 from ...context.prompts.planning import build_planning_validation_retry_prompt
 from .tools import build_single_agent_tools
 
@@ -253,7 +258,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
                 ),
                 system_prompt=render_single_system_prompt(),
                 prompt_name="single_control_advisor",
-                prompt_version="2.1.0",
+                prompt_version="2.2.0",
                 response_model=OsaAdvisorOutput,
                 max_iterations=12,
                 forbid_duplicate_tool_calls=True,
@@ -426,9 +431,8 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         rows_by_id = self._catalog_rows_by_flow_id(advisor_result)
         requested_flow_ids = [str(item.flow_id or "").strip() for item in advisor_output.sm_policies]
         requested_flow_ids.extend(
-            str(item.get("flow_id") or "").strip()
+            str(item.flow_id or "").strip()
             for item in advisor_output.partial_policies
-            if isinstance(item, dict)
         )
         requested_flow_ids = list(dict.fromkeys(item for item in requested_flow_ids if item))
         flows: List[FlowSelector] = []
@@ -442,7 +446,32 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             matching = next((item for item in advisor_output.sm_policies if item.flow_id == flow_id), None)
             app_id = str(getattr(matching, "app_id", "") or "").strip()
             if flow_id and app_id:
-                flows.append(FlowSelector(supi=supi, app_id=app_id, flow_id=flow_id, name=flow_id))
+                flows.append(
+                    FlowSelector(
+                        supi=supi,
+                        app_id=app_id,
+                        app_name=None,
+                        flow_id=flow_id,
+                        target_type="flow",
+                        name=flow_id,
+                        service_type=None,
+                        service_type_id=None,
+                        bw_ul=None,
+                        bw_dl=None,
+                        gbr_ul=None,
+                        gbr_dl=None,
+                        lat=None,
+                        loss_req=None,
+                        jitter_req=None,
+                        priority=None,
+                        description=None,
+                        five_tuple=None,
+                        current_slice_snssai=None,
+                        current_bw_ul=None,
+                        current_bw_dl=None,
+                        resolution_status="resolved",
+                    )
+                )
 
         retry_scope = "target_stable" if "retry_contract:" in feedback_context else "full_reground"
         profile_name = self._single_objective_profile(user_input)
@@ -463,11 +492,24 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             required_evidence=self._required_evidence_from_domains(active_domains),
         )
         planning_context = PlanningContext(
+            memory_context=MemoryContextView(
+                query=None,
+                selected_short_term=[],
+                selected_long_term=[],
+                prompt_text="",
+            ),
             shared_context=SharedControlContext(main_intent=main_intent),
             feedback_context=feedback_context,
             handoff_history=round_traces[-2:],
-            revision_requests=list(previous_mediator_decision.get("revision_requests") or []),
-            unified_constraints=dict(previous_mediator_decision.get("unified_constraints") or {}),
+            revision_requests=[
+                RevisionRequest.model_validate(item)
+                for item in previous_mediator_decision.get("revision_requests", [])
+            ],
+            unified_constraints=UnifiedConstraintSet.model_validate(
+                previous_mediator_decision.get("unified_constraints")
+                or {"hard_constraints": [], "evidence": []}
+            ),
+            qos_retry_constraints=[],
         )
         migration_required = self._requires_serving_slice_change(user_input)
         subscription = self._single_subscription_evidence(advisor_result)
@@ -482,29 +524,61 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         return PlanningRequest(
             grounding_decision=GroundingDecision(
                 flows=flows,
-                grounding_evidence={
-                    "grounded_supi": supi,
-                    "grounded_flows": [item.model_dump(mode="json") for item in flows],
-                    "evidence_sources": {"single_agent": ["get_sm_ue_flow_catalog"] if flows else []},
-                },
+                mobility_intent=None,
+                grounding_evidence=GroundingEvidenceBundle(
+                    grounded_supi=supi,
+                    grounded_apps=[],
+                    grounded_flows=[
+                        FlowCandidateEvidence(
+                            supi=flow.supi or supi,
+                            app_id=flow.app_id or "",
+                            app_name=flow.app_name,
+                            flow_id=flow.flow_id or "",
+                            flow_name=flow.name,
+                            service_type=flow.service_type,
+                            service_type_id=flow.service_type_id,
+                            score=1.0,
+                        )
+                        for flow in flows
+                    ],
+                    mobility=GroundedMobilityEvidence(
+                        summary=None,
+                        subscription_entitlement=subscription or None,
+                    ),
+                    evidence_sources={"single_agent": ["get_sm_ue_flow_catalog"]} if flows else {},
+                ),
                 qos_operation_constraints=[
                     QosOperationConstraint(
                         flow_id=str(flow.flow_id or "").strip(),
                         app_id=str(flow.app_id or "").strip(),
                         operation_type="slice_migration" if migration_required else "qos_reallocation",
                         require_slice_change=migration_required,
+                        source_slice_snssai=flow.current_slice_snssai,
+                        excluded_slice_snssais=(
+                            [flow.current_slice_snssai]
+                            if migration_required and flow.current_slice_snssai is not None
+                            else []
+                        ),
+                        target_slice_preference="lower_latency" if migration_required else "",
                         no_op_allowed=not migration_required,
-                        rationale=["Single-agent hidden IEA migration decision"] if migration_required else [],
+                        rationale=(
+                            ["Single-agent hidden IEA migration decision"]
+                            if migration_required
+                            else ["Single-agent hidden IEA same-slice QoS decision"]
+                        ),
                     )
                     for flow in flows
                     if str(flow.flow_id or "").strip() and str(flow.app_id or "").strip()
                 ],
                 slice_migration_authorization=SliceMigrationAuthorization(
                     decision=migration_decision,
-                    authority=str(subscription.get("authority") or "").strip(),
+                    authority=str(subscription.get("authority") or "").strip() or None,
                     authorized_snssais=authorized_snssais,
+                    target_snssais=[],
+                    subscription_change_required=False,
                     rationale=["Read-only subscription entitlement evidence was observed"] if subscription else [],
                 ),
+                open_questions=[],
             ),
             context=planning_context,
         )
@@ -676,7 +750,7 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
             metadata=TraceMetadata(
                 path_label="single_control_advisor",
                 prompt_name="single_control_advisor",
-                prompt_version="2.1.0",
+                prompt_version="2.2.0",
             ),
         )
         result = advisor_agent.invoke(

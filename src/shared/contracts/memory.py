@@ -31,7 +31,7 @@ class MemoryRecord(ContractModel):
 class MemoryQuery(ContractModel):
     scope: ExecutionScope
     text: NonEmptyStr
-    top_k: Annotated[int, Field(strict=True, ge=1, le=20)] = 3
+    top_k: Annotated[int, Field(strict=True, ge=1, le=20)]
 
 
 class MemoryBundle(ContractModel):
@@ -63,10 +63,41 @@ class MemoryBundle(ContractModel):
         return self
 
 
+class MemoryContextView(ContractModel):
+    """Exact memory selection and text exposed to an agent prompt."""
+
+    query: MemoryQuery | None
+    selected_short_term: list[MemoryRecord]
+    selected_long_term: list[MemoryRecord]
+    prompt_text: str
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "MemoryContextView":
+        if self.query is None:
+            if self.selected_short_term or self.selected_long_term or self.prompt_text:
+                raise ValueError("memory context without a query cannot contain selected records or prompt text")
+            return self
+        MemoryBundle(
+            query=self.query,
+            short_term=self.selected_short_term,
+            long_term=self.selected_long_term,
+        )
+        has_selected_records = bool(self.selected_short_term or self.selected_long_term)
+        if has_selected_records != bool(self.prompt_text.strip()):
+            raise ValueError("memory prompt_text presence must match the selected records")
+        return self
+
+
 def _long_term_identity(scope: ExecutionScope) -> tuple[str, str]:
     if scope.supi is not None:
         return ("supi", scope.supi)
     return ("session", scope.session_id)
 
 
-__all__ = ["MemoryBundle", "MemoryKind", "MemoryQuery", "MemoryRecord"]
+__all__ = [
+    "MemoryBundle",
+    "MemoryContextView",
+    "MemoryKind",
+    "MemoryQuery",
+    "MemoryRecord",
+]

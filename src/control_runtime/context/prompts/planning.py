@@ -51,7 +51,8 @@ def build_planning_validation_retry_prompt(
     if "bare array" in joined or "non-object" in joined:
         correction = (
             "Return one OsaAdvisorOutput JSON object, never a bare policy array or item. "
-            "Include planning_status, rationale, evidence arrays, sm_policies, am_policy, ursp_policies, and partial_policies."
+            "Include planning_status, rationale, evidence arrays, open_questions, sm_policies, am_policy, "
+            "ursp_policies, and partial_policies."
         )
     elif "serv_area_res is runtime-owned" in joined or "servareares" in joined:
         correction = (

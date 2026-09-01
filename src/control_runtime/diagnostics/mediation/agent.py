@@ -8,7 +8,13 @@ from shared.runtime import ArtifactWorkerMixin
 from application_runtime.persistence import create_runtime_persistence
 from ...contracts import ControlDomain
 
-from .contracts import ConflictResolutionRequest, ConflictResolutionResult, RevisionRequest, UnifiedConstraintSet
+from .contracts import (
+    ConflictResolutionRequest,
+    ConflictResolutionResult,
+    PolicyConflict,
+    RevisionRequest,
+    UnifiedConstraintSet,
+)
 
 
 class ConflictResolutionTool(ArtifactWorkerMixin):
@@ -20,7 +26,9 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
         self.init_worker_runtime(persistence=runtime_persistence)
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> ConflictResolutionResult:
-        request = ConflictResolutionRequest.model_validate(envelope.payload)
+        request = ConflictResolutionRequest.model_validate(
+            {**envelope.payload, "scope": envelope.scope.model_dump(mode="json")}
+        )
         return self.run(request)
 
     @staticmethod
@@ -188,13 +196,8 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
 
     def _collect_planner_conflicts(self, request: ConflictResolutionRequest) -> List[Dict[str, Any]]:
         conflicts: List[Dict[str, Any]] = []
-        upstream_context = request.upstream_context if isinstance(request.upstream_context, dict) else {}
-        verdicts = upstream_context.get("planner_cross_domain_verdicts")
-        if not isinstance(verdicts, list):
-            return conflicts
-        for verdict in verdicts:
-            if not isinstance(verdict, dict):
-                continue
+        for typed_verdict in request.upstream_context.planner_cross_domain_verdicts:
+            verdict = typed_verdict.model_dump(mode="json")
             status = str(verdict.get("status") or "").strip().lower()
             if status not in {"rejected", "failed", "incomplete_context"}:
                 continue
@@ -545,11 +548,11 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
     def _build_revision_bundle(
         self,
         conflicts: List[Dict[str, Any]],
-    ) -> tuple[List[Dict[str, Any]], UnifiedConstraintSet, List[str]]:
-        revision_requests: List[Dict[str, Any]] = []
+    ) -> tuple[List[RevisionRequest], UnifiedConstraintSet, List[ControlDomain]]:
+        revision_requests: List[RevisionRequest] = []
         hard_constraints: List[str] = []
         evidence: List[str] = []
-        affected_domains: List[str] = []
+        affected_domains: List[ControlDomain] = []
 
         for conflict in conflicts:
             if str(conflict.get("resolution_status") or "").strip().lower() != "unresolved":
@@ -565,7 +568,7 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
             evidence_line = json.dumps(conflict, ensure_ascii=False, sort_keys=True)
             evidence.append(evidence_line)
             hard_constraints.append(detail)
-            affected_domains.extend(domains)
+            affected_domains.extend(ControlDomain(domain) for domain in domains)
             for domain in domains:
                 revision_requests.append(
                     RevisionRequest(
@@ -577,7 +580,7 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
                         suggested_actions=[f"Revise the {domain} plan to satisfy: {detail}"],
                         hard_constraints=[detail],
                         evidence=[evidence_line],
-                    ).model_dump(mode="json")
+                    )
                 )
 
         return (
@@ -586,23 +589,17 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
                 hard_constraints=self._dedupe(hard_constraints),
                 evidence=evidence,
             ),
-            self._dedupe(affected_domains),
+            list(dict.fromkeys(affected_domains)),
         )
 
     def run(self, request: ConflictResolutionRequest) -> ConflictResolutionResult:
         policy_summaries = [
             self._summarize_policy(policy)
             for policy in request.candidate_policies
-            if isinstance(policy, dict)
         ]
-        requested_domains = {
-            str(item or "").strip().lower()
-            for item in ((request.conflict_scope or {}).get("domains") or [])
-            if str(item or "").strip()
-        }
-        resource_view = request.resource_view if isinstance(request.resource_view, dict) else {}
-        upstream_context = request.upstream_context if isinstance(request.upstream_context, dict) else {}
-        ue_context = upstream_context.get("ue_context") if isinstance(upstream_context.get("ue_context"), dict) else {}
+        requested_domains = {item.value for item in request.conflict_scope.domains}
+        resource_view = request.resource_view.model_dump(mode="json")
+        ue_context = request.upstream_context.ue_context
 
         conflicts: List[Dict[str, Any]] = []
         conflicts.extend(self._collect_planner_conflicts(request))
@@ -611,6 +608,15 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
         conflicts.extend(self._collect_resource_conflicts(policy_summaries, resource_view))
         conflicts.extend(self._collect_slice_capacity_conflicts(policy_summaries, resource_view))
         conflicts.extend(self._collect_cross_domain_conflicts(policy_summaries, ue_context, requested_domains))
+        typed_conflicts = [
+            PolicyConflict.model_validate(
+                {
+                    **conflict,
+                    "domain": conflict.get("domain") or None,
+                }
+            )
+            for conflict in conflicts
+        ]
 
         unresolved_conflicts = [
             conflict
@@ -632,8 +638,14 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
         if not conflicts:
             return ConflictResolutionResult(
                 mediator_status="approved",
+                conflicts=[],
+                affected_policy_ids=[],
+                affected_objects=[],
+                affected_domains=[],
+                resolution_recommendations=[],
                 reason_summary="No policy conflicts were detected from explicit planner, binding, or cross-domain evidence.",
-                unified_constraints=UnifiedConstraintSet(),
+                revision_requests=[],
+                unified_constraints=UnifiedConstraintSet(hard_constraints=[], evidence=[]),
             )
 
         mediator_status = "revise" if unresolved_conflicts else "approved"
@@ -653,7 +665,7 @@ class ConflictResolutionTool(ArtifactWorkerMixin):
 
         return ConflictResolutionResult(
             mediator_status=mediator_status,
-            conflicts=conflicts,
+            conflicts=typed_conflicts,
             affected_policy_ids=affected_policy_ids,
             affected_objects=affected_objects,
             affected_domains=affected_domains,

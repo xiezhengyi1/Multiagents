@@ -18,7 +18,9 @@ class AssuranceDiagnosisTool(ArtifactWorkerMixin):
         self.init_worker_runtime(persistence=runtime_persistence)
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> AssuranceDiagnosisResult:
-        request = AssuranceDiagnosisRequest.model_validate(envelope.payload)
+        request = AssuranceDiagnosisRequest.model_validate(
+            {**envelope.payload, "scope": envelope.scope.model_dump(mode="json")}
+        )
         return self.run(request)
 
     @staticmethod
@@ -282,22 +284,21 @@ class AssuranceDiagnosisTool(ArtifactWorkerMixin):
         )
 
     def run(self, request: AssuranceDiagnosisRequest) -> AssuranceDiagnosisResult:
-        execution_feedback = self._as_dict(request.execution_feedback)
-        dispatch_receipts = [item for item in (request.dispatch_receipts or []) if isinstance(item, dict)]
-        assurance_verdicts = [item for item in (request.assurance_verdicts or []) if isinstance(item, dict)]
-        telemetry_snapshot = self._as_dict(request.telemetry_snapshot)
-        upstream_context = self._as_dict(request.upstream_context)
+        execution_feedback = request.execution_feedback
+        dispatch_receipts = list(request.dispatch_receipts)
+        assurance_verdicts = list(request.assurance_verdicts)
+        telemetry_snapshot = request.telemetry_snapshot
 
-        pda_feedback = self._as_dict(execution_feedback.get("pda"))
-        qos_feedback = self._as_dict(execution_feedback.get("qos"))
-        mobility_feedback = self._as_dict(execution_feedback.get("mobility"))
+        pda_feedback = execution_feedback.pda
+        qos_feedback = execution_feedback.qos
+        mobility_feedback = execution_feedback.mobility
         affected_policy_ids, affected_flow_ids = self._collect_affected_ids(
             dispatch_receipts=dispatch_receipts,
             assurance_verdicts=assurance_verdicts,
             pda_feedback=pda_feedback,
         )
 
-        conflict_result = self._as_dict(upstream_context.get("conflict_result"))
+        conflict_result = request.upstream_context.conflict_result
         diagnosis = self._diagnose_conflict_block(
             conflict_result=conflict_result,
             affected_policy_ids=affected_policy_ids,
@@ -306,7 +307,14 @@ class AssuranceDiagnosisTool(ArtifactWorkerMixin):
         if diagnosis is not None:
             return diagnosis
 
-        if not execution_feedback and not dispatch_receipts and not assurance_verdicts and not telemetry_snapshot:
+        if (
+            not pda_feedback
+            and not qos_feedback
+            and not mobility_feedback
+            and not dispatch_receipts
+            and not assurance_verdicts
+            and not telemetry_snapshot
+        ):
             return self._build_result(
                 status="insufficient_evidence",
                 root_cause_category="missing_evidence",

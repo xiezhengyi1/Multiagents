@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
-
 from .contracts import IntentBinding, IntentLifecycle, IntentStatus, MonitorAlert
+from ..orchestrators.contracts import ControlRoundResult
 
 
 class IntentLifecycleManager:
@@ -14,7 +13,7 @@ class IntentLifecycleManager:
     def lifecycles(self) -> list[IntentLifecycle]:
         return list(self._lifecycles.values())
 
-    def record_initial(self, result: Any) -> IntentLifecycle:
+    def record_initial(self, result: ControlRoundResult) -> IntentLifecycle:
         bindings = (
             [
                 IntentBinding(
@@ -28,7 +27,7 @@ class IntentLifecycleManager:
             else []
         )
         lifecycle = IntentLifecycle(
-            intent_id=result.session_id,
+            intent_id=result.scope.session_id,
             bindings=bindings,
             status=IntentStatus.ACTIVE if result.completed else IntentStatus.FAILED,
         )

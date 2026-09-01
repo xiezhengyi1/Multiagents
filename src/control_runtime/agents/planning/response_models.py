@@ -6,6 +6,8 @@ from pydantic import Field, model_validator
 
 from shared.contracts import ContractModel, JsonValue, NonEmptyStr
 
+from ..main.contracts import OpenQuestion
+
 
 class SnssaiSpec(ContractModel):
     sst: int = Field(ge=0, le=255)
@@ -119,6 +121,7 @@ class OsaAdvisorOutput(ContractModel):
     blocked_targets: list[NonEmptyStr]
     upstream_requests: list[NonEmptyStr]
     planner_conflicts: list[NonEmptyStr]
+    open_questions: list[OpenQuestion]
     sm_policies: list[SmPolicySpec]
     am_policy: Optional[AmPolicySpec]
     ursp_policies: list[UrspPolicySpec]
