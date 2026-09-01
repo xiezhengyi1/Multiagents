@@ -27,6 +27,10 @@ RAG 工具在执行检索前创建 `KnowledgeQuery`。非法类型或超出 `1..
 
 编排器内部的 `UnifiedControlPlan`、`ControlRoundResult` 和 round execution 入口同样只接收 `ExecutionScope`，不再平铺复制 session、snapshot、round 和 SUPI。`ControlRoundTrace`、domain proposal、agent contribution、handoff、协商和重入消息全部使用严格 Pydantic 契约；未知字段或错误 JSON 类型直接拒绝，不再通过 `dict(...)`、空对象或过滤无效列表项来“修复”输入。
 
+Main 模型直接以严格 `MainControlDecision` 作为 response schema，不再经过 `extra=allow` 的 wire 模型。所有模型自有顶层字段都是 JSON Schema required；未知字段、缺失字段、重复集合、无效 `current_stage` 和重复 stage index 直接拒绝。运行时不再补写 semantic target 的 SUPI、不再裁剪 current stage，也不再维护代表旧 wire 修复次数的 schema projection 指标。
+
+编译后的 `GlobalControlIntent` 只通过 `ExecutionScope` 保存 session、thread、snapshot、round 和顶层 SUPI，不再平铺复制这些身份字段。Main compiler 只生成明确属于运行时的 routing、round strategy 和 reuse contract；retry 输出缺少 `retry_scope` 或 intent-encoding guidance 时返回验证错误，不能由 compiler 自动补文案或默认重试范围。
+
 ## 2. 模型工具协议
 
 工具定义的唯一公开形式是 JSON Schema；所有工具必须声明：

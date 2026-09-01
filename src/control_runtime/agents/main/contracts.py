@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, List, Literal, Optional, Any
+from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
+
+from shared.contracts import ContractModel, ExecutionScope, NonEmptyStr
 
 from ...contracts import ControlDomain, ObjectiveProfile
 
@@ -67,114 +69,110 @@ class ControlSemanticMode(str, Enum):
     CONDITIONAL_FALLBACK = "conditional_fallback"
 
 
-class MainSemanticTarget(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    semantic_name: str = Field(default="")
-    target_type: SemanticTargetType = Field(default=SemanticTargetType.NAMED_OBJECT)
-    goal: SemanticGoal = Field(default=SemanticGoal.PROTECT)
-    metric_focus: Optional[str] = Field(default=None)
-    note: str = Field(default="")
-    supi: str = Field(default="")
+class MainSemanticTarget(ContractModel):
+    semantic_name: str
+    target_type: SemanticTargetType
+    goal: SemanticGoal
+    metric_focus: Optional[str]
+    note: str
+    supi: str
 
 
-class MainControlStage(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    stage_index: int = Field(default=1, ge=1)
-    name: str = Field(default="")
-    trigger: StageTrigger = Field(default=StageTrigger.INITIAL)
-    summary: str = Field(default="")
-    targets: List[MainSemanticTarget] = Field(default_factory=list)
+class MainControlStage(ContractModel):
+    stage_index: int = Field(ge=1)
+    name: str
+    trigger: StageTrigger
+    summary: str
+    targets: list[MainSemanticTarget]
 
 
-class MainControlSemantics(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    mode: ControlSemanticMode = Field(default=ControlSemanticMode.SINGLE_STEP)
-    current_stage: int = Field(default=1, ge=1)
-    stages: List[MainControlStage] = Field(default_factory=list)
-    notes: List[str] = Field(default_factory=list)
+class MainControlSemantics(ContractModel):
+    mode: ControlSemanticMode
+    current_stage: int = Field(ge=1)
+    stages: list[MainControlStage]
+    notes: list[NonEmptyStr]
 
     @model_validator(mode="after")
-    def _normalize_current_stage(self) -> "MainControlSemantics":
+    def validate_stage_selection(self) -> "MainControlSemantics":
+        if len(self.notes) != len(set(self.notes)):
+            raise ValueError("control semantic notes must be unique")
         if not self.stages:
-            self.current_stage = 1
+            if self.current_stage != 1:
+                raise ValueError("current_stage must be 1 when stages is empty")
             return self
-        self.current_stage = min(self.current_stage, max(stage.stage_index for stage in self.stages))
+        stage_indices = [stage.stage_index for stage in self.stages]
+        if len(stage_indices) != len(set(stage_indices)):
+            raise ValueError("control semantic stage_index values must be unique")
+        if self.current_stage not in set(stage_indices):
+            raise ValueError("current_stage must reference an existing stage_index")
         return self
 
 
-class ReuseContract(BaseModel):
+class ReuseContract(ContractModel):
     allowed: bool = False
     preserve_bindings: bool = False
     preserve_domains: bool = False
     preserve_stage_scope: bool = False
-    invalidate_on: List[str] = Field(default_factory=list)
+    invalidate_on: list[NonEmptyStr] = Field(default_factory=list)
 
-
-class MainControlDecisionWire(BaseModel):
-    """Permissive transport shape repaired before strict decision validation."""
-
-    model_config = ConfigDict(extra="allow")
-
-    supi: str = ""
-    next_agent: str = ""
-    requested_domains: List[Any] = []
-    serving_slice_change_requested: bool = False
-    domain_evidence: Dict[str, Any] = {}
-    control_semantics: Dict[str, Any] = {}
-    objective_profile: Dict[str, Any] = {}
-    investigation_targets: List[Any] = []
-    uncertainty_flags: List[Any] = []
-    retry_scope: str = ""
-    required_evidence: List[Any] = []
-    forbidden_assumptions: List[Any] = []
-    intent_encoding_guidance: str = ""
-
-
-class MainControlDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    supi: str = ""
+class MainControlDecision(ContractModel):
+    supi: str
     next_agent: Literal["intent_encoding", "optimization_strategy"]
-    requested_domains: List[ControlDomain] = Field(default_factory=list)
-    serving_slice_change_requested: bool = False
-    domain_evidence: Dict[str, List[str]] = Field(default_factory=dict)
-    control_semantics: MainControlSemantics = Field(default_factory=MainControlSemantics)
-    objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)
-    investigation_targets: List[MainInvestigationTarget] = Field(default_factory=list)
-    uncertainty_flags: List[MainUncertaintyFlag] = Field(default_factory=list)
-    retry_scope: Optional[MainRetryScope] = Field(default=None)
-    required_evidence: List[str] = Field(default_factory=list)
-    forbidden_assumptions: List[str] = Field(default_factory=list)
-    intent_encoding_guidance: str = ""
+    requested_domains: list[ControlDomain]
+    serving_slice_change_requested: bool
+    domain_evidence: dict[ControlDomain, list[NonEmptyStr]]
+    control_semantics: MainControlSemantics
+    objective_profile: ObjectiveProfile
+    investigation_targets: list[MainInvestigationTarget]
+    uncertainty_flags: list[MainUncertaintyFlag]
+    retry_scope: Optional[MainRetryScope]
+    required_evidence: list[NonEmptyStr]
+    forbidden_assumptions: list[NonEmptyStr]
+    intent_encoding_guidance: str
+
+    @model_validator(mode="after")
+    def validate_unique_collections(self) -> "MainControlDecision":
+        for name, values in (
+            ("requested_domains", self.requested_domains),
+            ("investigation_targets", self.investigation_targets),
+            ("uncertainty_flags", self.uncertainty_flags),
+            ("required_evidence", self.required_evidence),
+            ("forbidden_assumptions", self.forbidden_assumptions),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"{name} must not contain duplicates")
+        return self
 
 
-class OpenQuestion(BaseModel):
+class OpenQuestion(ContractModel):
     owner_agent: str = Field(default="")
     question: str = Field(default="")
     blocking: bool = False
-    related_domains: List[str] = Field(default_factory=list)
+    related_domains: list[NonEmptyStr] = Field(default_factory=list)
 
 
-class GlobalControlIntent(BaseModel):
-    session_id: str = ""
-    snapshot_id: str = ""
+class GlobalControlIntent(ContractModel):
+    scope: ExecutionScope
     raw_input: str = ""
-    supi: str = ""
     round_strategy: MainRoundStrategy = Field(default=MainRoundStrategy.INITIAL_GROUNDING)
     next_agent: Literal["intent_encoding", "optimization_strategy"]
-    requested_domains: List[ControlDomain] = Field(default_factory=list)
+    requested_domains: list[ControlDomain] = Field(default_factory=list)
     serving_slice_change_requested: bool = False
-    domain_evidence: Dict[str, List[str]] = Field(default_factory=dict)
-    control_semantics: MainControlSemantics = Field(default_factory=MainControlSemantics)
+    domain_evidence: dict[ControlDomain, list[NonEmptyStr]] = Field(default_factory=dict)
+    control_semantics: MainControlSemantics = Field(
+        default_factory=lambda: MainControlSemantics(
+            mode=ControlSemanticMode.SINGLE_STEP,
+            current_stage=1,
+            stages=[],
+            notes=[],
+        )
+    )
     objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)
-    investigation_targets: List[MainInvestigationTarget] = Field(default_factory=list)
-    uncertainty_flags: List[MainUncertaintyFlag] = Field(default_factory=list)
+    investigation_targets: list[MainInvestigationTarget] = Field(default_factory=list)
+    uncertainty_flags: list[MainUncertaintyFlag] = Field(default_factory=list)
     retry_scope: Optional[MainRetryScope] = Field(default=None)
-    required_evidence: List[str] = Field(default_factory=list)
-    forbidden_assumptions: List[str] = Field(default_factory=list)
+    required_evidence: list[NonEmptyStr] = Field(default_factory=list)
+    forbidden_assumptions: list[NonEmptyStr] = Field(default_factory=list)
     intent_encoding_guidance: str = ""
     routing_decision: str = Field(default="")
     routing_rationale: str = Field(default="")
@@ -186,7 +184,6 @@ __all__ = [
     "ControlSemanticMode",
     "GlobalControlIntent",
     "MainControlDecision",
-    "MainControlDecisionWire",
     "MainControlSemantics",
     "MainControlStage",
     "MainInvestigationTarget",

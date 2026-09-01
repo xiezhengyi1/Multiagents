@@ -51,9 +51,13 @@ def _main_intent(*, next_agent: str = "optimization_strategy"):
     from control_runtime.agents.main.contracts import ControlDomain, GlobalControlIntent
 
     return GlobalControlIntent(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        supi="imsi-001",
+        scope=ExecutionScope(
+            session_id="session-1",
+            thread_id="session-1",
+            snapshot_id="snapshot-1",
+            round_index=1,
+            supi="imsi-001",
+        ),
         next_agent=next_agent,
         requested_domains=[ControlDomain.QOS],
         routing_decision="protect qos flow",
@@ -148,8 +152,6 @@ def _bare_main_for_public_contract(monkeypatch):
     agent = object.__new__(BareMainControlAgent)
     agent.agent_name = "main_control"
     agent.logger = SimpleNamespace()
-    agent._schema_projection_count = 0
-    agent._schema_projected_fields = []
     monkeypatch.setattr(agent, "_resolve_token_context", lambda: (None, None))
     monkeypatch.setattr(agent, "build_runtime_context", lambda **_kwargs: object())
     return agent, main_agent
@@ -159,15 +161,24 @@ def _main_control_decision_result(*, include_compiled_field: bool = False) -> Ag
     from control_runtime.agents.main.contracts import ControlDomain, MainControlDecision
 
     decision = MainControlDecision(
+        supi="",
         next_agent="intent_encoding",
         requested_domains=[ControlDomain.QOS],
+        serving_slice_change_requested=False,
         domain_evidence={},
-        control_semantics={"stages": [], "notes": []},
+        control_semantics={
+            "mode": "single_step",
+            "current_stage": 1,
+            "stages": [],
+            "notes": [],
+        },
         objective_profile={},
         investigation_targets=[],
         uncertainty_flags=[],
+        retry_scope=None,
         required_evidence=[],
         forbidden_assumptions=[],
+        intent_encoding_guidance="",
     ).model_dump(mode="json")
     if include_compiled_field:
         decision["routing_decision"] = "compiler-owned field"
@@ -880,10 +891,6 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
 
     class MainAgent:
         logger = SimpleNamespace()
-        schema_projection_metrics = {"count": 2, "field_count": 3, "fields": ["supi", "requested_domains"]}
-
-        def reset_schema_projection_metrics(self):
-            return None
 
     orchestrator = object.__new__(BareMainControlOrchestrator)
     orchestrator.main_agent = MainAgent()
@@ -993,7 +1000,6 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
     assert [trace["round_index"] for trace in result.round_traces] == [1, 2]
     assert plan_calls[1]["previous_report_payload"]["execution_status"] == "Failed"
     assert plan_calls[1]["previous_execution_reentry"]["target_bindings_at_risk"] == ["flow-1"]
-    assert result.main_schema_projection_count == 2
     assert finalization[0]["state"].completed is True
 
 
@@ -1433,8 +1439,7 @@ def test_main_public_analysis_retries_runtime_invocations_then_succeeds_with_ret
     result = agent.analyze_global_intent(
         user_input="protect QoS",
         context="{}",
-        session_id="session-1",
-        snapshot_id="snapshot-1",
+        scope=_execution_scope(),
     )
 
     assert result.next_agent == "intent_encoding"
@@ -1452,7 +1457,6 @@ def test_main_public_analysis_retries_runtime_invocations_then_succeeds_with_ret
         (1, str(first_error), "<empty>"),
         (2, str(second_error), "<empty>"),
     ]
-    assert agent.schema_projection_metrics == {"count": 0, "field_count": 0, "fields": []}
     assert trace_writes == [
         {"structured_response": result.model_dump(mode="json")}
     ]
@@ -1502,8 +1506,7 @@ def test_main_public_analysis_traces_each_rejected_parse_attempt(monkeypatch) ->
         agent.analyze_global_intent(
             user_input="protect QoS",
             context="{}",
-            session_id="session-1",
-            snapshot_id="snapshot-1",
+            scope=_execution_scope(),
         )
 
     expected_message = "Main Agent returned invalid MainControlDecision payload: compiler rejected main decision"
@@ -1539,8 +1542,7 @@ def test_main_public_analysis_traces_each_semantically_rejected_output(monkeypat
             write_final_trace=lambda **kwargs: trace_writes.append(kwargs),
         )
 
-    def return_intent(_result, *, projected_fields, **_kwargs):
-        projected_fields.append("routing_decision")
+    def return_intent(_result, **_kwargs):
         return intent
 
     def build_retry_prompt(**kwargs):
@@ -1552,7 +1554,6 @@ def test_main_public_analysis_traces_each_semantically_rejected_output(monkeypat
 
     monkeypatch.setattr(agent, "_invoke_global_intent_result", invoke_global_intent)
     monkeypatch.setattr(main_agent, "validate_global_intent_result", return_intent)
-    monkeypatch.setattr(main_agent, "normalize_semantic_target_scope", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(main_agent, "validate_main_global_intent", lambda *_args, **_kwargs: semantic_errors)
     monkeypatch.setattr(main_agent, "build_main_validation_retry_prompt", build_retry_prompt)
     monkeypatch.setattr(main_agent, "log_event", capture_event)
@@ -1562,8 +1563,7 @@ def test_main_public_analysis_traces_each_semantically_rejected_output(monkeypat
         agent.analyze_global_intent(
             user_input="protect QoS",
             context="{}",
-            session_id="session-1",
-            snapshot_id="snapshot-1",
+            scope=_execution_scope(),
         )
 
     expected_message = (
@@ -1584,11 +1584,6 @@ def test_main_public_analysis_traces_each_semantically_rejected_output(monkeypat
         (2, "semantic target is incomplete || route must retain required evidence", "imsi-001"),
         (3, "semantic target is incomplete || route must retain required evidence", "imsi-001"),
     ]
-    assert agent.schema_projection_metrics == {
-        "count": 3,
-        "field_count": 3,
-        "fields": ["routing_decision"],
-    }
     expected_trace = {
         "structured_response": None,
         "error": expected_message,
@@ -1634,8 +1629,7 @@ def test_main_public_analysis_does_not_retry_nonretryable_parse_value_error_and_
         agent.analyze_global_intent(
             user_input="protect QoS",
             context="{}",
-            session_id="session-1",
-            snapshot_id="snapshot-1",
+            scope=_execution_scope(),
         )
 
     assert raised.value is terminal_error
@@ -1643,7 +1637,6 @@ def test_main_public_analysis_does_not_retry_nonretryable_parse_value_error_and_
     assert retry_prompts == []
     assert [kwargs["attempt"] for event, kwargs in events if event == "main_control_attempt_start"] == [1]
     assert not [event for event, _kwargs in events if event == "main_control_validation_failed"]
-    assert agent.schema_projection_metrics == {"count": 0, "field_count": 0, "fields": []}
     assert trace_writes == [
         {"structured_response": None, "error": str(terminal_error)}
     ]

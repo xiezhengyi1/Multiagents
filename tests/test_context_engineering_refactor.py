@@ -28,10 +28,12 @@ from control_runtime.agents.grounding.contracts import (
 )
 from control_runtime.orchestrators.round_context import build_intent_encoding_context
 from control_runtime.agents.main.contracts import (
+    ControlSemanticMode,
     ControlDomain,
     GlobalControlIntent,
     MainControlSemantics,
     MainControlStage,
+    StageTrigger,
 )
 from control_runtime.context.prompts.main import build_main_validation_retry_prompt
 from control_runtime.agents.planning.contracts import (
@@ -52,6 +54,7 @@ from control_runtime.context.projectors import field, project_global_intent_for_
 from control_runtime.context.projectors.base import BaseProjector
 from control_runtime.orchestrators.round_context import build_planning_context
 from control_runtime.orchestrators.round_transitions import scope_global_intent_for_intent_encoding
+from shared.contracts import ExecutionScope
 
 
 LEGACY_CONTEXT_ENGINEERING_FILES = [
@@ -91,6 +94,21 @@ def _prompt_fixture(name: str) -> str:
     return (PROMPT_FIXTURES / name).read_text(encoding="utf-8")
 
 
+def _intent_scope(
+    *,
+    session_id: str = "s1",
+    snapshot_id: str = "snap1",
+    supi: str | None = "imsi-1",
+) -> ExecutionScope:
+    return ExecutionScope(
+        session_id=session_id,
+        thread_id=session_id,
+        snapshot_id=snapshot_id,
+        round_index=1,
+        supi=supi,
+    )
+
+
 def test_legacy_context_engineering_entrypoints_are_removed() -> None:
     for legacy_path in [*LEGACY_CONTEXT_ENGINEERING_FILES, *CONSOLIDATED_AGENT_HELPER_FILES]:
         assert not (ROOT / legacy_path).exists(), legacy_path
@@ -121,9 +139,7 @@ def test_projector_rejects_unknown_model_fields_at_definition_time() -> None:
 
 def test_global_control_intent_projection_uses_declared_routing_and_flow_contracts() -> None:
     intent = GlobalControlIntent(
-        session_id="s1",
-        snapshot_id="snap1",
-        supi="imsi-1",
+        scope=_intent_scope(),
         raw_input="protect flow",
         next_agent="intent_encoding",
         requested_domains=[ControlDomain.QOS],
@@ -134,7 +150,8 @@ def test_global_control_intent_projection_uses_declared_routing_and_flow_contrac
 
     projected = project_global_intent_for_prompt(intent)
 
-    assert projected["session_id"] == "s1"
+    assert projected["scope"]["session_id"] == "s1"
+    assert projected["scope"]["supi"] == "imsi-1"
     assert projected["requested_domains"] == ["qos"]
     assert projected["domain_evidence"] == {"qos": ["flow catalog"]}
     assert projected["routing_decision"] == "ground qos flow"
@@ -149,9 +166,7 @@ def test_routing_and_grounding_models_keep_ownership_boundaries() -> None:
 
 def test_planning_evidence_matches_operation_constraint_shape() -> None:
     main_intent = GlobalControlIntent(
-        session_id="s1",
-        snapshot_id="snap1",
-        supi="imsi-1",
+        scope=_intent_scope(),
         next_agent="optimization_strategy",
         requested_domains=[ControlDomain.QOS],
     )
@@ -321,17 +336,33 @@ def test_intent_context_keeps_the_1800_character_retry_feedback_window() -> None
 
 def test_intent_context_scopes_one_stage_without_mutating_the_main_intent() -> None:
     intent = GlobalControlIntent(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        supi="imsi-001",
+        scope=_intent_scope(
+            session_id="session-1",
+            snapshot_id="snapshot-1",
+            supi="imsi-001",
+        ),
         next_agent="intent_encoding",
         requested_domains=[ControlDomain.QOS],
         control_semantics=MainControlSemantics(
+            mode=ControlSemanticMode.STAGED_PRIORITY,
             current_stage=2,
             stages=[
-                MainControlStage(stage_index=2, name="ground first flow"),
-                MainControlStage(stage_index=5, name="ground second flow"),
+                MainControlStage(
+                    stage_index=2,
+                    name="ground first flow",
+                    trigger=StageTrigger.INITIAL,
+                    summary="first stage",
+                    targets=[],
+                ),
+                MainControlStage(
+                    stage_index=5,
+                    name="ground second flow",
+                    trigger=StageTrigger.AFTER_PREVIOUS_STAGE,
+                    summary="second stage",
+                    targets=[],
+                ),
             ],
+            notes=[],
         ),
     )
 
@@ -350,9 +381,11 @@ def test_intent_context_scopes_one_stage_without_mutating_the_main_intent() -> N
 
 def test_planning_context_keeps_last_two_handoffs_and_sorted_qos_retry_constraints() -> None:
     intent = GlobalControlIntent(
-        session_id="session-1",
-        snapshot_id="snapshot-1",
-        supi="imsi-001",
+        scope=_intent_scope(
+            session_id="session-1",
+            snapshot_id="snapshot-1",
+            supi="imsi-001",
+        ),
         next_agent="optimization_strategy",
         requested_domains=[ControlDomain.QOS],
     )

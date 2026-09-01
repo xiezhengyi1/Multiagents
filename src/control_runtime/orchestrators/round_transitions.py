@@ -49,7 +49,9 @@ def scope_global_intent_for_intent_encoding(
         return global_intent
 
     ordered_stages = sorted(stages, key=lambda stage: int(stage.stage_index or 0))
-    scoped_position = min(max(1, int(round_index or 1)), len(ordered_stages)) - 1
+    if round_index < 1 or round_index > len(ordered_stages):
+        raise ValueError("round_index must select an existing control semantic stage")
+    scoped_position = round_index - 1
     scoped_stage = ordered_stages[scoped_position].model_copy(deep=True)
     scoped_semantics = semantics.model_copy(
         update={
@@ -65,7 +67,7 @@ def scope_global_intent_for_intent_encoding(
 
 
 def has_supi_scope(global_intent: GlobalControlIntent) -> bool:
-    if str(global_intent.supi or "").strip():
+    if global_intent.scope.supi is not None:
         return True
     return any(
         str(target.supi or "").strip()
@@ -156,7 +158,12 @@ def should_reuse_grounding_decision(
         for flow in previous_grounding_decision.flows or []
         if str(flow.supi or "").strip()
     }
-    if contract.preserve_bindings and str(global_intent.supi or "").strip() and previous_supis and previous_supis != {str(global_intent.supi).strip()}:
+    if (
+        contract.preserve_bindings
+        and global_intent.scope.supi is not None
+        and previous_supis
+        and previous_supis != {global_intent.scope.supi}
+    ):
         return False
     invalidate_text = json.dumps(
         {

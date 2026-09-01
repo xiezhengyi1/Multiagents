@@ -208,8 +208,8 @@ def _effective_supi(
     grounding_decision: Optional[GroundingDecision],
     policy_plan: PolicyPlanDraft,
 ) -> str:
-    if global_intent is not None and str(global_intent.supi or "").strip():
-        return str(global_intent.supi or "").strip()
+    if global_intent is not None and global_intent.scope.supi is not None:
+        return global_intent.scope.supi
     if grounding_decision is not None:
         for flow in grounding_decision.flows or []:
             if str(flow.supi or "").strip():

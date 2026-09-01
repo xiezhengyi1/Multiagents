@@ -23,7 +23,7 @@ from .planning_validation import json_friendly
 
 def _optimizer_input_from_planning_request(planning_request: PlanningRequest) -> OptimizerInput:
     main_intent = planning_request.context.shared_context.main_intent
-    candidates = [main_intent.supi]
+    candidates = [main_intent.scope.supi]
     candidates.extend(
         target.supi
         for stage in main_intent.control_semantics.stages
@@ -66,7 +66,9 @@ def build_request_tools(
     }
 
     def _require_target_supi(candidate: Optional[str]) -> str:
-        target = str(candidate or "").strip() or str(planning_request.context.shared_context.main_intent.supi or "").strip()
+        target = str(candidate or "").strip() or (
+            planning_request.context.shared_context.main_intent.scope.supi or ""
+        )
         if not target:
             target = next(
                 (

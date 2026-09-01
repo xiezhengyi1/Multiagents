@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 from langchain.tools import ToolRuntime
 
 from shared.runtime import AgentRuntimeContext
+from shared.contracts import ExecutionScope
 from shared.tools.wrapper_think import tool_with_reason
 
 from ...integrations.scenario.network_status import get_network_status_summary
@@ -242,7 +243,13 @@ def _build_runtime_planning_request(
     flow_rows = _resolve_flow_catalog_rows(normalized_supi, flow_ids, snapshot_id)
     flows = [_flow_selector_from_catalog(item, normalized_supi) for item in flow_rows]
     main_intent = GlobalControlIntent(
-        supi=normalized_supi,
+        scope=ExecutionScope(
+            session_id=session_id,
+            thread_id=session_id,
+            snapshot_id=snapshot_id,
+            round_index=1,
+            supi=normalized_supi,
+        ),
         next_agent="optimization_strategy",
         round_strategy=MainRoundStrategy.INITIAL_GROUNDING,
         requested_domains=[ControlDomain(item) for item in normalized_domains],
@@ -262,7 +269,7 @@ def _build_runtime_planning_request(
 
 def _optimizer_input_from_planning_request(planning_request: PlanningRequest) -> OptimizerInput:
     main_intent = planning_request.context.shared_context.main_intent
-    candidates = [main_intent.supi]
+    candidates = [main_intent.scope.supi]
     candidates.extend(
         target.supi
         for stage in main_intent.control_semantics.stages

@@ -50,7 +50,7 @@ def _build_lean_grounding_decision(grounding_decision: Any) -> dict:
 
 
 def _planning_supi(planning_request: PlanningRequest) -> str:
-    main_supi = str(planning_request.context.shared_context.main_intent.supi or "").strip()
+    main_supi = planning_request.context.shared_context.main_intent.scope.supi or ""
     if main_supi:
         return main_supi
     return next(

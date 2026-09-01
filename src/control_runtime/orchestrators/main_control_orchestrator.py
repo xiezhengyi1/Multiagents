@@ -193,8 +193,7 @@ class MainControlOrchestrator:
         try:
             global_intent = self.main_agent.analyze_global_intent(
                 user_input=user_input,
-                session_id=session_id,
-                snapshot_id=snapshot_id,
+                scope=scope,
                 context=build_main_context(
                     snapshot_id,
                     round_index=round_index,
@@ -212,7 +211,6 @@ class MainControlOrchestrator:
                     previous_execution_reentry=previous_execution_reentry,
                     external_routing_hint=routing_hint,
                 ),
-                round_index=round_index,
                 trace_metadata=trace_metadata,
             )
         finally:
@@ -221,8 +219,7 @@ class MainControlOrchestrator:
             raise RuntimeError("Main Agent returned no requested_domains; refusing to infer domains outside the agent.")
         if not has_supi_scope(global_intent):
             raise RuntimeError("Main Agent returned no SUPI scope; refusing to patch identifiers outside the agent.")
-        memory_scope = scope.model_copy(update={"supi": global_intent.supi or None})
-        self._remember(memory_scope, "MAIN", global_intent)
+        self._remember(global_intent.scope, "MAIN", global_intent)
 
         selected_next_agent = str(global_intent.next_agent or "").strip().lower()
         reuse_grounding_decision = (
@@ -305,7 +302,6 @@ class MainControlOrchestrator:
         snapshot_id: str = "",
         routing_hint: Optional[Dict[str, Any]] = None,
     ) -> ControlRoundResult:
-        self.main_agent.reset_schema_projection_metrics()
         session_id, snapshot_id = start_control_session(step_name="main_control", user_input=user_input, snapshot_id=snapshot_id)
         self._token_budget = TokenBudget()
         self._inject_token_context()
@@ -457,7 +453,7 @@ class MainControlOrchestrator:
                 )
                 append_round_trace(state, trace=trace, feedback_added=feedback_added)
                 state.latest_result = ControlRoundResult(
-                    scope=scope.model_copy(update={"supi": global_intent.supi or None}),
+                    scope=global_intent.scope,
                     completed=False,
                     global_intent=global_intent.model_dump(mode="json"),
                     unified_plan={},
@@ -493,7 +489,7 @@ class MainControlOrchestrator:
             mobility_feedback = round_execution.mobility_feedback
             diagnosis = round_execution.diagnosis
             round_trace = round_execution.trace.with_agent_elapsed_ms(round_agent_elapsed_ms)
-            diagnosis_scope = scope.model_copy(update={"supi": global_intent.supi or None})
+            diagnosis_scope = global_intent.scope
             self._remember(diagnosis_scope, "AD", diagnosis)
             state.latest_result = ControlRoundResult(
                 scope=diagnosis_scope,
@@ -569,16 +565,12 @@ class MainControlOrchestrator:
         if state.latest_result is None:
             raise RuntimeError("main control orchestrator produced no result")
         agent_elapsed_totals["total"] = round(sum(agent_elapsed_totals.values()), 3)
-        projection_metrics = self.main_agent.schema_projection_metrics
         state.latest_result = state.latest_result.model_copy(
             update={
                 "agent_elapsed_ms": {
                     agent_name: round(elapsed_ms, 3)
                     for agent_name, elapsed_ms in agent_elapsed_totals.items()
                 },
-                "main_schema_projection_count": int(projection_metrics["count"]),
-                "main_schema_projected_field_count": int(projection_metrics["field_count"]),
-                "main_schema_projected_fields": list(projection_metrics["fields"]),
             }
         )
         return state.latest_result

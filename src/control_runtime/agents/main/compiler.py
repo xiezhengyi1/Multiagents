@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import List
 
-from shared.contracts import AgentRunResult
+from shared.contracts import AgentRunResult, ExecutionScope
 
 from .contracts import (
     GlobalControlIntent,
@@ -17,21 +17,15 @@ from .contracts import (
 def validate_global_intent_result(
     result: AgentRunResult,
     *,
-    user_input: str = "",
-    session_id: str = "",
-    snapshot_id: str = "",
-    round_index: int = 1,
-    projected_fields: Optional[List[str]] = None,
+    user_input: str,
+    scope: ExecutionScope,
 ) -> GlobalControlIntent:
     try:
-        del projected_fields
         decision = MainControlDecision.model_validate(result.structured_response)
         return compile_global_intent(
             decision,
             user_input=user_input,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            round_index=round_index,
+            scope=scope,
         )
     except Exception as exc:
         raise RuntimeError(f"Main Agent returned invalid MainControlDecision payload: {exc}") from exc
@@ -41,31 +35,29 @@ def compile_global_intent(
     decision: MainControlDecision,
     *,
     user_input: str,
-    session_id: str,
-    snapshot_id: str,
-    round_index: int,
+    scope: ExecutionScope,
 ) -> GlobalControlIntent:
-    next_agent = str(decision.next_agent or "").strip()
+    round_index = scope.round_index
+    next_agent = decision.next_agent
     if round_index <= 1:
         round_strategy = MainRoundStrategy.INITIAL_GROUNDING
         retry_scope = MainRetryScope.FULL_REGROUND
     elif next_agent == "optimization_strategy":
         round_strategy = MainRoundStrategy.POLICY_REVISION
-        retry_scope = decision.retry_scope or MainRetryScope.TARGET_STABLE
+        if decision.retry_scope is None:
+            raise ValueError("retry MainControlDecision requires retry_scope")
+        retry_scope = decision.retry_scope
     else:
         round_strategy = MainRoundStrategy.REGROUNDING
-        retry_scope = decision.retry_scope or MainRetryScope.FULL_REGROUND
+        if decision.retry_scope is None:
+            raise ValueError("retry MainControlDecision requires retry_scope")
+        retry_scope = decision.retry_scope
 
     reuse_allowed = next_agent == "optimization_strategy"
-    guidance = str(decision.intent_encoding_guidance or "").strip()
-    if round_index > 1 and next_agent == "intent_encoding" and not guidance:
-        guidance = "Re-ground the active stage using required_evidence; do not assume forbidden_assumptions."
     domains = ",".join(item.value for item in decision.requested_domains) or "none"
     return GlobalControlIntent(
-        session_id=session_id,
-        snapshot_id=snapshot_id,
+        scope=scope.model_copy(update={"supi": decision.supi or None}),
         raw_input=user_input,
-        supi=decision.supi,
         round_strategy=round_strategy,
         next_agent=decision.next_agent,
         requested_domains=decision.requested_domains,
@@ -78,7 +70,7 @@ def compile_global_intent(
         retry_scope=retry_scope,
         required_evidence=decision.required_evidence,
         forbidden_assumptions=decision.forbidden_assumptions,
-        intent_encoding_guidance=guidance,
+        intent_encoding_guidance=decision.intent_encoding_guidance,
         routing_decision=f"{round_strategy.value}_{next_agent}_{domains}",
         routing_rationale=(
             f"Round {round_index}: route {domains} control through {next_agent}; "
@@ -97,10 +89,9 @@ def compile_global_intent(
 
 def validate_global_intent(
     intent: GlobalControlIntent,
-    *,
-    user_input: str,
-    round_index: int,
 ) -> List[str]:
+    user_input = intent.raw_input
+    round_index = intent.scope.round_index
     errors: List[str] = []
     if not intent.requested_domains:
         errors.append("requested_domains is empty")
@@ -119,9 +110,9 @@ def validate_global_intent(
     unique_explicit_supis = list(dict.fromkeys(explicit_supis))
     if len(unique_explicit_supis) == 1:
         explicit_supi = unique_explicit_supis[0]
-        if str(intent.supi or "").strip() != explicit_supi:
+        if intent.scope.supi != explicit_supi:
             errors.append(f"supi must equal explicit user-provided identifier {explicit_supi}")
-    elif len(unique_explicit_supis) > 1 and str(intent.supi or "").strip():
+    elif len(unique_explicit_supis) > 1 and intent.scope.supi is not None:
         errors.append("top-level supi must not comma-join multiple identifiers; leave it empty for multi-SUPI requests")
     if isinstance(intent.domain_evidence, dict) and any(intent.domain_evidence.values()):
         unknown_domains = [key for key in intent.domain_evidence.keys() if key not in {"qos", "mobility"}]
@@ -150,29 +141,8 @@ def validate_global_intent(
     return errors
 
 
-def normalize_semantic_target_scope(
-    intent: GlobalControlIntent,
-    *,
-    user_input: str,
-) -> None:
-    explicit_supis = re.findall(r"(?i)(imsi-\d{5,})", str(user_input or ""))
-    unique_explicit_supis = list(dict.fromkeys(explicit_supis))
-    default_supi = ""
-    if len(unique_explicit_supis) == 1:
-        default_supi = unique_explicit_supis[0]
-    elif len(unique_explicit_supis) == 0:
-        default_supi = str(intent.supi or "").strip()
-    if not default_supi:
-        return
-    for stage in intent.control_semantics.stages or []:
-        for target in stage.targets or []:
-            if not str(target.supi or "").strip():
-                target.supi = default_supi
-
-
 __all__ = [
     "compile_global_intent",
-    "normalize_semantic_target_scope",
     "validate_global_intent",
     "validate_global_intent_result",
 ]

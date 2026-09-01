@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from shared.contracts import AgentMessage, AgentRunResult, ToolCall
+from shared.contracts import AgentMessage, AgentRunResult, ExecutionScope, ToolCall
 from control_runtime.agents.grounding.contracts import FlowSelector, GroundingDecision
 from control_runtime.agents.main.contracts import ControlDomain, GlobalControlIntent
 from control_runtime.agents.planning.compiler import OptimizationStrategyCompiler
@@ -19,7 +19,13 @@ from control_runtime.agents.single import agent as single_agent
 
 def _planning_request() -> PlanningRequest:
     intent = GlobalControlIntent(
-        supi="imsi-1",
+        scope=ExecutionScope(
+            session_id="session-1",
+            thread_id="session-1",
+            snapshot_id="snapshot-1",
+            round_index=1,
+            supi="imsi-1",
+        ),
         next_agent="optimization_strategy",
         requested_domains=[ControlDomain.QOS],
     )

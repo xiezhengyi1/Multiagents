@@ -446,8 +446,14 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         retry_scope = "target_stable" if "retry_contract:" in feedback_context else "full_reground"
         profile_name = self._single_objective_profile(user_input)
         main_intent = GlobalControlIntent(
+            scope=ExecutionScope(
+                session_id=session_id,
+                thread_id=session_id,
+                snapshot_id=snapshot_id,
+                round_index=round_index,
+                supi=supi,
+            ),
             raw_input=str(user_input or "").strip(),
-            supi=supi,
             next_agent="optimization_strategy",
             round_strategy=(MainRoundStrategy.POLICY_REVISION if round_index > 1 else MainRoundStrategy.INITIAL_GROUNDING),
             requested_domains=[ControlDomain(item) for item in active_domains],

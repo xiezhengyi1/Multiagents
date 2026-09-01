@@ -23,10 +23,9 @@ from shared.agents import (
 from ...tool_capabilities import CONTROL_RUNTIME_CAPABILITY_ALIASES
 from .contracts import (
     GlobalControlIntent,
-    MainControlDecisionWire,
+    MainControlDecision,
 )
 from .compiler import (
-    normalize_semantic_target_scope,
     validate_global_intent as validate_main_global_intent,
     validate_global_intent_result,
 )
@@ -79,14 +78,11 @@ class _MainIntentStageState:
     base_prompt: str
     current_prompt: str
     user_input: str
-    session_id: str
-    snapshot_id: str
-    round_index: int
+    scope: ExecutionScope
     runtime_context: Any
     trace_metadata: Dict[str, Any]
     invocation: Optional[MainControlInvocation] = None
     intent: Optional[GlobalControlIntent] = None
-    projected_fields: List[str] = field(default_factory=list)
     validation_errors: List[str] = field(default_factory=list)
     invocation_error: str = ""
     trace_recorded: bool = False
@@ -109,44 +105,17 @@ class MainControlAgent(BaseAgent):
             system_prompt=render_main_system_prompt(),
             prompt_name="main_control_decision",
             prompt_version="2.0.0",
-            response_model=MainControlDecisionWire,
+            response_model=MainControlDecision,
             max_iterations=6,
             capability_aliases=CONTROL_RUNTIME_CAPABILITY_ALIASES,
-        )
-        self.reset_schema_projection_metrics()
-
-    def reset_schema_projection_metrics(self) -> None:
-        self._schema_projection_count = 0
-        self._schema_projected_fields: List[str] = []
-
-    @property
-    def schema_projection_metrics(self) -> Dict[str, Any]:
-        return {
-            "count": self._schema_projection_count,
-            "field_count": len(self._schema_projected_fields),
-            "fields": list(dict.fromkeys(self._schema_projected_fields)),
-        }
-
-    def _record_schema_projection(self, fields: List[str]) -> None:
-        if not fields:
-            return
-        self._schema_projection_count += 1
-        self._schema_projected_fields.extend(fields)
-        log_event(
-            self.logger,
-            "main_control_schema_projected",
-            projected_field_count=len(fields),
-            projected_fields=",".join(fields),
         )
 
     def analyze_global_intent(
         self,
         *,
         user_input: str,
-        session_id: str = "",
-        snapshot_id: str = "",
+        scope: ExecutionScope,
         context: str = "",
-        round_index: int = 1,
         trace_metadata: Dict[str, Any] | None = None,
     ) -> GlobalControlIntent:
         log_event(self.logger, "main_control_start")
@@ -160,14 +129,7 @@ class MainControlAgent(BaseAgent):
         token_budget, token_counter = self._resolve_token_context()
         runtime_context = self.build_runtime_context(
             agent_name=self.agent_name,
-            scope=ExecutionScope(
-                session_id=session_id,
-                thread_id=session_id,
-                snapshot_id=snapshot_id or None,
-                round_index=round_index,
-                scenario_id=str((trace_metadata or {}).get("scenario_id") or "").strip() or None,
-                scenario_tags=list((trace_metadata or {}).get("scenario_tags") or []),
-            ),
+            scope=scope,
             token_budget=token_budget,
             token_counter=token_counter,
             trace_attributes=dict(trace_metadata or {}),
@@ -181,9 +143,7 @@ class MainControlAgent(BaseAgent):
             base_prompt=payload["content"],
             current_prompt=payload["content"],
             user_input=user_input,
-            session_id=session_id,
-            snapshot_id=snapshot_id,
-            round_index=round_index,
+            scope=scope,
             runtime_context=runtime_context,
             trace_metadata=base_trace_metadata,
         )
@@ -225,10 +185,9 @@ class MainControlAgent(BaseAgent):
                 self.logger,
                 "main_control_attempt_start",
                 attempt=attempt.attempt,
-                session_id=state.session_id,
-                snapshot_id=state.snapshot_id,
+                session_id=state.scope.session_id,
+                snapshot_id=state.scope.snapshot_id,
             )
-            state.projected_fields = []
             state.invocation = None
             state.intent = None
             state.trace_recorded = False
@@ -251,10 +210,7 @@ class MainControlAgent(BaseAgent):
             stage_value.intent = validate_global_intent_result(
                 invocation.raw_result,
                 user_input=stage_value.user_input,
-                session_id=stage_value.session_id,
-                snapshot_id=stage_value.snapshot_id,
-                round_index=stage_value.round_index,
-                projected_fields=stage_value.projected_fields,
+                scope=stage_value.scope,
             )
             return stage_value
 
@@ -262,27 +218,18 @@ class MainControlAgent(BaseAgent):
             stage_value: _MainIntentStageState,
             attempt: StageAttempt,
         ) -> List[str]:
-            self._record_schema_projection(stage_value.projected_fields)
             intent = stage_value.intent
             if intent is None:
                 raise AssertionError("Main intent must exist before semantic validation")
-            normalize_semantic_target_scope(
-                intent,
-                user_input=stage_value.user_input,
-            )
             stage_value.invocation_error = ""
-            stage_value.validation_errors = validate_main_global_intent(
-                intent,
-                user_input=stage_value.user_input,
-                round_index=stage_value.round_index,
-            )
+            stage_value.validation_errors = validate_main_global_intent(intent)
             if not stage_value.validation_errors:
                 log_event(
                     self.logger,
                     "main_control_attempt_success",
                     attempt=attempt.attempt,
                     requested_domains=",".join(item.value for item in intent.requested_domains),
-                    supi=intent.supi,
+                    supi=intent.scope.supi or "<empty>",
                 )
             return stage_value.validation_errors
 
@@ -304,7 +251,6 @@ class MainControlAgent(BaseAgent):
             if retry_context.phase in {RetryPhase.INVOKE, RetryPhase.PARSE}:
                 if not isinstance(retry_context.error, RuntimeError):
                     return
-                self._record_schema_projection(state.projected_fields)
                 state.invocation_error = str(retry_context.error)
                 log_event(
                     self.logger,
@@ -321,7 +267,7 @@ class MainControlAgent(BaseAgent):
                     "main_control_validation_failed",
                     attempt=retry_context.attempt,
                     validation_errors=" || ".join(retry_context.issues),
-                    supi=(str(intent.supi or "").strip() or "<empty>") if intent is not None else "<empty>",
+                    supi=(intent.scope.supi or "<empty>") if intent is not None else "<empty>",
                 )
 
         def prepare_stage_retry(retry_context: RetryContext) -> None:

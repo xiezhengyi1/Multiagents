@@ -167,9 +167,6 @@ class ControlRoundResult(ContractModel):
     retry_count: int = Field(default=0, ge=0)
     round_traces: list[dict[str, JsonValue]] = Field(default_factory=list)
     agent_elapsed_ms: dict[str, float] = Field(default_factory=dict)
-    main_schema_projection_count: int = Field(default=0, ge=0)
-    main_schema_projected_field_count: int = Field(default=0, ge=0)
-    main_schema_projected_fields: list[NonEmptyStr] = Field(default_factory=list)
     single_agent_details: list[dict[str, JsonValue]] = Field(default_factory=list)
 
     @model_validator(mode="after")

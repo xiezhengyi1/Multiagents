@@ -7,9 +7,7 @@ from .base import BaseProjector, field
 class GlobalControlIntentProjector(BaseProjector):
     model = GlobalControlIntent
     visible = (
-        field("session_id"),
-        field("snapshot_id"),
-        field("supi"),
+        field("scope"),
         field("round_strategy"),
         field("next_agent"),
         field("requested_domains"),
