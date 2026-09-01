@@ -269,7 +269,9 @@ def _build_runtime_planning_request(
         required_evidence=["qos_runtime_evidence"],
     )
     return PlanningRequest(
+        scope=main_intent.scope,
         grounding_decision=GroundingDecision(
+            scope=main_intent.scope,
             flows=flows,
             mobility_intent=None,
             grounding_evidence=GroundingEvidenceBundle(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -139,8 +138,8 @@ def test_execute_success_compiles_dispatches_assures_and_commits_without_snapsho
     assert outcome.execution_status == "Success"
     assert outcome.dispatch_attempts == 1
     assert calls == ["compile", "dispatch", "assurance", "commit"]
-    assert "committed_snapshot_id" not in outcome.to_dict()
-    assert "committed_snapshot_id" not in json.loads(outcome.performance_metrics)
+    assert "committed_snapshot_id" not in outcome.model_dump(mode="json")
+    assert "committed_snapshot_id" not in outcome.performance_metrics.model_dump(mode="json")
 
 
 def test_execute_partial_dispatch_failure_preserves_scope_attempts_and_retry_forbidden(monkeypatch) -> None:
@@ -177,7 +176,7 @@ def test_execute_partial_dispatch_failure_preserves_scope_attempts_and_retry_for
     )
 
     outcome = controller.execute(_strategy([qos_policy, mobility_policy]))
-    metrics = json.loads(outcome.performance_metrics)
+    metrics = outcome.performance_metrics.model_dump(mode="json")
 
     assert outcome.execution_status == "Partial Success"
     assert outcome.failure_scope == "mobility"
@@ -221,7 +220,7 @@ def test_execute_assurance_failure_does_not_commit(monkeypatch) -> None:
     )
 
     outcome = controller.execute(_strategy([policy]))
-    metrics = json.loads(outcome.performance_metrics)
+    metrics = outcome.performance_metrics.model_dump(mode="json")
 
     assert outcome.execution_status == "Failed"
     assert outcome.failure_scope == "qos"

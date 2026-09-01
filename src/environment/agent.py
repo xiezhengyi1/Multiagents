@@ -18,7 +18,11 @@ from shared.contracts import (
 from experiments.scripts.common import resolve_python_executable
 
 from .compiler import EnvironmentAgentCompiler, S3_QUALITY_PROFILE
-from .contracts import EnvironmentGenerationRequest, ScenarioCandidate
+from .contracts import (
+    EnvironmentGenerationRequest,
+    ScenarioCandidate,
+    ScenarioCandidateArtifact,
+)
 from .prompts import ENVIRONMENT_DESIGN_AGENT_SYSTEM_PROMPT
 from .tools import build_environment_tools
 from shared.agents import BaseAgent, coerce_structured_response
@@ -180,14 +184,14 @@ class EnvironmentGenerationAgent(BaseAgent, ArtifactWorkerMixin):
         return "EnvironmentGenerationRequest"
 
     def response_artifact_type(self) -> str:
-        return "ScenarioCandidate"
+        return "ScenarioCandidateArtifact"
 
-    def handle_artifact(self, envelope: ArtifactEnvelope) -> dict[str, Any]:
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> ScenarioCandidateArtifact:
         request = EnvironmentGenerationRequest.model_validate(envelope.payload)
         if envelope.scope != request.scope:
             raise ValueError("EnvironmentGenerationRequest scope must match its envelope scope")
         candidate = self.generate_environment(request)
-        return candidate.model_dump(mode="json")
+        return ScenarioCandidateArtifact(scope=request.scope, candidate=candidate)
 
     def generate_environment(
         self,

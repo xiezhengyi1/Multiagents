@@ -15,6 +15,7 @@ from shared.contracts import (
     MemoryBundle,
     MemoryQuery,
     MemoryRecord,
+    validate_scope_lineage,
 )
 
 
@@ -30,6 +31,45 @@ def _scope(
         snapshot_id="snapshot-1",
         supi=supi,
     )
+
+
+def _grounding_request_payload(scope: ExecutionScope) -> dict[str, object]:
+    return {
+        "scope": scope.model_dump(mode="json"),
+        "user_input": "protect flow",
+        "context": "",
+        "messages": [],
+        "allow_user_interaction": False,
+    }
+
+
+def _policy_plan_payload(scope: ExecutionScope) -> dict[str, object]:
+    return {
+        "scope": scope.model_dump(mode="json"),
+        "planning_status": "needs_upstream_reground",
+        "optimizer_result": {
+            "objective_breakdown": {},
+            "cross_domain_verdicts": [],
+        },
+        "planning_rationale": {
+            "selected_strategy_profile": "await-grounding",
+            "decisive_evidence": [],
+            "active_constraints": [],
+            "explanation": "Grounding evidence is required.",
+            "rejected_alternatives": [],
+            "main_constraints": [],
+            "iea_grounding_basis": [],
+            "osa_decision_basis": [],
+            "unresolved_gaps": ["grounding evidence"],
+        },
+        "all_policies": [],
+        "partial_policies": [],
+        "missing_evidence": ["grounding evidence"],
+        "blocked_targets": [],
+        "upstream_requests": ["reground policy targets"],
+        "planner_conflicts": [],
+        "open_questions": [],
+    }
 
 
 def _memory(
@@ -151,25 +191,27 @@ def test_knowledge_response_enforces_limit_and_unique_citations() -> None:
 
 
 def test_artifact_envelope_has_one_type_discriminator_and_explicit_direction() -> None:
+    scope = _scope()
     request = ArtifactEnvelope(
         kind="request",
         artifact_id="artifact-request",
-        artifact_type="PlanningRequest",
+        artifact_type="GroundingDecisionRequest",
         source_agent="main_control",
         target_agent="optimization_strategy",
-        scope=_scope(),
-        payload={"objective": "protect flow"},
+        scope=scope,
+        payload=_grounding_request_payload(scope),
     )
     assert "payload_schema_name" not in request.model_dump(mode="json")
+    assert request.payload["schema_version"] == "2.0.0"
 
     with pytest.raises(ValidationError, match="request artifact cannot declare upstream"):
         ArtifactEnvelope(
             kind="request",
-            artifact_type="PlanningRequest",
+            artifact_type="GroundingDecisionRequest",
             source_agent="main_control",
             target_agent="optimization_strategy",
-            scope=_scope(),
-            payload={},
+            scope=scope,
+            payload=_grounding_request_payload(scope),
             upstream_artifact_ids=["artifact-parent"],
         )
 
@@ -179,19 +221,67 @@ def test_artifact_envelope_has_one_type_discriminator_and_explicit_direction() -
             artifact_type="PolicyPlanDraft",
             source_agent="optimization_strategy",
             target_agent="main_control",
-            scope=_scope(),
-            payload={},
+            scope=scope,
+            payload=_policy_plan_payload(scope),
         )
 
     with pytest.raises(ValidationError, match="must differ"):
         ArtifactEnvelope(
             kind="request",
-            artifact_type="PlanningRequest",
+            artifact_type="GroundingDecisionRequest",
             source_agent="main_control",
             target_agent="main_control",
-            scope=_scope(),
-            payload={},
+            scope=scope,
+            payload=_grounding_request_payload(scope),
         )
+
+
+def test_artifact_registry_rejects_unknown_types_directions_and_scope_drift() -> None:
+    scope = _scope()
+    payload = _grounding_request_payload(scope)
+
+    with pytest.raises(ValidationError, match="unregistered artifact_type"):
+        ArtifactEnvelope(
+            kind="request",
+            artifact_type="UnregisteredArtifact",
+            source_agent="main_control",
+            target_agent="intent_encoding",
+            scope=scope,
+            payload=payload,
+        )
+
+    with pytest.raises(ValidationError, match="cannot be used as kind=response"):
+        ArtifactEnvelope(
+            kind="response",
+            artifact_type="GroundingDecisionRequest",
+            source_agent="intent_encoding",
+            target_agent="main_control",
+            scope=scope,
+            payload=payload,
+            upstream_artifact_ids=["artifact-request"],
+        )
+
+    drifted_scope = _scope(thread_id="thread-2")
+    with pytest.raises(ValidationError, match="payload scope must match"):
+        ArtifactEnvelope(
+            kind="request",
+            artifact_type="GroundingDecisionRequest",
+            source_agent="main_control",
+            target_agent="intent_encoding",
+            scope=scope,
+            payload=_grounding_request_payload(drifted_scope),
+        )
+
+
+def test_artifact_response_scope_only_allows_supi_enrichment() -> None:
+    upstream = _scope(supi=None)
+    validate_scope_lineage(upstream, _scope(supi="imsi-001"))
+
+    with pytest.raises(ValueError, match="scope lineage fields"):
+        validate_scope_lineage(upstream, _scope(thread_id="thread-2", supi="imsi-001"))
+
+    with pytest.raises(ValueError, match="established scope.supi"):
+        validate_scope_lineage(_scope(supi="imsi-001"), _scope(supi="imsi-002"))
 
 
 def test_memory_and_artifact_timestamps_must_be_timezone_aware() -> None:
@@ -207,12 +297,13 @@ def test_memory_and_artifact_timestamps_must_be_timezone_aware() -> None:
         )
 
     with pytest.raises(ValidationError):
+        scope = _scope()
         ArtifactEnvelope(
             kind="request",
-            artifact_type="PlanningRequest",
+            artifact_type="GroundingDecisionRequest",
             source_agent="main_control",
             target_agent="optimization_strategy",
-            scope=_scope(),
-            payload={},
+            scope=scope,
+            payload=_grounding_request_payload(scope),
             created_at=datetime(2026, 1, 1),
         )

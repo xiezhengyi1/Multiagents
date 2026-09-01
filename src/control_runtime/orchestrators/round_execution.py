@@ -31,6 +31,7 @@ from ..diagnostics.mediation.contracts import (
     MediatorDecision,
     UnifiedConstraintSet,
 )
+from ..execution.contracts import CompileFailureMetrics
 from ..integrations.storage import get_snapshot_data_by_id, get_ue_context_by_supi
 from .contracts import (
     ControlRoundTrace,
@@ -381,14 +382,11 @@ def _build_domain_feedback(
 
 
 def _parse_pda_metrics(report: FeedbackReport) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    raw_metrics = str(report.performance_metrics or "").strip()
-    if not raw_metrics:
+    metrics = report.performance_metrics
+    if isinstance(metrics, CompileFailureMetrics):
         return [], [], []
-    payload = json.loads(raw_metrics)
-    if not isinstance(payload, dict):
-        raise TypeError("performance_metrics must be a JSON object")
-    dispatch_receipts = payload.get("dispatch_results", []) if isinstance(payload.get("dispatch_results"), list) else []
-    assurance_verdicts = payload.get("assurance_results", []) if isinstance(payload.get("assurance_results"), list) else []
+    dispatch_receipts = metrics.dispatch_results
+    assurance_verdicts = metrics.assurance_results
     approved_policies = [
         {
             "domain": "mobility" if receipt.get("policy_type") == AM_POLICY_TYPE else "qos",
@@ -441,8 +439,9 @@ def _dispatch_mediated_plan(
                     "planning_status": "partial_plan",
                 }
             )
-            report = report.model_copy(
-                update={
+            report = FeedbackReport.model_validate(
+                {
+                    **report.model_dump(mode="json"),
                     "intent_status": "partially_satisfied",
                     "violation_details": partial_summary,
                     "feedback_payload": feedback_payload,

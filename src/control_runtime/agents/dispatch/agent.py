@@ -85,7 +85,7 @@ class PolicyDispatchAgent(ArtifactWorkerMixin):
             raise ValueError("PolicyPlanDraft scope must match its request envelope scope")
         outcome = self._execution_controller.execute(strategy_output)
         feedback_payload = self._build_feedback_payload(strategy_output=strategy_output, outcome=outcome)
-        outcome_payload = outcome.to_dict()
+        outcome_payload = outcome.model_dump(mode="json")
         if feedback_payload:
             outcome_payload["feedback_payload"] = feedback_payload
         feedback_report = FeedbackReport(**outcome_payload)

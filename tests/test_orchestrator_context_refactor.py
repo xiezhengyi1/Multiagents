@@ -43,6 +43,39 @@ def _execution_scope(round_index: int = 1) -> ExecutionScope:
         supi="imsi-001",
     )
 
+
+def _dispatch_metrics(
+    dispatch_results: list[dict[str, object]],
+    *,
+    scope: ExecutionScope,
+    assurance_results: list[dict[str, object]] | None = None,
+    dispatch_attempts: int,
+    failure_summaries: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "metrics_kind": "dispatch",
+        "policy_plan": {
+            "scope": scope.model_dump(mode="json"),
+            "policies": [],
+        },
+        "dispatch_results": dispatch_results,
+        "assurance_results": assurance_results or [],
+        "dispatch_attempts": dispatch_attempts,
+        "domain_receipts": {
+            "qos": [
+                item
+                for item in dispatch_results
+                if item.get("policy_type") != "PcfAmPolicyControlPolicyAssociation"
+            ],
+            "mobility": [
+                item
+                for item in dispatch_results
+                if item.get("policy_type") == "PcfAmPolicyControlPolicyAssociation"
+            ],
+        },
+        "failure_summaries": failure_summaries or [],
+    }
+
 from control_runtime.orchestrators.loop_state import (
     ControlRoundSnapshot,
     OrchestratorLoopState,
@@ -85,6 +118,7 @@ def _grounding_decision():
     )
 
     return GroundingDecision(
+        scope=_execution_scope(),
         flows=[
             FlowSelector(
                 supi="imsi-001",
@@ -295,7 +329,11 @@ def _bare_iea_for_public_contract(monkeypatch):
     monkeypatch.setattr(agent, "ensure_worker_runtime_initialized", lambda: None)
     monkeypatch.setattr(agent, "_extract_intent_evidence", lambda **_kwargs: evidence)
     monkeypatch.setattr(agent, "_resolve_token_context", lambda: (None, None))
-    monkeypatch.setattr(agent, "build_runtime_context", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        agent,
+        "build_runtime_context",
+        lambda **kwargs: SimpleNamespace(scope=kwargs["scope"]),
+    )
     monkeypatch.setattr(agent, "_create_advisor_agent", lambda _tools: object())
     monkeypatch.setattr(agent, "_build_advisor_prompt", lambda **_kwargs: "base prompt")
     monkeypatch.setattr(
@@ -321,7 +359,11 @@ def _bare_main_for_public_contract(monkeypatch):
     agent.agent_name = "main_control"
     agent.logger = SimpleNamespace()
     monkeypatch.setattr(agent, "_resolve_token_context", lambda: (None, None))
-    monkeypatch.setattr(agent, "build_runtime_context", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        agent,
+        "build_runtime_context",
+        lambda **kwargs: SimpleNamespace(scope=kwargs["scope"]),
+    )
     return agent, main_agent
 
 
@@ -624,18 +666,20 @@ def test_execute_planned_round_returns_success_contract_from_stubbed_boundaries(
     )
     monkeypatch.setattr(round_execution, "get_ue_context_by_supi", lambda *_args, **_kwargs: {})
     report = FeedbackReport(
+        scope=_execution_scope(),
         execution_status="Success",
-        performance_metrics=json.dumps(
-            {
-                "dispatch_results": [
-                    {"status": "success", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}
-                ],
-                "assurance_results": [
-                    {"status": "satisfied", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}
-                ],
-            }
+        performance_metrics=_dispatch_metrics(
+            [{"status": "success", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}],
+            scope=_execution_scope(),
+            assurance_results=[
+                {"status": "satisfied", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}
+            ],
+            dispatch_attempts=1,
         ),
         violation_details="none",
+        failure_scope="none",
+        feedback_payload={},
+        dispatch_attempts=1,
     )
     conflict_tool = _RecordingConflictTool(_conflict_result())
     dispatch_agent = _RecordingDispatchAgent(report)
@@ -681,9 +725,12 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
     )
     monkeypatch.setattr(round_execution, "get_ue_context_by_supi", lambda *_args, **_kwargs: {})
     report = FeedbackReport(
+        scope=_execution_scope(2),
         execution_status="Failed",
-        performance_metrics=json.dumps(
-            {"dispatch_results": [{"status": "failed", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}]}
+        performance_metrics=_dispatch_metrics(
+            [{"status": "failed", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}],
+            scope=_execution_scope(2),
+            dispatch_attempts=1,
         ),
         violation_details="policy gateway rejected sm-1",
         failure_scope="qos",
@@ -693,6 +740,7 @@ def test_execute_planned_round_emits_reentry_contract_after_dispatch_failure(mon
             "reason_by_domain": {"qos": "gateway rejected policy"},
             "failures": [{"phase": "dispatch", "policy_id": "sm-1"}],
         },
+        dispatch_attempts=1,
     )
 
     artifacts = round_execution.execute_planned_round(
@@ -750,6 +798,7 @@ def test_osa_public_generate_strategy_rejects_wrong_input_and_returns_reground_p
     empty_grounding_payload = _grounding_decision().model_dump(mode="json")
     empty_grounding_payload["flows"] = []
     request = PlanningRequest(
+        scope=_execution_scope(),
         grounding_decision=GroundingDecision.model_validate(empty_grounding_payload),
         context=_planning_context(),
     )
@@ -773,6 +822,7 @@ def test_osa_stage_retries_invocation_failures_and_reraises_the_original_excepti
     attempts = []
     terminal_error = RuntimeError("advisor transport unavailable")
     request = PlanningRequest(
+        scope=_execution_scope(),
         grounding_decision=_grounding_decision(),
         context=_planning_context(),
     )
@@ -813,6 +863,7 @@ def test_osa_stage_does_not_retry_or_record_non_retryable_invocation_errors(monk
     cached_evidence_calls = []
     terminal_error = ValueError("advisor request is malformed")
     request = PlanningRequest(
+        scope=_execution_scope(),
         grounding_decision=_grounding_decision(),
         context=_planning_context(),
     )
@@ -857,6 +908,7 @@ def test_osa_public_generate_strategy_preserves_stage_failure_cleanup_and_trace(
     terminal_error = RuntimeError("strategy advisor unavailable")
     trace_writes = []
     request = PlanningRequest(
+        scope=_execution_scope(),
         grounding_decision=_grounding_decision(),
         context=_planning_context(),
     )
@@ -903,6 +955,7 @@ def test_osa_stage_retries_contract_validation_and_keeps_terminal_message_stable
     validations = []
     trace_writes = []
     request = PlanningRequest(
+        scope=_execution_scope(),
         grounding_decision=_grounding_decision(),
         context=_planning_context(),
     )
@@ -987,13 +1040,12 @@ def test_iea_public_entrypoint_returns_grounding_decision_and_persists_artifact_
     result = agent.analyze_grounding_decision(
         "protect flow-1",
         context="ground current stage",
-        session_id="session-1",
-        snapshot_id="snapshot-1",
+        scope=_execution_scope(),
         trace_metadata={"scenario_id": "offline-case"},
     )
 
     assert result == decision
-    assert captured["request"]["session_id"] == "session-1"
+    assert captured["request"]["request"].scope == _execution_scope()
     assert captured["analysis"]["trace_metadata"] == {"scenario_id": "offline-case"}
     assert captured["result"] == {
         "request_envelope": request_envelope,
@@ -1024,7 +1076,11 @@ def test_iea_retries_the_public_analysis_contract_three_times_before_raising(mon
         ),
     )
     monkeypatch.setattr(agent, "_resolve_token_context", lambda: (None, None))
-    monkeypatch.setattr(agent, "build_runtime_context", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        agent,
+        "build_runtime_context",
+        lambda **kwargs: SimpleNamespace(scope=kwargs["scope"]),
+    )
     monkeypatch.setattr(agent, "_create_advisor_agent", lambda _tools: object())
     monkeypatch.setattr(agent, "_build_advisor_prompt", lambda **_kwargs: "base prompt")
     monkeypatch.setattr(
@@ -1042,12 +1098,11 @@ def test_iea_retries_the_public_analysis_contract_three_times_before_raising(mon
     monkeypatch.setattr(grounding_agent, "log_timing", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="advisor unavailable"):
-        agent.analyze_intent(
-            "protect flow-1",
-            context='{"main_intent":{"requested_domains":[],"domain_evidence":{}}}',
-            session_id="session-1",
-            snapshot_id="snapshot-1",
-        )
+            agent.analyze_intent(
+                "protect flow-1",
+                context='{"main_intent":{"requested_domains":[],"domain_evidence":{}}}',
+                scope=_execution_scope(),
+            )
 
     assert attempts == ["attempt", "attempt", "attempt"]
 
@@ -1082,10 +1137,13 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
     policy_plan = _qos_plan()
 
     first_report = FeedbackReport(
+        scope=_execution_scope(),
         execution_status="Failed",
-        performance_metrics='{"dispatch_results": []}',
+        performance_metrics=_dispatch_metrics([], scope=_execution_scope(), dispatch_attempts=0),
         violation_details="gateway rejected sm-1",
+        failure_scope="qos",
         feedback_payload={"target_bindings_at_risk": ["flow-1"]},
+        dispatch_attempts=0,
     )
     first_reentry = ExecutionReentryRequest(
         round_index=1,
@@ -1095,9 +1153,13 @@ def test_main_run_preserves_failed_round_feedback_for_the_next_round(monkeypatch
         summary="gateway rejected sm-1",
     )
     second_report = FeedbackReport(
+        scope=_execution_scope(2),
         execution_status="Success",
-        performance_metrics='{"dispatch_results": []}',
+        performance_metrics=_dispatch_metrics([], scope=_execution_scope(2), dispatch_attempts=0),
         violation_details="none",
+        failure_scope="none",
+        feedback_payload={},
+        dispatch_attempts=0,
     )
 
     def make_artifacts(*, round_index, completed, report, diagnosis, reentry=None):
@@ -1250,7 +1312,7 @@ def test_iea_public_analysis_records_rejected_output_before_later_invocation_fai
     agent._pending_invoke_messages = [{"role": "user", "content": "stale prompt"}]
 
     with pytest.raises(RuntimeError) as raised:
-        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, session_id="session-1", snapshot_id="snapshot-1")
+        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, scope=_execution_scope())
 
     assert raised.value is terminal_error
     assert raised.value.__cause__ is root_cause
@@ -1301,7 +1363,7 @@ def test_iea_public_analysis_keeps_terminal_parse_message_and_cause(monkeypatch)
     agent._pending_invoke_messages = [{"role": "user", "content": "stale prompt"}]
 
     with pytest.raises(RuntimeError) as raised:
-        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, session_id="session-1", snapshot_id="snapshot-1")
+        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, scope=_execution_scope())
 
     assert str(raised.value) == "IEA advisor output contract validation failed: advisor response is malformed"
     assert raised.value.__cause__ is parse_error
@@ -1362,7 +1424,7 @@ def test_iea_public_analysis_keeps_distinct_terminal_validation_messages(
     )
 
     with pytest.raises(RuntimeError) as raised:
-        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, session_id="session-1", snapshot_id="snapshot-1")
+        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, scope=_execution_scope())
 
     assert str(raised.value) == expected_message
     assert raised.value.__cause__ is None
@@ -1398,7 +1460,7 @@ def test_iea_public_analysis_does_not_retry_nonretryable_errors_and_cleans_pendi
     agent._pending_invoke_messages = [{"role": "user", "content": "stale prompt"}]
 
     with pytest.raises(ValueError) as raised:
-        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, session_id="session-1", snapshot_id="snapshot-1")
+        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, scope=_execution_scope())
 
     assert raised.value is terminal_error
     assert attempts == ["invoke"]
@@ -1447,7 +1509,7 @@ def test_iea_public_analysis_does_not_retry_invocation_validation_errors(monkeyp
     agent._pending_invoke_messages = [{"role": "user", "content": "stale prompt"}]
 
     with pytest.raises(ValidationError) as raised:
-        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, session_id="session-1", snapshot_id="snapshot-1")
+        agent.analyze_intent("protect flow-1", context=_IEA_TEST_CONTEXT, scope=_execution_scope())
 
     assert raised.value is terminal_error
     assert attempts == ["invoke"]
@@ -1475,9 +1537,17 @@ def test_execute_planned_round_preserves_wrapper_loader_monkeypatch_seam_and_art
         lambda supi, *, snapshot_id: loader_calls.append((supi, snapshot_id)) or ue_context,
     )
     report = FeedbackReport(
+        scope=_execution_scope(3),
         execution_status="Success",
-        performance_metrics='{"dispatch_results":[{"status":"success","policy_id":"sm-1","policy_type":"SmPolicyDecision"}]}',
+        performance_metrics=_dispatch_metrics(
+            [{"status": "success", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}],
+            scope=_execution_scope(3),
+            dispatch_attempts=1,
+        ),
         violation_details="none",
+        failure_scope="none",
+        feedback_payload={},
+        dispatch_attempts=1,
     )
     conflict_tool = _RecordingConflictTool(_conflict_result())
 
@@ -1560,9 +1630,17 @@ def test_execute_planned_round_keeps_partial_plan_dispatch_and_artifact_semantic
     monkeypatch.setattr(round_execution, "get_ue_context_by_supi", lambda *_args, **_kwargs: {})
     plan = _qos_plan(planning_status="partial_plan", round_index=4)
     report = FeedbackReport(
+        scope=_execution_scope(4),
         execution_status="Success",
-        performance_metrics='{"dispatch_results":[{"status":"success","policy_id":"sm-1","policy_type":"SmPolicyDecision"}]}',
+        performance_metrics=_dispatch_metrics(
+            [{"status": "success", "policy_id": "sm-1", "policy_type": "SmPolicyDecision"}],
+            scope=_execution_scope(4),
+            dispatch_attempts=1,
+        ),
         violation_details="none",
+        failure_scope="none",
+        feedback_payload={},
+        dispatch_attempts=1,
     )
 
     artifacts = round_execution.execute_planned_round(

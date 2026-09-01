@@ -174,6 +174,7 @@ def test_planning_evidence_matches_operation_constraint_shape() -> None:
         objective_profile=standard_objective_profile("balanced"),
     )
     grounding_decision = GroundingDecision(
+        scope=main_intent.scope,
         flows=[
             FlowSelector(
                 supi="imsi-1",
@@ -248,6 +249,7 @@ def test_planning_evidence_matches_operation_constraint_shape() -> None:
 
     evidence = build_planning_evidence(
         PlanningRequest(
+            scope=main_intent.scope,
             grounding_decision=grounding_decision,
             context=planning_context,
         )

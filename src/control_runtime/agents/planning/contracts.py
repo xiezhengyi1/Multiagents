@@ -6,7 +6,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
-from shared.contracts import ContractModel, ExecutionScope, JsonValue, MemoryContextView, NonEmptyStr
+from shared.contracts import (
+    CONTRACT_VERSION,
+    ContractModel,
+    ContractVersion,
+    ExecutionScope,
+    JsonValue,
+    MemoryContextView,
+    NonEmptyStr,
+)
 
 from ..grounding.contracts import GroundingDecision
 from ..main.contracts import GlobalControlIntent, OpenQuestion
@@ -59,8 +67,18 @@ class PlanningContext(ContractModel):
 
 
 class PlanningRequest(ContractModel):
+    schema_version: ContractVersion = CONTRACT_VERSION
+    scope: ExecutionScope
     grounding_decision: GroundingDecision
     context: PlanningContext
+
+    @model_validator(mode="after")
+    def validate_request_scope(self) -> "PlanningRequest":
+        if self.scope != self.grounding_decision.scope:
+            raise ValueError("PlanningRequest scope must match GroundingDecision scope")
+        if self.scope != self.context.shared_context.main_intent.scope:
+            raise ValueError("PlanningRequest scope must match GlobalControlIntent scope")
+        return self
 
 
 PolicyType = Literal[
@@ -128,6 +146,7 @@ class OptimizerPlanEvidence(ContractModel):
 
 
 class PolicyPlanDraft(ContractModel):
+    schema_version: ContractVersion = CONTRACT_VERSION
     scope: ExecutionScope
     planning_status: PlanningStatus
     optimizer_result: OptimizerPlanEvidence

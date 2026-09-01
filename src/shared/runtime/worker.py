@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-from shared.contracts import ExecutionScope
+from shared.contracts import (
+    ArtifactType,
+    ContractModel,
+    ExecutionScope,
+    validate_scope_lineage,
+)
 from .core import AgentWorkspace
 from .storage import ArtifactCache, ArtifactEnvelope, ArtifactStore, FileTaskQueue, RuntimePersistence
 
@@ -39,29 +44,31 @@ class ArtifactWorkerMixin:
                 raise RuntimeError("worker runtime requires an explicit RuntimePersistence instance")
             self.init_worker_runtime(persistence=persistence)
 
-    def expected_request_type(self) -> str:
+    def expected_request_type(self) -> ArtifactType:
         raise NotImplementedError
 
-    def response_artifact_type(self) -> str:
+    def response_artifact_type(self) -> ArtifactType:
         raise NotImplementedError
 
-    def handle_artifact(self, envelope: ArtifactEnvelope) -> Any:
+    def handle_artifact(self, envelope: ArtifactEnvelope) -> ContractModel:
         raise NotImplementedError
 
-    def build_response_payload(self, result: Any) -> dict:
-        if hasattr(result, "model_dump"):
-            dumped = result.model_dump(mode="json")
-            if isinstance(dumped, dict):
-                return dumped
-        if isinstance(result, dict):
-            return result
-        raise TypeError(f"Unsupported worker result payload: {type(result).__name__}")
+    @staticmethod
+    def build_response_payload(result: ContractModel) -> dict:
+        return result.model_dump(mode="json")
+
+    @staticmethod
+    def artifact_payload_scope(payload: ContractModel) -> ExecutionScope:
+        scope = getattr(payload, "scope")
+        if not isinstance(scope, ExecutionScope):
+            raise TypeError(f"artifact payload {type(payload).__name__} must expose ExecutionScope")
+        return scope
 
     def cache_received_artifact(
         self,
         *,
-        artifact_type: str,
-        payload: Any,
+        artifact_type: ArtifactType,
+        payload: ContractModel,
         source_agent: str = "coordinator",
         scope: ExecutionScope,
         target_agent: Optional[str] = None,
@@ -69,6 +76,9 @@ class ArtifactWorkerMixin:
         if not hasattr(self, "cache"):
             raise RuntimeError("cache_received_artifact() requires initialized worker runtime")
 
+        payload_scope = self.artifact_payload_scope(payload)
+        if payload_scope != scope:
+            raise ValueError("received artifact payload scope must match the requested envelope scope")
         envelope = ArtifactEnvelope(
             kind="request",
             artifact_type=artifact_type,
@@ -83,21 +93,23 @@ class ArtifactWorkerMixin:
     def cache_produced_artifact(
         self,
         *,
-        artifact_type: str,
+        artifact_type: ArtifactType,
         request_envelope: ArtifactEnvelope,
-        payload: Any,
+        payload: ContractModel,
         source_agent: Optional[str] = None,
         target_agent: Optional[str] = None,
     ) -> ArtifactEnvelope:
         if not hasattr(self, "cache"):
             raise RuntimeError("cache_produced_artifact() requires initialized worker runtime")
 
+        payload_scope = self.artifact_payload_scope(payload)
+        validate_scope_lineage(request_envelope.scope, payload_scope)
         envelope = ArtifactEnvelope(
             kind="response",
             artifact_type=artifact_type,
             source_agent=source_agent if source_agent is not None else self.agent_name,
             target_agent=target_agent if target_agent is not None else request_envelope.source_agent,
-            scope=request_envelope.scope,
+            scope=payload_scope,
             correlation_id=request_envelope.correlation_id,
             upstream_artifact_ids=[request_envelope.artifact_id],
             payload=self.build_response_payload(payload),
@@ -120,12 +132,16 @@ class ArtifactWorkerMixin:
         try:
             self.cache.cache_received(envelope)
             result = self.handle_artifact(envelope)
+            if not isinstance(result, ContractModel):
+                raise TypeError("artifact worker must return a ContractModel")
+            response_scope = self.artifact_payload_scope(result)
+            validate_scope_lineage(envelope.scope, response_scope)
             response_envelope = ArtifactEnvelope(
                 kind="response",
                 artifact_type=self.response_artifact_type(),
                 source_agent=self.agent_name,
                 target_agent=envelope.source_agent,
-                scope=envelope.scope,
+                scope=response_scope,
                 correlation_id=envelope.correlation_id,
                 upstream_artifact_ids=[envelope.artifact_id],
                 payload=self.build_response_payload(result),

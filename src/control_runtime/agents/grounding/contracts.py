@@ -6,7 +6,15 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from shared.contracts import ContractModel, JsonValue, NonEmptyStr
+from shared.contracts import (
+    AgentMessage,
+    CONTRACT_VERSION,
+    ContractModel,
+    ContractVersion,
+    ExecutionScope,
+    JsonValue,
+    NonEmptyStr,
+)
 
 from ..main.contracts import OpenQuestion
 
@@ -20,6 +28,23 @@ SM_GROUNDING_TOOLS = {
     "search_flow_targets_by_name",
 }
 AM_GROUNDING_TOOLS = {"get_am_policy_context", "search_am_policy_targets"}
+
+
+class GroundingDecisionRequest(ContractModel):
+    schema_version: ContractVersion = CONTRACT_VERSION
+    scope: ExecutionScope
+    user_input: NonEmptyStr
+    context: str
+    messages: list[AgentMessage]
+    allow_user_interaction: bool
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "GroundingDecisionRequest":
+        if self.scope.snapshot_id is None:
+            raise ValueError("grounding request requires scope.snapshot_id")
+        if any(message.role not in {"user", "assistant"} for message in self.messages):
+            raise ValueError("grounding request history only accepts user and assistant messages")
+        return self
 
 
 def normalize_requested_domains(requested_domains: Any) -> List[str]:
@@ -270,6 +295,8 @@ class GroundingAdvisorOutput(ContractModel):
 
 
 class GroundingDecision(ContractModel):
+    schema_version: ContractVersion = CONTRACT_VERSION
+    scope: ExecutionScope
     flows: list[FlowSelector]
     mobility_intent: MobilityIntent | None
     grounding_evidence: GroundingEvidenceBundle
@@ -291,6 +318,7 @@ class GroundingDecision(ContractModel):
 
 
 __all__ = [
+    "GroundingDecisionRequest",
     "AM_GROUNDING_TOOLS",
     "ExplicitFlowTarget",
     "FlowCandidateEvidence",

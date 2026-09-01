@@ -211,6 +211,38 @@ def _envelope(
     source_agent: str = "main_control",
     upstream_artifact_ids: list[str] | None = None,
 ) -> Any:
+    scope = ExecutionScope(
+        session_id="session-1",
+        thread_id="session-1",
+        snapshot_id="snapshot-1",
+        supi="imsi-001",
+    )
+    payload = {
+        "scope": scope.model_dump(mode="json"),
+        "planning_status": "needs_upstream_reground",
+        "optimizer_result": {
+            "objective_breakdown": {},
+            "cross_domain_verdicts": [],
+        },
+        "planning_rationale": {
+            "selected_strategy_profile": "await-grounding",
+            "decisive_evidence": [],
+            "active_constraints": [],
+            "explanation": "Grounding evidence is required.",
+            "rejected_alternatives": [],
+            "main_constraints": [],
+            "iea_grounding_basis": [],
+            "osa_decision_basis": [],
+            "unresolved_gaps": ["grounding evidence"],
+        },
+        "all_policies": [],
+        "partial_policies": [],
+        "missing_evidence": ["grounding evidence"],
+        "blocked_targets": [],
+        "upstream_requests": ["reground policy targets"],
+        "planner_conflicts": [],
+        "open_questions": [],
+    }
     return artifacts.ArtifactEnvelope(
         artifact_id=artifact_id,
         correlation_id="corr-1",
@@ -218,12 +250,8 @@ def _envelope(
         artifact_type="PolicyPlanDraft",
         source_agent=source_agent,
         target_agent=target_agent,
-        scope=ExecutionScope(
-            session_id="session-1",
-            thread_id="session-1",
-            snapshot_id="snapshot-1",
-        ),
-        payload={"policy": "draft"},
+        scope=scope,
+        payload=payload,
         upstream_artifact_ids=upstream_artifact_ids or [],
     )
 

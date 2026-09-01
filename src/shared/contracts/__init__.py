@@ -1,5 +1,14 @@
-from .artifacts import ArtifactEnvelope, ArtifactKind
-from .common import CONTRACT_VERSION, ContractModel, ContractVersion, ExecutionScope, JsonValue, NonEmptyStr, utc_now
+from .artifacts import ArtifactEnvelope, ArtifactKind, ArtifactType
+from .common import (
+    CONTRACT_VERSION,
+    ContractModel,
+    ContractVersion,
+    ExecutionScope,
+    JsonValue,
+    NonEmptyStr,
+    utc_now,
+    validate_scope_lineage,
+)
 from .dataset import ManifestStatus, TraceDatasetManifest, TraceSegmentManifest, TraceWorkerManifest
 from .knowledge import KnowledgeCitation, KnowledgeDomain, KnowledgeDomainHint, KnowledgeHit, KnowledgeQuery, KnowledgeResponse
 from .memory import MemoryBundle, MemoryContextView, MemoryKind, MemoryQuery, MemoryRecord
@@ -15,6 +24,7 @@ __all__ = [
     "AgentTrace",
     "ArtifactEnvelope",
     "ArtifactKind",
+    "ArtifactType",
     "CONTRACT_VERSION",
     "ContractModel",
     "ContractVersion",
@@ -52,4 +62,5 @@ __all__ = [
     "TraceWorkerManifest",
     "validate_message_sequence",
     "utc_now",
+    "validate_scope_lineage",
 ]

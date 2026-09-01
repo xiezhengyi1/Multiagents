@@ -522,7 +522,9 @@ class SingleControlAgent(BaseAgent, ArtifactWorkerMixin):
         if migration_required:
             migration_decision = "migration_authorized" if authorized_snssais else "evidence_missing"
         return PlanningRequest(
+            scope=main_intent.scope,
             grounding_decision=GroundingDecision(
+                scope=main_intent.scope,
                 flows=flows,
                 mobility_intent=None,
                 grounding_evidence=GroundingEvidenceBundle(

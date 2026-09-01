@@ -125,10 +125,9 @@ def write_deterministic_execution_trace(
 
 
 def _decode_metrics_payload(outcome: Any) -> dict[str, Any]:
-    metrics_text = str(outcome.performance_metrics).strip()
-    metrics_payload = json.loads(metrics_text)
+    metrics_payload = outcome.performance_metrics.model_dump(mode="json")
     if not isinstance(metrics_payload, dict):
-        raise TypeError("performance_metrics must decode to a JSON object")
+        raise TypeError("performance_metrics must serialize to a JSON object")
     return metrics_payload
 
 

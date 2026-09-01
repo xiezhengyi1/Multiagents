@@ -6,6 +6,11 @@ from typing import Any
 
 from control_runtime.agents.dispatch.agent import PolicyDispatchAgent
 from control_runtime.agents.planning.contracts import PolicyPlanDraft
+from control_runtime.execution import ExecutionOutcome
+from control_runtime.execution.contracts import (
+    DispatchExecutionMetrics,
+    DomainExecutionReceipts,
+)
 from shared.contracts import AgentTrace, ArtifactEnvelope, ExecutionScope
 from shared.runtime.trace.execution import write_deterministic_execution_trace
 
@@ -82,36 +87,42 @@ def _policy_plan() -> dict[str, Any]:
     }
 
 
-def _outcome(*, dispatch_status: str, feedback_payload: dict[str, Any]) -> SimpleNamespace:
-    return SimpleNamespace(
-        performance_metrics=json.dumps(
-            {
-                "policy_plan": {
-                    "policies": [
-                        {
-                            "policy_id": "sm-1",
-                            "policy_type": "SmPolicyDecision",
-                            "flow_id": "flow-1",
-                        }
-                    ]
-                },
-                "dispatch_results": [
-                    {
-                        "status": dispatch_status,
-                        "policy_id": "sm-1",
-                        "policy_type": "SmPolicyDecision",
-                        "flow_id": "flow-1",
-                    }
-                ],
-                "assurance_results": (
-                    [{"status": "satisfied", "policy_id": "sm-1", "flow_id": "flow-1"}]
-                    if dispatch_status == "success"
-                    else []
-                ),
-            }
+def _outcome(*, dispatch_status: str, feedback_payload: dict[str, Any]) -> ExecutionOutcome:
+    receipt = {
+        "status": dispatch_status,
+        "policy_id": "sm-1",
+        "policy_type": "SmPolicyDecision",
+        "flow_id": "flow-1",
+    }
+    performance_metrics = DispatchExecutionMetrics(
+        policy_plan={
+            "scope": _policy_plan()["scope"],
+            "policies": [
+                {
+                    "policy_id": "sm-1",
+                    "policy_type": "SmPolicyDecision",
+                    "flow_id": "flow-1",
+                }
+            ],
+        },
+        dispatch_results=[receipt],
+        assurance_results=(
+            [{"status": "satisfied", "policy_id": "sm-1", "flow_id": "flow-1"}]
+            if dispatch_status == "success"
+            else []
         ),
-        feedback_payload=feedback_payload,
+        dispatch_attempts=1,
+        domain_receipts=DomainExecutionReceipts(qos=[receipt], mobility=[]),
+        failure_summaries=[] if dispatch_status == "success" else [feedback_payload],
+    )
+    return ExecutionOutcome(
+        scope=ExecutionScope.model_validate(_policy_plan()["scope"]),
+        execution_status="Success" if dispatch_status == "success" else "Failed",
+        performance_metrics=performance_metrics,
         violation_details="none" if dispatch_status == "success" else "gateway rejected",
+        failure_scope="none" if dispatch_status == "success" else "qos",
+        feedback_payload=feedback_payload,
+        dispatch_attempts=1,
     )
 
 
@@ -124,7 +135,7 @@ def test_deterministic_execution_trace_projects_successful_execution() -> None:
     outcome = _outcome(dispatch_status="success", feedback_payload={})
     feedback_report = {
         "execution_status": "Success",
-        "performance_metrics": outcome.performance_metrics,
+        "performance_metrics": outcome.performance_metrics.model_dump(mode="json"),
         "violation_details": "none",
     }
     write_deterministic_execution_trace(
@@ -159,7 +170,7 @@ def test_deterministic_execution_trace_retains_failed_execution_shape() -> None:
     )
     feedback_report = {
         "execution_status": "Failed",
-        "performance_metrics": outcome.performance_metrics,
+        "performance_metrics": outcome.performance_metrics.model_dump(mode="json"),
         "violation_details": "gateway rejected",
     }
     write_deterministic_execution_trace(
@@ -186,15 +197,6 @@ def test_policy_dispatch_preserves_request_correlation_on_cached_feedback() -> N
     agent._trace_writer = _RecordingWriter()
     agent.cache = _RecordingCache()
     outcome = _outcome(dispatch_status="success", feedback_payload={})
-    outcome.execution_status = "Success"
-    outcome.dispatch_attempts = 1
-    outcome.failure_scope = "none"
-    outcome.to_dict = lambda: {
-        "execution_status": "Success",
-        "performance_metrics": outcome.performance_metrics,
-        "violation_details": "none",
-        "dispatch_attempts": 1,
-    }
     agent._execution_controller = SimpleNamespace(execute=lambda _plan: outcome)
     request_envelope = _request_envelope()
 

@@ -41,6 +41,26 @@ class ExecutionScope(ContractModel):
         return values
 
 
+def validate_scope_lineage(upstream: ExecutionScope, downstream: ExecutionScope) -> None:
+    lineage_fields = (
+        "session_id",
+        "thread_id",
+        "snapshot_id",
+        "round_index",
+        "scenario_id",
+        "scenario_tags",
+    )
+    changed = [
+        field_name
+        for field_name in lineage_fields
+        if getattr(upstream, field_name) != getattr(downstream, field_name)
+    ]
+    if changed:
+        raise ValueError("artifact response changed scope lineage fields: " + ", ".join(changed))
+    if upstream.supi is not None and downstream.supi != upstream.supi:
+        raise ValueError("artifact response changed an established scope.supi")
+
+
 __all__ = [
     "CONTRACT_VERSION",
     "ContractModel",
@@ -49,4 +69,5 @@ __all__ = [
     "JsonValue",
     "NonEmptyStr",
     "utc_now",
+    "validate_scope_lineage",
 ]

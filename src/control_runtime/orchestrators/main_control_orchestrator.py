@@ -233,7 +233,12 @@ class MainControlOrchestrator:
         )
 
         if reuse_grounding_decision:
-            grounding_decision = previous_grounding_decision.model_copy(deep=True)
+            grounding_decision = GroundingDecision.model_validate(
+                {
+                    **previous_grounding_decision.model_dump(mode="json"),
+                    "scope": global_intent.scope.model_dump(mode="json"),
+                }
+            )
             log_event(
                 self.main_agent.logger,
                 "control_round_resume",
@@ -257,8 +262,7 @@ class MainControlOrchestrator:
                         diagnosis=previous_diagnosis,
                         feedback_context=feedback_context,
                     ),
-                    session_id=session_id,
-                    snapshot_id=snapshot_id,
+                    scope=ie_scoped_intent.scope,
                     trace_metadata=trace_metadata,
                 )
             finally:
@@ -271,6 +275,7 @@ class MainControlOrchestrator:
                 )
 
         planning_request = PlanningRequest(
+            scope=grounding_decision.scope,
             grounding_decision=grounding_decision,
             context=build_planning_context(
                 global_intent,

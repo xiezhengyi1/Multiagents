@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
+from .artifact_registry import ArtifactType, validate_artifact_payload
 from .common import CONTRACT_VERSION, ContractModel, ContractVersion, ExecutionScope, NonEmptyStr, utc_now
 
 
@@ -17,7 +18,7 @@ class ArtifactEnvelope(ContractModel):
     schema_version: ContractVersion = CONTRACT_VERSION
     artifact_id: NonEmptyStr = Field(default_factory=lambda: f"artifact-{uuid4()}")
     kind: ArtifactKind
-    artifact_type: NonEmptyStr
+    artifact_type: ArtifactType
     source_agent: NonEmptyStr
     target_agent: NonEmptyStr
     scope: ExecutionScope
@@ -25,6 +26,23 @@ class ArtifactEnvelope(ContractModel):
     correlation_id: NonEmptyStr = Field(default_factory=lambda: f"corr-{uuid4()}")
     payload: dict[str, JsonValue]
     upstream_artifact_ids: list[NonEmptyStr] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_registered_payload(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        artifact_type = value.get("artifact_type")
+        kind = value.get("kind")
+        payload = value.get("payload")
+        scope_payload = value.get("scope")
+        if not isinstance(artifact_type, str) or kind not in {"request", "response"} or not isinstance(payload, dict):
+            return value
+        canonical_payload, payload_scope = validate_artifact_payload(artifact_type, kind, payload)
+        envelope_scope = ExecutionScope.model_validate(scope_payload)
+        if payload_scope != envelope_scope:
+            raise ValueError("artifact payload scope must match ArtifactEnvelope scope")
+        return {**value, "payload": canonical_payload}
 
     @model_validator(mode="after")
     def validate_provenance(self) -> "ArtifactEnvelope":
@@ -41,4 +59,4 @@ class ArtifactEnvelope(ContractModel):
         return self
 
 
-__all__ = ["ArtifactEnvelope", "ArtifactKind"]
+__all__ = ["ArtifactEnvelope", "ArtifactKind", "ArtifactType"]

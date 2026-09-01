@@ -51,6 +51,12 @@ class ScenarioCandidate(ContractModel):
         return self
 
 
+class ScenarioCandidateArtifact(ContractModel):
+    schema_version: ContractVersion = CONTRACT_VERSION
+    scope: ExecutionScope
+    candidate: ScenarioCandidate
+
+
 class EnvironmentValidationReport(ContractModel):
     schema_version: ContractVersion = CONTRACT_VERSION
     scenario_id: NonEmptyStr

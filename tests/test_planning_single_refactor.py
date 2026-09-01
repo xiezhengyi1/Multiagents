@@ -39,7 +39,9 @@ def _planning_request() -> PlanningRequest:
         objective_profile=standard_objective_profile("balanced"),
     )
     return PlanningRequest(
+        scope=intent.scope,
         grounding_decision=GroundingDecision(
+            scope=intent.scope,
             flows=[
                 FlowSelector(
                     supi="imsi-1",

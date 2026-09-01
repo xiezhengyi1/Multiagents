@@ -45,6 +45,7 @@ from .contracts import (
     GroundedMobilityEvidence,
     GroundingAdvisorOutput,
     GroundingDecision,
+    GroundingDecisionRequest,
     GroundingEvidenceBundle,
     IntentEncodingDirectives,
     IntentEvidence,
@@ -256,40 +257,27 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         )
 
     def handle_artifact(self, envelope: ArtifactEnvelope) -> GroundingDecision:
-        payload = envelope.payload or {}
+        request = GroundingDecisionRequest.model_validate(envelope.payload)
+        if request.scope != envelope.scope:
+            raise ValueError("GroundingDecisionRequest scope must match its envelope scope")
         return self.analyze_grounding_decision(
-            user_input=str(payload.get("user_input") or ""),
-            context=str(payload.get("context") or ""),
-            conversation_messages=payload.get("messages"),
-            allow_user_interaction=bool(payload.get("allow_user_interaction", False)),
-            session_id=envelope.scope.session_id,
-            snapshot_id=envelope.scope.snapshot_id or "",
+            user_input=request.user_input,
+            context=request.context,
+            conversation_messages=request.messages,
+            allow_user_interaction=request.allow_user_interaction,
+            scope=request.scope,
             request_envelope=envelope,
         )
 
     def _cache_received_request(
         self,
         *,
-        user_input: str,
-        context: str,
-        conversation_messages: List[Dict[str, Any]] | None,
-        allow_user_interaction: bool,
-        session_id: str,
-        snapshot_id: str,
+        request: GroundingDecisionRequest,
     ) -> ArtifactEnvelope:
         return self.cache_received_artifact(
             artifact_type="GroundingDecisionRequest",
-            payload={
-                "user_input": str(user_input),
-                "context": str(context or ""),
-                "messages": list(conversation_messages or []),
-                "allow_user_interaction": bool(allow_user_interaction),
-            },
-            scope=ExecutionScope(
-                session_id=session_id,
-                thread_id=session_id,
-                snapshot_id=snapshot_id or None,
-            ),
+            payload=request,
+            scope=request.scope,
         )
 
     def _cache_produced_result(
@@ -308,29 +296,29 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         self,
         user_input: str,
         context: str = "",
-        conversation_messages: List[Dict[str, Any]] | None = None,
+        conversation_messages: List[AgentMessage] | None = None,
         *,
-        session_id: str = "",
-        snapshot_id: str = "",
+        scope: ExecutionScope,
         allow_user_interaction: bool = False,
         request_envelope: ArtifactEnvelope | None = None,
         trace_metadata: Dict[str, Any] | None = None,
     ) -> GroundingDecision:
         self.ensure_worker_runtime_initialized()
         if request_envelope is None:
-            request_envelope = self._cache_received_request(
+            request = GroundingDecisionRequest(
+                scope=scope,
                 user_input=user_input,
                 context=context,
-                conversation_messages=conversation_messages,
+                messages=list(conversation_messages or []),
                 allow_user_interaction=allow_user_interaction,
-                session_id=session_id,
-                snapshot_id=snapshot_id,
+            )
+            request_envelope = self._cache_received_request(
+                request=request,
             )
 
         analyze_kwargs = {
             "context": context,
-            "session_id": session_id,
-            "snapshot_id": snapshot_id,
+            "scope": scope,
             "allow_user_interaction": allow_user_interaction,
         }
 
@@ -350,12 +338,14 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         user_input: str,
         context: str = "",
         *,
-        session_id: str = "",
-        snapshot_id: str = "",
+        scope: ExecutionScope,
         allow_user_interaction: bool = False,
         trace_metadata: Dict[str, Any] | None = None,
     ) -> GroundingDecision:
         self.ensure_worker_runtime_initialized()
+        if scope.snapshot_id is None:
+            raise ValueError("grounding analysis requires scope.snapshot_id")
+        snapshot_id = scope.snapshot_id
         total_start = time.perf_counter()
         log_event(self.logger, "iea_analyze_start")
         main_directives = IntentEncodingDirectives.from_context(context).model_dump()
@@ -371,14 +361,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             token_budget, token_counter = self._resolve_token_context()
             runtime_context = self.build_runtime_context(
                 agent_name=self.agent_name,
-                scope=ExecutionScope(
-                    session_id=session_id,
-                    thread_id=session_id,
-                    snapshot_id=snapshot_id or None,
-                    scenario_id=str((trace_metadata or {}).get("scenario_id") or "").strip() or None,
-                    scenario_tags=list((trace_metadata or {}).get("scenario_tags") or []),
-                    supi=evidence.supi or None,
-                ),
+                scope=scope.model_copy(update={"supi": evidence.supi or scope.supi}),
                 allow_user_interaction=allow_user_interaction,
                 token_budget=token_budget,
                 token_counter=token_counter,
@@ -664,6 +647,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
             grounding_decision = self._compile_advisor_output(
                 advisor_output=advisor_output,
                 evidence=refreshed_evidence,
+                scope=stage_value.runtime_context.scope,
             )
             grounding_decision = self._materialize_catalog_facts(
                 grounding_decision=grounding_decision,
@@ -984,7 +968,6 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         am_context_payload: Dict[str, Any] = dict(evidence.am_context_payload or {})
         am_policy_candidates: List[Dict[str, Any]] = list(evidence.am_policy_candidates or [])
         subscription_payload: Dict[str, Any] = dict(evidence.subscription_payload or {})
-        requested_domains = list(evidence.requested_domains or [])
         requested_supis = set(extract_requested_supis(evidence.supi, evidence.user_input))
 
         for entry in extract_grounding_tool_payloads(advisor_result=advisor_result):
@@ -1028,6 +1011,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         *,
         advisor_output: GroundingAdvisorOutput,
         evidence: IntentEvidence,
+        scope: ExecutionScope,
     ) -> GroundingDecision:
         """Build the OSA handoff from narrow LLM choices and tool-owned facts."""
         subscription = dict(evidence.subscription_summary or {})
@@ -1046,6 +1030,7 @@ class IntentEncodingAgent(BaseAgent, ArtifactWorkerMixin):
         if evidence.am_policy_candidates:
             evidence_sources["search_am_policy_targets"] = ["runtime"]
         return GroundingDecision(
+            scope=scope,
             flows=[
                 FlowSelector(
                     supi=IntentEncodingAgent._binding_supi_from_evidence(flow=flow, evidence=evidence) or None,
