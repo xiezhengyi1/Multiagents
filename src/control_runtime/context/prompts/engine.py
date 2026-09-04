@@ -5,6 +5,7 @@ from typing import Any
 
 from jinja2 import Environment, PackageLoader, StrictUndefined
 
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 

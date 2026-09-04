@@ -157,17 +157,19 @@ class ColBERTRetriever:
     def record_ids(self) -> List[str]:
         return list(self._records_meta.keys())
 
-    def _load_embedding(self, record_id: str) -> Optional[np.ndarray]:
+    def _load_embedding(self, record_id: str) -> np.ndarray:
         if record_id in self._cache:
             return self._cache[record_id]
 
         record_meta = self._records_meta.get(record_id)
         if record_meta is None:
-            return None
+            raise KeyError(f"ColBERT index has no record metadata for {record_id}")
 
         filepath = self._embeddings_dir / record_meta["file"]
         if not filepath.exists():
-            return None
+            raise FileNotFoundError(
+                f"ColBERT embedding file not found for {record_id}: {filepath}"
+            )
 
         with np.load(str(filepath)) as data:
             emb = data["tokens"].astype(np.float32)
@@ -179,7 +181,7 @@ class ColBERTRetriever:
     def _load_embeddings_batch(
         self,
         record_ids: List[str],
-    ) -> List[Optional[np.ndarray]]:
+    ) -> List[np.ndarray]:
         return [self._load_embedding(rid) for rid in record_ids]
 
     def preload(self, record_ids: Optional[List[str]] = None) -> None:
@@ -210,8 +212,6 @@ class ColBERTRetriever:
             if domain_filter is not None and not domain_filter(record_meta):
                 continue
             doc_emb = self._load_embedding(record_id)
-            if doc_emb is None:
-                continue
             candidate_ids.append(record_id)
             candidate_embs.append(doc_emb)
 
@@ -237,10 +237,7 @@ class ColBERTRetriever:
         Returns list of (record_id, maxsim_score).
         """
         embs = self._load_embeddings_batch(candidate_ids)
-        ids_and_embs: List[Tuple[str, np.ndarray]] = []
-        for rid, emb in zip(candidate_ids, embs):
-            if emb is not None:
-                ids_and_embs.append((rid, emb))
+        ids_and_embs = list(zip(candidate_ids, embs))
 
         if not ids_and_embs:
             return []

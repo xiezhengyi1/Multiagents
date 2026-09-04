@@ -1,8 +1,10 @@
-from .logger import log_event, log_timing, observe_time, setup_logger
+from __future__ import annotations
 
-__all__ = [
-    "log_event",
-    "log_timing",
-    "observe_time",
-    "setup_logger",
-]
+import logging
+
+
+def setup_logger(name: str) -> logging.Logger:
+    return logging.getLogger(name)
+
+
+__all__ = ["setup_logger"]

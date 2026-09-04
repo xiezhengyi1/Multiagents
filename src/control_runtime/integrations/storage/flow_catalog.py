@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-def build_flow_description_from_five_tuple(five_tuple: Any) -> Optional[str]:
+
+def build_flow_description_from_five_tuple(five_tuple: Any) -> str | None:
     """Encode a flow five-tuple into the flowDescription string supported by PCC flowInfos."""
     if not isinstance(five_tuple, (list, tuple)) or len(five_tuple) != 5:
         return None
@@ -24,7 +25,7 @@ def build_flow_description_from_five_tuple(five_tuple: Any) -> Optional[str]:
     return f"permit out {protocol} from {src_ip} {src_port} to {dst_ip} {dst_port}"
 
 
-def build_flow_info_from_five_tuple(five_tuple: Any, *, flow_direction: str = "BIDIRECTIONAL") -> Optional[Dict[str, Any]]:
+def build_flow_info_from_five_tuple(five_tuple: Any, *, flow_direction: str = "BIDIRECTIONAL") -> dict[str, Any] | None:
     """Build a FlowInformation-compatible dict from a five tuple."""
     flow_description = build_flow_description_from_five_tuple(five_tuple)
     if not flow_description:
@@ -35,7 +36,7 @@ def build_flow_info_from_five_tuple(five_tuple: Any, *, flow_direction: str = "B
     }
 
 
-def _normalize_catalog_flow(app: Dict[str, Any], flow: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_catalog_flow(app: dict[str, Any], flow: dict[str, Any]) -> dict[str, Any]:
     service = flow.get("service") if isinstance(flow.get("service"), dict) else {}
     sla = flow.get("sla") if isinstance(flow.get("sla"), dict) else {}
     allocation = flow.get("allocation") if isinstance(flow.get("allocation"), dict) else {}
@@ -76,9 +77,9 @@ def _normalize_catalog_flow(app: Dict[str, Any], flow: Dict[str, Any]) -> Dict[s
     }
 
 
-def _build_catalogs_from_app_data(app_data: Any, supi: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    app_catalog: List[Dict[str, Any]] = []
-    flow_catalog: List[Dict[str, Any]] = []
+def _build_catalogs_from_app_data(app_data: Any, supi: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    app_catalog: list[dict[str, Any]] = []
+    flow_catalog: list[dict[str, Any]] = []
     if not isinstance(app_data, list) or not supi:
         return app_catalog, flow_catalog
 
@@ -108,7 +109,7 @@ def _build_catalogs_from_app_data(app_data: Any, supi: str) -> Tuple[List[Dict[s
 
 
 
-def _extract_flow_id_from_pcc_rule_id(rule_id: Any) -> Optional[str]:
+def _extract_flow_id_from_pcc_rule_id(rule_id: Any) -> str | None:
     text = str(rule_id or "").strip()
     if not text:
         return None
@@ -120,9 +121,9 @@ def _extract_flow_id_from_pcc_rule_id(rule_id: Any) -> Optional[str]:
 
 
 def _enrich_pcc_rules_with_flow_catalog(
-    pcc_rules: Optional[Dict[str, Any]],
-    flow_catalog: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+    pcc_rules: dict[str, Any] | None,
+    flow_catalog: list[dict[str, Any]],
+) -> dict[str, Any] | None:
     if not isinstance(pcc_rules, dict) or not pcc_rules:
         return pcc_rules
 
@@ -132,13 +133,13 @@ def _enrich_pcc_rules_with_flow_catalog(
         if isinstance(flow, dict) and flow.get("flow_id")
     }
 
-    enriched_top: Dict[str, Any] = {}
+    enriched_top: dict[str, Any] = {}
     for sm_policy_id, rule_map in pcc_rules.items():
         if not isinstance(rule_map, dict):
             enriched_top[sm_policy_id] = rule_map
             continue
 
-        enriched_rule_map: Dict[str, Any] = {}
+        enriched_rule_map: dict[str, Any] = {}
         for rule_key, rule_obj in rule_map.items():
             if not isinstance(rule_obj, dict):
                 enriched_rule_map[rule_key] = rule_obj

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Tuple
-
 from ...contracts import ObjectiveProfile
-from .contracts import JointOptimizationRequest, OptimizationProblemConfig, OptimizationTemplate
+from .contracts import (
+    JointOptimizationRequest,
+    OptimizationProblemConfig,
+    OptimizationTemplate,
+)
 
 
-def resolve_problem_config(request: JointOptimizationRequest) -> Tuple[OptimizationProblemConfig, ObjectiveProfile]:
+def resolve_problem_config(request: JointOptimizationRequest) -> tuple[OptimizationProblemConfig, ObjectiveProfile]:
     config = request.problem_config.normalized_for_domains(request.requested_domains)
     profile = request.objective_profile
 

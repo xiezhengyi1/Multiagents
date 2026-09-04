@@ -72,6 +72,8 @@ knowledge_build/data/
 !experiments/
 !experiments/configs/
 !experiments/configs/**
+!experiments/cases/
+!experiments/cases/**
 !experiments/scripts/
 !experiments/scripts/**
 experiments/scripts/__pycache__/

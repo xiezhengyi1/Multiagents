@@ -1,101 +1,40 @@
+from __future__ import annotations
+
 import os
-import re
-import sys
-from pathlib import Path
 
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, event
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import sessionmaker
-
-from .base import Base
-
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PACKAGE_ROOT / "src"
-for candidate in (PACKAGE_ROOT, SRC_ROOT):
-    candidate_text = str(candidate)
-    if candidate_text not in sys.path:
-        sys.path.insert(0, candidate_text)
-
-from shared.logging import setup_logger
-
-load_dotenv()
-
-logger = setup_logger(__name__)
-
-RAW_DATABASE_URL = os.getenv("DATABASE_URL")
-WORKER_SCHEMA = str(os.getenv("EXPERIMENT_WORKER_SCHEMA") or "").strip()
+from sqlalchemy import Engine, create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 
-def _validated_worker_schema(schema: str) -> str:
-    normalized = str(schema or "").strip()
-    if not normalized:
-        return ""
-    if not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", normalized):
-        raise RuntimeError(f"Invalid EXPERIMENT_WORKER_SCHEMA: {normalized!r}")
-    return normalized
+def require_database_url() -> str:
+    value = os.environ.get("DATABASE_URL", "").strip()
+    if not value:
+        raise RuntimeError("DATABASE_URL is required for the PostgreSQL knowledge backend")
+    return value
 
 
 def to_sqlalchemy_url(database_url: str) -> str:
-    normalized = str(database_url or "").strip()
-    if normalized.startswith("postgresql+psycopg://"):
-        return normalized
+    normalized = database_url.strip()
     if normalized.startswith("postgresql://"):
         return normalized.replace("postgresql://", "postgresql+psycopg://", 1)
     return normalized
 
 
-DATABASE_URL = to_sqlalchemy_url(RAW_DATABASE_URL)
-WORKER_SCHEMA = _validated_worker_schema(WORKER_SCHEMA)
-
-def _redact_database_url(database_url: str) -> str:
-    if not database_url:
-        return "<unset>"
-    url = make_url(database_url)
-    return url.render_as_string(hide_password=True)
-
-
-if not RAW_DATABASE_URL or not str(RAW_DATABASE_URL).strip():
-    raise RuntimeError(
-        "DATABASE_URL is not configured. Set it in the environment or .env before starting the application."
-    )
-
-try:
-    # Ensure client_encoding is utf8 to avoid encoding issues on Windows
-    engine = create_engine(
-        DATABASE_URL,
-        echo=False,
+def create_knowledge_engine(database_url: str) -> Engine:
+    return create_engine(
+        to_sqlalchemy_url(database_url),
         pool_pre_ping=True,
         connect_args={"client_encoding": "utf8"},
     )
-    if WORKER_SCHEMA:
-        @event.listens_for(engine, "connect")
-        def _pin_worker_search_path(dbapi_connection, _connection_record):
-            cursor = dbapi_connection.cursor()
-            try:
-                cursor.execute(f'SET search_path TO "{WORKER_SCHEMA}", public')
-            finally:
-                cursor.close()
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-except Exception as e:
-    redacted_url = _redact_database_url(DATABASE_URL)
-    raise RuntimeError(f"Failed to create database engine for {redacted_url}: {e}") from e
 
-def get_db():
-    """Generator function for dependency injection (e.g., in FastAPI or manually)"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+
+def create_session_factory(engine: Engine) -> sessionmaker[Session]:
+    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
 __all__ = [
-    "DATABASE_URL",
-    "RAW_DATABASE_URL",
-    "SessionLocal",
-    "WORKER_SCHEMA",
-    "engine",
-    "get_db",
+    "create_knowledge_engine",
+    "create_session_factory",
+    "require_database_url",
     "to_sqlalchemy_url",
 ]

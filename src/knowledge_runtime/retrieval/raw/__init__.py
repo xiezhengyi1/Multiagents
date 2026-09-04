@@ -1,7 +1,13 @@
-from .knowledge_tool import get_knowledge_by_key, search_semantic_knowledge, warmup_knowledge_tool_models
+from .knowledge_tool import (
+    DenseRetrieval,
+    HybridKnowledgeBackend,
+    RetrievalStage,
+    run_semantic_knowledge_pipeline,
+)
 
 __all__ = [
-    "get_knowledge_by_key",
-    "search_semantic_knowledge",
-    "warmup_knowledge_tool_models",
+    "DenseRetrieval",
+    "HybridKnowledgeBackend",
+    "RetrievalStage",
+    "run_semantic_knowledge_pipeline",
 ]

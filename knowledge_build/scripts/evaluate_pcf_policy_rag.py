@@ -307,13 +307,19 @@ def _safe_mean(values: Iterable[float]) -> float:
     return round(mean(values), 4) if values else 0.0
 
 
-def evaluate_case(case: Dict[str, Any], *, limit: int) -> Dict[str, Any]:
+def evaluate_case(
+    case: Dict[str, Any],
+    *,
+    limit: int,
+    dense_retrieval: knowledge_tool.DenseRetrieval,
+) -> Dict[str, Any]:
     query = str(case["query"]).strip()
     category = str(case.get("category") or "").strip() or None
     expected_keys = [str(item).strip() for item in case["expected_result_keys"]]
-    candidates, errors = knowledge_tool.run_semantic_knowledge_pipeline(
+    candidates = knowledge_tool.run_semantic_knowledge_pipeline(
         query,
         category=category,
+        dense_retrieval=dense_retrieval,
         limit=limit,
     )
     retrieved_keys = [
@@ -351,7 +357,6 @@ def evaluate_case(case: Dict[str, Any], *, limit: int) -> Dict[str, Any]:
         "success": bool(relevant_hits),
         "top1_domain": str((candidates[0]["metadata"].get("policy_domain") if candidates else "") or "").strip(),
         "empty_result": not bool(retrieved_top_k),
-        "warnings": errors,
     }
 
 
@@ -463,6 +468,7 @@ def run_evaluation(
     *,
     cases_path: Path,
     limit: int,
+    dense_retrieval: knowledge_tool.DenseRetrieval,
     case_source_type: str = "curated",
     trace_paths: Iterable[Path] = DEFAULT_IEA_TRACE_PATHS,
     trace_min_frequency: int = 1,
@@ -518,7 +524,11 @@ def run_evaluation(
             f"query={case['query']}",
             flush=True,
         )
-        result = evaluate_case(case, limit=limit)
+        result = evaluate_case(
+            case,
+            limit=limit,
+            dense_retrieval=dense_retrieval,
+        )
         print(
             f"[rag-eval] ({index}/{total_cases}) done case={case['id']} "
             f"success={result['success']} top1={result['accuracy_at_1']:.0f} "
@@ -536,6 +546,11 @@ def main() -> None:
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES_PATH)
     parser.add_argument("--case-source", choices=("curated", "merged", "extended", "iea_trace", "iea_trace_weak"), default="curated")
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--dense-retrieval",
+        choices=("colbert", "pgvector_bge"),
+        required=True,
+    )
     parser.add_argument("--trace-min-frequency", type=int, default=1)
     parser.add_argument("--trace-max-cases", type=int)
     parser.add_argument("--case-output", type=Path)
@@ -566,6 +581,7 @@ def main() -> None:
     report = run_evaluation(
         cases_path=args.cases,
         limit=max(1, int(args.top_k)),
+        dense_retrieval=args.dense_retrieval,
         case_source_type=args.case_source,
         trace_min_frequency=max(1, int(args.trace_min_frequency)),
         trace_max_cases=args.trace_max_cases,

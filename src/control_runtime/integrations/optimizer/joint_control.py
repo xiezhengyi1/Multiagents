@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-from ...contracts import ControlDomain, ObjectiveProfile
-from ...diagnostics.mediation.contracts import DomainStatus, DomainVerdict
-
-from .models import AMPolicyState
+from ...contracts import ControlDomain, DomainStatus, DomainVerdict, ObjectiveProfile
+from .contracts import (
+    JointOptimizationRequest,
+    JointOptimizationResult,
+    OptimizationProblemConfig,
+)
 from .interface import optimize_network_slices
-from .contracts import JointOptimizationRequest, JointOptimizationResult, OptimizationProblemConfig
-from .joint_mobility import build_mobility_draft, build_mobility_snapshot, run_cross_domain_checks
+from .joint_mobility import (
+    build_mobility_draft,
+    build_mobility_snapshot,
+    run_cross_domain_checks,
+)
 from .joint_problem import resolve_problem_config
+from .models import AMPolicyState
 from .objective_weights import build_qos_optimizer_weights
 
 
@@ -28,7 +34,7 @@ def _relax_lower_bound(value: Any, ratio: float) -> Any:
     return round(max(numeric * (1.0 - ratio), 0.0), 6)
 
 
-def _normalize_snssai_ref(value: Any) -> Optional[str]:
+def _normalize_snssai_ref(value: Any) -> str | None:
     if isinstance(value, dict):
         nested = value.get("snssai")
         if nested is not None and "sst" not in value and "sd" not in value:
@@ -53,12 +59,16 @@ def _normalize_snssai_ref(value: Any) -> Optional[str]:
     if re.fullmatch(r"[0-9A-F]{8}", compact):
         return compact
     parts = [part for part in re.split(r"[^0-9A-Fa-f]+", text) if part]
-    if len(parts) >= 2 and re.fullmatch(r"\d{1,3}", parts[0]) and re.fullmatch(r"[0-9A-Fa-f]{6}", parts[1]):
+    if (
+        len(parts) >= 2
+        and re.fullmatch(r"\d{1,3}", parts[0])
+        and re.fullmatch(r"[0-9A-Fa-f]{6}", parts[1])
+    ):
         return f"{int(parts[0]):02X}{parts[1].upper()}"
     return None
 
 
-def _normalize_snssai_refs(values: Any) -> List[str]:
+def _normalize_snssai_refs(values: Any) -> list[str]:
     if isinstance(values, list):
         raw_values = values
     elif values in (None, "", {}):
@@ -66,7 +76,7 @@ def _normalize_snssai_refs(values: Any) -> List[str]:
     else:
         raw_values = [values]
 
-    normalized: List[str] = []
+    normalized: list[str] = []
     for item in raw_values:
         if (snssai := _normalize_snssai_ref(item)) and snssai not in normalized:
             normalized.append(snssai)
@@ -74,13 +84,15 @@ def _normalize_snssai_refs(values: Any) -> List[str]:
 
 
 def _build_optimizer_target_app_from_grounding_decision(
-    grounding_decision: Dict[str, Any],
-) -> Dict[str, Any]:
+    grounding_decision: dict[str, Any],
+) -> dict[str, Any]:
     raw_flows = grounding_decision.get("flows")
     if not isinstance(raw_flows, list) or not raw_flows:
-        raise ValueError("grounding_decision.flows must be a non-empty list for QoS optimization")
+        raise ValueError(
+            "grounding_decision.flows must be a non-empty list for QoS optimization"
+        )
 
-    flow_by_id: Dict[str, Dict[str, Any]] = {}
+    flow_by_id: dict[str, dict[str, Any]] = {}
     for item in raw_flows:
         if not isinstance(item, dict):
             continue
@@ -88,7 +100,7 @@ def _build_optimizer_target_app_from_grounding_decision(
         if flow_id:
             flow_by_id[flow_id] = dict(item)
 
-    target_flows: List[Dict[str, Any]] = []
+    target_flows: list[dict[str, Any]] = []
     for flow_id, flow in flow_by_id.items():
         target_flows.append(dict(flow))
 
@@ -110,14 +122,11 @@ def _run_qos_subproblem(
     *,
     problem_config: OptimizationProblemConfig,
     objective_profile: ObjectiveProfile,
-    am_policy_state: Optional[AMPolicyState] = None,
-) -> Tuple[Dict[str, Any], List[str]]:
-    try:
-        target_app = _build_optimizer_target_app_from_grounding_decision(
-            request.grounding_decision or {},
-        )
-    except Exception as exc:
-        return {}, [str(exc)]
+    am_policy_state: AMPolicyState | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    target_app = _build_optimizer_target_app_from_grounding_decision(
+        request.grounding_decision,
+    )
     if "slice_assignment" not in problem_config.decision_variables:
         return {}, ["QoS optimization disabled by problem configuration"]
 
@@ -130,7 +139,7 @@ def _run_qos_subproblem(
         am_policy_state=am_policy_state,
         mobility_risk_weight=objective_profile.mobility_risk_cost,
         debug_context={
-            "session_id": request.scope.session_id,
+            "episode_id": request.scope.episode_id,
             "snapshot_id": request.scope.snapshot_id,
             "requested_domains": [domain.value for domain in request.requested_domains],
             "target_ues": list(request.target_ues or []),
@@ -148,7 +157,7 @@ def _run_qos_subproblem(
     return result, []
 
 
-def _collect_unassigned_requested_flow_errors(qos_plan: Dict[str, Any]) -> List[str]:
+def _collect_unassigned_requested_flow_errors(qos_plan: dict[str, Any]) -> list[str]:
     if not isinstance(qos_plan, dict):
         return []
     meta = qos_plan.get("meta") if isinstance(qos_plan.get("meta"), dict) else {}
@@ -156,18 +165,22 @@ def _collect_unassigned_requested_flow_errors(qos_plan: Dict[str, Any]) -> List[
     if not isinstance(details, list):
         return []
 
-    errors: List[str] = []
+    errors: list[str] = []
     for item in details:
         if not isinstance(item, dict):
             continue
         flow_id = str(item.get("flow_id") or "").strip()
         app_name = str(item.get("app_name") or "").strip()
-        candidate_slices = item.get("candidate_slices") if isinstance(item.get("candidate_slices"), list) else []
-        slice_summaries: List[str] = []
+        candidate_slices = (
+            item.get("candidate_slices")
+            if isinstance(item.get("candidate_slices"), list)
+            else []
+        )
+        slice_summaries: list[str] = []
         for candidate in candidate_slices:
             if not isinstance(candidate, dict):
                 continue
-            labels: List[str] = []
+            labels: list[str] = []
             for violation in candidate.get("violations") or []:
                 if not isinstance(violation, dict):
                     continue
@@ -187,21 +200,31 @@ def _collect_unassigned_requested_flow_errors(qos_plan: Dict[str, Any]) -> List[
                     f"{violation.get('constraint')}@{violation.get('node')}: actual={violation.get('actual')} < required_min={violation.get('required_min')}"
                 )
             if labels:
-                slice_summaries.append(f"{candidate.get('snssai')}: " + ", ".join(labels))
-        summary = "; ".join(slice_summaries) if slice_summaries else str(item.get("summary") or "no feasible slice assignment")
+                slice_summaries.append(
+                    f"{candidate.get('snssai')}: " + ", ".join(labels)
+                )
+        summary = (
+            "; ".join(slice_summaries)
+            if slice_summaries
+            else str(item.get("summary") or "no feasible slice assignment")
+        )
         errors.append(
             f"target flow {flow_id or '<unknown>'} in app {app_name or '<unknown>'} has no grounded slice assignment: {summary}"
         )
     return errors
 
 
-def _build_am_policy_state_from_request(request: JointOptimizationRequest) -> Optional[AMPolicyState]:
+def _build_am_policy_state_from_request(
+    request: JointOptimizationRequest,
+) -> AMPolicyState | None:
     """关键步骤：从 JointOptimizationRequest 中提取当前 AM 策略状态用于 MILP 联合优化。"""
     policy_state = request.policy_state or {}
     target_supi = str((request.target_ues or [""])[0] or "").strip()
 
     # policy_state 结构为 {supi: ue_context}，需要先取出 UE 级别的数据
-    ue_ctx = policy_state.get(target_supi) or policy_state if target_supi else policy_state
+    ue_ctx = (
+        policy_state.get(target_supi) or policy_state if target_supi else policy_state
+    )
     am_ctx = (
         ue_ctx.get("amPolicyContext")
         or ue_ctx.get("am_policy")
@@ -212,9 +235,7 @@ def _build_am_policy_state_from_request(request: JointOptimizationRequest) -> Op
         return None
 
     mobility_summary = (
-        ue_ctx.get("mobilitySummary")
-        or ue_ctx.get("mobility_summary")
-        or {}
+        ue_ctx.get("mobilitySummary") or ue_ctx.get("mobility_summary") or {}
     )
     raw_risk = mobility_summary.get("mobilityRiskScore")
     if raw_risk is None:
@@ -225,28 +246,36 @@ def _build_am_policy_state_from_request(request: JointOptimizationRequest) -> Op
         mobility_risk_score = 0.0
 
     return AMPolicyState(
-        old_allowed_snssais=_normalize_snssai_refs(am_ctx.get("allowed_snssais") or am_ctx.get("allowedSnssais") or []),
-        old_target_snssais=_normalize_snssai_refs(am_ctx.get("target_snssais") or am_ctx.get("targetSnssais") or []),
+        old_allowed_snssais=_normalize_snssai_refs(
+            am_ctx.get("allowed_snssais") or am_ctx.get("allowedSnssais") or []
+        ),
+        old_target_snssais=_normalize_snssai_refs(
+            am_ctx.get("target_snssais") or am_ctx.get("targetSnssais") or []
+        ),
         old_rfsp=am_ctx.get("rfsp") or am_ctx.get("rfspIndex") or 1,
-        old_triggers=am_ctx.get("triggers") or am_ctx.get("policyAssociationRequest", {}).get("triggers") or [],
+        old_triggers=am_ctx.get("triggers")
+        or am_ctx.get("policyAssociationRequest", {}).get("triggers")
+        or [],
         old_ue_ambr_ul=am_ctx.get("ue_ambr_ul") or 0.0,
         old_ue_ambr_dl=am_ctx.get("ue_ambr_dl") or 0.0,
         mobility_risk_score=mobility_risk_score,
     )
 
 
-def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptimizationResult:
+def run_joint_control_optimizer(
+    request: JointOptimizationRequest,
+) -> JointOptimizationResult:
     requested_domains = request.requested_domains or [ControlDomain.QOS]
     target_supi = str((request.target_ues or [""])[0] or "").strip()
-    infeasible_reasons: List[str] = []
-    qos_plan: Dict[str, Any] = {}
-    mobility_plan: Dict[str, Any] = {}
-    am_plan: Dict[str, Any] = {}
-    verdicts: List[DomainVerdict] = []
+    infeasible_reasons: list[str] = []
+    qos_plan: dict[str, Any] = {}
+    mobility_plan: dict[str, Any] = {}
+    am_plan: dict[str, Any] = {}
+    verdicts: list[DomainVerdict] = []
     problem_config, objective_profile = resolve_problem_config(request)
 
     # 关键步骤：当请求包含 MOBILITY 域时，尝试构建 AM 旧状态以启用联合优化
-    am_policy_state: Optional[AMPolicyState] = None
+    am_policy_state: AMPolicyState | None = None
     if ControlDomain.MOBILITY in requested_domains:
         am_policy_state = _build_am_policy_state_from_request(request)
 
@@ -305,7 +334,10 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
         else:
             snapshot = build_mobility_snapshot(request, target_supi)
             if snapshot.missing_fields:
-                infeasible_reasons.extend(f"missing mobility context field: {item}" for item in snapshot.missing_fields)
+                infeasible_reasons.extend(
+                    f"missing mobility context field: {item}"
+                    for item in snapshot.missing_fields
+                )
                 verdicts.append(
                     DomainVerdict(
                         domain=ControlDomain.MOBILITY,
@@ -313,12 +345,17 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
                         summary="Mobility context is incomplete",
                         hard_conflicts=[],
                         soft_conflicts=[],
-                        infeasible_reasons=[f"missing mobility context field: {item}" for item in snapshot.missing_fields],
+                        infeasible_reasons=[
+                            f"missing mobility context field: {item}"
+                            for item in snapshot.missing_fields
+                        ],
                         metrics={},
                     )
                 )
             else:
-                draft = build_mobility_draft(request, target_supi, snapshot, qos_plan, am_plan=am_plan)
+                draft = build_mobility_draft(
+                    request, target_supi, snapshot, qos_plan, am_plan=am_plan
+                )
                 mobility_plan = {
                     "association_id": draft.association_id,
                     "request": draft.request.model_dump(mode="json"),
@@ -358,11 +395,19 @@ def run_joint_control_optimizer(request: JointOptimizationRequest) -> JointOptim
             "decision_variables": list(problem_config.decision_variables),
             "grouped_decision_variables": problem_config.grouped_decision_variables(),
             "grouped_constraints": problem_config.grouped_constraints(),
-            "qos_optimizer_weights": build_qos_optimizer_weights(objective_profile).to_payload(),
+            "qos_optimizer_weights": build_qos_optimizer_weights(
+                objective_profile
+            ).to_payload(),
             "mobility_risk_cost": objective_profile.mobility_risk_cost,
-            "session_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("session_cost", 0.0),
-            "mobility_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("mobility_cost", 0.0),
-            "coupling_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get("coupling_cost", 0.0),
+            "session_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get(
+                "session_cost", 0.0
+            ),
+            "mobility_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get(
+                "mobility_cost", 0.0
+            ),
+            "coupling_cost": (qos_plan.get("meta", {}).get("breakdown") or {}).get(
+                "coupling_cost", 0.0
+            ),
         },
         infeasible_reasons=infeasible_reasons,
     )

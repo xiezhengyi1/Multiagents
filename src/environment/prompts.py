@@ -8,31 +8,14 @@ bandwidth guarantees, initial allocations, and the rationale for each choice.
 The deterministic compiler only derives mechanical identifiers and references;
 it never changes your topology or metrics.
 
-Return structured JSON only. Do not return markdown.
-
-Mandatory production loop:
-1. Call prepare_environment_design_context once. It returns both bounded executable
-   examples and the exact trusted S3 runtime shape; do not spend separate calls
-   rediscovering either input.
-2. Design the complete scenario entity manifest first and call
-   submit_environment_catalog. The catalog must enumerate every semantic key and
-   its expected count. S3 is the minimum production quality.
-3. Create one complete EnvironmentDesign using exactly those semantic keys and
-   call compile_environment_design. Every slice, UPF, gNB, UE, app, and flow must
-   include a non-empty rationale. Every flow must contain all traffic, SLA, and
-   allocation metrics chosen by you.
-4. When the first compilation returns design_schema, correct the full
-   EnvironmentDesign once. When it returns design_completeness or
-   compiled_candidate_validation, call revise_environment_design with complete
-   replacements for only the affected semantic entities. Omitted entities are
-   preserved exactly. Never patch generated IDs or final YAML sections.
-5. After compilation succeeds, call validate_environment_draft,
-   write_validated_environment_yaml, and simulate_candidate_environment in order.
-   Never call any of these three tools while compilation status is failed.
-6. Compilation and simulation failures are recorded automatically. If simulation
-   identifies a semantic cause, use revise_environment_design and repeat the gates.
-7. Final JSON must contain exactly scenario_id, name, validation_status,
-   validation_feedback, tool_loop_summary, and rationale.
+Return one structured `CoordinationDecision[EnvironmentProposal]`; do not return
+markdown. Put `target_agent="environment_compiler"` and the appropriate
+`proposal` or `repair_response` message type at the root. Put exactly one complete
+EnvironmentCatalog and one complete EnvironmentDesign inside `payload`. The
+deterministic validator and compiler perform every schema, completeness, quality,
+identifier, and cross-reference check. On repair, replace the invalid proposal
+with a complete corrected catalog and design; never emit a patch or compiler-owned
+identifier.
 
 Semantic key rules:
 - Keys are stable human-readable handles used only inside the design, such as
@@ -84,7 +67,6 @@ SEMANTIC_GENERATION_PROMPT_TEMPLATE = """Semantic environment design request:
 - requested target flow count: {target_flow_count}
 - topology mode: {topology_mode}
 - stress mode: {stress_mode}
-- output directory: {output_dir}
 - required quality profile: {quality_profile}
 - quality contract: {quality_requirements}
 

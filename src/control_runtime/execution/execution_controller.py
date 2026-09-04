@@ -1,213 +1,36 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Callable, Dict, Optional
-
-from shared.contracts import ExecutionScope
-from shared.logging import log_event, log_timing, setup_logger
+from control_runtime.simulation import ExecutionAction, SimulatorAdapter
 
 from .assurance_evaluator import AssuranceEvaluator
-from .contracts import (
-    CompileControllerFeedback,
-    CompileFailureMetrics,
-    DispatchExecutionMetrics,
-    DomainExecutionReceipts,
-    ExecutionControllerFeedback,
-    ExecutionOutcome,
-)
+from .contracts import ExecutionOutcome
 from .policy_batch_executor import PolicyBatchExecutor
-from .policy_compiler import PolicyCompiler
-from ..agents.planning.contracts import PolicyPlanDraft
 
 
 class ExecutionController:
-    AM_POLICY_TYPE = "PcfAmPolicyControlPolicyAssociation"
+    """Execute a typed action and optionally evaluate explicit objective metrics."""
 
     def __init__(
         self,
         *,
-        compiler: Optional[PolicyCompiler] = None,
-        dispatch_policy: Callable[..., Dict[str, Any]],
-        assurance_evaluator: AssuranceEvaluator,
-        commit_policies: Callable[..., None],
-        logger: Any = None,
+        backend: SimulatorAdapter,
+        assurance_evaluator: AssuranceEvaluator | None = None,
     ) -> None:
-        self.compiler = compiler or PolicyCompiler()
-        self.commit_policies = commit_policies
-        self.logger = logger or setup_logger(self.__class__.__name__, default_msg_color="\033[92m")
-        self.policy_batch_executor = PolicyBatchExecutor(
-            dispatch_policy=dispatch_policy,
-            assurance_evaluator=assurance_evaluator,
-            logger=self.logger,
-            mobility_policy_type=self.AM_POLICY_TYPE,
-        )
+        self.executor = PolicyBatchExecutor(backend=backend)
+        self.assurance_evaluator = assurance_evaluator
 
-    @staticmethod
-    def _build_failure_outcome(
-        *,
-        scope: ExecutionScope,
-        detail: str,
-        feedback_payload: Dict[str, Any],
-    ) -> ExecutionOutcome:
-        controller_feedback = CompileControllerFeedback.model_validate(feedback_payload)
+    def execute(self, action: ExecutionAction) -> ExecutionOutcome:
+        feedback = self.executor.execute(action)
+        assurance = (
+            self.assurance_evaluator.evaluate(feedback)
+            if self.assurance_evaluator is not None
+            else None
+        )
         return ExecutionOutcome(
-            scope=scope,
-            execution_status="Failed",
-            performance_metrics=CompileFailureMetrics(
-                feedback_payload=controller_feedback,
-            ),
-            violation_details=detail,
-            failure_scope="compile",
-            feedback_payload=controller_feedback,
-            dispatch_attempts=0,
-        )
-
-    def _failure_scope_from_policies(self, policies: list[Dict[str, Any]]) -> str:
-        if not policies:
-            return "none"
-        scopes = {
-            "mobility" if str(item.get("policy_type") or "").strip() == self.AM_POLICY_TYPE else "qos"
-            for item in policies
-        }
-        if scopes == {"qos"}:
-            return "qos"
-        if scopes == {"mobility"}:
-            return "mobility"
-        return "mixed"
-
-    def _failure_scope_from_entries(self, entries: list[Dict[str, Any]]) -> str:
-        policy_types = [entry.get("policy_type") for entry in entries if isinstance(entry, dict)]
-        return self._failure_scope_from_policies([{"policy_type": item} for item in policy_types if item])
-
-    def execute(self, strategy_output: PolicyPlanDraft) -> ExecutionOutcome:
-        total_start = datetime.now().timestamp()
-        policies = list(strategy_output.all_policies)
-        log_event(
-            self.logger,
-            "pda_execute_start",
-            session_id=strategy_output.scope.session_id,
-            snapshot_id=strategy_output.scope.snapshot_id,
-            supi=strategy_output.scope.supi,
-            policy_count=len(policies),
-        )
-
-        try:
-            plan = self.compiler.compile_plan(strategy_output)
-            policy_plan_payload = {
-                "scope": plan.scope.model_dump(mode="json"),
-                "policies": plan.policies,
-            }
-            policies = plan.policies
-        except Exception as exc:
-            log_timing(self.logger, "pda_total", datetime.now().timestamp() - total_start, status="error")
-            return self._build_failure_outcome(
-                scope=strategy_output.scope,
-                detail=str(exc),
-                feedback_payload={
-                    "phase": "compile",
-                    "error": str(exc),
-                },
-            )
-
-        batch = self.policy_batch_executor.run(
-            policies=policies,
-            session_id=plan.scope.session_id,
-            snapshot_id=plan.scope.snapshot_id,
-        )
-        execution_receipts = batch.execution_receipts
-        assurance_results = batch.assurance_results
-        total_dispatch_attempts = batch.total_dispatch_attempts
-        failures = batch.failures
-
-        if failures:
-            successful_policy_ids = [
-                str(item.get("policy_id") or "").strip()
-                for item in execution_receipts
-                if str(item.get("status") or "").strip().lower() == "success"
-            ]
-            failed_policy_ids = [
-                str(item.get("policy_id") or "").strip()
-                for item in failures
-                if str(item.get("policy_id") or "").strip()
-            ]
-            failure_scope = self._failure_scope_from_entries(failures)
-            performance_metrics = DispatchExecutionMetrics(
-                policy_plan=policy_plan_payload,
-                dispatch_results=execution_receipts,
-                assurance_results=assurance_results,
-                dispatch_attempts=total_dispatch_attempts,
-                domain_receipts=DomainExecutionReceipts(
-                    qos=[item for item in execution_receipts if item.get("policy_type") != self.AM_POLICY_TYPE],
-                    mobility=[item for item in execution_receipts if item.get("policy_type") == self.AM_POLICY_TYPE],
-                ),
-                failure_summaries=failures,
-            )
-            has_assurance_failure = any(str(item.get("phase") or "").strip() == "assurance" for item in failures)
-            retry_forbidden = any(
-                isinstance(item.get("feedback_payload"), dict)
-                and bool(item["feedback_payload"].get("retry_forbidden"))
-                for item in failures
-                if isinstance(item, dict)
-            )
-            execution_status = "Failed" if has_assurance_failure else ("Partial Success" if successful_policy_ids else "Failed")
-            violation_details = "; ".join(
-                str(item.get("error") or "").strip() for item in failures if str(item.get("error") or "").strip()
-            )
-            log_timing(
-                self.logger,
-                "pda_total",
-                datetime.now().timestamp() - total_start,
-                status="partial" if execution_status == "Partial Success" else "error",
-                failure_scope=failure_scope,
-                failed_policy_count=len(failed_policy_ids),
-                successful_policy_count=len(successful_policy_ids),
-            )
-            controller_feedback = ExecutionControllerFeedback(
-                failure_scope=failure_scope,
-                successful_policy_ids=successful_policy_ids,
-                failed_policy_ids=failed_policy_ids,
-                failures=failures,
-                retry_forbidden=retry_forbidden,
-            )
-            return ExecutionOutcome(
-                scope=plan.scope,
-                execution_status=execution_status,
-                performance_metrics=performance_metrics,
-                violation_details=violation_details or "execution failed",
-                failure_scope=failure_scope,
-                feedback_payload=controller_feedback,
-                dispatch_attempts=total_dispatch_attempts,
-            )
-
-        if plan.scope.supi is None:
-            raise ValueError("compiled policy plan requires scope.supi")
-        self.commit_policies(
-            supi=plan.scope.supi,
-            policies=policies,
-            session_id=plan.scope.session_id,
-            snapshot_id=plan.scope.snapshot_id,
-        )
-        performance_metrics = DispatchExecutionMetrics(
-            policy_plan=policy_plan_payload,
-            dispatch_results=execution_receipts,
-            assurance_results=assurance_results,
-            dispatch_attempts=total_dispatch_attempts,
-            domain_receipts=DomainExecutionReceipts(
-                qos=[item for item in execution_receipts if item.get("policy_type") != self.AM_POLICY_TYPE],
-                mobility=[item for item in execution_receipts if item.get("policy_type") == self.AM_POLICY_TYPE],
-            ),
-            failure_summaries=[],
-        )
-        log_timing(self.logger, "pda_total", datetime.now().timestamp() - total_start, status="success")
-        return ExecutionOutcome(
-            scope=plan.scope,
-            execution_status="Success",
-            performance_metrics=performance_metrics,
-            violation_details="None",
-            failure_scope="none",
-            feedback_payload=None,
-            dispatch_attempts=total_dispatch_attempts,
+            action=action,
+            feedback=feedback,
+            assurance=assurance,
         )
 
 
-__all__ = ["ExecutionOutcome", "ExecutionController"]
+__all__ = ["ExecutionController"]

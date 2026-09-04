@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal
+from typing import Any, Literal
 
 from ..storage import get_snapshot_data_by_id, get_ue_context_by_supi
 from .contracts import (
@@ -31,11 +31,7 @@ def build_optimizer_request(
     qos_feasibility_mode: Literal["auto", "hard", "soft"],
 ) -> JointOptimizationRequest:
     snapshot_id = optimizer_input.scope.snapshot_id
-    if snapshot_id is None:
-        raise ValueError("optimizer request requires scope.snapshot_id")
     snapshot = get_snapshot_data_by_id(snapshot_id)
-    if not snapshot:
-        raise LookupError(f"optimizer request snapshot not found: snapshot_id={snapshot_id}")
     target_supis = list(optimizer_input.target_supis)
 
     requested_domains = list(optimizer_input.requested_domains)
@@ -80,8 +76,7 @@ def build_optimizer_request(
     )
     _apply_qos_operation_constraints(optimizer_grounding_view)
     if _slice_migration_is_blocked_by_iea(optimizer_grounding_view):
-        _apply_entitlement_limited_qos_delivery(optimizer_grounding_view)
-        problem_config = problem_config.model_copy(update={"solver_mode": "hybrid"})
+        raise ValueError("slice migration is not authorized by subscription evidence")
 
     return JointOptimizationRequest(
         scope=optimizer_input.scope,
@@ -89,52 +84,65 @@ def build_optimizer_request(
         requested_domains=requested_domains,
         grounding_decision=optimizer_grounding_view,
         traffic_state={
-            "apps": snapshot.get("apps", []),
-            "slices": snapshot.get("slices", []),
-            "nodes": snapshot.get("nodes", []),
+            "flows": [
+                flow for flow in snapshot["flows"] if flow["supi"] in target_supis
+            ],
+            "sessions": [
+                session
+                for session in snapshot["sessions"]
+                if session["supi"] in target_supis
+            ],
         },
         resource_state={
-            "slices": snapshot.get("slices", []),
-            "nodes": snapshot.get("nodes", []),
+            "slice_states": snapshot["slice_states"],
+            "ran_nodes": snapshot["ran_nodes"],
+            "core_nodes": snapshot["core_nodes"],
+            "containers": snapshot["containers"],
         },
         mobility_state={
-            supi: ctx.get("accessMobilityContext", {})
+            supi: ctx["access_mobility_context"]
             for supi, ctx in ue_contexts.items()
-            if ctx
         },
-        policy_state={supi: ctx for supi, ctx in ue_contexts.items() if ctx},
+        policy_state={supi: ctx for supi, ctx in ue_contexts.items()},
         objective_profile=optimizer_input.objective_profile,
         problem_config=problem_config,
     )
 
 
 def _build_optimizer_grounding_view(
-    grounding_decision_payload: Dict[str, Any],
-    snapshot: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Combine the typed IEA result with snapshot defaults for the optimizer.
-
-    This is a private runtime view, not an agent artifact: Main's scope remains
-    in shared context and the original GroundingDecision is never mutated.
-    """
-    payload = dict(grounding_decision_payload or {})
+    grounding_decision_payload: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind grounded flow identities to authoritative live snapshot values."""
+    payload = dict(grounding_decision_payload)
     flow_catalog = _snapshot_flow_catalog_by_id(snapshot)
-    canonical_flows: List[Dict[str, Any]] = []
-    for flow_payload in payload.get("flows") or []:
+    canonical_flows: list[dict[str, Any]] = []
+    for flow_payload in payload["flows"]:
         if not isinstance(flow_payload, dict):
-            canonical_flows.append(flow_payload)
-            continue
-        flow = dict(flow_payload)
-        flow_id = str(flow.get("flow_id") or flow.get("id") or "").strip()
-        catalog_entry = flow_catalog.get(flow_id)
-        if catalog_entry is not None:
-            _apply_snapshot_flow_defaults(flow, catalog_entry)
-        canonical_flows.append(flow)
+            raise TypeError("grounding flows must be objects")
+        flow_id = str(flow_payload["flow_id"])
+        native = flow_catalog[flow_id]
+        canonical_flows.append(
+            {
+                **flow_payload,
+                "flow_id": native["id"],
+                "name": native["name"],
+                "supi": native["supi"],
+                "app_id": native["app_id"],
+                "app_name": native["app_name"],
+                "sla": native["sla"],
+                "allocation": native["allocation"],
+                "traffic": native["traffic"],
+                "telemetry": native["telemetry"],
+                "session": native["session"],
+                "ran": native["ran"],
+            }
+        )
     payload["flows"] = canonical_flows
     return payload
 
 
-def _apply_qos_operation_constraints(optimizer_grounding_view: Dict[str, Any]) -> None:
+def _apply_qos_operation_constraints(optimizer_grounding_view: dict[str, Any]) -> None:
     constraints = _derive_qos_operation_constraints(optimizer_grounding_view)
     if constraints:
         optimizer_grounding_view["qos_operation_constraints"] = constraints
@@ -153,15 +161,15 @@ def _apply_qos_operation_constraints(optimizer_grounding_view: Dict[str, Any]) -
 
 
 def _derive_qos_operation_constraints(
-    grounding_decision_payload: Dict[str, Any],
-) -> List[Dict[str, Any]]:
+    grounding_decision_payload: dict[str, Any],
+) -> list[dict[str, Any]]:
     """Project grounded operation constraints into the optimizer's input view."""
     flow_by_id = {
         str(flow.get("flow_id") or "").strip(): flow
         for flow in (grounding_decision_payload.get("flows") or [])
         if isinstance(flow, dict) and str(flow.get("flow_id") or "").strip()
     }
-    constraints: List[Dict[str, Any]] = []
+    constraints: list[dict[str, Any]] = []
     for raw_constraint in grounding_decision_payload.get("qos_operation_constraints") or []:
         if not isinstance(raw_constraint, dict):
             continue
@@ -201,7 +209,7 @@ def _derive_qos_operation_constraints(
     return constraints
 
 
-def _slice_migration_is_blocked_by_iea(optimizer_grounding_view: Dict[str, Any]) -> bool:
+def _slice_migration_is_blocked_by_iea(optimizer_grounding_view: dict[str, Any]) -> bool:
     authorization = optimizer_grounding_view.get("slice_migration_authorization")
     if not isinstance(authorization, dict):
         return False
@@ -210,38 +218,6 @@ def _slice_migration_is_blocked_by_iea(optimizer_grounding_view: Dict[str, Any])
         "blocked_requires_subscription_provisioning",
         "evidence_missing",
     }
-
-
-def _apply_entitlement_limited_qos_delivery(optimizer_grounding_view: Dict[str, Any]) -> None:
-    """Turn a blocked migration into an optimizer-safe QoS-only fallback.
-
-    Subscription evidence is an execution boundary: the optimizer may tune
-    bandwidth/QoS on the serving slice but cannot select a new S-NSSAI.
-    """
-    optimizer_grounding_view["entitlement_limited_best_effort"] = True
-    optimizer_grounding_view["preserve_current_slice"] = True
-    for constraint in optimizer_grounding_view.get("qos_operation_constraints") or []:
-        if not isinstance(constraint, dict):
-            continue
-        constraint["operation_type"] = "qos_reallocation"
-        constraint["require_slice_change"] = False
-        constraint["excluded_slice_snssais"] = []
-        constraint["target_slice_preference"] = ""
-        constraint["no_op_allowed"] = True
-        rationale = list(constraint.get("rationale") or [])
-        constraint["rationale"] = list(
-            dict.fromkeys(
-                [*rationale, "Subscription boundary: preserve current slice and optimize QoS best effort"]
-            )
-        )
-    for flow in optimizer_grounding_view.get("flows") or []:
-        if not isinstance(flow, dict):
-            continue
-        flow["require_slice_change"] = False
-        flow["excluded_slice_snssais"] = []
-        flow["target_slice_preference"] = ""
-        flow["no_op_allowed"] = True
-        flow["preserve_current_slice"] = True
 
 
 def _resolve_qos_feasibility_mode(
@@ -307,102 +283,5 @@ def _resolve_qos_feasibility_mode(
     return "soft"
 
 
-def _snapshot_flow_catalog_by_id(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    catalog: Dict[str, Dict[str, Any]] = {}
-    for app in snapshot.get("apps") or []:
-        if not isinstance(app, dict):
-            continue
-        for flow in app.get("flows") or []:
-            if not isinstance(flow, dict):
-                continue
-            flow_id = str(flow.get("flow_id") or flow.get("id") or "").strip()
-            if flow_id:
-                catalog[flow_id] = {"app": app, "flow": flow}
-    return catalog
-
-
-def _apply_snapshot_flow_defaults(flow: Dict[str, Any], catalog_entry: Dict[str, Any]) -> None:
-    app = catalog_entry["app"]
-    snapshot_flow = catalog_entry["flow"]
-    service = snapshot_flow.get("service") if isinstance(snapshot_flow.get("service"), dict) else {}
-    sla = snapshot_flow.get("sla") if isinstance(snapshot_flow.get("sla"), dict) else {}
-    allocation = snapshot_flow.get("allocation") if isinstance(snapshot_flow.get("allocation"), dict) else {}
-
-    canonical_values = {
-        "supi": _coalesce(_first_present(snapshot_flow, "supi"), _first_present(app, "supi")),
-        "app_id": _coalesce(_first_present(app, "app_id", "id"), _first_present(snapshot_flow, "app_id")),
-        "app_name": _coalesce(_first_present(app, "app_name", "name"), _first_present(snapshot_flow, "app_name")),
-        "flow_id": _first_present(snapshot_flow, "flow_id", "id"),
-        "name": _first_present(snapshot_flow, "flow_name", "name"),
-        "service_type": _coalesce(_first_present(snapshot_flow, "service_type"), _first_present(service, "service_type")),
-        "service_type_id": _coalesce(_first_present(snapshot_flow, "service_type_id"), _first_present(service, "service_type_id")),
-        "bw_ul": _coalesce(
-            _first_present(snapshot_flow, "bw_ul", "bandwidth_ul", "max_br_ul_mbps"),
-            _first_present(sla, "bandwidth_ul", "max_br_ul_mbps"),
-        ),
-        "bw_dl": _coalesce(
-            _first_present(snapshot_flow, "bw_dl", "bandwidth_dl", "max_br_dl_mbps"),
-            _first_present(sla, "bandwidth_dl", "max_br_dl_mbps"),
-        ),
-        "gbr_ul": _coalesce(
-            _first_present(snapshot_flow, "gbr_ul", "guaranteed_bandwidth_ul", "gbr_ul_mbps"),
-            _first_present(sla, "guaranteed_bandwidth_ul", "gbr_ul_mbps"),
-        ),
-        "gbr_dl": _coalesce(
-            _first_present(snapshot_flow, "gbr_dl", "guaranteed_bandwidth_dl", "gbr_dl_mbps"),
-            _first_present(sla, "guaranteed_bandwidth_dl", "gbr_dl_mbps"),
-        ),
-        "lat": _coalesce(
-            _first_present(snapshot_flow, "lat", "latency", "latency_ms"),
-            _first_present(sla, "latency", "latency_ms"),
-        ),
-        "loss_req": _coalesce(
-            _first_present(snapshot_flow, "loss_req", "loss_rate", "packet_error_rate"),
-            _first_present(sla, "loss_rate", "packet_error_rate"),
-        ),
-        "jitter_req": _coalesce(
-            _first_present(snapshot_flow, "jitter_req", "jitter", "jitter_ms"),
-            _first_present(sla, "jitter", "jitter_ms"),
-        ),
-        "priority": _coalesce(_first_present(snapshot_flow, "priority"), _first_present(sla, "priority")),
-        "current_slice_snssai": _coalesce(
-            _first_present(snapshot_flow, "current_slice_snssai"),
-            _first_present(allocation, "current_slice_snssai"),
-        ),
-        "current_bw_ul": _coalesce(
-            _first_present(snapshot_flow, "current_bw_ul"),
-            _first_present(allocation, "allocated_bandwidth_ul"),
-        ),
-        "current_bw_dl": _coalesce(
-            _first_present(snapshot_flow, "current_bw_dl"),
-            _first_present(allocation, "allocated_bandwidth_dl"),
-        ),
-    }
-
-    for key in ("supi", "app_id", "app_name", "flow_id", "name"):
-        if canonical_values.get(key) is not None:
-            flow[key] = canonical_values[key]
-    for key, value in canonical_values.items():
-        if key in {"supi", "app_id", "app_name", "flow_id", "name"}:
-            continue
-        if _is_missing(flow.get(key)) and value is not None:
-            flow[key] = value
-
-
-def _first_present(payload: Dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = payload.get(key)
-        if not _is_missing(value):
-            return value
-    return None
-
-
-def _coalesce(*values: Any) -> Any:
-    for value in values:
-        if not _is_missing(value):
-            return value
-    return None
-
-
-def _is_missing(value: Any) -> bool:
-    return value is None or (isinstance(value, str) and not value.strip())
+def _snapshot_flow_catalog_by_id(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {flow["id"]: flow for flow in snapshot["flows"]}

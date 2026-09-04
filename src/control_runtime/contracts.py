@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from shared.contracts import ContractModel, NonEmptyStr
+from shared.contracts import ContractModel, JsonValue, NonEmptyStr
 
 
 class ControlDomain(str, Enum):
@@ -22,10 +22,33 @@ class ObjectiveProfile(ContractModel):
     fairness_cost: float = Field(ge=0.0)
 
 
+class DomainStatus(str, Enum):
+    READY = "ready"
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    NEEDS_REVISION = "needs_revision"
+    INCOMPLETE_CONTEXT = "incomplete_context"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+class DomainVerdict(ContractModel):
+    domain: ControlDomain
+    status: DomainStatus
+    summary: NonEmptyStr
+    hard_conflicts: list[NonEmptyStr]
+    soft_conflicts: list[NonEmptyStr]
+    infeasible_reasons: list[NonEmptyStr]
+    metrics: dict[str, JsonValue]
+
+
 StandardObjectiveProfileName = Literal["balanced", "latency", "throughput", "stability"]
 
 
-def standard_objective_profile(profile_name: StandardObjectiveProfileName) -> ObjectiveProfile:
+def standard_objective_profile(
+    profile_name: StandardObjectiveProfileName,
+) -> ObjectiveProfile:
     """Build the explicit baseline used by deterministic single-agent routing."""
 
     return ObjectiveProfile(
@@ -40,6 +63,8 @@ def standard_objective_profile(profile_name: StandardObjectiveProfileName) -> Ob
 
 __all__ = [
     "ControlDomain",
+    "DomainStatus",
+    "DomainVerdict",
     "ObjectiveProfile",
     "StandardObjectiveProfileName",
     "standard_objective_profile",

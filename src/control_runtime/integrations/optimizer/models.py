@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
 from shared.logging import setup_logger
 
@@ -10,13 +9,13 @@ logger = setup_logger(__name__)
 class ServiceType:
     id: int
     name: str
-    critical_kpis: List[int]
+    critical_kpis: list[int]
 
 
 @dataclass
 class SLAProfile:
     service_type_id: int
-    kpi_thresholds: Dict[int, float]
+    kpi_thresholds: dict[int, float]
 
 
 @dataclass
@@ -30,7 +29,7 @@ class Link:
 class Path:
     id: str
     an_id: int
-    links: List[Tuple[int, int]]
+    links: list[tuple[int, int]]
 
 
 @dataclass
@@ -43,7 +42,7 @@ class FlowService:
 class FlowTraffic:
     packet_size: float = 0.0
     arrival_rate: float = 0.0
-    five_tuple: Optional[Tuple[str, str, int, int, str]] = None
+    five_tuple: tuple[str, str, int, int, str] | None = None
 
 
 @dataclass
@@ -60,23 +59,23 @@ class FlowSLA:
 
 @dataclass
 class FlowAllocation:
-    current_slice_snssai: Optional[str] = None
-    allocated_bandwidth_ul: Optional[float] = None
-    allocated_bandwidth_dl: Optional[float] = None
+    current_slice_snssai: str | None = None
+    allocated_bandwidth_ul: float | None = None
+    allocated_bandwidth_dl: float | None = None
     optimize_requested: bool = False
-    excluded_slice_snssais: List[str] = field(default_factory=list)
+    excluded_slice_snssais: list[str] = field(default_factory=list)
     target_slice_preference: str = ""
 
 
 @dataclass
 class FlowTelemetry:
-    throughput_ul: Optional[float] = None
-    throughput_dl: Optional[float] = None
-    latency: Optional[float] = None
-    jitter: Optional[float] = None
-    loss_rate: Optional[float] = None
-    packet_sent: Optional[int] = None
-    packet_received: Optional[int] = None
+    throughput_ul: float | None = None
+    throughput_dl: float | None = None
+    latency: float | None = None
+    jitter: float | None = None
+    loss_rate: float | None = None
+    packet_sent: int | None = None
+    packet_received: int | None = None
 
 
 @dataclass
@@ -85,6 +84,8 @@ class Flow:
     name: str
     service: FlowService
     sla: FlowSLA
+    ran_node_id: str
+    core_node_id: str
     traffic: FlowTraffic = field(default_factory=FlowTraffic)
     allocation: FlowAllocation = field(default_factory=FlowAllocation)
     telemetry: FlowTelemetry = field(default_factory=FlowTelemetry)
@@ -112,8 +113,8 @@ class AppSummary:
 class App:
     id: str
     name: str
-    flows: List[Flow]
-    supi: Optional[str] = None
+    flows: list[Flow]
+    supi: str | None = None
 
     @property
     def summary(self) -> AppSummary:
@@ -156,11 +157,11 @@ class SliceQos:
 
 @dataclass
 class SliceTelemetry:
-    utilization_ul: Optional[float] = None
-    utilization_dl: Optional[float] = None
-    latency: Optional[float] = None
-    jitter: Optional[float] = None
-    loss_rate: Optional[float] = None
+    utilization_ul: float | None = None
+    utilization_dl: float | None = None
+    latency: float | None = None
+    jitter: float | None = None
+    loss_rate: float | None = None
 
 
 @dataclass
@@ -178,17 +179,11 @@ class Slice:
         self.snssai = f"{self.sst:02X}{self.sd}"
 
     def can_accommodate(self, flow: Flow) -> bool:
-        avail_ul = (
-            self.capacity.total_bandwidth_ul
-            - self.load.current_bandwidth_ul
+        avail_ul = self.capacity.total_bandwidth_ul - self.load.current_bandwidth_ul
+        avail_dl = self.capacity.total_bandwidth_dl - self.load.current_bandwidth_dl
+        return not (
+            avail_ul < flow.sla.bandwidth_ul or avail_dl < flow.sla.bandwidth_dl
         )
-        avail_dl = (
-            self.capacity.total_bandwidth_dl
-            - self.load.current_bandwidth_dl
-        )
-        if avail_ul < flow.sla.bandwidth_ul or avail_dl < flow.sla.bandwidth_dl:
-            return False
-        return True
 
 
 @dataclass
@@ -201,19 +196,19 @@ class NodeCapacity:
 
 @dataclass
 class NodeTelemetry:
-    cpu_utilization: Optional[float] = 0
-    mec_utilization: Optional[float] = 0
-    memory_utilization: Optional[float] = 0
-    prb_utilization: Optional[float] = 0
+    cpu_utilization: float | None = 0
+    mec_utilization: float | None = 0
+    memory_utilization: float | None = 0
+    prb_utilization: float | None = 0
 
 
 @dataclass
 class Node:
-    id: int
+    id: str
     name: str
     node_type: str
     capacity: NodeCapacity
-    hosted_slice_snssais: List[str]
+    hosted_slice_snssais: list[str]
     telemetry: NodeTelemetry = field(default_factory=NodeTelemetry)
 
     @property
@@ -228,24 +223,27 @@ class Node:
 @dataclass
 class AMPolicyState:
     """关键步骤：记录当前 AM 策略的旧状态，供 MILP 计算变更代价。"""
-    old_allowed_snssais: List[str] = field(default_factory=list)
-    old_target_snssais: List[str] = field(default_factory=list)
+
+    old_allowed_snssais: list[str] = field(default_factory=list)
+    old_target_snssais: list[str] = field(default_factory=list)
     old_rfsp: int = 1
-    old_triggers: List[str] = field(default_factory=list)
+    old_triggers: list[str] = field(default_factory=list)
     old_ue_ambr_ul: float = 0.0
     old_ue_ambr_dl: float = 0.0
     mobility_risk_score: float = 0.0
     rfsp_max: int = 8
     ambr_headroom: float = 0.2
-    trigger_signal_costs: Dict[str, float] = field(default_factory=lambda: {
-        "LOC_CH": 1.0,
-        "PRA_CH": 0.6,
-        "ALLOWED_NSSAI_CH": 0.3,
-        "RFSP_CH": 0.2,
-        "UE_AMBR_CH": 0.2,
-        "NWDAF_DATA_CH": 0.4,
-    })
-    mandatory_triggers: List[str] = field(default_factory=lambda: ["LOC_CH"])
+    trigger_signal_costs: dict[str, float] = field(
+        default_factory=lambda: {
+            "LOC_CH": 1.0,
+            "PRA_CH": 0.6,
+            "ALLOWED_NSSAI_CH": 0.3,
+            "RFSP_CH": 0.2,
+            "UE_AMBR_CH": 0.2,
+            "NWDAF_DATA_CH": 0.4,
+        }
+    )
+    mandatory_triggers: list[str] = field(default_factory=lambda: ["LOC_CH"])
 
 
 @dataclass
@@ -263,10 +261,10 @@ class OptimizationConfig:
     alpha_an: float = 0.01
     beta: float = 0.05
     prb: float = 0.18
-    mec_overhead: List[float] = field(default_factory=lambda: [1, 4, 8])
+    mec_overhead: list[float] = field(default_factory=lambda: [1, 4, 8])
     enable_sla_constraints: bool = True
     enable_am_optimization: bool = False
-    am_policy_state: Optional[AMPolicyState] = None
+    am_policy_state: AMPolicyState | None = None
     solver_time_limit: int = 30
     qos_relaxation_ratio: float = 0.2
     slice_kpi_source: str = "qos"

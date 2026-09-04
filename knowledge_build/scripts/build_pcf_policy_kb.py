@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import re
 import sys
 from dataclasses import asdict
@@ -29,7 +28,6 @@ from shared.logging import setup_logger
 from knowledge_build.rag_release import (
     COLLECTIONS,
     CORPUS_ID,
-    DATA_ROOT,
     PROCESSED_ROOT,
     RAW_ROOT,
     RELEASE,
