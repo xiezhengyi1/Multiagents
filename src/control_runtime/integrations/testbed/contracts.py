@@ -59,6 +59,7 @@ class NativeFlow(NativeModel):
     session: dict[str, Any]
     path: dict[str, Any]
     data_quality: dict[str, Any]
+    ue_policy_route: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def identities_match(self) -> NativeFlow:
@@ -175,6 +176,7 @@ class NativeSnapshot(NativeModel):
     mobility: tuple[dict[str, Any], ...]
     active_actions: tuple[dict[str, Any], ...]
     trigger_event: str
+    ue_policies: tuple[dict[str, Any], ...] = ()
 
 
 class NativeActionReceipt(NativeModel):

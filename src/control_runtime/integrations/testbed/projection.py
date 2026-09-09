@@ -315,10 +315,13 @@ def build_am_context(
         for ue in ran["telemetry"]["ues"]
         if ue["supi"] == supi
     ]
+    policy_rows = [row for row in native.get("ue_policies", []) if row["supi"] == supi]
+    am = policy_rows[0]["am_policy_associations"] if policy_rows else []
+    ue_policy = policy_rows[0]["ue_policy_associations"] if policy_rows else []
     return {
         "supi": supi,
-        "association_id": None,
-        "rfsp": None,
+        "association_id": am[0]["id"] if len(am) == 1 else None,
+        "rfsp": am[0]["rfsp"] if len(am) == 1 else None,
         "allowed_snssais": subscription["allowed_snssais"],
         "target_snssais": sorted(
             {slice_snssais[item["slice_id"]] for item in sessions}
@@ -327,18 +330,25 @@ def build_am_context(
         "serving_gnb": serving_gnb,
         "rnti": ran_ues[0]["rnti"],
         "service_area_restriction": None,
-        "associations": [],
+        "associations": am,
         "data_availability": {
-            "ready_for_mobility_grounding": False,
-            "missing_fields": [
+            "ready_for_mobility_grounding": len(am) == 1,
+            "missing_fields": []
+            if len(am) == 1
+            else [
                 "association_id",
                 "rfsp",
                 "service_area_restriction",
             ],
         },
         "execution_capability": {
-            "am_policy": False,
-            "ursp": False,
+            "am_policy": len(am) == 1,
+            "ursp": len(ue_policy) == 1,
+            "am_fields": ["rfsp"] if am else [],
+            "ursp_profile": "ipv4_remote_tuple_existing_pdu_sessions"
+            if ue_policy
+            else None,
+            "radio_frequency_reselection": False,
         },
         "source_snapshot_id": native["snapshot_id"],
     }

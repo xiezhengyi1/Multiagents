@@ -16,6 +16,7 @@ from control_runtime.simulation import (
 from shared.contracts import utc_now
 
 from .client import TestbedClient, TestbedConfig
+from .ue_policy import project_policy_action
 from .projection import (
     build_am_context,
     build_flow_catalog,
@@ -99,7 +100,12 @@ class TestbedSimulatorAdapter:
             ),
             "inspect_mobility_ue_policies": lambda: {
                 **build_am_context(native, self._subscription(supi), supi),
-                "policies": [],
+                "policies": [
+                    association
+                    for row in native.get("ue_policies", [])
+                    if row["supi"] == supi
+                    for association in row["ue_policy_associations"]
+                ],
             },
         }
         return EnvironmentObservation(
@@ -161,7 +167,11 @@ class TestbedSimulatorAdapter:
         receipts: list[OperationReceipt] = []
         current_snapshot_id = native["snapshot_id"]
         for operation in action.operations:
-            if operation.resource_type != "SmPolicyDecision":
+            if operation.resource_type not in {
+                "SmPolicyDecision",
+                "PcfAmPolicyControlPolicyAssociation",
+                "UrspRuleRequest",
+            }:
                 receipts.append(
                     OperationReceipt(
                         operation_id=operation.operation_id,
@@ -177,21 +187,29 @@ class TestbedSimulatorAdapter:
                     OperationReceipt(
                         operation_id=operation.operation_id,
                         status="failed",
-                        error="testbed gateway supports only SM policy updates",
+                        error="testbed gateway supports policy updates only",
                     )
                 )
                 continue
             try:
-                payload = self._project_sm_policy_action(
-                    operation.payload,
-                    snapshot_id=current_snapshot_id,
-                )
+                if operation.resource_type == "SmPolicyDecision":
+                    payload = self._project_sm_policy_action(
+                        operation.payload, snapshot_id=current_snapshot_id
+                    )
+                else:
+                    payload = project_policy_action(
+                        operation,
+                        self._native(),
+                        self.client.config.run_id,
+                        self.client.config.plmn_id,
+                    )
                 result = self.client.dispatch_policy(payload)
                 if result["status"] != "verified":
                     raise RuntimeError(
                         f"testbed action {result['action_id']} ended as {result['status']}"
                     )
                 current_snapshot_id = result["snapshot_after"]
+                self._native_snapshot = self.client.snapshot(current_snapshot_id)
                 receipts.append(
                     OperationReceipt(
                         operation_id=operation.operation_id,
