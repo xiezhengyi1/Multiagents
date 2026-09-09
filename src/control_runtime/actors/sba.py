@@ -209,7 +209,12 @@ class SbaActor(StructuredModelActor):
             "`supi-12345`, examples, aliases, and any other value are invalid."
             "\n\nQoS observation gate:\n"
             "- When the active Main proposal selects QoS and UIR has no current `get_sm_ue_flow_catalog` fact for this SUPI, your next response is that tool call with this exact `supi`. Do not submit CoordinationDecision before its result.\n"
-            "- After the catalog result, use only its identifiers. If it lacks the named target, call `search_sm_flow_targets`; otherwise submit CoordinationDecision."
+            "- After the catalog result, use only its identifiers. If it lacks the named target, call `search_sm_flow_targets`; otherwise continue the active evidence gates below.\n"
+            "\nEvidence-completion gate:\n"
+            "- Do not submit a CoordinationDecision while an active Main domain lacks its required fact. If Main selects mobility and UIR has no current `get_am_policy_context` fact for this SUPI, call `get_am_policy_context` next.\n"
+            "- If Main set `serving_slice_change_requested:true`, bind the flow from the catalog, then, when UIR has no current `get_ue_slice_subscription` fact for this SUPI, call `get_ue_slice_subscription` next.\n"
+            "- When both mobility context and subscription are missing, call `get_am_policy_context` first, then call `get_ue_slice_subscription`; never repeat the catalog.\n"
+            "- A repair issue `missing_am_context` means call `get_am_policy_context`; `missing_subscription` means call `get_ue_slice_subscription`; `missing_sm_catalog` means call `get_sm_ue_flow_catalog`. Act on the missing fact, not on a previously completed query."
         )
 
 

@@ -163,6 +163,7 @@ class TestbedSimulatorAdapter:
         }
 
     def execute(self, action: ExecutionAction) -> ExecutionFeedback:
+        self._native_snapshot = self.client.latest_snapshot()
         native = self._native()
         receipts: list[OperationReceipt] = []
         current_snapshot_id = native["snapshot_id"]

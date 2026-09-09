@@ -221,7 +221,7 @@ def build_main_prompt(context_jsonl: str) -> str:
         coordinator_context=context_jsonl,
     ) + (
         "\n\nData-contract task: return one structured CoordinationDecision "
-        "with a MainProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event in the UIR event table. If it is a repair_request, set message_type to repair_response; otherwise set it to proposal. Copy the non-empty imsi- SUPI from the ControlRequest into payload.supi exactly."
+        "with a MainProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event in the UIR event table. If it is a repair_request, set message_type to repair_response; otherwise set it to proposal. Preserve every ControlRequest SUPI on its matching semantic target and follow the active single- or multi-SUPI gate exactly."
     )
 
 

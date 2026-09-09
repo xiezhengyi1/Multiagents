@@ -636,6 +636,12 @@ def validate_ppa_proposal(
                 "SM policy must reference an SBA-resolved flow/app pair",
                 f"payload.sm_policies.{index}",
             )
+        if policy.gbr_ul_mbps is None or policy.gbr_dl_mbps is None:
+            add(
+                "missing_testbed_gbr",
+                "live SM policy execution requires both GBR directions",
+                f"payload.sm_policies.{index}",
+            )
     issues.extend(
         _validate_ursp_policies(proposal=proposal, sba_artifact=sba_artifact)
     )

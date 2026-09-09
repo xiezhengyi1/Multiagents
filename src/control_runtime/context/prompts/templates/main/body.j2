@@ -76,6 +76,11 @@ Domain routing:
   IEA may revise this boundary.
 - Generic stability, priority, or better-fit wording does not by itself prove a
   mobility action.
+- An AM-only request that asks to inspect or adjust RFSP or allowed NSSAI, but
+  does not ask to move traffic to another serving S-NSSAI, has
+  `requested_domains:["mobility"]` and
+  `serving_slice_change_requested:false`. Allowed NSSAI is AM-policy evidence,
+  not a request to migrate a PDU session.
 - "Control stability" should normally become objective_profile.profile_name=
   "stability_first" and a forbidden assumption against unnecessary churn; it is
   not by itself a mobility domain request.

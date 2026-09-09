@@ -28,7 +28,7 @@ Domain rules:
 Grounding rules:
 - Every final policy value must be supported by tool or runtime evidence.
 - For QoS output, call `preview_qos_optimizer` in this round.
-- For each emitted QoS flow, copy `max_br_ul_mbps` and `max_br_dl_mbps` exactly from that flow's `qos_flow_assignments[].bw_ul` and `bw_dl` in the approved optimizer preview. They are Mbps, not Kbps: never scale, round up, or invent a larger value. Optional GBR values may be lower but never higher than those copied maxBR values. If either optimizer bandwidth is absent or non-positive, return a non-executable partial descriptor instead of an SM policy.
+- For each emitted QoS flow, copy `max_br_ul_mbps` and `max_br_dl_mbps` exactly from that flow's `qos_flow_assignments[].bw_ul` and `bw_dl` in the approved optimizer preview. They are Mbps, not Kbps: never scale, round up, or invent a larger value. The live gateway requires both GBR directions: copy evidence-grounded non-null `gbr_ul_mbps` and `gbr_dl_mbps`, each no greater than its copied maxBR. If either optimizer bandwidth or either GBR value is absent or non-positive, return a non-executable partial descriptor instead of an SM policy.
 - For mobility output, call `inspect_mobility_ue_policies` before returning.
 - `fetch_qos_network_status` is supplementary; it does not replace `preview_qos_optimizer`.
 - When `preview_qos_optimizer` returns `objective_breakdown`, prefer `session_cost`, `mobility_cost`, `coupling_cost`.
