@@ -6,7 +6,11 @@ from pydantic import Field, JsonValue, model_validator
 
 from control_runtime.context.prompts.grounding import render_grounding_system_prompt
 from control_runtime.graph import EpisodeGraphState, EventEmission
-from control_runtime.simulation import SBA_OBSERVATION_TOOLS, observation_query_names
+from control_runtime.simulation import (
+    SBA_OBSERVATION_TOOLS,
+    EnvironmentObservation,
+    observation_query_names,
+)
 from shared.contracts import ContractModel, NonEmptyStr
 from shared.contracts.coordination import (
     CoordinationDecision,
@@ -115,6 +119,10 @@ class SbaArtifact(HandoffPayload):
     qos_operation_constraints: list[QosOperationConstraint]
     slice_migration_authorization: SliceMigrationDecision
     open_questions: list[BlockingQuestion]
+    subscription: dict[str, JsonValue] | None = None
+    flow_catalog: list[dict[str, JsonValue]] | None = None
+    ue_policy_associations: list[dict[str, JsonValue]] | None = None
+    pdu_session_pool: list[dict[str, JsonValue]] | None = None
 
 
 SBA_SYSTEM_PROMPT = replace_contract_clauses(
@@ -378,9 +386,39 @@ class SbaCompiler:
             current_event=proposal_event,
             payload_type=MainProposal,
         )
+        observations = [
+            event.payload
+            for event_id in proposal_event.input_artifact_ids
+            if isinstance(
+                (event := self.journal.get_event(event_id)).payload,
+                EnvironmentObservation,
+            )
+        ]
+
+        def observation_result(query_name: str) -> dict[str, JsonValue] | None:
+            for observation in reversed(observations):
+                if observation.query.query_name == query_name and isinstance(
+                    observation.result, dict
+                ):
+                    return observation.result
+            return None
+
+        subscription = observation_result("get_ue_slice_subscription")
+        catalog = observation_result("get_sm_ue_flow_catalog")
+        am_context = observation_result("get_am_policy_context")
         artifact = SbaArtifact(
             supi=main_proposal.supi,
             **proposal_event.payload.model_dump(mode="python"),
+            subscription=subscription,
+            flow_catalog=catalog["flow_catalog"] if catalog is not None else None,
+            ue_policy_associations=(
+                am_context["ue_policy_associations"]
+                if am_context is not None
+                else None
+            ),
+            pdu_session_pool=(
+                am_context["pdu_session_pool"] if am_context is not None else None
+            ),
         )
         return EventEmission(
             decision=CoordinationDecision[SbaArtifact](

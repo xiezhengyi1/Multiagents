@@ -318,6 +318,14 @@ def build_am_context(
     policy_rows = [row for row in native.get("ue_policies", []) if row["supi"] == supi]
     am = policy_rows[0]["am_policy_associations"] if policy_rows else []
     ue_policy = policy_rows[0]["ue_policy_associations"] if policy_rows else []
+    pdu_session_pool = [
+        {
+            "pdu_session_id": session["pdu_session_id"],
+            "dnn": session["dnn"],
+            "snssai": slice_snssais[session["slice_id"]],
+        }
+        for session in sessions
+    ]
     return {
         "supi": supi,
         "association_id": am[0]["id"] if len(am) == 1 else None,
@@ -331,6 +339,8 @@ def build_am_context(
         "rnti": ran_ues[0]["rnti"],
         "service_area_restriction": None,
         "associations": am,
+        "ue_policy_associations": ue_policy,
+        "pdu_session_pool": pdu_session_pool,
         "data_availability": {
             "ready_for_mobility_grounding": len(am) == 1,
             "missing_fields": []

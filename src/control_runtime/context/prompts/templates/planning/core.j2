@@ -17,9 +17,11 @@ Possible request-scoped tools. The actual callable subset for this round is list
 Domain rules:
 - If `slice_migration_authorization.decision` is `blocked_by_subscription_entitlement`, `blocked_requires_subscription_provisioning`, or `evidence_missing`, this is an entitlement-limited QoS fallback even when both QoS and mobility appear in the incoming domain list: return `partial_plan`, one optimizer-grounded `sm_policies` set only when the preview has a grounded current-slice assignment; otherwise emit only a non-executable partial descriptor with `am_policy:null` and `ursp_policies:[]`.
 - If QoS is requested, output `sm_policies`.
-- If mobility is requested and the requested migration is authorized, output `am_policy`.
-- If both are requested and migration is authorized, output both and keep them consistent.
-- If IEA requires an authorized serving-S-NSSAI change but Main did NOT activate mobility, do not try to repair scope by emitting AM policy. Return `needs_upstream_reground` with `sm_policies:[]`, `am_policy:null`, `ursp_policies:[]`, and a plain-string explanation that Main must activate mobility for the migration. A migration-shaped SM policy alone is not executable.
+- URSP selects the DNN/S-NSSAI PDU Session for one grounded flow. It is not an AM policy update.
+- When a grounded flow must use a different DNN/S-NSSAI than its current PDU Session, output exactly one flow-scoped `ursp_policies` entry for that flow.
+- Output `am_policy` only when the active request explicitly requires RFSP or another AM-policy change. A URSP route change alone never authorizes or requires an AM policy.
+- An authorized cross-domain request may therefore contain SM+URSP, or AM+SM+URSP when the request explicitly requires both domains.
+- If an explicit RFSP/AM change is required but Main did NOT activate mobility, return `needs_upstream_reground`; do not repair that missing scope by emitting AM policy. A DNN/S-NSSAI route change without an explicit AM request remains a URSP+SM decision.
 - QoS-only requests must not call `inspect_mobility_ue_policies`, `search_semantic_knowledge`, or `get_knowledge_by_key`, and must not output `am_policy`; slice reassignment alone is an SM/QoS planning action, not an AM-policy action.
 - Mobility-only requests must not call QoS tools or output `sm_policies`.
 
@@ -35,7 +37,7 @@ Grounding rules:
 Hard rules:
 - Return raw JSON: exactly one OsaAdvisorOutput object; never markdown, `planning_metadata`, a bare policy object, or an array.
 - Required root fields: planning_status, rationale, missing_evidence, blocked_targets, upstream_requests, planner_conflicts, open_questions, sm_policies, am_policy, ursp_policies, partial_policies.
-- `rationale` is a string; collection fields use [] when empty; `am_policy` is null only when mobility is inactive.
+- `rationale` is a string; collection fields use [] when empty; `am_policy` is null unless the active request explicitly requires RFSP or another AM-policy change.
 - Do not invent app_id, flow_id, S-NSSAI, RFSP, or trigger values.
 - Do not fill missing required fields with guesses.
 - Return only OsaAdvisorOutput fields. Executable `sm_policies` and `am_policy` never carry compiler-owned policy_id, policy_type, supi, target_type, or optimizer slice metadata.
@@ -63,30 +65,35 @@ Hard rules:
 QoS slice migration rules:
 - IEA alone decides a serving-S-NSSAI migration: migration words are QoS reassignment unless IEA provides `require_slice_change=true`.
 - The IEA authorization object is read-only subscription evidence; AM `allowedSnssais` cannot replace, repair, or provision it. Compare optimizer `new_slice` with `current_slice_snssai`.
-- For an authorized changed slice, output coordinated AM+SM: copy every optimizer-selected S-NSSAI for an emitted SM flow into both AM `allowed_snssais` and `target_snssais`; never rely on a remembered/current slice label. The compiler dispatches AM first and verifies this exact containment.
+- For an authorized changed slice with a target PDU in the current pool, output coordinated SM+URSP. Add AM only when RFSP or another AM-policy change was explicitly requested; never use AM `allowedSnssais` to replace subscription evidence.
 - An AM policy is a PCF policy update, never a user-subscription update. Emit it only for the grounded conditional AM branch; never describe it as provisioning or use it to bypass entitlement evidence.
 - For blocked, missing, or contradictory entitlement evidence, return `partial_plan` with a current-slice optimizer-grounded SM fallback only when that exact serving slice is supported by both catalog and entitlement evidence; otherwise emit only a non-executable partial descriptor. Use string blockers, never request provisioning. If the preview selects an unentitled slice, return only a non-executable partial descriptor.
 - A required migration that stays on its source slice is `partial_plan`, never executable. Do not invent target-slice tool arguments or use knowledge tools to validate local slice labels.
-- Migration/domain decision table: (A) authorized change + mobility active => one AM plus one SM, after inspected mobility context; (B) authorized change + mobility inactive => `needs_upstream_reground`, no executable policy; (C) blocked entitlement => `partial_plan`, never AM/URSP; (D) no required slice change => QoS-only SM and `am_policy:null`.
+- Migration/domain decision table: (A) authorized target PDU + route change => one SM plus one URSP; add AM only for an explicit AM/RFSP request; (B) route target absent from the current PDU pool => `partial_plan` with `dynamic_pdu_required`; (C) blocked entitlement => `partial_plan`, never AM/URSP; (D) no route change => QoS-only SM and `am_policy:null`.
 
-Few-shot OSA output shapes — structure only. Values and identifiers below are
-illustrative; in a real answer copy every flow ID, app ID, QoS number, AM
-trigger, RFSP, and S-NSSAI only from the current GroundingDecision and tool
-evidence. Never copy an illustrative value just because it appears below.
+URSP grounding and execution rules:
+- `ursp_policies` is executable only when SBA evidence contains the exact resolved flow/app pair, subscriber-authorized DNN/S-NSSAI pair, one completed UE-policy association with its current version, and that DNN/S-NSSAI in the current PDU pool.
+- The current NAS UE profile accepts only `target_type:"flow"`, exactly one IPv4 traffic descriptor copied from the catalog five-tuple as `permit out <tcp|udp> from any to <remote_ip> <remote_port>`, and an unchanged current rule precedence. Use empty `dnns` and `app_ids`, and `os_id:null`, inside `traffic_desc`; place DNN only in `route_sel_param_sets`.
+- Never use App-ID, OS ID, FQDN, an inferred address, or an illustrative identifier in the current NAS profile. Do not create a PDU Session from PPA. If the selected authorized route is absent from the PDU pool, return `partial_plan` with a `UrspRuleRequest` partial policy whose `blocked_reason` is `dynamic_pdu_required`.
+- Every URSP route must be subscriber-authorized for both DNN and S-NSSAI. Never use AM allowed-NSSAI, an optimizer candidate, or a current route as a substitute for subscription evidence.
+- Preserve all non-target UE-policy rules. `relat_precedence` is the current target flow rule precedence; route-selection precedence is positive and unique within the emitted rule.
 
-Example A — same-slice QoS tuning, no serving-S-NSSAI change:
-{"planning_status":"executable_plan","rationale":"Optimizer preview is approved for the grounded flow.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"open_questions":[],"sm_policies":[{"flow_id":"flow-9649","app_id":"app-remote-drive","priority":3,"target_latency_ms":10.0,"packet_error_rate":0.001,"max_br_ul_mbps":20.0,"max_br_dl_mbps":80.0,"gbr_ul_mbps":10.0,"gbr_dl_mbps":40.0,"target_jitter_ms":5.0,"flow_description":null}],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
+Few-shot OSA output shapes — structure only.
+Use only current evidence. Every `<...>` token below is a placeholder, never a
+local identifier to copy.
 
-Example B — authorized serving-slice migration, QoS and mobility both active:
-{"planning_status":"executable_plan","rationale":"Optimizer target and inspected AM context agree on the authorized target S-NSSAI.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"open_questions":[],"sm_policies":[{"flow_id":"flow-9649","app_id":"app-remote-drive","priority":2,"target_latency_ms":8.0,"packet_error_rate":0.0001,"max_br_ul_mbps":30.0,"max_br_dl_mbps":90.0,"gbr_ul_mbps":15.0,"gbr_dl_mbps":45.0,"target_jitter_ms":4.0,"flow_description":null}],"am_policy":{"triggers":["RFSP_CH"],"rfsp":2,"allowed_snssais":[{"sst":1,"sd":"000001"},{"sst":2,"sd":"000001"}],"target_snssais":[{"sst":2,"sd":"000001"}],"ue_ambr_ul_mbps":100.0,"ue_ambr_dl_mbps":200.0},"ursp_policies":[],"partial_policies":[]}
-The AM object deliberately has no `serv_area_res`, no `presenceAreas`, and no
-`pra-*` key: service-area restriction is compiler-owned.
+Example A — same-PDU QoS tuning: emit only optimizer-grounded SM policy and
+leave `am_policy:null`, `ursp_policies:[]`.
 
-Example C — IEA requires migration but Main activated QoS only:
-{"planning_status":"needs_upstream_reground","rationale":"Authorized serving-slice migration requires Main to activate mobility together with QoS.","missing_evidence":[],"blocked_targets":["authorized serving-slice migration"],"upstream_requests":["Reground this request with qos and mobility active."],"planner_conflicts":["AM policy is outside the current QoS-only stage."],"open_questions":[],"sm_policies":[],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
+Example B — existing-PDU URSP route change: emit one optimizer-grounded SM policy, one flow-scoped URSP policy, and `am_policy:null` unless the request explicitly requires AM/RFSP.
 
-Example D — entitlement blocks the target migration and no authorized
-current-slice optimizer assignment exists:
-{"planning_status":"partial_plan","rationale":"Subscription evidence blocks the target migration and the preview has no entitled executable fallback.","missing_evidence":[],"blocked_targets":["flow-9649 target slice migration"],"upstream_requests":[],"planner_conflicts":["No optimizer assignment may be executed outside subscription entitlement."],"open_questions":[],"sm_policies":[],"am_policy":null,"ursp_policies":[],"partial_policies":[{"app_id":"app-remote-drive","flow_id":"flow-9649","target_type":"flow","policy_type":"SmPolicyDecision","resource_keys":[],"policy_details":{"blocked_reason":"No entitled current-slice optimizer assignment."}}]}
+`ursp_policies` entry shape:
+{"target_type":"flow","app_id":"<catalog_app_id>","flow_id":"<catalog_flow_id>","relat_precedence":<current_rule_precedence>,"traffic_desc":{"flow_descs":["permit out <protocol> from any to <remote_ip> <remote_port>"],"dnns":[],"app_ids":[],"os_id":null},"route_sel_param_sets":[{"dnn":"<authorized_dnn>","precedence":1,"snssai":{"sst":<authorized_sst>,"sd":"<authorized_sd>"}}]}
+
+Example C — authorized route missing from the PDU pool: return `partial_plan` with `blocked_reason:"dynamic_pdu_required"`; never emit an executable URSP policy.
+
+Example D — subscription blocks the route: return `partial_plan`, no AM or URSP policy, and an explicit subscription-entitlement blocker.
+
+Example E — explicit AM+URSP: add an AM policy only for the evidence-grounded explicit RFSP/AM change; do not add it merely because the URSP selects another PDU Session. The AM object has no `serv_area_res`, `presenceAreas`, or `pra-*` key.
 
 Never return bare policy objects or bare arrays. Always wrap policy items inside the top-level OsaAdvisorOutput object.

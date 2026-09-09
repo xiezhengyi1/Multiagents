@@ -392,6 +392,190 @@ def _validate_optimizer_values(
     return issues
 
 
+def _snssai_code(spec: SnssaiSpec) -> str | None:
+    if spec.sd is None:
+        return None
+    return f"{spec.sst:02X}{spec.sd}".upper()
+
+
+def _validate_ursp_policies(
+    *,
+    proposal: PpaProposal,
+    sba_artifact: SbaArtifact,
+) -> list[ValidationIssue]:
+    if not proposal.ursp_policies:
+        return []
+
+    issues: list[ValidationIssue] = []
+    subscription = sba_artifact.subscription
+    if subscription is None:
+        return [
+            ValidationIssue(
+                code="missing_ursp_subscription",
+                message="URSP requires SBA subscription evidence",
+            )
+        ]
+    if sba_artifact.flow_catalog is None:
+        return [
+            ValidationIssue(
+                code="missing_ursp_flow_catalog",
+                message="URSP requires the SBA flow catalog",
+            )
+        ]
+    if sba_artifact.ue_policy_associations is None:
+        return [
+            ValidationIssue(
+                code="missing_ursp_association",
+                message="URSP requires current UE policy association evidence",
+            )
+        ]
+    if len(sba_artifact.ue_policy_associations) != 1:
+        return [
+            ValidationIssue(
+                code="missing_ursp_association",
+                message="URSP requires one current UE policy association",
+            )
+        ]
+    association = sba_artifact.ue_policy_associations[0]
+    if association["status"] != "complete" or not isinstance(
+        association["version"], int
+    ):
+        return [
+            ValidationIssue(
+                code="invalid_ursp_association",
+                message="URSP requires a completed UE policy association with a version",
+            )
+        ]
+    if sba_artifact.pdu_session_pool is None:
+        return [
+            ValidationIssue(
+                code="missing_ursp_pdu_pool",
+                message="URSP requires the current PDU session pool",
+            )
+        ]
+
+    resolved_pairs = {
+        (flow.flow_id, flow.app_id)
+        for flow in sba_artifact.flows
+        if flow.resolution_status == "resolved"
+    }
+    catalog_by_pair = {
+        (str(flow["flow_id"]), str(flow["app_id"])): flow
+        for flow in sba_artifact.flow_catalog
+    }
+    allowed_snssais = {str(value).upper() for value in subscription["allowed_snssais"]}
+    subscribed_routes = {
+        (str(dnn), str(session["snssai"]).upper())
+        for session in subscription["session_management"]
+        for dnn in session["dnn_configurations"]
+    }
+    pdu_routes = {
+        (str(session["dnn"]), str(session["snssai"]).upper())
+        for session in sba_artifact.pdu_session_pool
+    }
+    if len({policy.relat_precedence for policy in proposal.ursp_policies}) != len(
+        proposal.ursp_policies
+    ):
+        issues.append(
+            ValidationIssue(
+                code="duplicate_ursp_rule_precedence",
+                message="URSP rule precedences must be unique",
+                path="payload.ursp_policies",
+            )
+        )
+
+    for index, policy in enumerate(proposal.ursp_policies):
+        path = f"payload.ursp_policies.{index}"
+        if policy.target_type != "flow" or policy.flow_id is None:
+            issues.append(
+                ValidationIssue(
+                    code="ursp_flow_scope_required",
+                    message="the NAS UE profile supports flow-scoped URSP only",
+                    path=path,
+                )
+            )
+            continue
+        pair = (policy.flow_id, policy.app_id)
+        if pair not in resolved_pairs or pair not in catalog_by_pair:
+            issues.append(
+                ValidationIssue(
+                    code="unknown_ursp_flow_binding",
+                    message="URSP must reference an SBA-resolved flow/app pair",
+                    path=path,
+                )
+            )
+            continue
+        flow = catalog_by_pair[pair]
+        traffic = flow["traffic"]
+        _, remote_ip, _, remote_port, protocol = traffic["five_tuple"]
+        expected_flow_desc = (
+            f"permit out {protocol} from any to {remote_ip} {remote_port}"
+        )
+        descriptor = policy.traffic_desc
+        if (
+            descriptor is None
+            or descriptor.flow_descs != [expected_flow_desc]
+            or descriptor.dnns
+            or descriptor.app_ids
+            or descriptor.os_id is not None
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="ursp_traffic_descriptor_mismatch",
+                    message="URSP must use the exact catalog IPv4 flow descriptor",
+                    path=f"{path}.traffic_desc",
+                )
+            )
+        if policy.relat_precedence != flow["ue_policy_route"]["rule_precedence"]:
+            issues.append(
+                ValidationIssue(
+                    code="ursp_precedence_mismatch",
+                    message="URSP must preserve the current flow rule precedence",
+                    path=f"{path}.relat_precedence",
+                )
+            )
+        if len({route.precedence for route in policy.route_sel_param_sets}) != len(
+            policy.route_sel_param_sets
+        ):
+            issues.append(
+                ValidationIssue(
+                    code="duplicate_ursp_route_precedence",
+                    message="URSP route precedences must be unique",
+                    path=f"{path}.route_sel_param_sets",
+                )
+            )
+        for route_index, route in enumerate(policy.route_sel_param_sets):
+            snssai = _snssai_code(route.snssai) if route.snssai is not None else None
+            route_path = f"{path}.route_sel_param_sets.{route_index}"
+            if snssai is None:
+                issues.append(
+                    ValidationIssue(
+                        code="ursp_snssai_required",
+                        message="the NAS UE profile requires explicit S-NSSAI",
+                        path=route_path,
+                    )
+                )
+                continue
+            route_key = (route.dnn, snssai)
+            if snssai not in allowed_snssais or route_key not in subscribed_routes:
+                issues.append(
+                    ValidationIssue(
+                        code="unsubscribed_ursp_route",
+                        message="URSP route must use an authorized DNN/S-NSSAI pair",
+                        path=route_path,
+                    )
+                )
+            elif route_key not in pdu_routes:
+                issues.append(
+                    ValidationIssue(
+                        code="dynamic_pdu_required",
+                        message="URSP route is authorized but absent from the current PDU pool",
+                        path=route_path,
+                    )
+                )
+    return issues
+
+
 def validate_ppa_proposal(
     *,
     proposal: PpaProposal,
@@ -452,6 +636,9 @@ def validate_ppa_proposal(
                 "SM policy must reference an SBA-resolved flow/app pair",
                 f"payload.sm_policies.{index}",
             )
+    issues.extend(
+        _validate_ursp_policies(proposal=proposal, sba_artifact=sba_artifact)
+    )
     if proposal.sm_policies:
         issues.extend(
             _validate_optimizer_values(
