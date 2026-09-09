@@ -50,7 +50,7 @@ Coordination data contract for the single-agent baseline:
 def build_single_prompt(context_jsonl: str) -> str:
     return (
         "User request, simulator snapshot, repair feedback, and tool observations are "
-        "provided as exact event ancestry. Complete the Main, SBA, and PPA semantic "
+        "provided as lossless UIR tables. Complete the Main, SBA, and PPA semantic "
         "stages in one model invocation.\n\nCoordinator context:\n"
         f"{context_jsonl}"
     )

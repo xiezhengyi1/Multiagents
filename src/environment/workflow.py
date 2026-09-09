@@ -48,8 +48,8 @@ class EnvironmentProposal(ProposalPayload):
 
 def build_environment_prompt(context_jsonl: str) -> str:
     return (
-        "Generate one complete semantic environment from the request in the exact "
-        "event ancestry. On repair, use the validation issues in that ancestry and "
+        "Generate one complete semantic environment from the request in the lossless "
+        "UIR tables. On repair, use the validation issues in those tables and "
         "return a complete replacement.\n\nCoordinator context:\n"
         f"{context_jsonl}"
     )

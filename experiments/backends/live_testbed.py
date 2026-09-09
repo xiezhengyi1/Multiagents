@@ -66,7 +66,7 @@ class LiveTestbedBackend:
             ),
             outcome_evaluator=LiveOutcomeEvaluator(),
             budget_exhausted_reward_components={"repair_budget": -1.0},
-            context_token_budget=24_000,
+            context_token_budget=6_000,
             count_tokens=self.count_tokens,
             transport_max_attempts=2,
         )
@@ -89,6 +89,7 @@ def create_backend() -> LiveTestbedBackend:
         api_key=os.environ["VLLM_API_KEY"],
         timeout=float(os.environ["VLLM_TIMEOUT_SECONDS"]),
         temperature=0,
+        max_tokens=4096,
         max_retries=0,
         model_kwargs={"parallel_tool_calls": False},
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},

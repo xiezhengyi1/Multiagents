@@ -12,9 +12,9 @@ from control_runtime.context.prompts.planning import (
 from control_runtime.execution.policy_compiler import compile_ppa_execution_action
 from control_runtime.graph import EpisodeGraphState, EventEmission
 from control_runtime.simulation import (
-    PPA_OBSERVATION_TOOLS,
     EnvironmentObservation,
     ExecutionAction,
+    SimulatorObservationSink,
     observation_query_names,
 )
 from shared.contracts import ContractModel, NonEmptyStr
@@ -235,15 +235,16 @@ def build_ppa_prompt(
     available_tool_names: list[str],
 ) -> str:
     return build_planning_user_prompt(
-        normalized_user_intent={"source": "MainProposal in events_jsonl"},
-        coordination_context={"events_jsonl": context_jsonl},
+        normalized_user_intent={"source": "MainProposal in the lossless UIR"},
+        coordination_context={"uir": context_jsonl},
         planning_evidence={
-            "source": "SbaArtifact and tool observations in events_jsonl"
+            "source": "SbaArtifact and tool observations in the lossless UIR"
         },
         available_tool_names=available_tool_names,
     ) + (
         "\nData-contract task: return one structured CoordinationDecision "
-        "with a PpaProposal payload under the replacement contract in the system prompt."
+        "with a PpaProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event. A repair_request requires message_type=repair_response; every other trigger requires message_type=proposal. Never copy a message_type from an older event."
+        "\nTool-use rule: call an available tool at most once for the same arguments. After receiving its result, do not call it again; return the CoordinationDecision when the required evidence is available."
     )
 
 
@@ -255,10 +256,9 @@ class PpaActor(StructuredModelActor):
     prompt_builder = staticmethod(
         lambda context_jsonl: build_ppa_prompt(
             context_jsonl,
-            available_tool_names=[tool.name for tool in PPA_OBSERVATION_TOOLS],
+            available_tool_names=[],
         )
     )
-    default_tools = PPA_OBSERVATION_TOOLS
     requires_simulator_adapter = True
 
     def render_prompt(self, context_jsonl: str) -> str:
@@ -266,6 +266,36 @@ class PpaActor(StructuredModelActor):
             context_jsonl,
             available_tool_names=list(self.tool_names),
         )
+
+    def prepare_observations(
+        self,
+        *,
+        current: object,
+        observation_sink: SimulatorObservationSink | None,
+    ) -> tuple[str, ...]:
+        if observation_sink is None:
+            raise ValueError("ppa requires a simulator observation sink")
+        sba_artifact = find_latest_event_payload(
+            journal=self.journal,
+            current_event=current,
+            payload_type=SbaArtifact,
+        )
+        flow_ids = [
+            flow.flow_id
+            for flow in sba_artifact.flows
+            if flow.resolution_status == "resolved" and flow.flow_id is not None
+        ]
+        if flow_ids:
+            observation_sink.record(
+                query_name="preview_qos_optimizer",
+                arguments={"supi": sba_artifact.supi, "flow_ids": flow_ids},
+            )
+        if sba_artifact.mobility_intent is not None:
+            observation_sink.record(
+                query_name="inspect_mobility_ue_policies",
+                arguments={"supi": sba_artifact.supi},
+            )
+        return observation_sink.event_ids
 
 
 def _latest_observation(

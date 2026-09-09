@@ -10,6 +10,7 @@ from langchain_core.tools import BaseTool
 
 from control_runtime.graph import (
     ContextBuilder,
+    ContextView,
     EpisodeGraphState,
     EventEmission,
     ModelFailure,
@@ -84,9 +85,16 @@ class StructuredModelActor:
     def render_prompt(self, context_jsonl: str) -> str:
         return self.prompt_builder(context_jsonl)
 
+    def prepare_observations(
+        self,
+        *,
+        current: Any,
+        observation_sink: SimulatorObservationSink | None,
+    ) -> tuple[str, ...]:
+        return ()
+
     def __call__(self, state: EpisodeGraphState) -> EventEmission | ModelFailure:
         current = state["current_event"]
-        view, context_jsonl = self.context_builder.build(current)
         observation_sink = (
             SimulatorObservationSink(
                 adapter=self.simulator_adapter,
@@ -97,6 +105,18 @@ class StructuredModelActor:
             if self.simulator_adapter is not None
             else None
         )
+        prepared_evidence_ids = self.prepare_observations(
+            current=current, observation_sink=observation_sink
+        )
+        view, context_jsonl = self.context_builder.build(current)
+        if prepared_evidence_ids:
+            source_event_ids = [*view.source_event_ids, *prepared_evidence_ids]
+            view = ContextView(
+                source_event_ids=list(dict.fromkeys(source_event_ids))
+            )
+            context_jsonl = self.context_builder.render(
+                [self.journal.get_event(event_id) for event_id in view.source_event_ids]
+            )
         try:
             result = self.agent.invoke(
                 {"messages": [HumanMessage(content=self.render_prompt(context_jsonl))]},
@@ -126,6 +146,14 @@ class StructuredModelActor:
             )
         if not isinstance(decision.payload, ProposalPayload):
             raise TypeError("structured model actor must produce a ProposalPayload")
+        expected_message_type = (
+            "repair_response"
+            if current.message_type == "repair_request"
+            else "proposal"
+        )
+        decision = decision.model_copy(
+            update={"message_type": expected_message_type}
+        )
         evidence_ids = (
             observation_sink.event_ids if observation_sink is not None else ()
         )

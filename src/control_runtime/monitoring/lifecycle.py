@@ -8,12 +8,24 @@ from .contracts import (
 )
 
 _ALLOWED_TRANSITIONS: dict[IntentStatus, frozenset[IntentStatus]] = {
-    "active": frozenset({"degraded", "satisfied", "failed"}),
-    "degraded": frozenset({"replanning", "satisfied", "failed"}),
-    "replanning": frozenset({"active", "satisfied", "failed"}),
+    "draft": frozenset({"active", "cancelled", "expired"}),
+    "active": frozenset(
+        {"suspended", "executing", "degraded", "satisfied", "failed", "cancelled", "expired"}
+    ),
+    "suspended": frozenset({"active", "cancelled", "expired"}),
+    "executing": frozenset({"active", "degraded", "satisfied", "failed", "cancelled", "expired"}),
+    "degraded": frozenset({"replanning", "satisfied", "failed", "cancelled", "expired"}),
+    "replanning": frozenset({"active", "degraded", "failed", "cancelled", "expired"}),
     "satisfied": frozenset(),
     "failed": frozenset(),
+    "cancelled": frozenset(),
+    "expired": frozenset(),
 }
+
+
+def ensure_transition(current: IntentStatus, next_status: IntentStatus) -> None:
+    if next_status not in _ALLOWED_TRANSITIONS[current]:
+        raise ValueError(f"intent transition {current} -> {next_status} is not allowed")
 
 
 class IntentLifecycleManager:
@@ -33,6 +45,7 @@ class IntentLifecycleManager:
             raise ValueError(f"intent {intent_id} is already registered")
         lifecycle = IntentLifecycle(
             intent_id=intent_id,
+            version=1,
             bindings=bindings,
             status="active",
             origin=origin,
@@ -48,10 +61,7 @@ class IntentLifecycleManager:
         reason: str,
     ) -> LifecycleTransition:
         current = self._items[intent_id]
-        if next_status not in _ALLOWED_TRANSITIONS[current.status]:
-            raise ValueError(
-                f"intent transition {current.status} -> {next_status} is not allowed"
-            )
+        ensure_transition(current.status, next_status)
         transition = LifecycleTransition(
             intent_id=intent_id,
             previous_status=current.status,
@@ -65,4 +75,4 @@ class IntentLifecycleManager:
         return self._items[intent_id]
 
 
-__all__ = ["IntentLifecycleManager"]
+__all__ = ["IntentLifecycleManager", "ensure_transition"]

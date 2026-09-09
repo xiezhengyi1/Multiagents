@@ -42,14 +42,16 @@ Rules:
 
 Few-shot output shapes (IDs are illustrative; copy only evidence-backed values):
 
-Example A — same-slice QoS tuning:
-{"flows":[{"app_id":"app-remote-drive","flow_id":"flow-9649","name":"Remote_Drive_video_1","resolution_status":"resolved"}],"mobility_intent":null,"qos_operation_constraints":[{"flow_id":"flow-9649","app_id":"app-remote-drive","operation_type":"qos_reallocation","require_slice_change":false,"target_slice_preference":"","no_op_allowed":true,"rationale":["Tune QoS without changing the serving slice"]}],"slice_migration_authorization":{"decision":"not_applicable","target_snssais":[],"subscription_change_required":false,"rationale":[]},"open_questions":[]}
+Few-shot A — QoS without a catalog fact:
+Main selects QoS for `<MainProposal.supi>` and UIR has no `get_sm_ue_flow_catalog` fact.
+Next action: call `get_sm_ue_flow_catalog({"supi":"<MainProposal.supi>"})`.
+Do not call structured completion in this action.
 
-Example B — migration is blocked by entitlement, but the flow remains bound:
-{"flows":[{"app_id":"app-remote-drive","flow_id":"flow-9649","name":"Remote_Drive_video_1","resolution_status":"resolved"}],"mobility_intent":null,"qos_operation_constraints":[{"flow_id":"flow-9649","app_id":"app-remote-drive","operation_type":"slice_migration","require_slice_change":true,"target_slice_preference":"lower_latency","no_op_allowed":false,"rationale":["A different serving slice is required"]}],"slice_migration_authorization":{"decision":"blocked_by_subscription_entitlement","target_snssais":[],"subscription_change_required":false,"rationale":["No different authorized target S-NSSAI is evidenced"]},"open_questions":[]}
+Few-shot B — catalog-backed completion:
+The catalog returns one matching row with `app_id`, `flow_id`, and `name`.
+Set the resolved flow binding by copying those three returned fields exactly. Never use an ID from this prompt or from another case.
 
-Example C — catalog/search has no exact match:
-{"flows":[{"app_id":null,"flow_id":null,"name":"Requested_video_1","resolution_status":"unresolved"}],"mobility_intent":null,"qos_operation_constraints":[],"slice_migration_authorization":{"decision":"not_applicable","target_snssais":[],"subscription_change_required":false,"rationale":[]},"open_questions":[]}
+No literal local identifier is supplied here. A resolved `app_id` or `flow_id` must appear in a current catalog or search observation.
 
 Return raw JSON only: one object, no prose or markdown. Do not output runtime
 keys, Main-owned fields, full policy payloads, or control-stage fields.

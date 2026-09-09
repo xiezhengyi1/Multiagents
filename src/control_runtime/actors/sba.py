@@ -151,14 +151,21 @@ SBA_SYSTEM_PROMPT = replace_contract_clauses(
 def build_sba_prompt(context_jsonl: str) -> str:
     return (
         "User request and structured evidence:\n"
-        "Read the Main proposal, ControlRequest, and simulator observations from the exact event ancestry.\n\n"
+        "Read the Main proposal, ControlRequest, and simulator observations from the lossless UIR tables. "
+        "`entities` holds exact identifiers, `facts` holds exact payloads, and `deltas` links each event to its payload.\n\n"
         "Coordinator context:\n"
         f"{context_jsonl}\n\n"
         "Task:\n"
         "- Resolve only choices that remain ambiguous; use already-grounded evidence directly.\n"
         "- Do not guess identifiers. An unresolved QoS target still appears in flows.\n"
         "- Follow every finalization and tool gate in the original system prompt.\n"
-        "- Return one structured CoordinationDecision with an SbaProposal payload."
+        "- Return one structured CoordinationDecision with an SbaProposal payload.\n"
+        "- Reply gate: inspect only the newest event. A repair_request requires message_type=repair_response; every other trigger requires message_type=proposal. Never copy a message_type from an older event."
+        "\nTool argument gate:\n"
+        "- For every observation tool call, copy `supi` exactly from the newest MainProposal. Never use an illustrative, inferred, or newly constructed SUPI.\n"
+        "- In a repair round, reuse observations already present in the coordinator context. Query only a fact that is still missing for the current MainProposal SUPI."
+        "\n- A validator issue `missing_sm_catalog` means the flow catalog is still missing. Query `get_sm_ue_flow_catalog` for the authoritative SUPI before returning the repair response."
+        "\n- In a QoS repair, inspect UIR `facts` for a current `get_sm_ue_flow_catalog` result for the authoritative SUPI. If it is absent, call that tool before grounding flows."
     )
 
 
@@ -170,6 +177,32 @@ class SbaActor(StructuredModelActor):
     prompt_builder = staticmethod(build_sba_prompt)
     default_tools = SBA_OBSERVATION_TOOLS
     requires_simulator_adapter = True
+
+    def prepare_observations(
+        self,
+        *,
+        current: object,
+        observation_sink: object,
+    ) -> tuple[str, ...]:
+        main_proposal = find_latest_event_payload(
+            journal=self.journal,
+            current_event=current,
+            payload_type=MainProposal,
+        )
+        self.authorized_supi = main_proposal.supi
+        return ()
+
+    def render_prompt(self, context_jsonl: str) -> str:
+        return (
+            build_sba_prompt(context_jsonl)
+            + "\n\nAuthoritative tool parameter for this invocation:\n"
+            + f"- The only allowed `supi` value is `{self.authorized_supi}`. "
+            "Copy this exact literal into every tool call. "
+            "`supi-12345`, examples, aliases, and any other value are invalid."
+            "\n\nQoS observation gate:\n"
+            "- When the active Main proposal selects QoS and UIR has no current `get_sm_ue_flow_catalog` fact for this SUPI, your next response is that tool call with this exact `supi`. Do not submit CoordinationDecision before its result.\n"
+            "- After the catalog result, use only its identifiers. If it lacks the named target, call `search_sm_flow_targets`; otherwise submit CoordinationDecision."
+        )
 
 
 def validate_sba_proposal(

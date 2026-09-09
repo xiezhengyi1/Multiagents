@@ -12,6 +12,7 @@ from .contracts import (
     MonitorRule,
 )
 from .flow_monitor import FlowTelemetryMonitor
+from .intent_lifecycle import PersistentIntentLifecycleManager
 from .lifecycle import IntentLifecycleManager
 from .watch_loop import MonitoringCoordinator
 
@@ -21,6 +22,7 @@ __all__ = [
     "IntentBinding",
     "IntentLifecycle",
     "IntentLifecycleManager",
+    "PersistentIntentLifecycleManager",
     "IntentStatus",
     "LifecycleTransition",
     "MetricRelation",

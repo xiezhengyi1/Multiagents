@@ -214,11 +214,14 @@ MAIN_SYSTEM_PROMPT = replace_contract_clauses(
 
 def build_main_prompt(context_jsonl: str) -> str:
     return build_main_user_prompt(
-        user_input="Read ControlRequest.user_input from the exact event JSONL below.",
+        user_input=(
+            "Read ControlRequest.user_input from the lossless UIR table below. "
+            "Resolve entity and fact references before deciding."
+        ),
         coordinator_context=context_jsonl,
     ) + (
         "\n\nData-contract task: return one structured CoordinationDecision "
-        "with a MainProposal payload under the replacement contract in the system prompt."
+        "with a MainProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event in the UIR event table. If it is a repair_request, set message_type to repair_response; otherwise set it to proposal. Copy the non-empty imsi- SUPI from the ControlRequest into payload.supi exactly."
     )
 
 
@@ -323,6 +326,45 @@ class MainActor(StructuredModelActor):
     system_prompt = MAIN_SYSTEM_PROMPT
     response_schema = CoordinationDecision[MainProposal]
     prompt_builder = staticmethod(build_main_prompt)
+
+    def prepare_observations(
+        self,
+        *,
+        current: object,
+        observation_sink: object,
+    ) -> tuple[str, ...]:
+        control_request = find_event_payload(
+            journal=self.journal,
+            current_event=current,
+            payload_type=ControlRequest,
+        )
+        supis = list(
+            dict.fromkeys(re.findall(r"(?i)(imsi-\d{5,})", control_request.user_input))
+        )
+        self.request_supis = tuple(supis)
+        self.authoritative_supi = supis[0] if len(supis) == 1 else None
+        return ()
+
+    def render_prompt(self, context_jsonl: str) -> str:
+        prompt = build_main_prompt(context_jsonl)
+        if len(self.request_supis) > 1:
+            target_supis = ", ".join(f"`{supi}`" for supi in self.request_supis)
+            return (
+                prompt
+                + "\n\nMulti-SUPI output gate:\n"
+                + f"- This request has these exact target SUPIs: {target_supis}.\n"
+                + "- Set payload.supi to the empty string `\"\"`. Never choose one target, invent a SUPI, or copy an illustrative SUPI into payload.supi.\n"
+                + "- Each semantic target keeps its own exact SUPI from this list. Preserve that target-to-SUPI mapping in every repair response."
+            )
+        if self.authoritative_supi is None:
+            return prompt
+        return (
+            prompt
+            + "\n\nAuthoritative repair anchor:\n"
+            + f"- This request has exactly one SUPI: `{self.authoritative_supi}`. "
+            "Copy it verbatim into payload.supi and every semantic target.supi, "
+            "including all repair responses. Repair evidence never replaces it."
+        )
 
 
 class MainValidator(ValidationActor):

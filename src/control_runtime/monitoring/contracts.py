@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -10,11 +11,16 @@ from shared.contracts.coordination import ObservationPayload
 MetricRelation = Literal["above", "below"]
 AlertSeverity = Literal["warning", "critical"]
 IntentStatus = Literal[
+    "draft",
     "active",
+    "suspended",
+    "executing",
     "degraded",
     "replanning",
     "satisfied",
     "failed",
+    "cancelled",
+    "expired",
 ]
 
 
@@ -53,9 +59,11 @@ class IntentBinding(ContractModel):
 
 class IntentLifecycle(ContractModel):
     intent_id: NonEmptyStr
+    version: int = Field(ge=1)
     bindings: list[IntentBinding] = Field(min_length=1)
     status: IntentStatus
     origin: Literal["user", "monitor"]
+    expires_at: datetime | None = None
 
 
 class LifecycleTransition(ContractModel):

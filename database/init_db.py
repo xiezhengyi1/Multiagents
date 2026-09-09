@@ -5,14 +5,29 @@ from sqlalchemy import text
 from database.base import Base
 from database.connection import create_knowledge_engine, require_database_url
 from database.langchain_pg import ensure_semantic_knowledge_collection
-from database.models import SemanticKnowledge
+from database.models import (
+    IntentAuditEvent,
+    ManagedIntent,
+    ManagedIntentVersion,
+    NetworkGraphSnapshot,
+    SemanticKnowledge,
+)
 
 
 def init_db(database_url: str | None = None) -> None:
     engine = create_knowledge_engine(database_url or require_database_url())
     with engine.begin() as connection:
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-    Base.metadata.create_all(bind=engine, tables=[SemanticKnowledge.__table__])
+    Base.metadata.create_all(
+        bind=engine,
+        tables=[
+            SemanticKnowledge.__table__,
+            NetworkGraphSnapshot.__table__,
+            ManagedIntent.__table__,
+            ManagedIntentVersion.__table__,
+            IntentAuditEvent.__table__,
+        ],
+    )
     ensure_semantic_knowledge_collection()
 
 

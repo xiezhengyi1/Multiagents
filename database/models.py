@@ -25,4 +25,25 @@ class SemanticKnowledge(Base):
     )
 
 
-__all__ = ["SemanticKnowledge"]
+class NetworkGraphSnapshot(Base):
+    __tablename__ = "network_graph_snapshot"
+
+    snapshot_id: Mapped[str] = mapped_column(String, primary_key=True)
+    base_network_snapshot_id: Mapped[str | None] = mapped_column(String, index=True)
+    trigger_event: Mapped[str | None] = mapped_column(String)
+    graph_summary: Mapped[dict[str, object] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        index=True,
+    )
+
+from .intent_models import IntentAuditEvent, ManagedIntent, ManagedIntentVersion
+
+__all__ = [
+    "IntentAuditEvent",
+    "ManagedIntent",
+    "ManagedIntentVersion",
+    "NetworkGraphSnapshot",
+    "SemanticKnowledge",
+]
