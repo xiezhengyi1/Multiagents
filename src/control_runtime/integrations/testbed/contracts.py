@@ -90,9 +90,9 @@ class NativeSliceQos(NativeModel):
 class NativeSliceTelemetry(NativeModel):
     utilization_ul: float = Field(ge=0)
     utilization_dl: float = Field(ge=0)
-    latency: float = Field(ge=0)
-    jitter: float = Field(ge=0)
-    loss_rate: float = Field(ge=0, le=1)
+    latency: float | None = Field(ge=0)
+    jitter: float | None = Field(ge=0)
+    loss_rate: float | None = Field(ge=0, le=1)
 
 
 class NativeSliceState(NativeModel):

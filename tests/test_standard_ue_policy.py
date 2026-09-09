@@ -7,6 +7,27 @@ from model.PcfAmPolicyControl import PcfAmPolicyControlPolicyAssociation
 from model.UrspRuleRequest import UrspRuleRequest
 
 
+def test_empty_slice_keeps_absent_measurements_not_zero():
+    from datetime import UTC, datetime
+    from control_runtime.integrations.testbed.contracts import NativeSliceTelemetry
+    from control_runtime.integrations.testbed.projection import _numeric_metrics
+
+    telemetry = NativeSliceTelemetry(
+        utilization_ul=0, utilization_dl=0, latency=None, jitter=None, loss_rate=None
+    )
+    assert telemetry.latency is None
+    metrics = _numeric_metrics(
+        owner="empty-slice",
+        prefix="telemetry",
+        payload=telemetry.model_dump(),
+        observed_at=datetime.now(UTC),
+    )
+    assert {row.metric_name for row in metrics} == {
+        "telemetry.utilization_ul",
+        "telemetry.utilization_dl",
+    }
+
+
 def context():
     return {
         "snapshot_id": "s1",
