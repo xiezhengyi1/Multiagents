@@ -36,6 +36,19 @@ FLOWS = (
     ("imsi-208930000000010", "cloud-render-stream-1", "cloud-render", "urllc", "02000001"),
 )
 
+SCENES = (
+    {"id": "remote_driving_edge", "site": "城市道路边缘站", "condition": "高速移动与低时延控制", "flow_index": 0},
+    {"id": "smart_factory", "site": "离散制造车间", "condition": "机器人协同与产线高负载", "flow_index": 1},
+    {"id": "industrial_iot", "site": "工业园区传感网", "condition": "海量遥测与低优先级竞争", "flow_index": 2},
+    {"id": "stadium_xr", "site": "体育场馆", "condition": "高密度 XR 互动", "flow_index": 3},
+    {"id": "smart_hospital", "site": "医院急诊区", "condition": "远程诊疗与可靠性保护", "flow_index": 4},
+    {"id": "live_video_venue", "site": "大型活动现场", "condition": "4K 视频上行拥塞", "flow_index": 5},
+    {"id": "edge_cloud", "site": "园区边缘云", "condition": "云渲染峰值与双业务并行", "flow_index": 6},
+    {"id": "emergency_response", "site": "灾害救援现场", "condition": "应急指挥与资源抢占", "flow_index": 0},
+    {"id": "warehouse_logistics", "site": "智能仓储", "condition": "移动机器人与视频巡检", "flow_index": 1},
+    {"id": "smart_city_sensing", "site": "城市感知网络", "condition": "广域遥测与背景流竞争", "flow_index": 2},
+)
+
 PROFILES: dict[str, dict[str, Any]] = {
     "qos_normal": {
         "subscription": ["01000001", "02000001", "03000001"],
@@ -161,7 +174,8 @@ def _cases(families: Iterable[Family], run_id: str) -> list[ExperimentCase]:
         for template in range(1, family.templates + 1):
             template_ordinal += 1
             for variant in range(1, 11):
-                flow = FLOWS[(template + variant - 2) % len(FLOWS)]
+                scene = SCENES[variant - 1]
+                flow = FLOWS[scene["flow_index"]]
                 supi, flow_id, app_id, dnn, snssai = flow
                 profile = family.profiles[(template + variant - 2) % len(family.profiles)]
                 catalog_id = f"S2K-{family.code}-{template:03d}-v{variant:02d}"
@@ -170,15 +184,18 @@ def _cases(families: Iterable[Family], run_id: str) -> list[ExperimentCase]:
                         case_id=catalog_id,
                         episode_id=f"{run_id}-{catalog_id.lower()}",
                         method="multi_agent_control",
-                        user_input=_request(family, template, variant, flow),
+                        user_input=(
+                            f"在{scene['site']}的{scene['condition']}场景中，" + _request(family, template, variant, flow)
+                        ),
                         metadata={
-                            "catalog_version": "s2k-v1",
+                            "catalog_version": "s2k-v2",
                             "catalog_id": catalog_id,
                             "partition": _partition(template_ordinal),
                             "template_ordinal": template_ordinal,
                             "variant": variant,
                             "scenario_profile": profile,
                             "scenario_initial_state": PROFILES[profile],
+                            "scenario_context": scene,
                             "flow_binding": {"supi": supi, "flow_id": flow_id, "app_id": app_id, "dnn": dnn, "snssai": snssai},
                             "operation_class": family.operation_class,
                             "feasibility": family.feasibility,

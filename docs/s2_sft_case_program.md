@@ -71,6 +71,10 @@
 | I4 安全约束冲突 | 8 x 10 | 服务区/订阅/优先级冲突 | 不允许的服务区、显式禁止迁移、不可同时满足的保护目标 | `infeasible` / `constraint_unsatisfied` |
 
 场景 profile 必须由测试床初始化脚本显式建立，而非让 case 假设状态存在：`qos_normal`、`qos_congested`、`qos_contention`、`dual_pdu_ursp`、`am_rfsp_only`、`am_ursp_authorized`、`multi_supi_staged`、`subscription_denied`、`pdu_pool_gap`、`capability_gap` 与 `safety_conflict`。每个 profile 都要落盘其订阅、PDU 池、capability inventory、负载快照与允许的流目录。
+
+### 空间与业务场景层
+
+`s2k-v2` 让每个模板的十个变体分别落到十个具名场景：远程驾驶边缘站、智能制造、工业 IoT、XR 场馆、医院急诊、活动现场 4K 视频、园区边缘云、应急救援、智能仓储与城市感知。每条记录同时固定场景地点、业务压力与匹配流，再与 policy profile 组合；这不是同义改写。
 `flow` 不存在、SBA 查询失败、字段不匹配、模型结构输出错误、optimizer 不可用、HTTP 超时和执行回执失败都不是无解样本；它们必须保留为 `failed` 诊断样本，不能进入正向 SFT。
 
 ### Case 金标与 SFT 准入
@@ -104,7 +108,7 @@
 ### 划分、生成与验收
 
 - 训练/验证/测试固定为 700/150/150。完整语义模板只能落在一个 partition：70/15/15 个模板，每模板恰好 10 个变体；不得只改 SUPI、应用名或同义词后跨分区。
-- 变体只改变已声明的维度：SUPI/流/应用、负载档、授权集合、PDU 池、目标 KPI、优先级、中文表达和否定约束。每个变体必须同时有可机器检查的前置状态与验收状态。
+- 变体只改变已声明的维度：空间/业务场景、SUPI/流/应用、负载档、授权集合、PDU 池、目标 KPI、优先级、中文表达和否定约束。每个变体必须同时有可机器检查的前置状态与验收状态。
 - 先生成 100-case pilot（每个模板族 10 个），逐条经过环境 preflight、三智能体执行和人工抽审；pilot 的标签与场景合格后才 materialize 余下 900 个。未通过 preflight 的记录不得以虚构无解标签补位。
 - 每个可执行 case 需要干净场景、执行前 snapshot、action receipt、执行后 snapshot 和 acceptance checks；每个无解 case 需要 subscription/capability/PDU-pool 的权威证据与三个 agent 的终止链路。
 

@@ -20,6 +20,9 @@ def test_build_s2k_catalog_has_fixed_quota_and_gold_contract() -> None:
         "test": 150,
     }
     assert all(case.metadata["sft_disposition"] == "pending_execution" for case in cases)
+    assert {case.metadata["catalog_version"] for case in cases} == {"s2k-v2"}
+    assert len({case.metadata["scenario_context"]["id"] for case in cases}) == 10
+    assert set(Counter(case.metadata["scenario_context"]["id"] for case in cases).values()) == {100}
     assert all(case.metadata["scenario_initial_state"] for case in cases)
     assert all(case.metadata["expected_terminal"] for case in cases)
     assert all(case.metadata["expected_agent_path"] for case in cases)
