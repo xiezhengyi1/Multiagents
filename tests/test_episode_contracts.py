@@ -1101,7 +1101,7 @@ def test_subscription_entitlement_blocker_requires_complete_evidence() -> None:
         qos_operation_constraints=[],
         slice_migration_authorization=SliceMigrationDecision(
             decision="blocked_by_subscription_entitlement",
-            target_snssais=[],
+            target_snssais=["01000001"],
             subscription_change_required=False,
             rationale=["no different authorized slice"],
         ),
@@ -1129,7 +1129,7 @@ def test_subscription_entitlement_blocker_requires_complete_evidence() -> None:
                 policy_type="slice_migration",
                 resource_keys=["slice_migration_authorization"],
                 policy_details={
-                    "blocked_reason": "blocked_by_subscription_entitlement"
+                    "decision": "blocked_by_subscription_entitlement"
                 },
             )
         ],

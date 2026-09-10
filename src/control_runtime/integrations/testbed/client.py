@@ -74,7 +74,10 @@ class TestbedClient:
             headers={"X-API-Key": self.config.action_api_key},
             json=payload,
         )
-        response.raise_for_status()
+        if response.is_error:
+            raise RuntimeError(
+                f"testbed action request failed: {response.status_code} {response.text}"
+            )
         return NativeActionReceipt.model_validate(response.json()).model_dump(mode="json")
 
 

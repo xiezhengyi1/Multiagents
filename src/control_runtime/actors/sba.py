@@ -225,6 +225,7 @@ class SbaActor(StructuredModelActor):
             "\n\nQoS observation gate:\n"
             "- When the active Main proposal selects QoS and UIR has no current `get_sm_ue_flow_catalog` fact for this SUPI, your next response is that tool call with this exact `supi`. Do not submit CoordinationDecision before its result.\n"
             "- After the catalog result, use only its identifiers. If it lacks the named target, call `search_sm_flow_targets`; otherwise continue the active evidence gates below.\n"
+            "- When Main selects mobility only, set flows and qos_operation_constraints to []; do not create an inspection placeholder or QoS binding.\n"
             "\nEvidence-completion gate:\n"
             "- Do not submit a CoordinationDecision while an active Main domain lacks its required fact. If Main selects mobility and UIR has no current `get_am_policy_context` fact for this SUPI, call `get_am_policy_context` next.\n"
             "- If Main set `serving_slice_change_requested:true`, bind the flow from the catalog, then, when UIR has no current `get_ue_slice_subscription` fact for this SUPI, call `get_ue_slice_subscription` next.\n"
@@ -232,6 +233,7 @@ class SbaActor(StructuredModelActor):
             "- For QoS plus mobility with `serving_slice_change_requested:true`, the only valid sequence is catalog, AM context, subscription, then structured completion. A catalog result alone is never sufficient.\n"
             "- A repair issue `missing_am_context` means call `get_am_policy_context`; `missing_subscription` means call `get_ue_slice_subscription`; `missing_sm_catalog` means call `get_sm_ue_flow_catalog`. Act on the missing fact, not on a previously completed query.\n"
             "- Once the catalog, AM context, and subscription required by the active Main proposal are present, finalize from those facts: emit the evidence-grounded mobility_intent and migration decision, and set open_questions to []. A subscription result is an answer, not a blocking question.\n"
+            "- Copy mobility_intent.target_snssais only from observed allowed_snssais; a requested or preferred slice is not evidence. When migration is blocked and no alternative is authorized, slice_migration_authorization.target_snssais must be [].\n"
             "- Never change a catalog-resolved flow into unresolved during repair. `resolution_status=resolved` requires its exact catalog app_id and flow_id; `resolution_status=unresolved` requires both JSON fields to be null."
             "\n- A blocked_by_subscription_entitlement decision is final evidence: set open_questions to [] and return it without another tool call."
         )

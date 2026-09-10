@@ -222,6 +222,7 @@ def build_main_prompt(context_jsonl: str) -> str:
     ) + (
         "\n\nData-contract task: return one structured CoordinationDecision "
         "with a MainProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event in the UIR event table. If it is a repair_request, set message_type to repair_response; otherwise set it to proposal. Preserve every ControlRequest SUPI on its matching semantic target and follow the active single- or multi-SUPI gate exactly."
+        "\nDomain gate: a request to prioritize, protect, rebalance, or improve resources is QoS-only. Set serving_slice_change_requested:true and add mobility only for an explicit S-NSSAI, DNN, PDU-route, allowed-NSSAI, or RFSP change. Better resources alone is not a slice or mobility request."
     )
 
 
@@ -372,7 +373,7 @@ class MainActor(StructuredModelActor):
                 prompt
                 + "\n\nMulti-SUPI output gate:\n"
                 + f"- This request has these exact target SUPIs: {target_supis}.\n"
-                + "- Set payload.supi to the empty string `\"\"`. Never choose one target, invent a SUPI, or copy an illustrative SUPI into payload.supi.\n"
+                + "- Set payload.supi to JSON null. Never emit an empty string, choose one target, invent a SUPI, or copy an illustrative SUPI into payload.supi.\n"
                 + "- Each semantic target keeps its own exact SUPI from this list. Preserve that target-to-SUPI mapping in every repair response."
             )
         if self.authoritative_supi is None:
