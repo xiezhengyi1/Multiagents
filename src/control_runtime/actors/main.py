@@ -124,7 +124,7 @@ class MainDomainEvidence(ContractModel):
 
 
 class MainProposal(ProposalPayload):
-    supi: NonEmptyStr
+    supi: NonEmptyStr | None
     requested_domains: list[ControlDomain]
     serving_slice_change_requested: bool
     domain_evidence: MainDomainEvidence
@@ -312,7 +312,7 @@ def validate_main_proposal(
                         f"payload.control_semantics.stages.{stage_index}.targets.{target_index}.supi",
                     )
     elif len(explicit_supis) > 1:
-        if proposal.supi not in explicit_supis:
+        if proposal.supi is not None and proposal.supi not in explicit_supis:
             add(
                 "supi_mismatch",
                 "top-level supi must be one explicit request SUPI",
@@ -326,15 +326,16 @@ def validate_main_proposal(
                         "semantic target must carry one explicit request SUPI",
                         f"payload.control_semantics.stages.{stage_index}.targets.{target_index}.supi",
                     )
-                if (
-                    stage.stage_index == proposal.control_semantics.current_stage
-                    and target.supi != proposal.supi
-                ):
-                    add(
-                        "semantic_target_supi",
-                        "current-stage semantic targets must match top-level supi",
-                        f"payload.control_semantics.stages.{stage_index}.targets.{target_index}.supi",
-                    )
+        if proposal.supi is None and not any(
+            stage.stage_index == proposal.control_semantics.current_stage
+            and stage.targets
+            for stage in proposal.control_semantics.stages
+        ):
+            add(
+                "missing_execution_scope",
+                "a multi-SUPI proposal without top-level supi needs a current-stage target",
+                "payload.control_semantics.stages",
+            )
     return issues
 
 

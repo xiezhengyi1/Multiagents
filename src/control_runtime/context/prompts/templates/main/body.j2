@@ -42,13 +42,13 @@ Responsibility boundary:
 - GlobalControlIntent stages must not contain `active_flow_ids` or `active_app_ids`.
   Those are IEA-owned grounded identifiers and are not valid Main fields.
 - Do not copy candidate, prior-intent, or catalog identifiers into control_semantics targets.
-- Every MainProposal has exactly one non-empty authoritative `supi` scope.
 - Single-SUPI requests: copy the explicit SUPI into top-level `supi` and every
   control_semantics target.
-- Multi-SUPI requests: choose one explicit SUPI for top-level `supi`. Every
-  target in `current_stage` must use that same SUPI. Put targets for each other
-  explicit SUPI into later stages with their exact SUPI. Never leave a target
-  SUPI blank and never comma-join identifiers.
+- Multi-SUPI requests: `supi` is an optional coordinator scope. Keep it null
+  when the current stage contains targets for more than one explicit SUPI;
+  otherwise it may name one explicit SUPI. Every target must carry its exact
+  explicit SUPI. Never leave a target SUPI blank and never comma-join
+  identifiers.
 - A flow named only in an explicit negative constraint such as "do not change",
   "do not move", or "leave unchanged" is not a semantic action target; preserve
   the prohibition in the active target note instead.

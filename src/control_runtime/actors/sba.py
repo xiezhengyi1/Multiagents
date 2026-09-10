@@ -179,6 +179,17 @@ def build_sba_prompt(context_jsonl: str) -> str:
     )
 
 
+def _execution_supi(proposal: MainProposal) -> NonEmptyStr:
+    if proposal.supi is not None:
+        return proposal.supi
+    return next(
+        target.supi
+        for stage in proposal.control_semantics.stages
+        if stage.stage_index == proposal.control_semantics.current_stage
+        for target in stage.targets
+    )
+
+
 class SbaActor(StructuredModelActor):
     actor_id = "sba"
     validator_actor = "sba_validator"
@@ -199,7 +210,7 @@ class SbaActor(StructuredModelActor):
             current_event=current,
             payload_type=MainProposal,
         )
-        self.authorized_supi = main_proposal.supi
+        self.authorized_supi = _execution_supi(main_proposal)
         return ()
 
     def render_prompt(self, context_jsonl: str) -> str:
@@ -209,6 +220,7 @@ class SbaActor(StructuredModelActor):
             + f"- The only allowed `supi` value is `{self.authorized_supi}`. "
             "Copy this exact literal into every tool call. "
             "`supi-12345`, examples, aliases, and any other value are invalid."
+            "\n- When Main top-level supi is null, this is the primary SUPI of the first current-stage target. Ground only current-stage targets with this SUPI; later targets remain Main-owned staged semantics."
             "\n\nQoS observation gate:\n"
             "- When the active Main proposal selects QoS and UIR has no current `get_sm_ue_flow_catalog` fact for this SUPI, your next response is that tool call with this exact `supi`. Do not submit CoordinationDecision before its result.\n"
             "- After the catalog result, use only its identifiers. If it lacks the named target, call `search_sm_flow_targets`; otherwise continue the active evidence gates below.\n"
@@ -417,7 +429,7 @@ class SbaCompiler:
         catalog = observation_result("get_sm_ue_flow_catalog")
         am_context = observation_result("get_am_policy_context")
         artifact = SbaArtifact(
-            supi=main_proposal.supi,
+            supi=_execution_supi(main_proposal),
             **proposal_event.payload.model_dump(mode="python"),
             subscription=subscription,
             flow_catalog=catalog["flow_catalog"] if catalog is not None else None,

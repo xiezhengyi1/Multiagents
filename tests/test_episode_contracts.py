@@ -665,7 +665,35 @@ def test_main_rejects_multi_supi_target_outside_active_scope() -> None:
         round_index=0,
     )
 
-    assert {issue.code for issue in issues} == {"semantic_target_supi"}
+    assert issues == []
+
+
+def test_main_accepts_multi_supi_targets_without_a_top_level_scope() -> None:
+    original = _main_proposal(evidence=True)
+    first_target = original.control_semantics.stages[0].targets[0].model_copy(
+        update={"supi": "imsi-208930000000001"}
+    )
+    second_target = first_target.model_copy(
+        update={"semantic_name": "medical", "supi": "imsi-208930000000006"}
+    )
+    stage = original.control_semantics.stages[0].model_copy(
+        update={"targets": [first_target, second_target]}
+    )
+    semantics = original.control_semantics.model_copy(update={"stages": [stage]})
+    proposal = original.model_copy(update={"supi": None, "control_semantics": semantics})
+
+    issues = validate_main_proposal(
+        proposal=proposal,
+        target_agent="sba",
+        message_type="proposal",
+        trigger_message_type="control_request",
+        user_input=(
+            "Protect imsi-208930000000001 first, then imsi-208930000000006."
+        ),
+        round_index=0,
+    )
+
+    assert issues == []
 
 
 def test_main_proposal_is_intercepted_repaired_and_delivered(tmp_path: Path) -> None:
