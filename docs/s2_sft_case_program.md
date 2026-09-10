@@ -26,6 +26,18 @@
 
 ## 1000-case SFT 语料方案
 
+### 当前正式基线：`s2k-topology-v1`
+
+- 场景源固定为 `/home/yinyuexi/xiezhengyi/oai-free5gc-testbed/scenarios/experiments/s2k-*.yaml`。
+- 每个场景只有一个 YAML；同一文件同时声明网络拓扑、流量拓扑、PDU 会话、资源与移动事件。
+- 共 20 个底层拓扑，每个拓扑生成 50 个 case，其中 30 个可执行、20 个应正确拒绝，总计 600/400。
+- 正式 case 文件为 `experiments/cases/s2k_topology_v1.jsonl`，生成器为 `experiments/scripts/build_s2k_topology_cases.py`。
+- 每条 case 都绑定配置文件 SHA-256、网络拓扑 SHA-256、流量拓扑 SHA-256，以及配置中真实存在的 SUPI、UE、gNB、flow、service、PDU、DNN 和 S-NSSAI。
+- 训练/验证/测试按完整场景切分为 14/3/3 个拓扑，即 700/150/150；同一底层拓扑不得跨 partition。
+- 可执行集覆盖同 PDU QoS、已有 PDU 间 URSP、RFSP-only、多 SUPI 分阶段和安全 QoS；不可执行集覆盖订阅授权阻塞与已授权路由上的硬约束冲突。
+
+`s2k-v1`、`s2k-v2`、`s2k-v3` 均为 metadata-first 历史草案，只保留生成审计，不得进入仿真、评测或 SFT。以下旧模板方案仅作为设计演进记录，若与 `s2k-topology-v1` 冲突，以当前正式基线为准。
+
 每个新 case 采用下列必填标注，生成时写入 case JSONL 的 `metadata`，运行后将实际 terminal 与预期对齐：
 
 ```json
@@ -54,7 +66,7 @@
 | 安全约束不可满足 | 80 | 目标违反明确订阅/服务区/冲突约束 | `infeasible` / constraint code |
 
 
-### 场景与模板目录
+### 历史模板草案（已废弃）
 
 1,000 个 case 不是把 30 个 S2 请求改写 33 次。首版固定为 100 个语义模板，每个模板在一个明确的初始场景下展开 10 个受控变体。模板、初始状态和语言表达三者必须同时固定，标签不得由模型生成。
 
@@ -75,7 +87,7 @@
 ### 空间与业务场景层
 
 `s2k-v3` 让每个模板的十个变体分别落到十个具名场景：远程驾驶边缘站、智能制造、工业 IoT、XR 场馆、医院急诊、活动现场 4K 视频、园区边缘云、应急救援、智能仓储与城市感知。每条记录同时固定场景地点、业务压力与匹配流，再与 policy profile 组合；这不是同义改写。
-v1/v2 仅保留为生成审计草稿，不用于执行或 SFT；v3 才进入 profile preflight 与 pilot。
+v1/v2/v3 均仅保留为生成审计草稿，不用于执行、评测或 SFT。
 `flow` 不存在、SBA 查询失败、字段不匹配、模型结构输出错误、optimizer 不可用、HTTP 超时和执行回执失败都不是无解样本；它们必须保留为 `failed` 诊断样本，不能进入正向 SFT。
 
 ### Case 金标与 SFT 准入
@@ -117,7 +129,7 @@ v1/v2 仅保留为生成审计草稿，不用于执行或 SFT；v3 才进入 pro
 
 1. 修复并全量复测 S2 30 case；正确率以金标终态匹配计算，达到或超过 75% 才能冻结 S2 基线。
 2. 若未达到 75%，依据每条 `results.jsonl.terminal` 的 reason、resolution 和 reason code 迭代提示词或逻辑代码；失败数大于 7 时只复测失败集，失败数不大于 7 时下一轮全量复测。
-3. 实现上述 11 个 scenario profile 的初始化与 preflight，并将 100 个模板的金标写为可版本化 catalog；先运行 100-case pilot。
+3. 对 20 个 topology-first 场景逐个执行资源评估、配置编译和隔离仿真 preflight；先用可承载拓扑运行 pilot。
 4. pilot 通过后生成其余 900 个 case，执行、审计并仅投影 `positive` 样本到 SFT；`diagnostic` 样本独立保留供错误分析。
 ## 公开资料的使用边界
 
