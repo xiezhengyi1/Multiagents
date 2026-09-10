@@ -15,8 +15,6 @@ TRANSPORT_ERRORS = (
 )
 
 
-def transport_retry_policy(*, max_attempts: int) -> RetryPolicy:
-
 def retryable_transport_error(error: Exception) -> bool:
     return isinstance(error, TRANSPORT_ERRORS) or (
         isinstance(error, BadRequestError)
@@ -24,6 +22,7 @@ def retryable_transport_error(error: Exception) -> bool:
     )
 
 
+def transport_retry_policy(*, max_attempts: int) -> RetryPolicy:
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
     return RetryPolicy(
