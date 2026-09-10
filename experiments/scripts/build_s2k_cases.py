@@ -139,9 +139,65 @@ def _partition(template_ordinal: int) -> str:
     return "test"
 
 
-def _request(family: Family, template: int, variant: int, flow: tuple[str, str, str, str, str]) -> str:
+SNSSAI_DNN = {
+    "01000001": "embb",
+    "02000001": "urllc",
+    "03000001": "mmtc",
+}
+
+
+def _alternate_snssai(current: str, template: int) -> str:
+    choices = [snssai for snssai in SNSSAI_DNN if snssai != current]
+    return choices[template % len(choices)]
+
+
+def _target_snssai(
+    family: Family, template: int, flow: tuple[str, str, str, str, str]
+) -> str | None:
+    current = flow[4]
+    if family.code in {"F2", "I1", "I2"}:
+        return _alternate_snssai(current, template)
+    if family.code == "F3" and template % 2 == 0:
+        return _alternate_snssai(current, template)
+    return None
+
+
+def _initial_state(
+    family: Family, profile: str, flow: tuple[str, str, str, str, str], target: str | None
+) -> dict[str, Any]:
+    source = PROFILES[profile]
+    supi, _, _, dnn, current = flow
+    subscription = list(source["subscription"])
+    pdu_pool = list(source["pdu_pool"])
+    current_pdu = f"{dnn}/{current}"
+    if current_pdu not in pdu_pool:
+        pdu_pool.append(current_pdu)
+    if family.code == "I1":
+        subscription = [current]
+    elif family.code == "I2":
+        subscription = [current, target]
+        pdu_pool = [item for item in pdu_pool if not item.endswith(target)]
+    elif target is not None:
+        target_pdu = f"{SNSSAI_DNN[target]}/{target}"
+        if target_pdu not in pdu_pool:
+            pdu_pool.append(target_pdu)
+    return {
+        "subscription": subscription,
+        "pdu_pool": pdu_pool,
+        "capability_inventory": list(source["capability_inventory"]),
+        "load_class": source["load_class"],
+        "bound_supi": supi,
+    }
+
+
+def _request(
+    family: Family,
+    template: int,
+    variant: int,
+    flow: tuple[str, str, str, str, str],
+    target: str | None,
+) -> str:
     supi, flow_id, app_id, dnn, snssai = flow
-    target = ("02000001", "03000001", "01000001")[template % 3]
     style = ("请", "需要", "请立即", "请优先", "请在不影响其他业务的前提下")[variant % 5]
     if family.code == "F1":
         metric = ("上行保障带宽", "下行保障带宽", "时延目标", "抖动目标", "业务优先级", "GBR")[template % 6]
@@ -149,9 +205,9 @@ def _request(family: Family, template: int, variant: int, flow: tuple[str, str, 
     if family.code == "F2":
         return f"{style}为 {supi} 的 {flow_id} 配置到已存在 {target} PDU 的 URSP 选路，不创建新 PDU。"
     if family.code == "F3":
-        if template % 2:
+        if target is None:
             return f"{style}仅调整 {supi} 的 RFSP，保持 {flow_id} 当前 PDU 路由不变。"
-        return f"{style}调整 {supi} 的 RFSP，并把 {flow_id} 选路到已存在的授权 PDU。"
+        return f"{style}调整 {supi} 的 RFSP，并把 {flow_id} 选路到已存在的授权 {target} PDU。"
     if family.code == "F4":
         peer = FLOWS[(template + variant + 1) % len(FLOWS)][0]
         return f"{style}先保护 {supi} 的 {flow_id}，再处理 {peer} 的低优先级流；必须逐 SUPI 分阶段执行。"
@@ -178,6 +234,8 @@ def _cases(families: Iterable[Family], run_id: str) -> list[ExperimentCase]:
                 flow = FLOWS[scene["flow_index"]]
                 supi, flow_id, app_id, dnn, snssai = flow
                 profile = family.profiles[(template + variant - 2) % len(family.profiles)]
+                target = _target_snssai(family, template, flow)
+                initial_state = _initial_state(family, profile, flow, target)
                 catalog_id = f"S2K-{family.code}-{template:03d}-v{variant:02d}"
                 cases.append(
                     ExperimentCase(
@@ -185,18 +243,19 @@ def _cases(families: Iterable[Family], run_id: str) -> list[ExperimentCase]:
                         episode_id=f"{run_id}-{catalog_id.lower()}",
                         method="multi_agent_control",
                         user_input=(
-                            f"在{scene['site']}的{scene['condition']}场景中，" + _request(family, template, variant, flow)
+                            f"在{scene['site']}的{scene['condition']}场景中，" + _request(family, template, variant, flow, target)
                         ),
                         metadata={
-                            "catalog_version": "s2k-v2",
+                            "catalog_version": "s2k-v3",
                             "catalog_id": catalog_id,
                             "partition": _partition(template_ordinal),
                             "template_ordinal": template_ordinal,
                             "variant": variant,
                             "scenario_profile": profile,
-                            "scenario_initial_state": PROFILES[profile],
+                            "scenario_initial_state": initial_state,
                             "scenario_context": scene,
                             "flow_binding": {"supi": supi, "flow_id": flow_id, "app_id": app_id, "dnn": dnn, "snssai": snssai},
+                            "requested_route": {"target_snssai": target, "requires_existing_pdu": family.code in {"F2", "F3"}},
                             "operation_class": family.operation_class,
                             "feasibility": family.feasibility,
                             "expected_terminal": {"resolution": family.resolution, "reason_code": family.reason_code},
