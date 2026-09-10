@@ -189,18 +189,21 @@ class ContextBuilder:
         self,
         current_event: CoordinationEvent[object],
     ) -> list[CoordinationEvent[object]]:
-        collected = {current_event.event_id: current_event}
-        reference_ids = [
-            *current_event.input_artifact_ids,
-            *current_event.invalidated_artifact_ids,
-            *(
-                [current_event.in_reply_to]
-                if current_event.in_reply_to is not None
-                else []
-            ),
-        ]
-        for reference_id in reference_ids:
-            collected[reference_id] = self.journal.get_event(reference_id)
+        collected: dict[str, CoordinationEvent[object]] = {}
+
+        def collect(event: CoordinationEvent[object]) -> None:
+            if event.event_id in collected:
+                return
+            collected[event.event_id] = event
+            reference_ids = [
+                *event.input_artifact_ids,
+                *event.invalidated_artifact_ids,
+                *([event.in_reply_to] if event.in_reply_to is not None else []),
+            ]
+            for reference_id in reference_ids:
+                collect(self.journal.get_event(reference_id))
+
+        collect(current_event)
         events = sorted(collected.values(), key=lambda event: event.event_index)
         if current_event.target_agent == "main":
             return [

@@ -47,9 +47,12 @@ Main selects QoS for `<MainProposal.supi>` and UIR has no `get_sm_ue_flow_catalo
 Next action: call `get_sm_ue_flow_catalog({"supi":"<MainProposal.supi>"})`.
 Do not call structured completion in this action.
 
-Few-shot B — catalog-backed completion:
+Few-shot B — all-required-evidence completion:
 The catalog returns one matching row with `app_id`, `flow_id`, and `name`.
-Set the resolved flow binding by copying those three returned fields exactly. Never use an ID from this prompt or from another case.
+Copy those three returned fields exactly. If the active stage is QoS plus mobility
+with `serving_slice_change_requested:true`, this is not completion: call
+`get_am_policy_context`, then `get_ue_slice_subscription`, before structured
+completion. Never use an ID from this prompt or from another case.
 
 No literal local identifier is supplied here. A resolved `app_id` or `flow_id` must appear in a current catalog or search observation.
 
