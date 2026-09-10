@@ -214,37 +214,36 @@ class ContextBuilder:
             ),
             key=lambda event: event.event_index,
         )
-        if current_event.target_agent == "main":
-            return [
-                event
-                for event in events
-                if not isinstance(event.payload, ExecutionFeedback)
-            ]
-        if current_event.target_agent != "ppa":
-            return [
-                event
-                for event in events
-                if not isinstance(
-                    event.payload, (EnvironmentSnapshot, ExecutionFeedback)
-                )
-            ]
-        latest_observations: dict[str, str] = {}
+        latest_observations: dict[tuple[str, str], str] = {}
+        latest_sba_handoff: str | None = None
         for event in events:
+            if isinstance(event.payload, EnvironmentObservation):
+                latest_observations[
+                    (event.target_agent, event.payload.query.model_dump_json())
+                ] = event.event_id
             if (
-                event.target_agent == "ppa"
-                and isinstance(event.payload, EnvironmentObservation)
+                event.source_agent == "sba_compiler"
+                and event.target_agent == "ppa"
+                and event.message_type == "handoff"
             ):
-                latest_observations[event.payload.query.model_dump_json()] = event.event_id
+                latest_sba_handoff = event.event_id
         return [
             event
             for event in events
             if not (
                 isinstance(event.payload, (EnvironmentSnapshot, ExecutionFeedback))
                 or (
-                    event.target_agent == "ppa"
-                    and isinstance(event.payload, EnvironmentObservation)
-                    and latest_observations[event.payload.query.model_dump_json()]
+                    isinstance(event.payload, EnvironmentObservation)
+                    and latest_observations[
+                        (event.target_agent, event.payload.query.model_dump_json())
+                    ]
                     != event.event_id
+                )
+                or (
+                    event.source_agent == "sba_compiler"
+                    and event.target_agent == "ppa"
+                    and event.message_type == "handoff"
+                    and latest_sba_handoff != event.event_id
                 )
             )
         ]

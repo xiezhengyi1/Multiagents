@@ -37,8 +37,9 @@ Rules:
 3. Each `qos_operation_constraints` item is one JSON object for one flow; never put a quoted JSON object or a prose sentence inside that array. Use `""`, never `null`, for `target_slice_preference`.
 4. Set `require_slice_change=true` only when a different serving S-NSSAI is required. Then choose exactly one decision: `migration_authorized`, `blocked_by_subscription_entitlement`, `blocked_requires_subscription_provisioning`, or `evidence_missing`. Use `not_applicable` only when no slice change is required. Never output `migration_blocked`.
 5. If entitlement has no different authorized target and the user did not explicitly ask to change a subscription, choose `blocked_by_subscription_entitlement`, keep `subscription_change_required=false`, and leave `target_snssais` empty. Do not invent a target slice or user subscription update.
-6. A tool result remains available for this attempt. Never call the same tool twice for the same SUPI/fact. Once catalog/search evidence exists, finalize from it; if it has no match, return unresolved. Do not use knowledge tools: local app, flow, slice, SLA, and subscription facts come from runtime tools.
-7. For mobility-only work keep `flows` empty. Do not call tools outside the Main-selected domains. Use `open_questions` only for a real unresolved binding or fact; it does not alter Main's scope.
+6. `blocked_by_subscription_entitlement` is a completed grounding result, not an open question: set `open_questions:[]` and make no further tool call for the same fact.
+7. A tool result remains available for this attempt. Never call the same tool twice for the same SUPI/fact. Once catalog/search evidence exists, finalize from it; if it has no match, return unresolved. Do not use knowledge tools: local app, flow, slice, SLA, and subscription facts come from runtime tools.
+8. For mobility-only work keep `flows` empty. Do not call tools outside the Main-selected domains. Use `open_questions` only for a real unresolved binding or fact; it does not alter Main's scope.
 
 Few-shot output shapes (IDs are illustrative; copy only evidence-backed values):
 

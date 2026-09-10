@@ -168,6 +168,7 @@ def build_sba_prompt(context_jsonl: str) -> str:
         "- Do not guess identifiers. An unresolved QoS target still appears in flows.\n"
         "- A flow named only under an explicit no-change constraint is not a QoS target: omit it from flows and qos_operation_constraints.\n"
         "- A resolved flow has both catalog app_id and flow_id. An unresolved flow has both fields set to JSON null; never mix the two states.\n"
+        "- Emit one qos_operation_constraints item for each resolved flow and never emit two items with the same flow_id. A slice migration is encoded by require_slice_change on that one item, never by a second operation.\n"
         "- Follow every finalization and tool gate in the original system prompt.\n"
         "- Return one structured CoordinationDecision with an SbaProposal payload.\n"
         "- Reply gate: inspect only the newest event. A repair_request requires message_type=repair_response; every other trigger requires message_type=proposal. Never copy a message_type from an older event."
@@ -232,6 +233,7 @@ class SbaActor(StructuredModelActor):
             "- A repair issue `missing_am_context` means call `get_am_policy_context`; `missing_subscription` means call `get_ue_slice_subscription`; `missing_sm_catalog` means call `get_sm_ue_flow_catalog`. Act on the missing fact, not on a previously completed query.\n"
             "- Once the catalog, AM context, and subscription required by the active Main proposal are present, finalize from those facts: emit the evidence-grounded mobility_intent and migration decision, and set open_questions to []. A subscription result is an answer, not a blocking question.\n"
             "- Never change a catalog-resolved flow into unresolved during repair. `resolution_status=resolved` requires its exact catalog app_id and flow_id; `resolution_status=unresolved` requires both JSON fields to be null."
+            "\n- A blocked_by_subscription_entitlement decision is final evidence: set open_questions to [] and return it without another tool call."
         )
 
 
