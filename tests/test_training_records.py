@@ -116,6 +116,8 @@ def test_native_episode_records_select_only_validator_confirmed_sft_calls(
         input_artifact_ids=[accepted.event_id],
         payload=TerminalPayload(
             outcome="success",
+            resolution="executed",
+            reason_code="objective_achieved",
             reason="done",
             reward_total=1.0,
             reward_components={"objective": 1.0},
@@ -136,6 +138,8 @@ def test_native_episode_records_select_only_validator_confirmed_sft_calls(
     assert len(sft_examples) == 1
     assert sft_examples[0].example_id == candidates[0].trace.trace_id
     assert sft_examples[0].output_message.content == {"value": "good"}
+    assert sft_examples[0].resolution == "executed"
+    assert sft_examples[0].reason_code == "objective_achieved"
     assert rl_trajectory.episode_id == "episode-training"
     assert rl_trajectory.events == records.events
     assert rl_trajectory.traces == records.traces
@@ -190,6 +194,8 @@ def test_valid_upstream_repair_is_sft_eligible_without_invalidating_model_output
         input_artifact_ids=[repair.event_id],
         payload=TerminalPayload(
             outcome="failure",
+            resolution="failed",
+            reason_code="test_stop",
             reason="test stop",
             reward_total=-1.0,
             reward_components={"test": -1.0},
@@ -200,6 +206,7 @@ def test_valid_upstream_repair_is_sft_eligible_without_invalidating_model_output
 
     assert candidate.output_event_id == proposal.event_id
     assert candidate.disposition == "accepted_upstream_repair"
+    assert project_sft_examples(EpisodeRecords.load(journal.directory)) == []
 
 
 @pytest.mark.parametrize(
@@ -255,6 +262,8 @@ def test_all_model_workflow_variants_produce_sft_candidates(
         input_artifact_ids=[accepted.event_id],
         payload=TerminalPayload(
             outcome="success",
+            resolution="executed",
+            reason_code="objective_achieved",
             reason="done",
             reward_total=1.0,
             reward_components={"objective": 1.0},

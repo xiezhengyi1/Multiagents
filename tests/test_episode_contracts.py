@@ -38,7 +38,11 @@ from control_runtime.actors.main import (
     StageTrigger,
     validate_main_proposal,
 )
-from control_runtime.actors.ppa import PPA_SYSTEM_PROMPT
+from control_runtime.actors.ppa import (
+    PPA_SYSTEM_PROMPT,
+    PartialPolicySpec,
+    _is_subscription_entitlement_blocker,
+)
 from control_runtime.actors.sba import (
     SBA_SYSTEM_PROMPT,
     GroundedFlowBinding,
@@ -201,6 +205,8 @@ def test_episode_journal_writes_only_events_and_atomic_traces(tmp_path: Path) ->
         input_artifact_ids=[trigger.event_id],
         payload=TerminalPayload(
             outcome="success",
+            resolution="executed",
+            reason_code="objective_achieved",
             reason="objective reached",
             reward_total=1.0,
             reward_components={"objective": 1.0},
@@ -231,6 +237,8 @@ def test_terminal_reward_total_is_reproducible_from_components() -> None:
     with pytest.raises(ValidationError, match="sum of reward_components"):
         TerminalPayload(
             outcome="failure",
+            resolution="failed",
+            reason_code="repair_budget_exhausted",
             reason="budget exhausted",
             reward_total=-1.0,
             reward_components={"invalid_output": -0.5},
@@ -469,6 +477,8 @@ def test_langgraph_routes_bidirectional_repairs_as_ordered_events(
                 message_type="terminal",
                 payload=TerminalPayload(
                     outcome="success",
+                    resolution="executed",
+                    reason_code="validation_accepted",
                     reason="validated",
                     reward_total=1.0,
                     reward_components={"validation": 1.0},
@@ -777,6 +787,8 @@ def test_main_proposal_is_intercepted_repaired_and_delivered(tmp_path: Path) -> 
                 message_type="terminal",
                 payload=TerminalPayload(
                     outcome="success",
+                    resolution="executed",
+                    reason_code="main_delivered",
                     reason="main delivered",
                     reward_total=1.0,
                     reward_components={"delivery": 1.0},
@@ -1079,6 +1091,55 @@ def test_ppa_can_request_sba_reground_without_invalidating_valid_feedback(
     assert result.decision.target_agent == "sba"
     assert result.input_artifact_ids == (proposal.event_id,)
     assert result.invalidated_artifact_ids == ()
+
+
+def test_subscription_entitlement_blocker_requires_complete_evidence() -> None:
+    sba_artifact = SbaArtifact(
+        supi="imsi-12345",
+        flows=[],
+        mobility_intent=None,
+        qos_operation_constraints=[],
+        slice_migration_authorization=SliceMigrationDecision(
+            decision="blocked_by_subscription_entitlement",
+            target_snssais=[],
+            subscription_change_required=False,
+            rationale=["no different authorized slice"],
+        ),
+        open_questions=[],
+        subscription={"allowed_snssais": ["01000001"]},
+    )
+    proposal = PpaProposal(
+        planning_status="partial_plan",
+        rationale="subscription blocks migration",
+        missing_evidence=[],
+        blocked_targets=["slice_migration_authorization"],
+        upstream_requests=[],
+        planner_conflicts=["blocked_by_subscription_entitlement"],
+        open_questions=[],
+        sm_policies=[],
+        am_policy=None,
+        ursp_policies=[],
+        partial_policies=[
+            PartialPolicySpec(
+                app_id="app-1",
+                flow_id="flow-1",
+                target_type="flow",
+                policy_type="slice_migration",
+                resource_keys=["slice_migration_authorization"],
+                policy_details={
+                    "blocked_reason": "blocked_by_subscription_entitlement"
+                },
+            )
+        ],
+    )
+
+    assert _is_subscription_entitlement_blocker(
+        proposal=proposal, sba_artifact=sba_artifact
+    )
+    assert not _is_subscription_entitlement_blocker(
+        proposal=proposal,
+        sba_artifact=sba_artifact.model_copy(update={"subscription": None}),
+    )
 
 
 def test_function_simulator_adapter_exposes_one_strict_boundary() -> None:

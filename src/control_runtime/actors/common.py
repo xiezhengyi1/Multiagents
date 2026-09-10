@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Literal, TypeVar
 
+from pydantic import model_validator
+
 from shared.contracts import NonEmptyStr
 from shared.contracts.coordination import (
     CoordinationEvent,
@@ -17,11 +19,21 @@ class ControlRequest(HandoffPayload):
 
 class PlanningBlocker(HandoffPayload):
     rationale: NonEmptyStr
+    resolution: Literal["repairable", "infeasible"]
+    reason_code: NonEmptyStr
     missing_evidence: list[NonEmptyStr]
     blocked_targets: list[NonEmptyStr]
     upstream_requests: list[NonEmptyStr]
     planner_conflicts: list[NonEmptyStr]
     repair_owner: Literal["sba", "ppa"]
+
+    @model_validator(mode="after")
+    def validate_resolution(self) -> PlanningBlocker:
+        if self.resolution == "infeasible" and (
+            self.missing_evidence or self.upstream_requests
+        ):
+            raise ValueError("infeasible planning blocker cannot require more evidence")
+        return self
 
 
 PayloadT = TypeVar("PayloadT", bound=CoordinationPayload)

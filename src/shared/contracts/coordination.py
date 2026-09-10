@@ -89,12 +89,18 @@ class TerminalPayload(CoordinationPayload):
     allowed_message_types = frozenset({"terminal"})
 
     outcome: Literal["success", "failure"]
+    resolution: Literal["executed", "infeasible", "failed"]
+    reason_code: NonEmptyStr
     reason: NonEmptyStr
     reward_total: float
     reward_components: dict[NonEmptyStr, float]
 
     @model_validator(mode="after")
     def validate_reward(self) -> TerminalPayload:
+        if self.resolution in {"executed", "infeasible"} and self.outcome != "success":
+            raise ValueError("executed and infeasible terminals must be successful")
+        if self.resolution == "failed" and self.outcome != "failure":
+            raise ValueError("failed terminals must be failures")
         values = [self.reward_total, *self.reward_components.values()]
         if not all(math.isfinite(value) for value in values):
             raise ValueError("terminal rewards must be finite")

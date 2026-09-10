@@ -42,12 +42,15 @@ class EpisodeController:
         self.budget_exhausted_reward_components = dict(
             budget_exhausted_reward_components
         )
+        self._execution_failure_keys: set[tuple[str, tuple[str, ...]]] = set()
 
     @staticmethod
     def _terminal(
         *,
         current: object,
         outcome: str,
+        resolution: str,
+        reason_code: str,
         reason: str,
         reward_components: dict[str, float],
     ) -> EventEmission:
@@ -58,6 +61,8 @@ class EpisodeController:
                 message_type="terminal",
                 payload=TerminalPayload(
                     outcome=outcome,
+                    resolution=resolution,
+                    reason_code=reason_code,
                     reason=reason,
                     reward_total=sum(reward_components.values()),
                     reward_components=reward_components,
@@ -77,6 +82,15 @@ class EpisodeController:
 
         current = state["current_event"]
         if isinstance(current.payload, PlanningBlocker):
+            if current.payload.resolution == "infeasible":
+                return self._terminal(
+                    current=current,
+                    outcome="success",
+                    resolution="infeasible",
+                    reason_code=current.payload.reason_code,
+                    reason=current.payload.rationale,
+                    reward_components={"infeasible_request": 1.0},
+                )
             details = [
                 current.payload.rationale,
                 *current.payload.missing_evidence,
@@ -94,6 +108,8 @@ class EpisodeController:
             return self._terminal(
                 current=current,
                 outcome="failure",
+                resolution="failed",
+                reason_code="repair_budget_exhausted",
                 reason=reason,
                 reward_components=self.budget_exhausted_reward_components,
             )
@@ -110,9 +126,26 @@ class EpisodeController:
                 return self._terminal(
                     current=current,
                     outcome="success",
+                    resolution="executed",
+                    reason_code="objective_achieved",
                     reason=current.payload.reason_summary,
                     reward_components=current.payload.reward_components,
                 )
+            if current.payload.status == "execution_failed":
+                failure_key = (
+                    current.payload.reason_summary,
+                    tuple(sorted(current.payload.affected_operation_ids)),
+                )
+                if failure_key in self._execution_failure_keys:
+                    return self._terminal(
+                        current=current,
+                        outcome="failure",
+                        resolution="failed",
+                        reason_code="repeated_execution_failure",
+                        reason=current.payload.reason_summary,
+                        reward_components=current.payload.reward_components,
+                    )
+                self._execution_failure_keys.add(failure_key)
             issues = [
                 ValidationIssue(
                     code=current.payload.root_cause_category,
@@ -139,6 +172,8 @@ class EpisodeController:
             return self._terminal(
                 current=current,
                 outcome="failure",
+                resolution="failed",
+                reason_code="repair_budget_exhausted",
                 reason="; ".join(issue.message for issue in route.issues),
                 reward_components=reward_components,
             )

@@ -245,6 +245,7 @@ def build_ppa_prompt(
         "\nData-contract task: return one structured CoordinationDecision "
         "with a PpaProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event. A repair_request requires message_type=repair_response; every other trigger requires message_type=proposal. Never copy a message_type from an older event."
         "\nTool-use rule: call an available tool at most once for the same arguments. After receiving its result, do not call it again; return the CoordinationDecision when the required evidence is available."
+        "\nFinality gate: when the SBA artifact has `slice_migration_authorization.decision=blocked_by_subscription_entitlement`, an empty target_snssais list, and no subscription change requested, return one partial_plan to episode_controller. State the block in `blocked_targets` and `planner_conflicts`; leave missing_evidence, upstream_requests, and open_questions empty."
     )
 
 
@@ -675,6 +676,28 @@ def validate_ppa_proposal(
     return issues
 
 
+def _is_subscription_entitlement_blocker(
+    *, proposal: PpaProposal, sba_artifact: SbaArtifact
+) -> bool:
+    authorization = sba_artifact.slice_migration_authorization
+    return (
+        authorization.decision == "blocked_by_subscription_entitlement"
+        and sba_artifact.subscription is not None
+        and not authorization.target_snssais
+        and not authorization.subscription_change_required
+        and not proposal.missing_evidence
+        and not proposal.upstream_requests
+        and "slice_migration_authorization" in proposal.blocked_targets
+        and "blocked_by_subscription_entitlement" in proposal.planner_conflicts
+        and any(
+            policy.policy_type == "slice_migration"
+            and policy.policy_details.get("blocked_reason")
+            == "blocked_by_subscription_entitlement"
+            for policy in proposal.partial_policies
+        )
+    )
+
+
 class PpaValidator(ValidationActor):
     actor_id = "ppa_validator"
 
@@ -734,12 +757,22 @@ class PpaValidator(ValidationActor):
                 invalidated_artifact_ids=(),
             )
         if current.payload.planning_status == "partial_plan" and not issues:
+            infeasible = _is_subscription_entitlement_blocker(
+                proposal=current.payload,
+                sba_artifact=sba_artifact,
+            )
             return EventEmission(
                 decision=CoordinationDecision[PlanningBlocker](
                     target_agent="episode_controller",
                     message_type="handoff",
                     payload=PlanningBlocker(
                         rationale=current.payload.rationale,
+                        resolution="infeasible" if infeasible else "repairable",
+                        reason_code=(
+                            "blocked_by_subscription_entitlement"
+                            if infeasible
+                            else "partial_plan_requires_repair"
+                        ),
                         missing_evidence=current.payload.missing_evidence,
                         blocked_targets=current.payload.blocked_targets,
                         upstream_requests=current.payload.upstream_requests,

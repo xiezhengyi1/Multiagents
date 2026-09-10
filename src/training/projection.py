@@ -7,6 +7,9 @@ from .schemas import EpisodeMetrics, RlTrajectory, SftExample
 
 
 def project_sft_examples(records: EpisodeRecords) -> list[SftExample]:
+    terminal = TerminalPayload.model_validate(records.events[-1]["payload"])
+    if terminal.outcome != "success":
+        return []
     episode_id = _episode_id(records)
     examples: list[SftExample] = []
     for candidate in records.sft_candidates():
@@ -26,6 +29,8 @@ def project_sft_examples(records: EpisodeRecords) -> list[SftExample]:
                 output_event_id=candidate.output_event_id,
                 validation_event_id=candidate.validation_event_id,
                 disposition=candidate.disposition,
+                resolution=terminal.resolution,
+                reason_code=terminal.reason_code,
             )
         )
     return examples

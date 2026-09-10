@@ -221,6 +221,8 @@ def test_assurance_diagnosis_routes_repair_and_projects_metrics(
         input_artifact_ids=[repair_event.event_id],
         payload=TerminalPayload(
             outcome="failure",
+            resolution="failed",
+            reason_code="test_terminal",
             reason="test terminal",
             reward_total=-1.0,
             reward_components={"objective": -1.0},
@@ -244,6 +246,8 @@ def test_partial_plan_reenters_the_responsible_agent(tmp_path: Path) -> None:
         message_type="handoff",
         payload=PlanningBlocker(
             rationale="fresh binding required",
+            resolution="repairable",
+            reason_code="upstream_binding_required",
             missing_evidence=["flow binding"],
             blocked_targets=["flow-1"],
             upstream_requests=["rebind flow-1"],
@@ -268,3 +272,41 @@ def test_partial_plan_reenters_the_responsible_agent(tmp_path: Path) -> None:
     assert result.decision.message_type == "repair_request"
     assert result.decision.target_agent == "sba"
     assert result.decision.payload.issues[0].code == "planning_blocked"
+
+
+def test_certified_infeasible_plan_terminates_without_repair(tmp_path: Path) -> None:
+    journal = EpisodeJournal(root=tmp_path, episode_id="infeasible-plan")
+    blocker = journal.append_event(
+        round_index=0,
+        source_agent="ppa_validator",
+        target_agent="episode_controller",
+        message_type="handoff",
+        payload=PlanningBlocker(
+            rationale="subscription does not authorize a different slice",
+            resolution="infeasible",
+            reason_code="blocked_by_subscription_entitlement",
+            missing_evidence=[],
+            blocked_targets=["slice_migration_authorization"],
+            upstream_requests=[],
+            planner_conflicts=["blocked_by_subscription_entitlement"],
+            repair_owner="ppa",
+        ),
+    )
+    controller = EpisodeController(
+        repair_budget=RepairBudget(
+            RepairLimits(
+                local_limits={"ppa": 2},
+                upstream={"ppa": "sba"},
+                total_limit=2,
+                controller_actor="episode_controller",
+            )
+        ),
+        budget_exhausted_reward_components={"repair_budget": -1.0},
+    )
+
+    result = controller({"current_event": blocker, "pending_model_failure": None})
+
+    assert result.decision.message_type == "terminal"
+    assert result.decision.payload.outcome == "success"
+    assert result.decision.payload.resolution == "infeasible"
+    assert result.decision.payload.reason_code == "blocked_by_subscription_entitlement"

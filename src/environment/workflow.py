@@ -222,6 +222,12 @@ class EnvironmentController:
                 message_type="terminal",
                 payload=TerminalPayload(
                     outcome=outcome,
+                    resolution="executed" if outcome == "success" else "failed",
+                    reason_code=(
+                        "environment_validated"
+                        if outcome == "success"
+                        else "environment_validation_failed"
+                    ),
                     reason=reason,
                     reward_total=sum(components.values()),
                     reward_components=components,

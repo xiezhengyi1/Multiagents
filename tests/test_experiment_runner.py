@@ -22,6 +22,8 @@ class _Backend:
                 message_type="terminal",
                 payload=TerminalPayload(
                     outcome="success",
+                    resolution="executed",
+                    reason_code="experiment_complete",
                     reason="experiment complete",
                     reward_total=1.0,
                     reward_components={"objective": 1.0},

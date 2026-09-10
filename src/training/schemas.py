@@ -26,6 +26,8 @@ class SftExample(ContractModel):
     output_event_id: NonEmptyStr
     validation_event_id: NonEmptyStr
     disposition: Literal["accepted", "accepted_upstream_repair"]
+    resolution: Literal["executed", "infeasible"]
+    reason_code: NonEmptyStr
 
 
 class EpisodeMetrics(ContractModel):
