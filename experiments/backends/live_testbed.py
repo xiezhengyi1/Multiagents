@@ -66,7 +66,7 @@ class LiveTestbedBackend:
             ),
             outcome_evaluator=LiveOutcomeEvaluator(),
             budget_exhausted_reward_components={"repair_budget": -1.0},
-            context_token_budget=9_000,
+            context_token_budget=12_000,
             count_tokens=self.count_tokens,
             transport_max_attempts=2,
         )
