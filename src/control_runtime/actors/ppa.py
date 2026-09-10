@@ -245,7 +245,7 @@ def build_ppa_prompt(
         "\nData-contract task: return one structured CoordinationDecision "
         "with a PpaProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event. A repair_request requires message_type=repair_response; every other trigger requires message_type=proposal. Never copy a message_type from an older event."
         "\nTool-use rule: call an available tool at most once for the same arguments. After receiving its result, do not call it again; return the CoordinationDecision when the required evidence is available."
-        "\nFinality gate: when the SBA artifact has `slice_migration_authorization.decision=blocked_by_subscription_entitlement` and no subscription change requested, return exactly one partial_plan to episode_controller. State the block in `blocked_targets` and `planner_conflicts`; leave missing_evidence, upstream_requests, and open_questions empty. Its partial policy must use `policy_type=slice_migration` and `policy_details.decision=blocked_by_subscription_entitlement`."
+        "\nFinality gate: when the SBA artifact has `slice_migration_authorization.decision=blocked_by_subscription_entitlement` and no subscription change requested, return one partial_plan to episode_controller. State the block in `blocked_targets` and `planner_conflicts`; leave missing_evidence, upstream_requests, and open_questions empty. Every partial policy must use `policy_type=slice_migration` and `policy_details.decision=blocked_by_subscription_entitlement`."
         "\nPolicy scope: do not emit SM or URSP policies for a flow Main explicitly leaves unchanged, excludes, or says not to move. Emit URSP only when evidence shows the selected DNN/S-NSSAI differs from the current PDU route; a new association or version is not route evidence."
     )
 
@@ -687,8 +687,8 @@ def _is_subscription_entitlement_blocker(
         and not authorization.subscription_change_required
         and not proposal.missing_evidence
         and not proposal.upstream_requests
-        and len(proposal.partial_policies) == 1
-        and any(
+        and proposal.partial_policies
+        and all(
             policy.policy_type == "slice_migration"
             and policy.policy_details.get("decision")
             == "blocked_by_subscription_entitlement"
