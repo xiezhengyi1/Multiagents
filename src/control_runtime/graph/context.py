@@ -190,11 +190,13 @@ class ContextBuilder:
         current_event: CoordinationEvent[object],
     ) -> list[CoordinationEvent[object]]:
         collected: dict[str, CoordinationEvent[object]] = {}
+        invalidated_event_ids: set[str] = set()
 
         def collect(event: CoordinationEvent[object]) -> None:
             if event.event_id in collected:
                 return
             collected[event.event_id] = event
+            invalidated_event_ids.update(event.invalidated_artifact_ids)
             reference_ids = [
                 *event.input_artifact_ids,
                 *event.invalidated_artifact_ids,
@@ -204,7 +206,14 @@ class ContextBuilder:
                 collect(self.journal.get_event(reference_id))
 
         collect(current_event)
-        events = sorted(collected.values(), key=lambda event: event.event_index)
+        events = sorted(
+            (
+                event
+                for event_id, event in collected.items()
+                if event_id not in invalidated_event_ids
+            ),
+            key=lambda event: event.event_index,
+        )
         if current_event.target_agent == "main":
             return [
                 event

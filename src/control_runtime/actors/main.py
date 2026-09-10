@@ -124,7 +124,7 @@ class MainDomainEvidence(ContractModel):
 
 
 class MainProposal(ProposalPayload):
-    supi: str
+    supi: NonEmptyStr
     requested_domains: list[ControlDomain]
     serving_slice_change_requested: bool
     domain_evidence: MainDomainEvidence
