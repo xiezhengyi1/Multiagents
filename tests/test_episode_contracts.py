@@ -1112,9 +1112,11 @@ def test_subscription_entitlement_blocker_requires_complete_evidence() -> None:
         planning_status="partial_plan",
         rationale="subscription blocks migration",
         missing_evidence=[],
-        blocked_targets=["slice_migration_authorization"],
+        blocked_targets=["Remote_Drive_video_1"],
         upstream_requests=[],
-        planner_conflicts=["blocked_by_subscription_entitlement"],
+        planner_conflicts=[
+            "slice_migration_authorization.decision=blocked_by_subscription_entitlement"
+        ],
         open_questions=[],
         sm_policies=[],
         am_policy=None,

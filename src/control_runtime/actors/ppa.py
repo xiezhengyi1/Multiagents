@@ -687,8 +687,6 @@ def _is_subscription_entitlement_blocker(
         and not authorization.subscription_change_required
         and not proposal.missing_evidence
         and not proposal.upstream_requests
-        and "slice_migration_authorization" in proposal.blocked_targets
-        and "blocked_by_subscription_entitlement" in proposal.planner_conflicts
         and any(
             policy.policy_type == "slice_migration"
             and policy.policy_details.get("blocked_reason")
