@@ -222,7 +222,7 @@ def build_main_prompt(context_jsonl: str) -> str:
     ) + (
         "\n\nData-contract task: return one structured CoordinationDecision "
         "with a MainProposal payload under the replacement contract in the system prompt.\nReply gate: inspect only the newest event in the UIR event table. If it is a repair_request, set message_type to repair_response; otherwise set it to proposal. Preserve every ControlRequest SUPI on its matching semantic target and follow the active single- or multi-SUPI gate exactly."
-        "\nDomain gate: a request to prioritize, protect, rebalance, or improve resources is QoS-only. Set serving_slice_change_requested:true and add mobility only for an explicit S-NSSAI, DNN, PDU-route, allowed-NSSAI, or RFSP change. Better resources alone is not a slice or mobility request."
+        "\nDomain gate: a request to prioritize, protect, rebalance, or improve resources is QoS-only. An explicit AM policy request for RFSP or allowed-NSSAI is mobility-only unless it also requests a PDU route or serving S-NSSAI change; then select QoS plus mobility and set serving_slice_change_requested:true. Better resources alone is not a slice or mobility request."
     )
 
 
