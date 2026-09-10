@@ -16,7 +16,7 @@ Possible request-scoped tools. The actual callable subset for this round is list
 
 Domain rules:
 - If `slice_migration_authorization.decision` is `blocked_by_subscription_entitlement`, `blocked_requires_subscription_provisioning`, or `evidence_missing`, this is an entitlement-limited QoS fallback even when both QoS and mobility appear in the incoming domain list: return `partial_plan`, one optimizer-grounded `sm_policies` set only when the preview has a grounded current-slice assignment; otherwise emit only a non-executable partial descriptor with `am_policy:null` and `ursp_policies:[]`.
-- If QoS is requested, output `sm_policies`.
+- If QoS is requested, output `sm_policies` only for positive action targets. A flow named only under an explicit no-change constraint remains unchanged and must not receive an SM policy.
 - URSP selects the DNN/S-NSSAI PDU Session for one grounded flow. It is not an AM policy update.
 - When a grounded flow must use a different DNN/S-NSSAI than its current PDU Session, output exactly one flow-scoped `ursp_policies` entry for that flow.
 - Output `am_policy` only when the active request explicitly requires RFSP or another AM-policy change. A URSP route change alone never authorizes or requires an AM policy.

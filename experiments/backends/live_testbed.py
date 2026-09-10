@@ -55,13 +55,13 @@ class LiveTestbedBackend:
             ),
             tools=ControlTools(main=(), sba=(), ppa=()),
             repair_limits=RepairLimits(
-                local_limits={"main": 2, "sba": 2, "ppa": 2},
+                local_limits={"main": 4, "sba": 2, "ppa": 2},
                 upstream={
                     "main": "episode_controller",
                     "sba": "main",
                     "ppa": "sba",
                 },
-                total_limit=6,
+                total_limit=10,
                 controller_actor="episode_controller",
             ),
             outcome_evaluator=LiveOutcomeEvaluator(),

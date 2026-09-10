@@ -311,12 +311,30 @@ def validate_main_proposal(
                         f"semantic target must carry {explicit}",
                         f"payload.control_semantics.stages.{stage_index}.targets.{target_index}.supi",
                     )
-    elif len(explicit_supis) > 1 and proposal.supi.strip():
-        add(
-            "multi_supi",
-            "top-level supi must be empty for multi-SUPI requests",
-            "payload.supi",
-        )
+    elif len(explicit_supis) > 1:
+        if proposal.supi not in explicit_supis:
+            add(
+                "supi_mismatch",
+                "top-level supi must be one explicit request SUPI",
+                "payload.supi",
+            )
+        for stage_index, stage in enumerate(proposal.control_semantics.stages):
+            for target_index, target in enumerate(stage.targets):
+                if target.supi not in explicit_supis:
+                    add(
+                        "semantic_target_supi",
+                        "semantic target must carry one explicit request SUPI",
+                        f"payload.control_semantics.stages.{stage_index}.targets.{target_index}.supi",
+                    )
+                if (
+                    stage.stage_index == proposal.control_semantics.current_stage
+                    and target.supi != proposal.supi
+                ):
+                    add(
+                        "semantic_target_supi",
+                        "current-stage semantic targets must match top-level supi",
+                        f"payload.control_semantics.stages.{stage_index}.targets.{target_index}.supi",
+                    )
     return issues
 
 

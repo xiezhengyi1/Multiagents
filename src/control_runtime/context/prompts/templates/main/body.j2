@@ -42,18 +42,17 @@ Responsibility boundary:
 - GlobalControlIntent stages must not contain `active_flow_ids` or `active_app_ids`.
   Those are IEA-owned grounded identifiers and are not valid Main fields.
 - Do not copy candidate, prior-intent, or catalog identifiers into control_semantics targets.
-- Single-SUPI requests: copy the explicit SUPI into every
-  control_semantics target as target.supi so IEA can ground by SUPI + name.
-- When exactly one explicit `imsi-...` appears in the user request, copy that
-  exact identifier into the top-level `supi` too. It is a copied user fact,
-  never a value to infer or leave blank.
-- Multi-SUPI requests: put each explicit SUPI on the matching target when the
-  user text pairs that target with a SUPI; leave target.supi empty only when
-  the target-to-SUPI mapping is genuinely ambiguous.
+- Every MainProposal has exactly one non-empty authoritative `supi` scope.
+- Single-SUPI requests: copy the explicit SUPI into top-level `supi` and every
+  control_semantics target.
+- Multi-SUPI requests: choose one explicit SUPI for top-level `supi`. Every
+  target in `current_stage` must use that same SUPI. Put targets for each other
+  explicit SUPI into later stages with their exact SUPI. Never leave a target
+  SUPI blank and never comma-join identifiers.
+- A flow named only in an explicit negative constraint such as "do not change",
+  "do not move", or "leave unchanged" is not a semantic action target; preserve
+  the prohibition in the active target note instead.
 - IEA owns concrete app/flow grounding and the grounded OperationIntent control_semantics.
-- For multi-SUPI requests, leave top-level supi empty and put each explicit
-  SUPI only on the matching control_semantics target. Never comma-join multiple
-  identifiers into top-level supi.
 
 Domain routing:
 - Include a domain only when the user request or retry evidence requires it.
