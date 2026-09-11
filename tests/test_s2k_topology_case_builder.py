@@ -12,21 +12,21 @@ from experiments.scripts.build_s2k_topology_cases import (
 def test_topology_catalog_has_fixed_quota_and_scenario_level_partitions() -> None:
     cases = build_s2k_topology_cases(run_id="s2k-topology-test")
 
-    assert len({case.user_input for case in cases}) == 1000
-    assert len(cases) == 1000
-    assert len({case.case_id for case in cases}) == 1000
+    assert len({case.user_input for case in cases}) == 1560
+    assert len(cases) == 1560
+    assert len({case.case_id for case in cases}) == 1560
     assert Counter(case.metadata["case_class"] for case in cases) == {
-        "feasible": 600,
+        "feasible": 1160,
         "infeasible": 400,
     }
     assert Counter(case.metadata["partition"] for case in cases) == {
-        "train": 700,
-        "validation": 150,
-        "test": 150,
+        "train": 1092,
+        "validation": 234,
+        "test": 234,
     }
-    assert set(Counter(case.metadata["scenario_id"] for case in cases).values()) == {50}
+    assert set(Counter(case.metadata["scenario_id"] for case in cases).values()) == {78}
     assert {case.metadata["catalog_version"] for case in cases} == {
-        "s2k-topology-v2-natural-input"
+        "s2k-topology-v3-balanced"
     }
     assert all(
         case.metadata["sft_disposition"] == "pending_execution" for case in cases
@@ -76,10 +76,10 @@ def test_topology_catalog_operation_mix_is_stable() -> None:
     cases = build_s2k_topology_cases(run_id="s2k-topology-test")
     assert Counter(case.metadata["operation_class"] for case in cases) == {
         "qos_same_pdu": 360,
-        "ursp_existing_pdu": 120,
-        "am_rfsp_only": 60,
-        "multi_supi_staged": 40,
-        "safe_qos_execution": 20,
+        "ursp_existing_pdu": 200,
+        "am_rfsp_only": 200,
+        "multi_supi_staged": 200,
+        "safe_qos_execution": 200,
         "subscription_entitlement_block": 200,
         "hard_constraint_conflict": 200,
     }

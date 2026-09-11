@@ -275,7 +275,7 @@ def _case(
 ) -> ExperimentCase:
     case_id = f"S2K-T{record.number:02d}-{case_number:02d}"
     metadata = {
-        "catalog_version": "s2k-topology-v2-natural-input",
+        "catalog_version": "s2k-topology-v3-balanced",
         "catalog_id": case_id,
         "partition": record.partition,
         **_scenario_metadata(record),
@@ -356,7 +356,7 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
             )
         )
 
-    for index in range(19, 25):
+    for index in range(19, 29):
         binding = multi_route_bindings[(index - 19) % len(multi_route_bindings)]
         target = _existing_target(binding, inventory, index)
         cases.append(
@@ -392,8 +392,8 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
             )
         )
 
-    for index in range(25, 28):
-        binding = bindings[(index - 25) % len(bindings)]
+    for index in range(29, 39):
+        binding = bindings[(index - 29) % len(bindings)]
         cases.append(
             _case(
                 record=record,
@@ -401,7 +401,7 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 case_number=index,
                 user_input=(
                     f"请只调整用户 SUPI {binding['supi']} 的移动性优先级和驻留偏好，"
-                    f"调整幅度为第 {index - 24} 档，不要改变其{_flow_description(binding)}正在使用的业务连接。"
+                    f"调整幅度为第 {index - 28} 档，不要改变其{_flow_description(binding)}正在使用的业务连接。"
                 ),
                 bindings=[binding],
                 operation_class="am_rfsp_only",
@@ -425,8 +425,20 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
             )
         )
 
-    for index in range(28, 30):
-        primary = bindings[(index - 28) % len(bindings)]
+    multi_supi_priorities = (
+        "稳定",
+        "连续",
+        "低时延",
+        "低抖动",
+        "上行保障",
+        "下行保障",
+        "低丢包",
+        "可用性",
+        "控制响应",
+        "视频质量",
+    )
+    for index in range(39, 49):
+        primary = bindings[(index - 39) % len(bindings)]
         peer = next(item for item in bindings if item["supi"] != primary["supi"])
         cases.append(
             _case(
@@ -435,7 +447,7 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 case_number=index,
                 user_input=(
                     f"先确保用户 SUPI {primary['supi']} 的{_flow_description(primary)}"
-                    f"{('稳定', '连续')[index - 28]}，"
+                    f"{multi_supi_priorities[index - 39]}，"
                     f"再处理用户 SUPI {peer['supi']} 的{_flow_description(peer)}，请分两步完成。"
                 ),
                 bindings=[primary, peer],
@@ -452,33 +464,46 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
             )
         )
 
-    binding = bindings[29 % len(bindings)]
-    cases.append(
-        _case(
-            record=record,
-            run_id=run_id,
-            case_number=30,
-            user_input=(
-                f"当前负载较高，请改善用户 SUPI {binding['supi']} 的{_flow_description(binding)}；"
-                "不能牺牲更重要业务的保障，也不要改变它正在使用的业务连接。"
-            ),
-            bindings=[binding],
-            operation_class="safe_qos_execution",
-            feasibility="feasible",
-            reason_code="objective_achieved",
-            requested_route=None,
-            main_domains=["qos"],
-            sba_evidence=["flow_catalog", "resource_snapshot"],
-            ppa_plan="safe_qos_only",
-            evidence_contract=["snapshot_id", "flow_catalog", "resource_snapshot"],
-            acceptance_checks=[
-                "receipt_success",
-                "safety_budget_preserved",
-                "route_unchanged",
-            ],
-            inventory=inventory,
-        )
+    safe_goals = (
+        "适度改善体验",
+        "改善响应速度",
+        "改善传输稳定性",
+        "改善画面连续性",
+        "改善控制及时性",
+        "改善上行表现",
+        "改善下行表现",
+        "改善时延表现",
+        "改善抖动表现",
+        "改善丢包表现",
     )
+    for index in range(49, 59):
+        binding = bindings[(index - 49) % len(bindings)]
+        cases.append(
+            _case(
+                record=record,
+                run_id=run_id,
+                case_number=index,
+                user_input=(
+                    f"当前负载较高，请{safe_goals[index - 49]}用户 SUPI {binding['supi']} 的"
+                    f"{_flow_description(binding)}；不能牺牲更重要业务的保障，也不要改变它正在使用的业务连接。"
+                ),
+                bindings=[binding],
+                operation_class="safe_qos_execution",
+                feasibility="feasible",
+                reason_code="objective_achieved",
+                requested_route=None,
+                main_domains=["qos"],
+                sba_evidence=["flow_catalog", "resource_snapshot"],
+                ppa_plan="safe_qos_only",
+                evidence_contract=["snapshot_id", "flow_catalog", "resource_snapshot"],
+                acceptance_checks=[
+                    "receipt_success",
+                    "safety_budget_preserved",
+                    "route_unchanged",
+                ],
+                inventory=inventory,
+            )
+        )
 
     migration_goals = (
         "降低时延",
@@ -492,10 +517,10 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
         "保障边缘处理",
         "避开退化回传",
     )
-    for index in range(31, 41):
-        binding = bindings[(index - 31) % len(bindings)]
+    for index in range(59, 69):
+        binding = bindings[(index - 59) % len(bindings)]
         target = _unauthorized_target(binding, inventory, index)
-        goal = migration_goals[index - 31]
+        goal = migration_goals[index - 59]
         cases.append(
             _case(
                 record=record,
@@ -531,10 +556,10 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
         "切换到云端",
         "重排业务路径",
     )
-    for index in range(41, 51):
-        binding = multi_route_bindings[(index - 41) % len(multi_route_bindings)]
+    for index in range(69, 79):
+        binding = multi_route_bindings[(index - 69) % len(multi_route_bindings)]
         target = _existing_target(binding, inventory, index)
-        goal = conflict_goals[index - 41]
+        goal = conflict_goals[index - 69]
         cases.append(
             _case(
                 record=record,
@@ -575,8 +600,8 @@ def build_s2k_topology_cases(
         for record in load_scenarios(scenario_root)
         for case in _scenario_cases(record, run_id)
     ]
-    if len(cases) != 1000:
-        raise ValueError(f"expected 1000 topology-bound cases, found {len(cases)}")
+    if len(cases) != 1560:
+        raise ValueError(f"expected 1560 topology-bound cases, found {len(cases)}")
     return cases
 
 
