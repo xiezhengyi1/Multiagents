@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -99,7 +100,11 @@ def _missing_acceptance(records: EpisodeRecords, checks: list[str], resolution: 
 
 def audit_result(case: ExperimentCase, raw_result: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     result = ExperimentResult.model_validate(
-        {key: value for key, value in raw_result.items() if key != "baseline_id"}
+        {
+            key: value
+            for key, value in raw_result.items()
+            if key not in {"baseline_id", "case_input_sha256"}
+        }
     )
     expected = dict(case.metadata["expected_terminal"])
     audit: dict[str, Any] = {
@@ -110,10 +115,15 @@ def audit_result(case: ExperimentCase, raw_result: dict[str, Any]) -> tuple[dict
         "terminal": result.terminal.model_dump(mode="json"),
         "expected_terminal": expected,
         "baseline_id": raw_result.get("baseline_id"),
+        "case_input_sha256": raw_result.get("case_input_sha256"),
         "sft_disposition": "diagnostic",
     }
     if raw_result.get("baseline_id") != case.case_id:
         audit["reason"] = "missing_clean_baseline"
+        return audit, []
+    expected_input_sha256 = hashlib.sha256(case.user_input.encode()).hexdigest()
+    if raw_result.get("case_input_sha256") != expected_input_sha256:
+        audit["reason"] = "case_input_mismatch"
         return audit, []
     actual = result.terminal.model_dump(mode="json")
     if any(actual[name] != expected[name] for name in ("outcome", "resolution", "reason_code")):
