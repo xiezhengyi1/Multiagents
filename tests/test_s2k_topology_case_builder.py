@@ -25,7 +25,9 @@ def test_topology_catalog_has_fixed_quota_and_scenario_level_partitions() -> Non
         "test": 150,
     }
     assert set(Counter(case.metadata["scenario_id"] for case in cases).values()) == {50}
-    assert {case.metadata["catalog_version"] for case in cases} == {"s2k-topology-v1"}
+    assert {case.metadata["catalog_version"] for case in cases} == {
+        "s2k-topology-v2-natural-input"
+    }
     assert all(
         case.metadata["sft_disposition"] == "pending_execution" for case in cases
     )
@@ -81,3 +83,22 @@ def test_topology_catalog_operation_mix_is_stable() -> None:
         "subscription_entitlement_block": 200,
         "hard_constraint_conflict": 200,
     }
+
+
+def test_topology_catalog_user_inputs_are_natural_and_keep_supi_only() -> None:
+    cases = build_s2k_topology_cases(run_id="s2k-topology-test")
+
+    for case in cases:
+        bindings = case.metadata["flow_bindings"]
+        assert not case.user_input.startswith("在 ")
+        for binding in bindings:
+            assert binding["supi"] in case.user_input
+            for internal_value in (
+                binding["flow_id"],
+                binding["app_id"],
+                binding["session_id"],
+                binding["dnn"],
+                binding["snssai"],
+                binding["slice_id"],
+            ):
+                assert internal_value not in case.user_input

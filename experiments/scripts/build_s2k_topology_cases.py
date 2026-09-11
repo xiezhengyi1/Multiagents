@@ -50,6 +50,25 @@ SCENE_LABELS = {
     19: "退化云回传",
     20: "灾害场景有损回传",
 }
+SERVICE_LABELS = {
+    "remote-drive": "远程驾驶的视频画面",
+    "factory-robot": "工厂机器人的控制业务",
+    "ar-gaming": "AR 交互业务",
+    "iot-sensor": "传感器遥测业务",
+    "telemedicine": "远程诊疗视频",
+    "video-4k": "4K 视频业务",
+    "cloud-render": "云端渲染交互业务",
+    "inference": "边缘智能推理业务",
+    "web-browse": "网页浏览业务",
+}
+QOS_REQUESTS = {
+    "上行保障带宽": "提升上行传输保障",
+    "下行保障带宽": "提升下行传输保障",
+    "时延目标": "降低端到端时延",
+    "抖动目标": "减少时延抖动",
+    "丢包率目标": "降低丢包",
+    "业务优先级": "提高业务优先级",
+}
 
 
 @dataclass(frozen=True)
@@ -138,6 +157,10 @@ def _flow_binding(
         "slice_id": session["slice_id"],
         "snssai": _snssai(inventory["slices"], session["slice_id"]),
     }
+
+
+def _flow_description(binding: dict[str, Any]) -> str:
+    return SERVICE_LABELS[binding["app_id"]]
 
 
 def _session_pool(
@@ -252,7 +275,7 @@ def _case(
 ) -> ExperimentCase:
     case_id = f"S2K-T{record.number:02d}-{case_number:02d}"
     metadata = {
-        "catalog_version": "s2k-topology-v1",
+        "catalog_version": "s2k-topology-v2-natural-input",
         "catalog_id": case_id,
         "partition": record.partition,
         **_scenario_metadata(record),
@@ -296,10 +319,6 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
     multi_route_bindings = [
         binding for binding in bindings if len(_session_pool(binding, inventory)) > 1
     ]
-    prefix = (
-        f"在 {record.payload['scenario_id']}（{len(record.payload['ran']['gnbs'])} 个 gNB、"
-        f"{len(record.payload['ues'])} 个 UE）的{SCENE_LABELS[record.number]}场景中，"
-    )
     cases = []
 
     metrics = (
@@ -319,9 +338,9 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 run_id=run_id,
                 case_number=index,
                 user_input=(
-                    prefix
-                    + f"按 {5 + index}% 的优化幅度调整 {binding['supi']} 的 {binding['flow_id']} 的{metric}，"
-                    + f"保持当前 {binding['dnn']}/{binding['snssai']} PDU 与路由不变。"
+                    f"请为用户 SUPI {binding['supi']} 的{_flow_description(binding)}"
+                    f"{QOS_REQUESTS[metric]}约 {5 + index}% ，"
+                    "保持它现在使用的业务连接不变。"
                 ),
                 bindings=[binding],
                 operation_class="qos_same_pdu",
@@ -346,9 +365,8 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 run_id=run_id,
                 case_number=index,
                 user_input=(
-                    prefix
-                    + f"把 {binding['supi']} 的 {binding['flow_id']} 通过 URSP 选路到已存在的 "
-                    + f"{target['dnn']}/{target['snssai']} PDU，规则优先级设为 {index - 18}，不创建新 PDU。"
+                    f"用户 SUPI {binding['supi']} 的{_flow_description(binding)}需要走已经可用的"
+                    f"低时延业务连接，并将它设为第 {index - 18} 优先选择，请不要新建连接。"
                 ),
                 bindings=[binding],
                 operation_class="ursp_existing_pdu",
@@ -382,8 +400,8 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 run_id=run_id,
                 case_number=index,
                 user_input=(
-                    prefix
-                    + f"仅调整 {binding['supi']} 的 RFSP，保持 {binding['flow_id']} 的 PDU 路由不变。"
+                    f"请只调整用户 SUPI {binding['supi']} 的移动性优先级和驻留偏好，"
+                    f"调整幅度为第 {index - 24} 档，不要改变其{_flow_description(binding)}正在使用的业务连接。"
                 ),
                 bindings=[binding],
                 operation_class="am_rfsp_only",
@@ -416,9 +434,9 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 run_id=run_id,
                 case_number=index,
                 user_input=(
-                    prefix
-                    + f"先保护 {primary['supi']} 的 {primary['flow_id']}，再调整 "
-                    + f"{peer['supi']} 的 {peer['flow_id']}，必须逐 SUPI 分阶段执行。"
+                    f"先确保用户 SUPI {primary['supi']} 的{_flow_description(primary)}"
+                    f"{('稳定', '连续')[index - 28]}，"
+                    f"再处理用户 SUPI {peer['supi']} 的{_flow_description(peer)}，请分两步完成。"
                 ),
                 bindings=[primary, peer],
                 operation_class="multi_supi_staged",
@@ -441,9 +459,8 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
             run_id=run_id,
             case_number=30,
             user_input=(
-                prefix
-                + f"在当前负载下改善 {binding['supi']} 的 {binding['flow_id']}，"
-                + "不得降低任何更高优先级流的保障，且不得改变 PDU 路由。"
+                f"当前负载较高，请改善用户 SUPI {binding['supi']} 的{_flow_description(binding)}；"
+                "不能牺牲更重要业务的保障，也不要改变它正在使用的业务连接。"
             ),
             bindings=[binding],
             operation_class="safe_qos_execution",
@@ -485,9 +502,8 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 run_id=run_id,
                 case_number=index,
                 user_input=(
-                    prefix
-                    + f"以{goal}为目标，将 {binding['supi']} 的 {binding['flow_id']} 迁移到 "
-                    + f"{target['dnn']}/{target['snssai']}，不允许修改该用户订阅。"
+                    f"用户 SUPI {binding['supi']} 的{_flow_description(binding)}想要{goal}，"
+                    "请切换到更合适的业务连接，但不要变更该用户的订阅。"
                 ),
                 bindings=[binding],
                 operation_class="subscription_entitlement_block",
@@ -525,10 +541,8 @@ def _scenario_cases(record: ScenarioRecord, run_id: str) -> list[ExperimentCase]
                 run_id=run_id,
                 case_number=index,
                 user_input=(
-                    prefix
-                    + f"为了{goal}，把 {binding['supi']} 的 {binding['flow_id']} 迁移到 "
-                    + f"{target['dnn']}/{target['snssai']}，同时必须保持其当前 "
-                    + f"{binding['dnn']}/{binding['snssai']} 路由完全不变。"
+                    f"为了{goal}，请为用户 SUPI {binding['supi']} 的{_flow_description(binding)}"
+                    "换到更合适的业务连接，同时又必须完全保留现在的业务连接。"
                 ),
                 bindings=[binding],
                 operation_class="hard_constraint_conflict",
