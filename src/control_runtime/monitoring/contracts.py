@@ -1,166 +1,92 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Literal
+
+from pydantic import Field, model_validator
+
+from shared.contracts import ContractModel, NonEmptyStr
+from shared.contracts.coordination import ObservationPayload
+
+MetricRelation = Literal["above", "below"]
+AlertSeverity = Literal["warning", "critical"]
+IntentStatus = Literal[
+    "draft",
+    "active",
+    "suspended",
+    "executing",
+    "degraded",
+    "replanning",
+    "satisfied",
+    "failed",
+    "cancelled",
+    "expired",
+]
 
 
-@dataclass(frozen=True)
-class MonitorAlert:
-    alert_id: str
-    snapshot_id: str
-    supi: str
-    app_id: str
-    app_name: str
-    flow_id: str
-    flow_name: str
-    severity: str
-    status: str
-    violated_metrics: List[str]
-    metric_deltas: Dict[str, Dict[str, float]]
-    recommended_consumer: str
-    summary: str
-    suggested_domains: List[str] = field(default_factory=list)
-    reuse_binding: bool = True
-    observed_at: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "alert_id": self.alert_id,
-            "snapshot_id": self.snapshot_id,
-            "supi": self.supi,
-            "app_id": self.app_id,
-            "app_name": self.app_name,
-            "flow_id": self.flow_id,
-            "flow_name": self.flow_name,
-            "severity": self.severity,
-            "status": self.status,
-            "violated_metrics": list(self.violated_metrics),
-            "metric_deltas": dict(self.metric_deltas),
-            "recommended_consumer": self.recommended_consumer,
-            "summary": self.summary,
-            "suggested_domains": list(self.suggested_domains),
-            "reuse_binding": self.reuse_binding,
-            "observed_at": self.observed_at,
-        }
+class MonitorRule(ContractModel):
+    owner_entity_id: NonEmptyStr
+    metric_name: NonEmptyStr
+    relation: MetricRelation
+    threshold: float
+    severity: AlertSeverity
+    suggested_domains: list[Literal["qos", "mobility"]] = Field(min_length=1)
 
 
-@dataclass(frozen=True)
-class MonitorResult:
-    snapshot_id: str
-    scanned_flow_count: int
-    alerts: List[MonitorAlert] = field(default_factory=list)
-    summary: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "snapshot_id": self.snapshot_id,
-            "scanned_flow_count": self.scanned_flow_count,
-            "alerts": [alert.to_dict() for alert in self.alerts],
-            "summary": self.summary,
-        }
+class MonitorAlert(ContractModel):
+    alert_id: NonEmptyStr
+    snapshot_id: NonEmptyStr
+    owner_entity_id: NonEmptyStr
+    metric_name: NonEmptyStr
+    observed_value: float
+    relation: MetricRelation
+    threshold: float
+    severity: AlertSeverity
+    suggested_domains: list[Literal["qos", "mobility"]] = Field(min_length=1)
+    summary: NonEmptyStr
 
 
-@dataclass(frozen=True)
-class RequirementDraft:
-    source_alert_id: str
-    snapshot_id: str
-    user_input: str
-    routing_hint: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "source_alert_id": self.source_alert_id,
-            "snapshot_id": self.snapshot_id,
-            "user_input": self.user_input,
-            "routing_hint": dict(self.routing_hint),
-        }
+class MonitorResult(ObservationPayload):
+    snapshot_id: NonEmptyStr
+    scanned_metric_count: int = Field(ge=0)
+    alerts: list[MonitorAlert]
 
 
-class IntentStatus(str, Enum):
-    ACTIVE = "active"
-    DEGRADED = "degraded"
-    REPLANNING = "replanning"
-    SATISFIED = "satisfied"
-    FAILED = "failed"
+class IntentBinding(ContractModel):
+    entity_id: NonEmptyStr
+    relation: NonEmptyStr
 
 
-@dataclass(frozen=True)
-class IntentBinding:
-    supi: str
-    app_id: str
-    flow_id: str
-
-
-@dataclass
-class IntentLifecycle:
-    intent_id: str
-    bindings: List[IntentBinding]
+class IntentLifecycle(ContractModel):
+    intent_id: NonEmptyStr
+    version: int = Field(ge=1)
+    bindings: list[IntentBinding] = Field(min_length=1)
     status: IntentStatus
-    origin: str = "user"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "intent_id": self.intent_id,
-            "bindings": [
-                {
-                    "supi": binding.supi,
-                    "app_id": binding.app_id,
-                    "flow_id": binding.flow_id,
-                }
-                for binding in self.bindings
-            ],
-            "status": self.status.value,
-            "origin": self.origin,
-        }
+    origin: Literal["user", "monitor"]
+    expires_at: datetime | None = None
 
 
-@dataclass(frozen=True)
-class WatchLoopTriggerRecord:
-    trigger_type: str
-    snapshot_id: str
-    user_input: str
-    source_alert_id: str = ""
-    intent_id: str = ""
-    lifecycle_status: str = ""
-    routing_hint: Dict[str, Any] = field(default_factory=dict)
-    control_result: Any = None
-    data_flywheel: Dict[str, Any] = field(default_factory=dict)
+class LifecycleTransition(ContractModel):
+    intent_id: NonEmptyStr
+    previous_status: IntentStatus
+    next_status: IntentStatus
+    reason: NonEmptyStr
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "trigger_type": self.trigger_type,
-            "snapshot_id": self.snapshot_id,
-            "user_input": self.user_input,
-            "source_alert_id": self.source_alert_id,
-            "intent_id": self.intent_id,
-            "lifecycle_status": self.lifecycle_status,
-            "routing_hint": dict(self.routing_hint),
-            "control_result": self.control_result,
-            "data_flywheel": dict(self.data_flywheel),
-        }
+    @model_validator(mode="after")
+    def reject_noop(self) -> LifecycleTransition:
+        if self.previous_status == self.next_status:
+            raise ValueError("lifecycle transition must change status")
+        return self
 
 
-@dataclass(frozen=True)
-class WatchLoopIterationResult:
-    snapshot_id: str
-    monitor_result: Optional[MonitorResult] = None
-    records: List[WatchLoopTriggerRecord] = field(default_factory=list)
-    user_input_seen: bool = False
-    pending_monitor_alerts: List[Dict[str, Any]] = field(default_factory=list)
-    lifecycles: List[Dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def pending_monitor_alert_count(self) -> int:
-        return len(self.pending_monitor_alerts)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "snapshot_id": self.snapshot_id,
-            "monitor_result": self.monitor_result.to_dict() if self.monitor_result is not None else None,
-            "records": [record.to_dict() for record in self.records],
-            "user_input_seen": self.user_input_seen,
-            "pending_monitor_alert_count": self.pending_monitor_alert_count,
-            "pending_monitor_alerts": [dict(alert) for alert in self.pending_monitor_alerts],
-            "lifecycles": [dict(lifecycle) for lifecycle in self.lifecycles],
-        }
+__all__ = [
+    "AlertSeverity",
+    "IntentBinding",
+    "IntentLifecycle",
+    "IntentStatus",
+    "LifecycleTransition",
+    "MetricRelation",
+    "MonitorAlert",
+    "MonitorResult",
+    "MonitorRule",
+]

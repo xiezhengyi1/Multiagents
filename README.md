@@ -1,148 +1,92 @@
 # Multiagents
 
-这是当前重构后的主工作区。实验、训练、控制运行时、知识运行时都以这个目录为准，不再以外层旧目录为准。
+面向 6G 策略控制研究的数据生成运行时。当前重构的目标不是建设通用平台，而是让多智能体协同、单智能体基线和环境生成使用同一套可追溯数据契约，直接服务 SFT 与 RL。
 
-## 当前主结构
+## 核心链路
 
-```text
-Multiagents/
-  database/
-  model/
-  src/
-    control_runtime/
-    knowledge_runtime/
-    shared/
-      agents/
-      runtime/
-  experiments/
-    configs/
-    scenarios/
-    tasks/
-    scripts/
-    results/
-  training/
-  knowledge_build/
-  tests/
-  docs/
-  data/
-    runtime/
-```
-
-## 控制逻辑
-
-三智能体主链路保持为：
-
-1. `Main`
-   - 负责高层路由、轮次策略、失败归因后的重试入口选择
-   - 产出 `requested_domains`、`supi`、`retry_scope`、`next_agent`、`intent_encoding_guidance`
-   - 不负责 app/flow/association 的最终 grounding
-2. `IEA`
-   - 负责实体解析和语义 grounding
-   - 必须把 app/flow/AM target 绑定到工具或缓存证据
-   - 产出可复用的 `GroundingDecision`
-3. `OSA`
-   - 负责优化预览、策略参数选择、修订轮策略生成
-   - 输出必须和 optimizer preview / runtime evidence 交叉一致
-
-诊断职责已收回到主控闭环，不再把 diagnosis 当成独立主智能体阶段。
-
-## 运行时指标读取
-
-Multiagents不直接查Prometheus，也不直接解析OAI/free5GC日志。测试床的Snapshot Builder先将业务流、RAN、PDU会话、UPF路径和MEC/云站点数据关联，再以不可变 `snapshot_id` 写入PostgreSQL的 `network_graph_snapshot.graph_summary`。
-
-读取链路为：
+多智能体控制图为：
 
 ```text
-OAI/free5GC/Traffic Exporter/Prometheus
-  -> Flow Correlator
-  -> Snapshot Builder
-  -> network_graph_snapshot.graph_summary
-  -> get_snapshot_data_by_id(snapshot_id)
-  -> Agent read tools / Optimizer / FlowTelemetryMonitor
+environment snapshot
+  -> Main -> validator
+  -> SBA  -> validator -> deterministic compiler
+  -> PPA  -> validator -> typed policy compiler
+  -> policy mediator -> execution -> assurance diagnoser
+  -> episode controller -> terminal / repair reentry
 ```
 
-每个控制会话必须绑定一个 `snapshot_id`，Main、IEA、OSA、Mediator、Dispatch和Assurance不允许在同一轮内各自读取“latest”。动作验证另建post-action snapshot，与pre-action snapshot比较。
+修复不是固定单向链：PPA 可以请求 SBA 重新绑定证据，SBA 可以请求 Main 重新路由，超过预算后交给 episode controller 终止。所有正向交接、验证、修复、观察、执行反馈和终止都记录为 `CoordinationEvent`。
 
-| 消费者 | 读取入口 | 主要指标 |
-|---|---|---|
-| Main | 监控告警和紧凑网络摘要 | 违反SLA的流、严重度、影响域 |
-| IEA | `get_sm_ue_flow_catalog` | SUPI/App/Flow绑定、SLA、实测吞吐/时延/抖动/丢包、RAN和PDU会话关联 |
-| OSA | snapshot + optimizer input | 流分配、切片容量/利用率、RAN PRB、MEC/云路径 |
-| FlowTelemetryMonitor | 图快照 `metrics` | `telemetry.*` 与 `sla.*` 的同窗口对比 |
-| Assurance/Diagnosis | pre/post snapshot + Action receipt | 策略生效、KPI改善、会话/无线/路径变化 |
+三个模型 actor 保留原 Main、IEA/SBA、OSA/PPA prompt，只替换其中的数据契约说明。模型只生成 `CoordinationDecision`；事件编号、来源、作用域和引用关系由运行时写入。
 
-单流的规范字段分为：
+PPA 的模型提案不会直接作为 PCF 请求发送。确定性编译器将其转换为 `src/model` 中的 3GPP 类型：
 
-- `telemetry`：上/下行吞吐、时延、抖动、丢包率、包计数、TCP重传/RTT、可用性和观测时间。
-- `ran`：serving cell、gNB、RNTI、QFI/DRB、MCS、BLER、PRB、RSRP、SINR和handover状态。
-- `session`：PDU Session、DNN、S-NSSAI、QFI、5QI、UPF和UE IP。
-- `path`：边缘/云站点、业务实例和UPF路径。
-- `data_quality`：观测窗口、样本数、是否过期和关联完整性。
+- `SmPolicyDecision`
+- `PcfAmPolicyControlPolicyAssociation`
+- `UrspRuleRequest`
 
-Agent工具只返回上述紧凑字段；原始Prometheus时序、容器日志和高频RAN样本留在测试床观测层，通过 `snapshot_id` 和 `observed_at` 追溯。
+因此同时保留模型原始输出和可执行类型化产物，训练时可分别选择。
 
-## 运行实验
+## 目录
 
-在当前目录下执行：
-
-```bash
-python experiments/scripts/build_user_inputs.py --experiment E1 --scenario S2
-python experiments/scripts/launch_experiments.py --method B1 --experiment E1 --scenario S2
+```text
+src/
+  control_runtime/
+    actors/        # Main、SBA、PPA、single、validator、诊断与controller
+    graph/         # LangGraph 路由、事件上下文、修复预算
+    simulation/    # 新仿真环境必须实现的统一边界与观察工具
+    execution/     # 类型化策略编译、提交、回执校验、指标评估
+    monitoring/    # 快照指标检测和 episode-local 生命周期
+    integrations/  # 暂停迁移，等待新仿真环境接口确定
+  environment/     # 独立的环境生成 workflow
+  knowledge_runtime/ # 可拆装 RAG 工具和检索后端
+  model/           # 3GPP 输出模型
+  shared/          # 唯一通信、trace、journal 和 agent 工厂
+  training/        # 原生 episode 读取及显式 SFT/RL 投影
+experiments/       # 实验契约、runner、矩阵与离线分析
+knowledge_build/   # 知识库构建和评估
+database/          # 知识库持久化
+tests/
+docs/
 ```
 
-前提：
+## 数据集
 
-- 需要使用项目依赖环境运行，而不是裸 `C:\Python314\python.exe`
-- 当前项目已在 `pyproject.toml` 中声明 `PyYAML` 等依赖；如果直接用系统 Python 运行，脚本会因为缺依赖而失败
+运行时只落地：
 
-常用方式：
-
-```bash
-# 全量实验矩阵
-python experiments/scripts/launch_experiments.py
-
-# 指定方法
-python experiments/scripts/launch_experiments.py --method B1
-
-# 指定实验与场景
-python experiments/scripts/launch_experiments.py --method B1 --experiment E1 --scenario S2
-
-# 只生成输入与执行，不聚合结果
-python experiments/scripts/launch_experiments.py --method B1 --experiment E1 --scenario S2 --skip-aggregate
+```text
+<dataset_root>/<partition>/<episode_id>/
+  events.jsonl
+  traces.jsonl
 ```
 
-说明：
+分区固定为：
 
-- `build_user_inputs.py` 先按 `experiment/scenario` 过滤任务，再做一致性校验。
-- `launch_experiments.py` 会串联：
-  - 生成输入
-  - 调 `run_method.py`
-  - 最后聚合结果
-- `run_method.py` 继续调用 `experiments/scripts/` 下的：
-  - `run_workflow_experiment.py`
-  - `run_single_agent_experiment.py`
+- `multi_agent_control`
+- `single_agent_control`
+- `environment`
 
-## 与外层旧目录的关系
+SFT 与 RL 文件是离线投影，不是运行时的第二套真相：
 
-外层目录仍有旧代码和旧脚本残留，例如：
+```powershell
+uv run python -m training.project `
+  --dataset-root data/runtime `
+  --partition multi_agent_control `
+  --sft-output data/projected/multi_agent_sft.jsonl `
+  --rl-output data/projected/multi_agent_rl.jsonl
+```
 
-- `experiment/`
-- `sft_data/`
-- 旧版根目录 `README.md`
+## 当前边界
 
-这些内容现在只应视为迁移残留。新的改动应优先落在本目录。
+- OAI/free5GC 仿真环境已通过 `TestbedSimulatorAdapter` 提供 snapshot、read 和 execute 能力。
+- 旧 `agents/diagnostics/orchestrators` 已完成行为迁移并删除。
+- `integrations` 以仿真平台的原生 snapshot、action 和 free5GC 订阅数据为唯一事实源，不再读取旧数据库、NS-3 策略端点或随机拓扑。
+- 完整联合优化直接使用 snapshot 中的 slice 双向带宽容量与负载、gNB CPU/PRB 容量与利用率、UPF CPU/内存容量与利用率。
+- RAG 是显式注入的 LangChain 工具，不向共享上下文偷偷注入内容。
+- 长期记忆暂缓；当前只保留 episode 事件祖先上下文。
+- 不接受 `schema_version`，不兼容或修复旧 trace。
+- 不使用异常兜底来切换模型、检索器或执行后端。
 
-## 设计原则
+本地运行前必须显式配置 `TESTBED_SNAPSHOT_BASE_URL`、`TESTBED_ACTION_BASE_URL`、`TESTBED_SUBSCRIBER_BASE_URL`、`TESTBED_RUN_ID`、`TESTBED_PLMN_ID`、`TESTBED_ACTION_API_KEY` 和 `TESTBED_HTTP_TIMEOUT_SECONDS`。入口为 `control_runtime.integrations.create_live_testbed_adapter()`。
 
-- 不加 fallback 来掩盖真实问题
-- 不保留假的包边界、假的 compiler 契约、假的 validator 契约
-- Main 强化，但不越权做 grounding
-- IEA 必须证据化 grounding
-- OSA 必须对 optimizer 结果负责，而不是自由生成不可执行 payload
-
-## 进一步阅读
-
-- [STRUCTURE.md](C:\Users\xiezhengyi\Desktop\research\6G+AI\code\Multiagents\Multiagents\STRUCTURE.md)
-- [CONTROL_RUNTIME_LOGIC.md](C:\Users\xiezhengyi\Desktop\research\6G+AI\code\Multiagents\Multiagents\CONTROL_RUNTIME_LOGIC.md)
-- [CONTROL_RUNTIME_MINDMAP.md](C:\Users\xiezhengyi\Desktop\research\6G+AI\code\Multiagents\Multiagents\CONTROL_RUNTIME_MINDMAP.md)
-- [RESEARCH_ARCHITECTURE_THREE_AGENT.md](C:\Users\xiezhengyi\Desktop\research\6G+AI\code\Multiagents\Multiagents\RESEARCH_ARCHITECTURE_THREE_AGENT.md)
+详细契约见 [docs/DATA_CONTRACT.md](docs/DATA_CONTRACT.md)，架构说明见 [docs/TECHNICAL_DOCUMENTATION.md](docs/TECHNICAL_DOCUMENTATION.md)。

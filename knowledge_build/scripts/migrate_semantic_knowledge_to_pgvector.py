@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -13,7 +12,11 @@ for candidate in (PACKAGE_ROOT, SRC_ROOT):
 
 from sqlalchemy import select
 
-from database.connection import SessionLocal
+from database.connection import (
+    create_knowledge_engine,
+    create_session_factory,
+    require_database_url,
+)
 from database.langchain_pg import build_semantic_knowledge_document, get_semantic_knowledge_store
 from database.models import SemanticKnowledge
 from shared.logging import setup_logger
@@ -22,9 +25,9 @@ logger = setup_logger(__name__)
 
 
 def migrate() -> int:
-    session = SessionLocal()
-    if session is None:
-        raise RuntimeError("Database session factory is not initialized.")
+    session = create_session_factory(
+        create_knowledge_engine(require_database_url())
+    )()
 
     try:
         rows = session.execute(select(SemanticKnowledge)).scalars().all()

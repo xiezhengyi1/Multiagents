@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from math import isfinite
-from typing import Any, Iterable
+from typing import Any
 
-from .contracts import EnvironmentGenerationRequest, EnvironmentValidationReport, ScenarioCandidate
-from .prompts import GENERATION_PROMPT_TEMPLATE, SEMANTIC_GENERATION_PROMPT_TEMPLATE
-
+from .contracts import (
+    EnvironmentGenerationRequest,
+    EnvironmentValidationReport,
+    ScenarioCandidate,
+)
+from .prompts import SEMANTIC_GENERATION_PROMPT_TEMPLATE
 
 S3_QUALITY_PROFILE = "s3"
 S3_MINIMUM_COUNTS = {
@@ -19,8 +23,8 @@ S3_MINIMUM_COUNTS = {
 }
 
 
-class EnvironmentAgentCompiler:
-    """Pure scenario prompt and validation logic for the environment agent."""
+class EnvironmentCandidateValidator:
+    """Deterministic launch-readiness and quality validation for one scenario."""
 
     REQUIRED_ROOT_FIELDS = (
         "name",
@@ -39,26 +43,14 @@ class EnvironmentAgentCompiler:
         "topology",
         "bridge",
     )
-    REQUIRED_OVERLAY_FIELDS = ("name", "scenario_id", "base_scenario", "ns3", "runtime", "radio")
-
-    def build_generation_prompt(
-        self,
-        request: EnvironmentGenerationRequest,
-        *,
-        quality_profile: str | None = S3_QUALITY_PROFILE,
-    ) -> str:
-        quality_requirements = self.quality_requirements(quality_profile)
-        return GENERATION_PROMPT_TEMPLATE.format(
-            scenario_id=request.scenario_id,
-            objective=request.objective,
-            complexity=request.complexity,
-            target_flow_count=request.target_flow_count,
-            topology_mode=request.topology_mode,
-            stress_mode=request.stress_mode,
-            output_dir=request.output_dir,
-            quality_profile=quality_profile or "schema-only",
-            quality_requirements=quality_requirements,
-        )
+    REQUIRED_OVERLAY_FIELDS = (
+        "name",
+        "scenario_id",
+        "base_scenario",
+        "ns3",
+        "runtime",
+        "radio",
+    )
 
     def build_semantic_generation_prompt(
         self,
@@ -73,7 +65,6 @@ class EnvironmentAgentCompiler:
             target_flow_count=request.target_flow_count,
             topology_mode=request.topology_mode,
             stress_mode=request.stress_mode,
-            output_dir=request.output_dir,
             quality_profile=quality_profile or "schema-only",
             quality_requirements=self.quality_requirements(quality_profile),
         )
@@ -83,8 +74,13 @@ class EnvironmentAgentCompiler:
         if quality_profile is None:
             return "Schema and launch-readiness checks only."
         if str(quality_profile).strip().lower() != S3_QUALITY_PROFILE:
-            raise ValueError(f"unsupported environment quality profile: {quality_profile}")
-        counts = ", ".join(f"at least {count} {section}" for section, count in S3_MINIMUM_COUNTS.items())
+            raise ValueError(
+                f"unsupported environment quality profile: {quality_profile}"
+            )
+        counts = ", ".join(
+            f"at least {count} {section}"
+            for section, count in S3_MINIMUM_COUNTS.items()
+        )
         return (
             "S3 production floor: "
             f"{counts}; every slice is served by at least two gNBs; every gNB serves at least two slices; "
@@ -110,33 +106,71 @@ class EnvironmentAgentCompiler:
 
         errors.extend(self._validate_root_fields(scenario))
         if errors:
-            return EnvironmentValidationReport(candidate.scenario_id, ok=False, errors=tuple(errors))
+            return EnvironmentValidationReport(
+                scenario_id=candidate.scenario_id,
+                ok=False,
+                errors=tuple(errors),
+            )
         self._validate_loader_contract(scenario, errors)
 
-        slice_labels = self._collect_unique_strings(scenario.get("slices"), "label", errors, "slice")
-        upf_names = self._collect_unique_strings(scenario.get("upfs"), "name", errors, "upf")
-        gnb_names = self._collect_unique_strings(scenario.get("gnbs"), "name", errors, "gNB")
-        ue_names = self._collect_unique_strings(scenario.get("ues"), "name", errors, "UE")
-        ue_supis = self._collect_unique_strings(scenario.get("ues"), "supi", errors, "UE")
-        app_ids = self._collect_unique_strings(scenario.get("apps"), "app_id", errors, "app")
-        flow_ids = self._collect_unique_strings(scenario.get("flows"), "flow_id", errors, "flow")
+        slice_labels = self._collect_unique_strings(
+            scenario.get("slices"), "label", errors, "slice"
+        )
+        upf_names = self._collect_unique_strings(
+            scenario.get("upfs"), "name", errors, "upf"
+        )
+        gnb_names = self._collect_unique_strings(
+            scenario.get("gnbs"), "name", errors, "gNB"
+        )
+        ue_names = self._collect_unique_strings(
+            scenario.get("ues"), "name", errors, "UE"
+        )
+        ue_supis = self._collect_unique_strings(
+            scenario.get("ues"), "supi", errors, "UE"
+        )
+        app_ids = self._collect_unique_strings(
+            scenario.get("apps"), "app_id", errors, "app"
+        )
+        flow_ids = self._collect_unique_strings(
+            scenario.get("flows"), "flow_id", errors, "flow"
+        )
 
         gnb_slice_map: dict[str, set[str]] = {}
         for gnb in scenario.get("gnbs") or []:
             if isinstance(gnb, dict):
                 name = str(gnb.get("name") or "").strip()
                 if name:
-                    gnb_slice_map[name] = {str(s) for s in (gnb.get("slices") or []) if str(s).strip()}
+                    gnb_slice_map[name] = {
+                        str(s) for s in (gnb.get("slices") or []) if str(s).strip()
+                    }
 
         self._validate_gnbs(scenario.get("gnbs") or [], slice_labels, upf_names, errors)
-        self._validate_ues(scenario.get("ues") or [], slice_labels, gnb_names, gnb_slice_map, app_ids, errors)
-        self._validate_apps(scenario.get("apps") or [], ue_names, ue_supis, flow_ids, errors)
-        self._validate_flows(scenario.get("flows") or [], slice_labels, ue_names, ue_supis, app_ids, errors)
+        self._validate_ues(
+            scenario.get("ues") or [],
+            slice_labels,
+            gnb_names,
+            gnb_slice_map,
+            app_ids,
+            errors,
+        )
+        self._validate_apps(
+            scenario.get("apps") or [], ue_names, ue_supis, flow_ids, errors
+        )
+        self._validate_flows(
+            scenario.get("flows") or [],
+            slice_labels,
+            ue_names,
+            ue_supis,
+            app_ids,
+            errors,
+        )
         self._validate_cross_entity_contract(scenario, errors)
         self._validate_sla_contract(scenario.get("flows") or [], errors)
         self._validate_capacity(scenario, errors, warnings)
         self._validate_overlay(candidate.split_mode_overlay, errors)
-        self._validate_quality_profile(scenario, candidate.split_mode_overlay, quality_profile, errors)
+        self._validate_quality_profile(
+            scenario, candidate.split_mode_overlay, quality_profile, errors
+        )
 
         return EnvironmentValidationReport(
             scenario_id=candidate.scenario_id,
@@ -163,7 +197,7 @@ class EnvironmentAgentCompiler:
             label = str(item.get("label") or "<unknown>").strip()
             try:
                 if isinstance(item.get("sst"), bool):
-                    raise ValueError
+                    raise TypeError
                 sst = int(item["sst"])
             except (KeyError, TypeError, ValueError):
                 errors.append(f"slice {label} field sst must be an integer")
@@ -194,10 +228,18 @@ class EnvironmentAgentCompiler:
                     try:
                         numeric_value = float(value)
                     except (TypeError, ValueError):
-                        errors.append(f"slice {label} resource field {field} must be numeric")
+                        errors.append(
+                            f"slice {label} resource field {field} must be numeric"
+                        )
                         continue
-                    if isinstance(value, bool) or not isfinite(numeric_value) or numeric_value < 0:
-                        errors.append(f"slice {label} resource field {field} must be finite and non-negative")
+                    if (
+                        isinstance(value, bool)
+                        or not isfinite(numeric_value)
+                        or numeric_value < 0
+                    ):
+                        errors.append(
+                            f"slice {label} resource field {field} must be finite and non-negative"
+                        )
 
         for item in scenario.get("ues") or []:
             if not isinstance(item, dict):
@@ -249,7 +291,9 @@ class EnvironmentAgentCompiler:
                 errors.append(f"{entity_name} entry is missing {key}")
                 continue
             values.append(value)
-        duplicates = sorted(value for value, count in Counter(values).items() if count > 1)
+        duplicates = sorted(
+            value for value, count in Counter(values).items() if count > 1
+        )
         for value in duplicates:
             errors.append(f"duplicate {entity_name} {key} {value}")
         return set(values)
@@ -270,7 +314,9 @@ class EnvironmentAgentCompiler:
                     errors.append(f"gNB {name} references missing slice {slice_ref}")
             backhaul_upf = str(gnb.get("backhaul_upf") or "").strip()
             if backhaul_upf and backhaul_upf not in upf_names:
-                errors.append(f"gNB {name} references missing backhaul_upf {backhaul_upf}")
+                errors.append(
+                    f"gNB {name} references missing backhaul_upf {backhaul_upf}"
+                )
 
     @staticmethod
     def _validate_ues(
@@ -288,22 +334,32 @@ class EnvironmentAgentCompiler:
             gnb = str(ue.get("gnb") or "").strip()
             if gnb and gnb not in gnb_names:
                 errors.append(f"UE {name} references missing gnb {gnb}")
-            policy = ue.get("free5gc_policy") if isinstance(ue.get("free5gc_policy"), dict) else {}
+            policy = (
+                ue.get("free5gc_policy")
+                if isinstance(ue.get("free5gc_policy"), dict)
+                else {}
+            )
             target_gnb = str(policy.get("target_gnb") or "").strip()
             if target_gnb and target_gnb not in gnb_names:
                 errors.append(f"UE {name} references missing target_gnb {target_gnb}")
             for preferred in policy.get("preferred_gnbs") or []:
                 if str(preferred) not in gnb_names:
-                    errors.append(f"UE {name} references missing preferred_gnb {preferred}")
+                    errors.append(
+                        f"UE {name} references missing preferred_gnb {preferred}"
+                    )
             for session in ue.get("sessions") or []:
                 if not isinstance(session, dict):
                     continue
                 slice_ref = str(session.get("slice_ref") or "").strip()
                 app_id = str(session.get("app_id") or "").strip()
                 if slice_ref and slice_ref not in slice_labels:
-                    errors.append(f"UE {name} session references missing slice_ref {slice_ref}")
+                    errors.append(
+                        f"UE {name} session references missing slice_ref {slice_ref}"
+                    )
                 if app_id and app_id not in app_ids:
-                    errors.append(f"UE {name} session references missing app_id {app_id}")
+                    errors.append(
+                        f"UE {name} session references missing app_id {app_id}"
+                    )
             # Cross-reference: UE's attached gNB must serve the slices in the UE's sessions
             if gnb in gnb_slice_map:
                 for session in ue.get("sessions") or []:
@@ -358,14 +414,18 @@ class EnvironmentAgentCompiler:
             if app_id and app_id not in app_ids:
                 errors.append(f"flow {flow_id} references missing app_id {app_id}")
             if slice_ref and slice_ref not in slice_labels:
-                errors.append(f"flow {flow_id} references missing slice_ref {slice_ref}")
+                errors.append(
+                    f"flow {flow_id} references missing slice_ref {slice_ref}"
+                )
             if ue_name and ue_name not in ue_names:
                 errors.append(f"flow {flow_id} references missing ue_name {ue_name}")
             if supi and supi not in ue_supis:
                 errors.append(f"flow {flow_id} references missing supi {supi}")
 
     @staticmethod
-    def _validate_cross_entity_contract(scenario: dict[str, Any], errors: list[str]) -> None:
+    def _validate_cross_entity_contract(
+        scenario: dict[str, Any], errors: list[str]
+    ) -> None:
         ues = {
             str(item.get("name") or "").strip(): item
             for item in scenario.get("ues") or []
@@ -424,7 +484,9 @@ class EnvironmentAgentCompiler:
             }
             actual_flow_ids = flows_by_app.get(app_id, set())
             if declared_flow_ids != actual_flow_ids:
-                errors.append(f"app {app_id} flow_ids do not match its flow definitions")
+                errors.append(
+                    f"app {app_id} flow_ids do not match its flow definitions"
+                )
 
         for ue_name, ue in ues.items():
             supi = str(ue.get("supi") or "").strip()
@@ -440,7 +502,9 @@ class EnvironmentAgentCompiler:
                     errors.append(f"UE {ue_name} session_ref must equal {expected_ref}")
 
     @staticmethod
-    def _validate_sla_contract(flows: Iterable[dict[str, Any]], errors: list[str]) -> None:
+    def _validate_sla_contract(
+        flows: Iterable[dict[str, Any]], errors: list[str]
+    ) -> None:
         required_sla_fields = (
             "latency_ms",
             "jitter_ms",
@@ -471,15 +535,28 @@ class EnvironmentAgentCompiler:
                     errors.append(f"flow {flow_id} SLA field {field} must be numeric")
                     continue
                 if not isfinite(number) or number < 0:
-                    errors.append(f"flow {flow_id} SLA field {field} must be finite and non-negative")
+                    errors.append(
+                        f"flow {flow_id} SLA field {field} must be finite and non-negative"
+                    )
                     continue
                 parsed[field] = number
-            if parsed.get("priority", 0) < 1 or not parsed.get("priority", 0).is_integer():
+            if (
+                parsed.get("priority", 0) < 1
+                or not parsed.get("priority", 0).is_integer()
+            ):
                 errors.append(f"flow {flow_id} SLA priority must be a positive integer")
-            if parsed.get("bandwidth_dl_mbps", 0) < parsed.get("guaranteed_bandwidth_dl_mbps", 0):
-                errors.append(f"flow {flow_id} DL target bandwidth is below its guarantee")
-            if parsed.get("bandwidth_ul_mbps", 0) < parsed.get("guaranteed_bandwidth_ul_mbps", 0):
-                errors.append(f"flow {flow_id} UL target bandwidth is below its guarantee")
+            if parsed.get("bandwidth_dl_mbps", 0) < parsed.get(
+                "guaranteed_bandwidth_dl_mbps", 0
+            ):
+                errors.append(
+                    f"flow {flow_id} DL target bandwidth is below its guarantee"
+                )
+            if parsed.get("bandwidth_ul_mbps", 0) < parsed.get(
+                "guaranteed_bandwidth_ul_mbps", 0
+            ):
+                errors.append(
+                    f"flow {flow_id} UL target bandwidth is below its guarantee"
+                )
             for direction in ("dl", "ul"):
                 allocation_key = f"allocated_bandwidth_{direction}_mbps"
                 guarantee_key = f"guaranteed_bandwidth_{direction}_mbps"
@@ -493,12 +570,18 @@ class EnvironmentAgentCompiler:
                     errors.append(f"flow {flow_id} {allocation_key} must be numeric")
                     continue
                 if not isfinite(allocation_value) or allocation_value < 0:
-                    errors.append(f"flow {flow_id} {allocation_key} must be finite and non-negative")
+                    errors.append(
+                        f"flow {flow_id} {allocation_key} must be finite and non-negative"
+                    )
                 elif allocation_value < parsed.get(guarantee_key, 0):
-                    errors.append(f"flow {flow_id} allocated {direction.upper()} bandwidth is below its guarantee")
+                    errors.append(
+                        f"flow {flow_id} allocated {direction.upper()} bandwidth is below its guarantee"
+                    )
 
     @staticmethod
-    def _validate_capacity(scenario: dict[str, Any], errors: list[str], warnings: list[str]) -> None:
+    def _validate_capacity(
+        scenario: dict[str, Any], errors: list[str], warnings: list[str]
+    ) -> None:
         def number_or_zero(value: Any) -> float:
             try:
                 parsed = float(value)
@@ -511,7 +594,9 @@ class EnvironmentAgentCompiler:
             if not isinstance(item, dict):
                 continue
             label = str(item.get("label") or "").strip()
-            resource = item.get("resource") if isinstance(item.get("resource"), dict) else {}
+            resource = (
+                item.get("resource") if isinstance(item.get("resource"), dict) else {}
+            )
             capacity_by_slice[label] = (
                 number_or_zero(resource.get("capacity_dl_mbps", 0.0)),
                 number_or_zero(resource.get("capacity_ul_mbps", 0.0)),
@@ -521,10 +606,18 @@ class EnvironmentAgentCompiler:
             if not isinstance(flow, dict):
                 continue
             slice_ref = str(flow.get("slice_ref") or "").strip()
-            sla = flow.get("sla_target") if isinstance(flow.get("sla_target"), dict) else {}
+            sla = (
+                flow.get("sla_target")
+                if isinstance(flow.get("sla_target"), dict)
+                else {}
+            )
             requested_by_slice.setdefault(slice_ref, [0.0, 0.0])
-            requested_by_slice[slice_ref][0] += number_or_zero(sla.get("guaranteed_bandwidth_dl_mbps", 0.0))
-            requested_by_slice[slice_ref][1] += number_or_zero(sla.get("guaranteed_bandwidth_ul_mbps", 0.0))
+            requested_by_slice[slice_ref][0] += number_or_zero(
+                sla.get("guaranteed_bandwidth_dl_mbps", 0.0)
+            )
+            requested_by_slice[slice_ref][1] += number_or_zero(
+                sla.get("guaranteed_bandwidth_ul_mbps", 0.0)
+            )
         for slice_ref, requested in requested_by_slice.items():
             capacity = capacity_by_slice.get(slice_ref)
             if not capacity:
@@ -536,7 +629,9 @@ class EnvironmentAgentCompiler:
                     f"requested_ul={requested[1]}, capacity_ul={capacity[1]})"
                 )
             elif requested[0] > capacity[0] * 0.9 or requested[1] > capacity[1] * 0.9:
-                warnings.append(f"slice {slice_ref} guaranteed bandwidth is above 90 percent of capacity")
+                warnings.append(
+                    f"slice {slice_ref} guaranteed bandwidth is above 90 percent of capacity"
+                )
 
     def _validate_quality_profile(
         self,
@@ -556,9 +651,21 @@ class EnvironmentAgentCompiler:
                     f"quality profile {S3_QUALITY_PROFILE} requires at least {minimum} {section}; found {count}"
                 )
         if overlay is None:
-            errors.append(f"quality profile {S3_QUALITY_PROFILE} requires a split_mode_overlay")
+            errors.append(
+                f"quality profile {S3_QUALITY_PROFILE} requires a split_mode_overlay"
+            )
         for gnb in scenario.get("gnbs") or []:
-            if isinstance(gnb, dict) and len({str(item).strip() for item in gnb.get("slices") or [] if str(item).strip()}) < 2:
+            if (
+                isinstance(gnb, dict)
+                and len(
+                    {
+                        str(item).strip()
+                        for item in gnb.get("slices") or []
+                        if str(item).strip()
+                    }
+                )
+                < 2
+            ):
                 errors.append(
                     f"quality profile {S3_QUALITY_PROFILE} requires gNB {gnb.get('name') or '<unknown>'} to serve at least two slices"
                 )
@@ -597,14 +704,25 @@ class EnvironmentAgentCompiler:
             errors.append(
                 f"quality profile {S3_QUALITY_PROFILE} requires service types: {', '.join(missing_service_types)}"
             )
-        if str((scenario.get("free5gc") or {}).get("mode") or "").strip().lower() != "ulcl":
-            errors.append(f"quality profile {S3_QUALITY_PROFILE} requires free5gc.mode=ulcl")
+        if (
+            str((scenario.get("free5gc") or {}).get("mode") or "").strip().lower()
+            != "ulcl"
+        ):
+            errors.append(
+                f"quality profile {S3_QUALITY_PROFILE} requires free5gc.mode=ulcl"
+            )
         if (scenario.get("ns3") or {}).get("slice_isolation") is not True:
-            errors.append(f"quality profile {S3_QUALITY_PROFILE} requires ns3.slice_isolation=true")
+            errors.append(
+                f"quality profile {S3_QUALITY_PROFILE} requires ns3.slice_isolation=true"
+            )
         if (scenario.get("bridge") or {}).get("enable_inline_harness") is not True:
-            errors.append(f"quality profile {S3_QUALITY_PROFILE} requires bridge.enable_inline_harness=true")
+            errors.append(
+                f"quality profile {S3_QUALITY_PROFILE} requires bridge.enable_inline_harness=true"
+            )
 
-    def _validate_overlay(self, overlay: dict[str, Any] | None, errors: list[str]) -> None:
+    def _validate_overlay(
+        self, overlay: dict[str, Any] | None, errors: list[str]
+    ) -> None:
         if overlay is None:
             return
         if not isinstance(overlay, dict):

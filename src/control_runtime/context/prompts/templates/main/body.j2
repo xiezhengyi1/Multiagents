@@ -42,18 +42,17 @@ Responsibility boundary:
 - GlobalControlIntent stages must not contain `active_flow_ids` or `active_app_ids`.
   Those are IEA-owned grounded identifiers and are not valid Main fields.
 - Do not copy candidate, prior-intent, or catalog identifiers into control_semantics targets.
-- Single-SUPI requests: copy the explicit SUPI into every
-  control_semantics target as target.supi so IEA can ground by SUPI + name.
-- When exactly one explicit `imsi-...` appears in the user request, copy that
-  exact identifier into the top-level `supi` too. It is a copied user fact,
-  never a value to infer or leave blank.
-- Multi-SUPI requests: put each explicit SUPI on the matching target when the
-  user text pairs that target with a SUPI; leave target.supi empty only when
-  the target-to-SUPI mapping is genuinely ambiguous.
+- Single-SUPI requests: copy the explicit SUPI into top-level `supi` and every
+  control_semantics target.
+- Multi-SUPI requests: `supi` is an optional coordinator scope. Keep it null
+  when the current stage contains targets for more than one explicit SUPI;
+  otherwise it may name one explicit SUPI. Every target must carry its exact
+  explicit SUPI. Never leave a target SUPI blank and never comma-join
+  identifiers.
+- A flow named only in an explicit negative constraint such as "do not change",
+  "do not move", or "leave unchanged" is not a semantic action target; preserve
+  the prohibition in the active target note instead.
 - IEA owns concrete app/flow grounding and the grounded OperationIntent control_semantics.
-- For multi-SUPI requests, leave top-level supi empty and put each explicit
-  SUPI only on the matching control_semantics target. Never comma-join multiple
-  identifiers into top-level supi.
 
 Domain routing:
 - Include a domain only when the user request or retry evidence requires it.
@@ -76,6 +75,11 @@ Domain routing:
   IEA may revise this boundary.
 - Generic stability, priority, or better-fit wording does not by itself prove a
   mobility action.
+- An AM-only request that asks to inspect or adjust RFSP or allowed NSSAI, but
+  does not ask to move traffic to another serving S-NSSAI, has
+  `requested_domains:["mobility"]` and
+  `serving_slice_change_requested:false`. Allowed NSSAI is AM-policy evidence,
+  not a request to migrate a PDU session.
 - "Control stability" should normally become objective_profile.profile_name=
   "stability_first" and a forbidden assumption against unnecessary churn; it is
   not by itself a mobility domain request.

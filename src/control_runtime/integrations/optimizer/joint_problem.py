@@ -1,43 +1,59 @@
 from __future__ import annotations
 
-from typing import Tuple
-
 from ...contracts import ObjectiveProfile
-from .contracts import JointOptimizationRequest, OptimizationProblemConfig, OptimizationTemplate
+from .contracts import (
+    JointOptimizationRequest,
+    OptimizationProblemConfig,
+    OptimizationTemplate,
+)
 
 
-def resolve_problem_config(request: JointOptimizationRequest) -> Tuple[OptimizationProblemConfig, ObjectiveProfile]:
+def resolve_problem_config(request: JointOptimizationRequest) -> tuple[OptimizationProblemConfig, ObjectiveProfile]:
     config = request.problem_config.normalized_for_domains(request.requested_domains)
-    profile = request.objective_profile.model_copy(deep=True)
+    profile = request.objective_profile
 
     if config.template == OptimizationTemplate.QOS_FIRST:
-        config.solver_mode = "incremental"
-        profile.sla_violation_cost = max(profile.sla_violation_cost, 1.4)
-        profile.resource_pressure_cost = max(profile.resource_pressure_cost, 0.8)
-        profile.control_churn_cost = min(profile.control_churn_cost, 0.4)
-        profile.mobility_risk_cost = min(profile.mobility_risk_cost, 0.5)
+        config = config.model_copy(update={"solver_mode": "incremental"})
+        profile = profile.model_copy(
+            update={
+                "sla_violation_cost": max(profile.sla_violation_cost, 1.4),
+                "resource_pressure_cost": max(profile.resource_pressure_cost, 0.8),
+                "control_churn_cost": min(profile.control_churn_cost, 0.4),
+                "mobility_risk_cost": min(profile.mobility_risk_cost, 0.5),
+            }
+        )
     elif config.template == OptimizationTemplate.MOBILITY_FIRST:
-        config.solver_mode = "incremental"
-        profile.mobility_risk_cost = max(profile.mobility_risk_cost, 1.4)
-        profile.control_churn_cost = max(profile.control_churn_cost, 0.7)
-        profile.sla_violation_cost = max(profile.sla_violation_cost, 0.9)
+        config = config.model_copy(update={"solver_mode": "incremental"})
+        profile = profile.model_copy(
+            update={
+                "mobility_risk_cost": max(profile.mobility_risk_cost, 1.4),
+                "control_churn_cost": max(profile.control_churn_cost, 0.7),
+                "sla_violation_cost": max(profile.sla_violation_cost, 0.9),
+            }
+        )
     elif config.template == OptimizationTemplate.STABILITY_FIRST:
-        config.solver_mode = "incremental"
-        profile.control_churn_cost = max(profile.control_churn_cost, 1.2)
-        profile.fairness_cost = max(profile.fairness_cost, 0.6)
+        config = config.model_copy(update={"solver_mode": "incremental"})
+        profile = profile.model_copy(
+            update={
+                "control_churn_cost": max(profile.control_churn_cost, 1.2),
+                "fairness_cost": max(profile.fairness_cost, 0.6),
+            }
+        )
     elif config.template == OptimizationTemplate.CONGESTION_RELIEF:
-        config.solver_mode = "hybrid"
-        profile.resource_pressure_cost = max(profile.resource_pressure_cost, 1.3)
-        profile.sla_violation_cost = max(profile.sla_violation_cost, 1.0)
-        profile.control_churn_cost = min(profile.control_churn_cost, 0.35)
-    else:
-        config.solver_mode = config.solver_mode or "incremental"
+        config = config.model_copy(update={"solver_mode": "hybrid"})
+        profile = profile.model_copy(
+            update={
+                "resource_pressure_cost": max(profile.resource_pressure_cost, 1.3),
+                "sla_violation_cost": max(profile.sla_violation_cost, 1.0),
+                "control_churn_cost": min(profile.control_churn_cost, 0.35),
+            }
+        )
 
     if bool((request.grounding_decision or {}).get("preserve_current_slice", False)):
         # IEA subscription evidence prohibits a migration. Keep the serving
         # slice fixed, but let the hybrid optimizer find the best QoS envelope
         # that can still be delivered on that entitlement.
-        config.solver_mode = "hybrid"
+        config = config.model_copy(update={"solver_mode": "hybrid"})
 
     return config, profile
 

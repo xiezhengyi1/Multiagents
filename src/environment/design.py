@@ -3,12 +3,11 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .contracts import ScenarioCandidate
-
 
 SERVICE_TYPE_IDS = {"eMBB": 1, "URLLC": 2, "mMTC": 3}
 DEFAULT_UE_KEY = "8baf473f2f8fd09487cccbd7097c6862"
@@ -137,16 +136,68 @@ class FlowDesign(StrictDesignModel):
     rationale: str = Field(min_length=1)
 
 
-class RuntimeDesign(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class Free5gcRuntimeDesign(StrictDesignModel):
+    compose_file: str = Field(min_length=1)
+    config_root: str = Field(min_length=1)
+    mode: Literal["single_upf", "ulcl"]
+    bridge_name: str = Field(min_length=1)
+    project_name: str = Field(min_length=1)
 
-    free5gc: dict[str, Any]
-    ns3: dict[str, Any]
-    writer: dict[str, Any]
-    bridge: dict[str, Any]
-    split_mode_ns3: dict[str, Any]
-    split_mode_runtime: dict[str, Any]
-    split_mode_radio: dict[str, Any]
+
+class Ns3RuntimeDesign(StrictDesignModel):
+    ns3_root: str = Field(min_length=1)
+    scratch_name: str = Field(min_length=1)
+    output_subdir: str = Field(min_length=1)
+    simulator: str = Field(min_length=1)
+    sim_time_ms: int = Field(gt=0)
+    bridge_mode: Literal["l2_inline"]
+    slice_isolation: bool
+
+
+class WriterRuntimeDesign(StrictDesignModel):
+    archive_dir: str = Field(min_length=1)
+    state_db: str = Field(min_length=1)
+    graph_db_url: str = Field(min_length=1)
+
+
+class BridgeRuntimeDesign(StrictDesignModel):
+    enable_inline_harness: bool
+    n3_network_name: str = Field(min_length=1)
+    n3_network_cidr: str = Field(min_length=1)
+
+
+class SplitModeNs3Design(StrictDesignModel):
+    output_subdir: str = Field(min_length=1)
+    scratch_name: str = Field(min_length=1)
+    policy_reload_ms: int = Field(gt=0)
+    activation_poll_ms: int = Field(gt=0)
+    nr_numerology: int = Field(ge=0)
+    nr_bandwidth_hz: int = Field(gt=0)
+
+
+class SplitModeRuntimeDesign(StrictDesignModel):
+    startup_timeout_seconds: int = Field(gt=0)
+    state_poll_ms: int = Field(gt=0)
+
+
+class SplitModeRadioDesign(StrictDesignModel):
+    scheduler_type: str = Field(min_length=1)
+    tdd_pattern: str = Field(min_length=1)
+    gnb_tx_power_dbm: float
+    ue_tx_power_dbm: float
+    enable_uplink_power_control: bool
+    gnb_noise_figure_db: float = Field(ge=0)
+    ue_noise_figure_db: float = Field(ge=0)
+
+
+class RuntimeDesign(StrictDesignModel):
+    free5gc: Free5gcRuntimeDesign
+    ns3: Ns3RuntimeDesign
+    writer: WriterRuntimeDesign
+    bridge: BridgeRuntimeDesign
+    split_mode_ns3: SplitModeNs3Design
+    split_mode_runtime: SplitModeRuntimeDesign
+    split_mode_radio: SplitModeRadioDesign
 
 
 class EnvironmentDesign(StrictDesignModel):
@@ -165,27 +216,6 @@ class EnvironmentDesign(StrictDesignModel):
     runtime: RuntimeDesign
 
 
-class EnvironmentDesignRevision(StrictDesignModel):
-    """LLM-authored replacements for a previously accepted semantic design.
-
-    Every collection entry is a complete semantic entity.  The deterministic
-    merge only replaces the entity with the same key; it never invents values,
-    adds entities, or alters an omitted entity.
-    """
-
-    name: str | None = Field(default=None, min_length=1)
-    rationale: str | None = Field(default=None, min_length=1)
-    tick_ms: int | None = Field(default=None, gt=0)
-    seed: int | None = Field(default=None, ge=0)
-    slices: list[SliceDesign] = Field(default_factory=list)
-    upfs: list[UpfDesign] = Field(default_factory=list)
-    gnbs: list[GnbDesign] = Field(default_factory=list)
-    ues: list[UeDesign] = Field(default_factory=list)
-    apps: list[AppDesign] = Field(default_factory=list)
-    flows: list[FlowDesign] = Field(default_factory=list)
-    runtime: RuntimeDesign | None = None
-
-
 class EnvironmentDesignError(ValueError):
     def __init__(self, errors: list[str]) -> None:
         self.errors = tuple(errors)
@@ -201,7 +231,7 @@ class CompiledEnvironmentDesign:
 class EnvironmentDesignCompiler:
     """Compile an LLM-authored semantic design without changing its metrics."""
 
-    CATALOG_FIELDS = {
+    CATALOG_FIELDS: ClassVar[dict[str, str]] = {
         "slices": "slice_keys",
         "upfs": "upf_keys",
         "gnbs": "gnb_keys",
@@ -210,68 +240,18 @@ class EnvironmentDesignCompiler:
         "flows": "flow_keys",
     }
 
-    def apply_revision(
-        self,
-        design: EnvironmentDesign,
-        revision: EnvironmentDesignRevision,
-    ) -> tuple[EnvironmentDesign, list[str]]:
-        """Apply only explicit LLM-authored semantic replacements."""
-
-        payload = design.model_dump(mode="json")
-        changed: list[str] = []
-        for field_name in ("name", "rationale", "tick_ms", "seed"):
-            value = getattr(revision, field_name)
-            if value is not None:
-                payload[field_name] = value
-                changed.append(field_name)
-
-        errors: list[str] = []
-        for section in self.CATALOG_FIELDS:
-            replacements = list(getattr(revision, section))
-            if not replacements:
-                continue
-            duplicate_keys = sorted(
-                key
-                for key, count in Counter(item.key for item in replacements).items()
-                if count > 1
-            )
-            if duplicate_keys:
-                errors.append(
-                    f"revision {section} contains duplicate replacement keys: "
-                    + ", ".join(duplicate_keys)
-                )
-                continue
-            indexed = {str(item["key"]): item for item in payload[section]}
-            for replacement in replacements:
-                if replacement.key not in indexed:
-                    errors.append(
-                        f"revision cannot add undeclared {section} key {replacement.key}; "
-                        "submit a new catalog and complete design to change the manifest"
-                    )
-                    continue
-                indexed[replacement.key] = replacement.model_dump(mode="json")
-                changed.append(f"{section}.{replacement.key}")
-            payload[section] = [indexed[str(item["key"])] for item in payload[section]]
-
-        if revision.runtime is not None:
-            payload["runtime"] = revision.runtime.model_dump(mode="json")
-            changed.append("runtime")
-        if errors:
-            raise EnvironmentDesignError(errors)
-        if not changed:
-            raise EnvironmentDesignError(
-                ["revision contains no explicit semantic replacements"]
-            )
-        return EnvironmentDesign.model_validate(payload), changed
-
     def validate_catalog(self, catalog: EnvironmentCatalog) -> list[str]:
         errors: list[str] = []
         expected = catalog.expected_counts.model_dump()
         for section, key_field in self.CATALOG_FIELDS.items():
             keys = list(getattr(catalog, key_field))
-            duplicates = sorted(key for key, count in Counter(keys).items() if count > 1)
+            duplicates = sorted(
+                key for key, count in Counter(keys).items() if count > 1
+            )
             if duplicates:
-                errors.append(f"catalog {section} contains duplicate keys: {', '.join(duplicates)}")
+                errors.append(
+                    f"catalog {section} contains duplicate keys: {', '.join(duplicates)}"
+                )
             if len(keys) != expected[section]:
                 errors.append(
                     f"catalog expected {expected[section]} {section} but declared {len(keys)} keys"
@@ -291,7 +271,9 @@ class EnvironmentDesignCompiler:
                 f"design scenario_id {design.scenario_id} does not match catalog {catalog.scenario_id}"
             )
         if design.objective != catalog.objective:
-            errors.append("design objective does not match the accepted catalog objective")
+            errors.append(
+                "design objective does not match the accepted catalog objective"
+            )
         errors.extend(self._validate_design_completeness(catalog, design))
         if errors:
             raise EnvironmentDesignError(errors)
@@ -317,7 +299,10 @@ class EnvironmentDesignCompiler:
             for index, item in enumerate(ordered["flows"], start=1)
         }
 
-        slices = [self._compile_slice(item, slice_labels[item.key]) for item in ordered["slices"]]
+        slices = [
+            self._compile_slice(item, slice_labels[item.key])
+            for item in ordered["slices"]
+        ]
         upfs = [
             {"name": item.name, "role": item.role, "dnn": item.dnn}
             for item in ordered["upfs"]
@@ -358,7 +343,9 @@ class EnvironmentDesignCompiler:
                 "amf": "8000",
                 "free5gc_policy": {
                     "target_gnb": gnb_names[item.target_gnb_key],
-                    "preferred_gnbs": [gnb_names[key] for key in item.preferred_gnb_keys],
+                    "preferred_gnbs": [
+                        gnb_names[key] for key in item.preferred_gnb_keys
+                    ],
                 },
                 "sessions": sessions_by_ue[item.key],
             }
@@ -383,7 +370,11 @@ class EnvironmentDesignCompiler:
                 ue_name=ue_names[apps_by_key[item.app_key].ue_key],
                 supi=ue_supis[apps_by_key[item.app_key].ue_key],
                 slice_label=slice_labels[item.slice_key],
-                slice_design=next(slice_ for slice_ in ordered["slices"] if slice_.key == item.slice_key),
+                slice_design=next(
+                    slice_
+                    for slice_ in ordered["slices"]
+                    if slice_.key == item.slice_key
+                ),
             )
             for item in ordered["flows"]
         ]
@@ -422,7 +413,6 @@ class EnvironmentDesignCompiler:
             split_mode_overlay=overlay,
         )
         report = {
-            "version": 1,
             "scenario_id": design.scenario_id,
             "objective": design.objective,
             "scenario_rationale": design.rationale,
@@ -450,15 +440,23 @@ class EnvironmentDesignCompiler:
             expected_keys = set(getattr(catalog, key_field))
             actual_items = list(getattr(design, section))
             actual_keys = [item.key for item in actual_items]
-            duplicate_keys = sorted(key for key, count in Counter(actual_keys).items() if count > 1)
+            duplicate_keys = sorted(
+                key for key, count in Counter(actual_keys).items() if count > 1
+            )
             if duplicate_keys:
-                errors.append(f"design {section} contains duplicate keys: {', '.join(duplicate_keys)}")
+                errors.append(
+                    f"design {section} contains duplicate keys: {', '.join(duplicate_keys)}"
+                )
             missing = sorted(expected_keys - set(actual_keys))
             extra = sorted(set(actual_keys) - expected_keys)
             if missing:
-                errors.append(f"design {section} is missing catalog keys: {', '.join(missing)}")
+                errors.append(
+                    f"design {section} is missing catalog keys: {', '.join(missing)}"
+                )
             if extra:
-                errors.append(f"design {section} contains undeclared keys: {', '.join(extra)}")
+                errors.append(
+                    f"design {section} contains undeclared keys: {', '.join(extra)}"
+                )
 
         slice_keys = set(catalog.slice_keys)
         upf_keys = set(catalog.upf_keys)
@@ -466,23 +464,45 @@ class EnvironmentDesignCompiler:
         ue_keys = set(catalog.ue_keys)
         app_keys = set(catalog.app_keys)
         for item in design.gnbs:
-            self._check_references(errors, f"gNB {item.key} slice", item.served_slice_keys, slice_keys)
-            self._check_references(errors, f"gNB {item.key} backhaul UPF", [item.backhaul_upf_key], upf_keys)
+            self._check_references(
+                errors, f"gNB {item.key} slice", item.served_slice_keys, slice_keys
+            )
+            self._check_references(
+                errors,
+                f"gNB {item.key} backhaul UPF",
+                [item.backhaul_upf_key],
+                upf_keys,
+            )
         gnb_slice_map = {item.key: set(item.served_slice_keys) for item in design.gnbs}
         for item in design.ues:
-            self._check_references(errors, f"UE {item.key} attached gNB", [item.attached_gnb_key], gnb_keys)
-            self._check_references(errors, f"UE {item.key} target gNB", [item.target_gnb_key], gnb_keys)
-            self._check_references(errors, f"UE {item.key} preferred gNB", item.preferred_gnb_keys, gnb_keys)
+            self._check_references(
+                errors, f"UE {item.key} attached gNB", [item.attached_gnb_key], gnb_keys
+            )
+            self._check_references(
+                errors, f"UE {item.key} target gNB", [item.target_gnb_key], gnb_keys
+            )
+            self._check_references(
+                errors,
+                f"UE {item.key} preferred gNB",
+                item.preferred_gnb_keys,
+                gnb_keys,
+            )
         for item in design.apps:
             self._check_references(errors, f"app {item.key} UE", [item.ue_key], ue_keys)
         app_by_key = {item.key: item for item in design.apps}
         ue_by_key = {item.key: item for item in design.ues}
         for item in design.flows:
-            self._check_references(errors, f"flow {item.key} app", [item.app_key], app_keys)
-            self._check_references(errors, f"flow {item.key} slice", [item.slice_key], slice_keys)
+            self._check_references(
+                errors, f"flow {item.key} app", [item.app_key], app_keys
+            )
+            self._check_references(
+                errors, f"flow {item.key} slice", [item.slice_key], slice_keys
+            )
             app = app_by_key.get(item.app_key)
             ue = ue_by_key.get(app.ue_key) if app is not None else None
-            if ue is not None and item.slice_key not in gnb_slice_map.get(ue.attached_gnb_key, set()):
+            if ue is not None and item.slice_key not in gnb_slice_map.get(
+                ue.attached_gnb_key, set()
+            ):
                 errors.append(
                     f"flow {item.key} requests slice {item.slice_key}, which is not served by "
                     f"UE {ue.key} attached gNB {ue.attached_gnb_key}"

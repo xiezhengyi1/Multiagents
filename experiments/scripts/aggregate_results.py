@@ -11,7 +11,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from experiments.scripts.common import EXPERIMENT_ROOT, LEDGER_ROOT, TASK_ROOT, load_json
+from experiments.scripts.common import LEDGER_ROOT, TASK_ROOT, load_json
 
 TASK_CATALOG_PATH = TASK_ROOT / "task_catalog.json"
 LEDGER_PATH = LEDGER_ROOT / "run_ledger.csv"

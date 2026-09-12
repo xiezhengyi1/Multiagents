@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Literal
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import Field, model_validator
 
-from ...contracts import ControlDomain, ObjectiveProfile
-from ...diagnostics.mediation.contracts import DomainStatus, DomainVerdict
+from shared.contracts import ContractModel, JsonValue, NonEmptyStr
+
+from ...contracts import ControlDomain, DomainStatus, DomainVerdict, ObjectiveProfile
 
 
 class OptimizationTemplate(str, Enum):
@@ -15,6 +16,12 @@ class OptimizationTemplate(str, Enum):
     JOINT_BALANCED = "joint_balanced"
     STABILITY_FIRST = "stability_first"
     CONGESTION_RELIEF = "congestion_relief"
+
+
+class OptimizerScope(ContractModel):
+    episode_id: NonEmptyStr
+    round_index: int = Field(ge=0)
+    snapshot_id: NonEmptyStr
 
 
 SESSION_DECISION_VARIABLES = [
@@ -55,63 +62,84 @@ COUPLING_CONSTRAINTS = [
 ]
 
 
-class OptimizationProblemConfig(BaseModel):
-    template: OptimizationTemplate = Field(default=OptimizationTemplate.JOINT_BALANCED)
-    solver_mode: str = Field(default="incremental")
-    active_objectives: List[str] = Field(
-        default_factory=lambda: [
-            "sla_violation_cost",
-            "mobility_risk_cost",
-            "control_churn_cost",
-            "resource_pressure_cost",
-            "fairness_cost",
-        ]
-    )
-    active_constraints: List[str] = Field(
-        default_factory=lambda: [
-            *SESSION_CONSTRAINTS,
-            *MOBILITY_CONSTRAINTS,
-            *COUPLING_CONSTRAINTS,
-        ]
-    )
-    decision_variables: List[str] = Field(
-        default_factory=lambda: [*SESSION_DECISION_VARIABLES, *MOBILITY_DECISION_VARIABLES]
-    )
-    qos_relaxation_ratio: float = Field(default=0.2, ge=0.0, le=1.0)
-    slice_kpi_source: Literal["qos", "telemetry"] = Field(default="qos")
-    qos_feasibility_mode: Literal["hard", "soft"] = Field(default="hard")
-    enable_sla_constraints: bool = Field(default=True)
+class OptimizationProblemConfig(ContractModel):
+    template: OptimizationTemplate
+    solver_mode: NonEmptyStr
+    active_objectives: list[NonEmptyStr]
+    active_constraints: list[NonEmptyStr]
+    decision_variables: list[NonEmptyStr]
+    qos_relaxation_ratio: float = Field(ge=0.0, le=1.0)
+    slice_kpi_source: Literal["qos", "telemetry"]
+    qos_feasibility_mode: Literal["hard", "soft"]
+    enable_sla_constraints: bool
 
-    def grouped_decision_variables(self) -> Dict[str, List[str]]:
+    @model_validator(mode="after")
+    def validate_unique_members(self) -> OptimizationProblemConfig:
+        for name, values in (
+            ("active_objectives", self.active_objectives),
+            ("active_constraints", self.active_constraints),
+            ("decision_variables", self.decision_variables),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"{name} must not contain duplicates")
+        return self
+
+    def grouped_decision_variables(self) -> dict[str, list[str]]:
         variables = set(self.decision_variables)
         return {
-            "session_domain": [item for item in SESSION_DECISION_VARIABLES if item in variables],
-            "mobility_domain": [item for item in MOBILITY_DECISION_VARIABLES if item in variables],
+            "session_domain": [
+                item for item in SESSION_DECISION_VARIABLES if item in variables
+            ],
+            "mobility_domain": [
+                item for item in MOBILITY_DECISION_VARIABLES if item in variables
+            ],
             "cross_domain": [],
         }
 
-    def grouped_constraints(self) -> Dict[str, List[str]]:
+    def grouped_constraints(self) -> dict[str, list[str]]:
         constraints = set(self.active_constraints)
         return {
-            "session_feasibility": [item for item in SESSION_CONSTRAINTS if item in constraints],
-            "mobility_feasibility": [item for item in MOBILITY_CONSTRAINTS if item in constraints],
+            "session_feasibility": [
+                item for item in SESSION_CONSTRAINTS if item in constraints
+            ],
+            "mobility_feasibility": [
+                item for item in MOBILITY_CONSTRAINTS if item in constraints
+            ],
             "coupling": [item for item in COUPLING_CONSTRAINTS if item in constraints],
         }
 
-    def normalized_for_domains(self, requested_domains: List[ControlDomain]) -> "OptimizationProblemConfig":
+    def normalized_for_domains(
+        self, requested_domains: list[ControlDomain]
+    ) -> OptimizationProblemConfig:
         domains = set(requested_domains)
-        active_objectives = list(dict.fromkeys(self.active_objectives))
-        active_constraints = list(dict.fromkeys(self.active_constraints))
-        decision_variables = list(dict.fromkeys(self.decision_variables))
+        active_objectives = list(self.active_objectives)
+        active_constraints = list(self.active_constraints)
+        decision_variables = list(self.decision_variables)
         if ControlDomain.MOBILITY not in domains:
-            active_objectives = [item for item in active_objectives if item != "mobility_risk_cost"]
-            active_constraints = [
-                item for item in active_constraints if item not in set(MOBILITY_CONSTRAINTS + COUPLING_CONSTRAINTS)
+            active_objectives = [
+                item for item in active_objectives if item != "mobility_risk_cost"
             ]
-            decision_variables = [item for item in decision_variables if item not in set(MOBILITY_DECISION_VARIABLES)]
+            active_constraints = [
+                item
+                for item in active_constraints
+                if item not in set(MOBILITY_CONSTRAINTS + COUPLING_CONSTRAINTS)
+            ]
+            decision_variables = [
+                item
+                for item in decision_variables
+                if item not in set(MOBILITY_DECISION_VARIABLES)
+            ]
         if ControlDomain.QOS not in domains:
-            active_constraints = [item for item in active_constraints if item not in set(SESSION_CONSTRAINTS)]
-            decision_variables = [item for item in decision_variables if item not in set(SESSION_DECISION_VARIABLES)]
+            active_constraints = [
+                item
+                for item in active_constraints
+                if item not in set(SESSION_CONSTRAINTS)
+            ]
+            decision_variables = [
+                item
+                for item in decision_variables
+                if item not in set(SESSION_DECISION_VARIABLES)
+            ]
         return OptimizationProblemConfig(
             template=self.template,
             solver_mode=self.solver_mode,
@@ -125,51 +153,74 @@ class OptimizationProblemConfig(BaseModel):
         )
 
 
-class OptimizerInput(BaseModel):
+class OptimizerInput(ContractModel):
     """Agent-projected input accepted at the optimizer integration boundary."""
 
-    session_id: str
-    snapshot_id: str
-    target_supis: List[str]
-    requested_domains: List[ControlDomain]
-    grounding_decision: Dict[str, Any]
+    scope: OptimizerScope
+    target_supis: list[NonEmptyStr]
+    requested_domains: list[ControlDomain]
+    grounding_decision: dict[str, JsonValue]
     objective_profile: ObjectiveProfile
     raw_intent: str
 
-
-class JointOptimizationRequest(BaseModel):
-    session_id: str = ""
-    snapshot_id: str = ""
-    target_ues: List[str] = Field(default_factory=list)
-    requested_domains: List[ControlDomain] = Field(default_factory=list)
-    grounding_decision: Dict[str, Any] = Field(default_factory=dict)
-    traffic_state: Dict[str, Any] = Field(default_factory=dict)
-    resource_state: Dict[str, Any] = Field(default_factory=dict)
-    mobility_state: Dict[str, Any] = Field(default_factory=dict)
-    policy_state: Dict[str, Any] = Field(default_factory=dict)
-    objective_profile: ObjectiveProfile = Field(default_factory=ObjectiveProfile)
-    problem_config: OptimizationProblemConfig = Field(default_factory=OptimizationProblemConfig)
+    @model_validator(mode="after")
+    def validate_optimizer_input(self) -> OptimizerInput:
+        if not self.target_supis:
+            raise ValueError("optimizer input requires target_supis")
+        if len(self.target_supis) != len(set(self.target_supis)):
+            raise ValueError("target_supis must not contain duplicates")
+        if not self.requested_domains:
+            raise ValueError("optimizer input requires requested_domains")
+        if len(self.requested_domains) != len(set(self.requested_domains)):
+            raise ValueError("requested_domains must not contain duplicates")
+        return self
 
 
-class JointOptimizationResult(BaseModel):
+class JointOptimizationRequest(ContractModel):
+    scope: OptimizerScope
+    target_ues: list[NonEmptyStr]
+    requested_domains: list[ControlDomain]
+    grounding_decision: dict[str, JsonValue]
+    traffic_state: dict[str, JsonValue]
+    resource_state: dict[str, JsonValue]
+    mobility_state: dict[str, JsonValue]
+    policy_state: dict[str, JsonValue]
+    objective_profile: ObjectiveProfile
+    problem_config: OptimizationProblemConfig
+
+    @model_validator(mode="after")
+    def validate_request_scope(self) -> JointOptimizationRequest:
+        if not self.target_ues:
+            raise ValueError("joint optimization requires target_ues")
+        if len(self.target_ues) != len(set(self.target_ues)):
+            raise ValueError("target_ues must not contain duplicates")
+        if not self.requested_domains:
+            raise ValueError("joint optimization requires requested_domains")
+        if len(self.requested_domains) != len(set(self.requested_domains)):
+            raise ValueError("requested_domains must not contain duplicates")
+        return self
+
+
+class JointOptimizationResult(ContractModel):
     status: DomainStatus
-    qos_plan: Dict[str, Any] = Field(default_factory=dict)
-    mobility_plan: Dict[str, Any] = Field(default_factory=dict)
-    am_plan: Dict[str, Any] = Field(default_factory=dict)
-    cross_domain_verdicts: List[DomainVerdict] = Field(default_factory=list)
-    objective_breakdown: Dict[str, Any] = Field(default_factory=dict)
-    infeasible_reasons: List[str] = Field(default_factory=list)
+    qos_plan: dict[str, JsonValue]
+    mobility_plan: dict[str, JsonValue]
+    am_plan: dict[str, JsonValue]
+    cross_domain_verdicts: list[DomainVerdict]
+    objective_breakdown: dict[str, JsonValue]
+    infeasible_reasons: list[NonEmptyStr]
 
 
 __all__ = [
     "COUPLING_CONSTRAINTS",
-    "JointOptimizationRequest",
-    "JointOptimizationResult",
     "MOBILITY_CONSTRAINTS",
     "MOBILITY_DECISION_VARIABLES",
+    "SESSION_CONSTRAINTS",
+    "SESSION_DECISION_VARIABLES",
+    "JointOptimizationRequest",
+    "JointOptimizationResult",
     "OptimizationProblemConfig",
     "OptimizationTemplate",
     "OptimizerInput",
-    "SESSION_CONSTRAINTS",
-    "SESSION_DECISION_VARIABLES",
+    "OptimizerScope",
 ]

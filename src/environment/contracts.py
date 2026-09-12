@@ -1,51 +1,52 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import Literal
+
+from pydantic import Field, JsonValue, model_validator
+
+from shared.contracts import ContractModel, NonEmptyStr
+from shared.contracts.coordination import HandoffPayload
 
 
-@dataclass(frozen=True)
-class EnvironmentGenerationRequest:
-    scenario_id: str
-    objective: str
-    complexity: str = "medium"
-    target_flow_count: int = 8
-    topology_mode: str = "ulcl"
-    stress_mode: str = "slice_resource_contention"
-    output_dir: Path = Path("generated")
+class EnvironmentGenerationRequest(HandoffPayload):
+    scenario_id: NonEmptyStr
+    objective: NonEmptyStr
+    complexity: Literal["low", "medium", "high"] = "medium"
+    target_flow_count: int = Field(default=8, ge=1)
+    topology_mode: NonEmptyStr = "ulcl"
+    stress_mode: NonEmptyStr = "slice_resource_contention"
 
 
-@dataclass(frozen=True)
-class ScenarioCandidate:
-    scenario_id: str
-    name: str
-    scenario: dict[str, Any]
-    split_mode_overlay: dict[str, Any] | None = None
-    source_path: Path | None = None
+class ScenarioCandidate(ContractModel):
+    scenario_id: NonEmptyStr
+    name: NonEmptyStr
+    scenario: dict[str, JsonValue]
+    split_mode_overlay: dict[str, JsonValue] | None = None
+
+    @model_validator(mode="after")
+    def validate_identity(self) -> ScenarioCandidate:
+        if str(self.scenario.get("scenario_id") or "").strip() != self.scenario_id:
+            raise ValueError("scenario.scenario_id must match scenario_id")
+        if str(self.scenario.get("name") or "").strip() != self.name:
+            raise ValueError("scenario.name must match name")
+        return self
 
 
-@dataclass(frozen=True)
-class EnvironmentValidationReport:
-    scenario_id: str
+class EnvironmentValidationReport(ContractModel):
+    scenario_id: NonEmptyStr
     ok: bool
-    errors: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
-
-    @property
-    def error_count(self) -> int:
-        return len(self.errors)
+    errors: tuple[NonEmptyStr, ...] = ()
+    warnings: tuple[NonEmptyStr, ...] = ()
 
 
-@dataclass(frozen=True)
-class LaunchPlan:
-    cwd: Path
-    argv: list[object]
-    graph_db_url: str
-    live_graph_snapshot_id: str
-    manifest_path: Path
-    healthcheck_host: str = "127.0.0.1"
-    healthcheck_port: int = 18080
-    healthcheck_path: str = "/policy-executions/launch-healthcheck"
-    timeout_seconds: float = 180.0
-    metadata: dict[str, Any] = field(default_factory=dict)
+class EnvironmentArtifact(HandoffPayload):
+    candidate: ScenarioCandidate
+    compilation_report: dict[str, JsonValue]
+
+
+__all__ = [
+    "EnvironmentArtifact",
+    "EnvironmentGenerationRequest",
+    "EnvironmentValidationReport",
+    "ScenarioCandidate",
+]

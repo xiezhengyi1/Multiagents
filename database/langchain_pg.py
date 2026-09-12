@@ -10,7 +10,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_postgres import PGVector
 from openai import OpenAI
 
-from database.connection import DATABASE_URL, RAW_DATABASE_URL
+from database.connection import require_database_url, to_sqlalchemy_url
 from knowledge_build.rag_release import COLLECTIONS
 
 
@@ -159,7 +159,7 @@ def get_openai_embeddings() -> CompatibleOpenAIEmbeddings:
 
 
 def get_pgvector_connection() -> str:
-    return DATABASE_URL
+    return to_sqlalchemy_url(require_database_url())
 
 
 def get_pgvector_store(
@@ -227,31 +227,6 @@ def ensure_semantic_knowledge_collection(
     store: Optional[PGVector] = None,
 ) -> PGVector:
     return store or ensure_pgvector_collection(collection_name=SEMANTIC_KNOWLEDGE_COLLECTION)
-
-
-def setup_langgraph_postgres(
-    *,
-    database_url: Optional[str] = None,
-    embeddings: Optional[Embeddings] = None,
-) -> None:
-    from langgraph.checkpoint.postgres import PostgresSaver
-    from langgraph.store.postgres import PostgresStore
-
-    raw_url = str(database_url or RAW_DATABASE_URL).strip()
-    embedding_model = embeddings or get_openai_embeddings()
-
-    with PostgresSaver.from_conn_string(raw_url) as saver:
-        saver.setup()
-
-    with PostgresStore.from_conn_string(
-        raw_url,
-        index={
-            "dims": get_embedding_dimensions(),
-            "embed": embedding_model,
-            "fields": ["content"],
-        },
-    ) as store:
-        store.setup()
 
 
 def build_semantic_knowledge_document(
@@ -323,5 +298,4 @@ __all__ = [
     "get_pgvector_store",
     "get_semantic_knowledge_store",
     "rebuild_pgvector_collection",
-    "setup_langgraph_postgres",
 ]

@@ -62,7 +62,7 @@ Internal sequence: route QoS-only -> call get_sm_ue_flow_catalog -> bind the
 exact flow -> call preview_qos_optimizer once -> finalize. Do not inspect AM
 policy or search again after an exact catalog match.
 Final output:
-{"planning_status":"executable_plan","rationale":"The optimizer approved the exact catalog-grounded QoS target.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-3521","app_id":"app-telemedicine","priority":2,"target_latency_ms":13.0,"packet_error_rate":0.0005,"max_br_ul_mbps":3.8,"max_br_dl_mbps":3.0,"gbr_ul_mbps":3.0,"gbr_dl_mbps":2.4,"target_jitter_ms":4.0}],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
+{"planning_status":"executable_plan","rationale":"The optimizer approved the exact catalog-grounded QoS target.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-3521","app_id":"app-telemedicine","priority":2,"target_latency_ms":13.0,"packet_error_rate":0.0005,"max_br_ul_mbps":3.8,"max_br_dl_mbps":3.0,"gbr_ul_mbps":3.0,"gbr_dl_mbps":2.4,"target_jitter_ms":4.0,"flow_description":null}],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
 
 Example 2 — target-stable assurance retry:
 Retry contract: preserved flow_id=flow-3521, app_id=app-telemedicine,
@@ -72,11 +72,11 @@ Internal sequence: keep the exact binding and QoS-only scope -> rerun only
 preview_qos_optimizer -> do not repeat catalog/search and do not propose a PDB
 below 13 -> finalize from the new preview.
 Final output:
-{"planning_status":"executable_plan","rationale":"Target-stable retry reused the grounded flow and the optimizer met the measured latency floor.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-3521","app_id":"app-telemedicine","priority":2,"target_latency_ms":13.0,"packet_error_rate":0.0005,"max_br_ul_mbps":3.8,"max_br_dl_mbps":3.0,"gbr_ul_mbps":3.0,"gbr_dl_mbps":2.4}],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
+{"planning_status":"executable_plan","rationale":"Target-stable retry reused the grounded flow and the optimizer met the measured latency floor.","missing_evidence":[],"blocked_targets":[],"upstream_requests":[],"planner_conflicts":[],"sm_policies":[{"flow_id":"flow-3521","app_id":"app-telemedicine","priority":2,"target_latency_ms":13.0,"packet_error_rate":0.0005,"max_br_ul_mbps":3.8,"max_br_dl_mbps":3.0,"gbr_ul_mbps":3.0,"gbr_dl_mbps":2.4,"target_jitter_ms":null,"flow_description":null}],"am_policy":null,"ursp_policies":[],"partial_policies":[]}
 
 Example 3 — explicit serving-S-NSSAI migration but entitlement is absent:
 Internal sequence: route joint QoS+mobility -> ground flow -> call
 get_ue_slice_subscription once -> entitlement is missing/blocked -> do not
 call AM inspection to manufacture a workaround. If no entitled optimizer
 fallback exists, return this bounded non-executable outcome:
-{"planning_status":"partial_plan","rationale":"Subscription entitlement blocks the requested serving-slice change.","missing_evidence":["authorized target S-NSSAI"],"blocked_targets":["flow-3521 target slice migration"],"upstream_requests":[],"planner_conflicts":["No entitled optimizer assignment is available for the requested migration."],"sm_policies":[],"am_policy":null,"ursp_policies":[],"partial_policies":[{"policy_type":"SmPolicyDecision","policy_id":"partial-sm-flow-3521","flow_id":"flow-3521","app_id":"app-telemedicine","target_type":"flow","blocked_reason":"No entitled current-slice optimizer assignment."}]}
+{"planning_status":"partial_plan","rationale":"Subscription entitlement blocks the requested serving-slice change.","missing_evidence":["authorized target S-NSSAI"],"blocked_targets":["flow-3521 target slice migration"],"upstream_requests":[],"planner_conflicts":["No entitled optimizer assignment is available for the requested migration."],"sm_policies":[],"am_policy":null,"ursp_policies":[],"partial_policies":[{"app_id":"app-telemedicine","flow_id":"flow-3521","target_type":"flow","policy_type":"SmPolicyDecision","resource_keys":[],"policy_details":{"blocked_reason":"No entitled current-slice optimizer assignment."}}]}
